@@ -1,0 +1,25 @@
+/*
+ * Obsidian's OWN rules for a range input - the ones that reach a plugin's
+ * slider whether or not the plugin styles it. Reduced by hand to the
+ * declarations that can move a thumb; this is NOT a copy of the app's
+ * stylesheet and the suite does not need one.
+ *
+ * Source: the CSS bundled in the installed app
+ * (C:/Program Files/Obsidian/resources/obsidian.asar, the plain-text block
+ * around "slider-runnable-track"), read on 2026-09-06 from the build dated
+ * 2025-08-12. The same bundle sets `--slider-thumb-y` twice: -6px in its
+ * `body` variables and -9px in its `.is-mobile` block. Both ship, so the test
+ * that loads this file supplies the value and runs at both.
+ */
+input[type='range']::-webkit-slider-runnable-track {
+	height: 6px;
+	-webkit-appearance: none;
+}
+input[type='range']::-webkit-slider-thumb {
+	-webkit-appearance: none;
+	position: relative;
+	top: var(--slider-thumb-y);
+}
+input[type='range']:not(:disabled)::-webkit-slider-thumb:active {
+	top: var(--slider-thumb-y-active, var(--slider-thumb-y));
+}

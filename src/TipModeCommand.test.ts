@@ -32,7 +32,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import HandwritingPlugin from "./main";
-import { consumeMousePutDown, markMousePutDown, mouseInkEnabled, setMouseInk } from "./inline/MouseInk";
+import {
+	clearToolPicked,
+	consumeMousePutDown,
+	markMousePutDown,
+	mouseInkEnabled,
+	setMouseInk,
+	toolPickedHere,
+} from "./inline/MouseInk";
 import {
 	clearPenHardwareSeen,
 	markPenHardwareSeen,
@@ -267,5 +274,31 @@ describe("tipModeOffNotice: what the OFF toast says", () => {
 
 		expect(first).toBe("Handwriting: cursor");
 		expect(second).toBe("Handwriting: pen");
+	});
+});
+
+/**
+ * THE NIB HALF OF "a tool has been picked" (MouseInk.ts, `toolPicked`), which
+ * on a pen-less device is what the mouse's grant and the nib's light both
+ * read through `toolIsLit`. `setInlineTool` is where it is set - the one line
+ * the Pen and Highlighter commands, the strip's two nib buttons, every colour
+ * command and every quick-pen preset all end in - so this file, which already
+ * drives the real `setInlineTool` against the real plugin prototype, is where
+ * that wiring is pinned. The tip half is TipMode.test.ts's.
+ */
+describe("picking a nib is a pick", () => {
+	beforeEach(() => clearToolPicked());
+
+	it("setInlineTool marks the tool picked", () => {
+		expect(toolPickedHere()).toBe(false);
+		setInlineTool("highlighter");
+		expect(toolPickedHere()).toBe(true);
+	});
+
+	it("re-picking the tool already held still counts - no early return to hide behind", () => {
+		setInlineTool("pen");
+		clearToolPicked();
+		setInlineTool("pen");
+		expect(toolPickedHere()).toBe(true);
 	});
 });

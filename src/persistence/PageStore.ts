@@ -1,5 +1,10 @@
 import { normalizePath } from "obsidian";
-import { DEFAULT_INK_FOLDER, SYNCED_INK_FOLDER, ensureFolder } from "./InkFolder";
+import {
+	DEFAULT_INK_FOLDER,
+	SYNCED_INK_FOLDER,
+	ensureFolder,
+	isLiveSidecarName,
+} from "./InkFolder";
 import {
 	PageData,
 	ParseResult,
@@ -122,6 +127,23 @@ function generationOf(file: string, prefix: string): number {
 	if (!m) return -1;
 	return Number(m[1]) * 1000 + Number(m[2] ?? 1);
 }
+
+/**
+ * A sidecar path with its `.json` taken off, so the recovery copies can be
+ * named as SIBLINGS OF THE FILE rather than of the configured folder. A page
+ * being served from the other well-known folder used to have its conflict and
+ * damaged copies written into the configured one, which scattered one page's
+ * history across two directories.
+ */
+function stripJson(path: string): string {
+	return path.endsWith(".json") ? path.slice(0, -".json".length) : path;
+}
+
+/** The folder a sidecar path sits in; "" when it names no folder at all. */
+function folderOf(path: string): string {
+	const i = path.lastIndexOf("/");
+	return i <= 0 ? "" : path.slice(0, i);
+}
 /**
  * Maximum dirty interval, anchored to the FIRST unsaved change of a batch and
  * never re-armed by later ones. The quiet-period debounce alone restarted on
@@ -186,6 +208,61 @@ export class PageStore {
 	private knownMtime = new Map<string, number>();
 	/** Stamp of the content this session last read or wrote (see contentStamp). */
 	private knownHash = new Map<string, string>();
+	/**
+	 * WHERE EACH PAGE LIVES: the path a page's sidecar was found at, or was
+	 * last written to. One page id, one live sidecar.
+	 *
+	 * This map is the whole fix for the two-device fork. Reads have fallen
+	 * back to the other well-known folder for a while (see `findSidecar`), but
+	 * writes went to `path()` - the CONFIGURED folder - so a device whose
+	 * data.json names the other folder read the ink from where it is and then
+	 * wrote a SECOND sidecar under the same id next door. Worse, the
+	 * external-revision guard sat inside `if (exists(final))`, and `final` was
+	 * the empty configured path, so the fork happened silently: nothing
+	 * preserved, nothing announced. Pinning the resolved path makes that
+	 * sequence impossible by construction rather than by a check.
+	 *
+	 * Only a path that was FOUND (or written) is pinned. A page that exists
+	 * nowhere stays unpinned, so ink that arrives later by sync is adopted on
+	 * the next resolve instead of being forked past.
+	 */
+	private resolved = new Map<string, string>();
+	/**
+	 * PINS MADE BY A WRITE THAT FOUND NOTHING. A guess, not a fact.
+	 *
+	 * A page found on disk pins where it was found; a page found NOWHERE is
+	 * written to the configured folder and pins itself the moment the rename
+	 * lands. That second pin is not evidence about where the page lives - it is
+	 * evidence about where this device wrote blind - and treating the two the
+	 * same forked a fresh install on the exact ordering sync produces: the note
+	 * arrives before its sidecar. Adoption ran with neither folder present and
+	 * chose `.handwriting`; the user opened page X (correctly unpinned, nothing
+	 * found), drew, and the write created and pinned `.handwriting/X.json`; sync
+	 * then delivered `handwriting/X.json`. `resolvePath` short-circuits on a
+	 * live pin, so the second copy was never looked for again - and after a
+	 * restart the configured folder is searched first anyway. Two live sidecars
+	 * for good, and this device's copy is the one that never syncs back.
+	 *
+	 * So a provisional pin is re-checked against the OTHER well-known folders on
+	 * every resolve, and stays provisional until either a copy appears there
+	 * (that copy is the synced one and becomes the page's home) or a LOAD reads
+	 * the pinned file and finds nothing elsewhere, which confirms it. Ordinary
+	 * pins never enter this set and cost exactly what they always did.
+	 */
+	private provisional = new Set<string>();
+	/**
+	 * A provisional file that has just lost its page to a copy found elsewhere,
+	 * waiting to be preserved beside the winner.
+	 *
+	 * It holds ink this device wrote, so it is never deleted; it is treated
+	 * exactly as the external-revision guard treats a foreign revision - moved
+	 * to a `.conflict-<mtime>.json` beside the winner and announced - which is
+	 * done on the write path, where the announcement can honestly follow a
+	 * completed save (see `absorbProvisional` and `pendingConflict`).
+	 */
+	private displacedProvisional = new Map<string, string>();
+	/** True between `holdWrites` and `releaseWrites`; see those. */
+	private migrating = false;
 	private failures = new Map<string, number>();
 	private errorNotified = new Set<string>();
 	/** Pages whose change-check has already reported a read failure once. */
@@ -229,8 +306,7 @@ export class PageStore {
 	) {}
 
 	/**
-	 * The sidecar path for `pageId` - and the base every other name here is
-	 * built from (tmp, trash, damaged, conflict).
+	 * This page's sidecar name INSIDE a named folder.
 	 *
 	 * The assert is the last line, not the first: `isSafePageId` runs at both
 	 * frontmatter ingress points and inside `parsePage`, so an id reaching
@@ -239,38 +315,99 @@ export class PageStore {
 	 * retries and then tells the user - rather than letting an interpolated
 	 * `..` walk out of the ink folder and write there.
 	 */
-	path(pageId: string): string {
+	private pathIn(folder: string, pageId: string): string {
 		if (!isSafePageId(pageId)) {
 			throw new Error(`Handwriting: refusing to build a sidecar path for ${JSON.stringify(pageId)}`);
 		}
-		return normalizePath(`${this.folder}/${pageId}.json`);
+		return normalizePath(`${folder}/${pageId}.json`);
 	}
 
 	/**
-	 * Every sidecar id in the folder starting with `prefix` - the instance
-	 * enumeration behind pdf identity. Conflict, damaged and tmp artifacts
-	 * are not sidecars and are not listed. An adapter without list() (test
-	 * doubles, an exotic platform) yields none, which degrades resolution
-	 * to "first instance" rather than failing anything.
+	 * The sidecar path for a page in the CONFIGURED folder - the default for a
+	 * page that has never been seen anywhere, and nothing else.
+	 *
+	 * It used to be the base every other name was built from (tmp, trash,
+	 * damaged, conflict, clone destination, trash restore), and that was the
+	 * defect: a page whose ink lives in the OTHER well-known folder had its
+	 * trash generations, its duplicate's sidecar and its restored file planted
+	 * in the configured folder instead, which is a second live sidecar for one
+	 * page id the moment sync sees only one of the two folders. A page's
+	 * family - trash, conflict and damaged copies, and the sidecar a duplicate
+	 * gets - stays in the folder the page was FOUND in; see `folderOf`,
+	 * `trashDirIn` and `resolvePath`.
+	 */
+	path(pageId: string): string {
+		return this.pathIn(this.folder, pageId);
+	}
+
+	/**
+	 * The folders a page can be served from, configured one first. The order
+	 * `findSidecar` searches, and the order `listIds` and the trash sweep
+	 * enumerate, because every one of them has to agree with the lookup.
+	 */
+	private searchFolders(): string[] {
+		return [
+			this.folder,
+			...[DEFAULT_INK_FOLDER, SYNCED_INK_FOLDER].filter((f) => f !== this.folder),
+		];
+	}
+
+	/**
+	 * Every sidecar id starting with `prefix`, across EVERY folder a page can
+	 * be served from - the instance enumeration behind pdf identity. Conflict,
+	 * damaged and tmp artifacts are not sidecars and are not listed. An adapter
+	 * without list() (test doubles, an exotic platform) yields none, which
+	 * degrades resolution to "first instance" rather than failing anything.
+	 *
+	 * The folders are the ones `findSidecar` searches, in its order, because
+	 * the enumeration has to agree with the lookup: `load` on any id returned
+	 * here resolves across both well-known folders already, so listing only the
+	 * configured one was the READ-side half of the two-device fork. A device
+	 * whose data.json names `.handwriting` while the ink sits in `handwriting/`
+	 * enumerated NOTHING, so `chooseInstance` saw no candidate claiming this
+	 * file's path, called a document that already had ink a fresh copy, and
+	 * handed it an id `nextInstanceId` believed was free - an id the unseen
+	 * sidecar next door may already own. Missing candidates do not degrade
+	 * identity gracefully; they fork it.
+	 *
+	 * Each id ONCE, and only the id: the same page id present in both folders
+	 * is one page, and which file it is served from stays `resolvePath`'s
+	 * answer (the pin if there is one, otherwise `findSidecar`), exactly as it
+	 * is for every other caller. Nothing is pinned here - enumerating a folder
+	 * is not evidence about a page the caller has not touched.
+	 *
+	 * A folder that will not enumerate is skipped rather than fatal, PER
+	 * FOLDER: a vault with only one ink folder has the other one throw ENOENT
+	 * on every call, so a single try around the whole sweep would have made
+	 * the ordinary case return nothing.
 	 */
 	async listIds(prefix: string): Promise<string[]> {
 		const adapter = this.app.vault.adapter;
 		if (typeof adapter.list !== "function") return [];
-		try {
-			const l = await adapter.list(this.folder);
-			return l.files
-				.map((f) => f.split("/").pop() ?? "")
-				.filter(
-					(n) =>
-						n.startsWith(prefix) &&
-						n.endsWith(".json") &&
-						!n.includes(".conflict-") &&
-						!n.includes(".damaged-")
-				)
-				.map((n) => n.slice(0, -".json".length));
-		} catch {
-			return [];
+		const list = adapter.list.bind(adapter);
+		const folders = this.searchFolders();
+		const seen = new Set<string>();
+		const ids: string[] = [];
+		for (const folder of folders) {
+			let files: string[];
+			try {
+				files = (await list(folder)).files;
+			} catch {
+				continue;
+			}
+			for (const file of files) {
+				const n = file.split("/").pop() ?? "";
+				// The same predicate `adoptInkFolder` decides by, shared so the
+				// two can never drift: a conflict or damaged copy is residue,
+				// not a page, in both answers.
+				if (!n.startsWith(prefix) || !isLiveSidecarName(n)) continue;
+				const id = n.slice(0, -".json".length);
+				if (seen.has(id)) continue;
+				seen.add(id);
+				ids.push(id);
+			}
 		}
+		return ids;
 	}
 
 	/** Where sidecars are being kept right now. */
@@ -279,15 +416,62 @@ export class PageStore {
 	}
 
 	/**
+	 * WRITES ARE HELD WHILE THE INK FOLDER IS BEING MOVED.
+	 *
+	 * `changeFolder` settles the queue first, but settling drains it ONCE and
+	 * the move that follows spans a list plus a rename per file, with the store
+	 * still pointed at the old folder and every pin intact. A stroke landing in
+	 * that window recreated the sidecar in the folder being emptied: the pin's
+	 * file had already been renamed away, `findSidecar` cannot see a custom
+	 * destination, so `pinned ?? path` named `from/X.json` and the write made
+	 * it. Then `repoint` cleared the pins, the next resolve served the older
+	 * copy the migration had moved, and the newest ink sat orphaned in a folder
+	 * the user believes they emptied.
+	 *
+	 * Held, not dropped: `writeNow` puts the state back in `pending` and arms
+	 * the ordinary retry timer, so the write lands in the DESTINATION once the
+	 * move and the repoint are done. `busy` and `hasQueuedWrite` stay true
+	 * throughout, which is the truth.
+	 */
+	holdWrites(): void {
+		this.migrating = true;
+	}
+
+	/** Release the hold. Always from a `finally`; see `changeFolder`. */
+	releaseWrites(): void {
+		this.migrating = false;
+	}
+
+	/**
 	 * Point the store at a different folder. Writes go here from now on.
 	 *
-	 * Reads keep a fallback (see `readPath`), which is what makes a folder
-	 * change safe to interrupt: a move that half-finished, or a settings save
-	 * that never landed, leaves pages readable from wherever they actually
-	 * are instead of invisible.
+	 * Reads keep a fallback (see `findSidecar`), which is what makes a move
+	 * between the TWO WELL-KNOWN folders safe to interrupt: half-finished, or
+	 * with a settings save that never landed, pages stay readable from
+	 * wherever they actually are instead of invisible. A CUSTOM destination
+	 * is not searched, so there the recovery is to set the folder again in
+	 * Settings; nothing is lost either way.
+	 *
+	 * The resolved-path map is CLEARED here, and that is not a detail. This is
+	 * `changeFolder`'s `repoint` step, which runs AFTER `migrate` has already
+	 * renamed every sidecar into the new folder (InkFolder.ts changeFolder,
+	 * main.ts changeInkFolder). Every pinned path therefore names a file that
+	 * the migration just moved away; keeping them would send the next write
+	 * back to the emptied folder, re-creating exactly the second sidecar this
+	 * map exists to prevent. Cleared, each page resolves again on its next
+	 * touch and finds itself in the new folder. Startup's repoint (main.ts,
+	 * before any note opens) clears an empty map, which costs nothing.
 	 */
 	useInkFolder(folder: string): void {
 		this.folder = folder;
+		this.resolved.clear();
+		// Both are statements ABOUT the pins, so they go with them: a
+		// provisional mark on a pin that no longer exists would make the next
+		// resolve of a freshly re-resolved page pay for a search it does not
+		// need, and a displaced file waiting to be preserved beside a winner
+		// that has just been migrated names a path nothing will look at.
+		this.provisional.clear();
+		this.displacedProvisional.clear();
 	}
 
 	/**
@@ -309,29 +493,137 @@ export class PageStore {
 	 * path. See adoptInkFolder for the other half - reading is what keeps
 	 * the ink visible, adopting is what stops the fork.
 	 */
-	private async readPath(pageId: string): Promise<string> {
+	private async findSidecar(pageId: string): Promise<{ path: string; found: boolean }> {
 		const primary = this.path(pageId);
 		const others = [DEFAULT_INK_FOLDER, SYNCED_INK_FOLDER].filter((f) => f !== this.folder);
-		if (others.length === 0) return primary;
 		const adapter = this.app.vault.adapter;
-		if (await adapter.exists(primary)) return primary;
+		if (await adapter.exists(primary)) return { path: primary, found: true };
 		for (const folder of others) {
 			const fallback = normalizePath(`${folder}/${pageId}.json`);
-			if (await adapter.exists(fallback)) return fallback;
+			if (await adapter.exists(fallback)) return { path: fallback, found: true };
 		}
-		return primary;
-	}
-
-	private tmpPath(pageId: string): string {
-		return `${this.path(pageId)}.tmp`;
-	}
-
-	private trashDir(): string {
-		return normalizePath(`${this.folder}/trash`);
+		return { path: primary, found: false };
 	}
 
 	/**
-	 * A never-taken name for the next trash generation (RC4).
+	 * THE path for this page: pinned if we have already found or written it
+	 * AND the file is still there, otherwise whatever `findSidecar` turns up
+	 * now.
+	 *
+	 * A pin is a hint, not a fact: sync can move or remove the file the pin
+	 * names while a session sits open (another device migrated the note to a
+	 * different folder, or deleted it), and blindly trusting a stale pin is
+	 * exactly the fork this map exists to prevent - the next write would
+	 * recreate the sidecar at the empty pinned path while the real one lives
+	 * elsewhere, leaving two live files under one id. So a pinned path is
+	 * re-proven with one `exists` before it is trusted; the external-revision
+	 * guard on the write path stats the same file again immediately after, so
+	 * this costs nothing extra there.
+	 *
+	 * Every path-taking operation goes through here - load, the write, the
+	 * external-revision guard, the change poll, preserve, remove - so a page
+	 * is read from and written to ONE file. A page that exists nowhere
+	 * resolves to the configured folder and is deliberately NOT pinned, so
+	 * "never seen before goes to the configured folder" is unchanged, and a
+	 * sidecar that turns up later (sync landing it while the note sits open)
+	 * is still adopted rather than written past.
+	 */
+	private async resolvePath(pageId: string): Promise<string> {
+		return (await this.resolveFor(pageId)).path;
+	}
+
+	/**
+	 * `resolvePath` plus the fact the write path needs: was the page PROVEN to
+	 * exist somewhere, or is this only where it would go?
+	 *
+	 * A write that resolves to a proven file confirms the pin. A write that
+	 * resolves to nothing is writing blind, and the pin it leaves behind is
+	 * provisional (see `provisional`).
+	 */
+	private async resolveFor(pageId: string): Promise<{ path: string; found: boolean }> {
+		const pinned = this.resolved.get(pageId);
+		if (pinned !== undefined && (await this.app.vault.adapter.exists(pinned))) {
+			if (!this.provisional.has(pageId)) return { path: pinned, found: true };
+			// A PROVISIONAL pin: this file exists because this device wrote it
+			// blind, never because anything found the page here. One `exists`
+			// per other well-known folder settles whether the real, synced copy
+			// has since arrived; ordinary pins never reach this branch.
+			const arrived = await this.findElsewhere(pageId, pinned);
+			if (arrived === null) return { path: pinned, found: true };
+			// It has. That copy is the page's home from here on - it is the one
+			// the vault's other devices can see - and the blind local file is
+			// kept beside it rather than discarded (absorbProvisional).
+			this.resolved.set(pageId, arrived);
+			this.provisional.delete(pageId);
+			this.displacedProvisional.set(pageId, pinned);
+			return { path: arrived, found: true };
+		}
+		const { path, found } = await this.findSidecar(pageId);
+		if (found) {
+			this.resolved.set(pageId, path);
+			// Found on disk: the pin is now a fact whatever it was before.
+			this.provisional.delete(pageId);
+			return { path, found: true };
+		}
+		// Found nowhere. A page never seen before still goes to the configured
+		// folder (`path` names it, `pinned` is undefined). A page whose pin
+		// just went missing keeps its last known home instead of being
+		// redirected there: the page's last known home, and a page deleted on
+		// the other device is recreated where it lived - today's behaviour,
+		// deliberately unchanged.
+		return { path: pinned ?? path, found: false };
+	}
+
+	/**
+	 * The page's sidecar in some folder OTHER than the one `not` sits in, or
+	 * null. Only ever asked about a provisional pin, so the ordinary resolve
+	 * still costs exactly one `exists`.
+	 */
+	private async findElsewhere(pageId: string, not: string): Promise<string | null> {
+		const home = folderOf(not);
+		const adapter = this.app.vault.adapter;
+		for (const folder of this.searchFolders()) {
+			if (folder === home) continue;
+			const candidate = this.pathIn(folder, pageId);
+			if (await adapter.exists(candidate)) return candidate;
+		}
+		return null;
+	}
+
+	/**
+	 * The pin without the lookup, for the one caller that cannot await: the
+	 * background flush's raw tmp write (see writeTmpNow). Falls back to the
+	 * configured folder, which is where an unresolved page would be written
+	 * anyway, and the normal write chained behind it resolves properly.
+	 */
+	private pinnedPath(pageId: string): string {
+		return this.resolved.get(pageId) ?? this.path(pageId);
+	}
+
+	/** The scratch file for a save, always a SIBLING of the file it becomes. */
+	private tmpFor(final: string): string {
+		return `${final}.tmp`;
+	}
+
+	/**
+	 * ONE TRASH PER INK FOLDER, not one per store.
+	 *
+	 * The trash used to be `<configured folder>/trash` whatever folder the page
+	 * itself lived in, so deleting a note whose ink sits in `handwriting/`
+	 * recycled it into `.handwriting/trash/` - and restoring it then planted
+	 * the live file in `.handwriting/` too. Sync, which had already carried the
+	 * deletion of `handwriting/X.json` to the other device, never sees either,
+	 * so that device opens the restored note blank and its first stroke starts
+	 * a SECOND live sidecar under the same id. A page's whole family stays in
+	 * the folder the page was found in.
+	 */
+	private trashDirIn(folder: string): string {
+		return normalizePath(`${folder}/trash`);
+	}
+
+	/**
+	 * A never-taken name for the next trash generation (RC4), in the trash that
+	 * belongs to the page's OWN folder.
 	 *
 	 * Before RC4 the trash held ONE slot per page id, so a second "delete all
 	 * ink", or a delete-all followed by a note delete, silently overwrote the
@@ -340,9 +632,9 @@ export class PageStore {
 	 * millisecond are entirely possible (and are exercised by the tests).
 	 * Every candidate is probed, so an existing file is never the destination.
 	 */
-	private async freeTrashPath(pageId: string): Promise<string> {
+	private async freeTrashPath(pageId: string, folder: string): Promise<string> {
 		const adapter = this.app.vault.adapter;
-		const base = `${this.trashDir()}/${pageId}-${this.now()}`;
+		const base = `${this.trashDirIn(folder)}/${pageId}-${this.now()}`;
 		let candidate = normalizePath(`${base}.json`);
 		for (let n = 2; await adapter.exists(candidate); n++) {
 			candidate = normalizePath(`${base}-${n}.json`);
@@ -400,7 +692,7 @@ export class PageStore {
 			// Watching only the configured folder meant a page being served
 			// from the other one never appeared to change, so live reload
 			// silently stopped for exactly the vaults the fallback exists for.
-			const watched = await this.readPath(pageId);
+			const watched = await this.resolvePath(pageId);
 			const st = await adapter.stat(watched).catch(() => null);
 			if (!st || st.mtime === known) {
 				changed = false;
@@ -443,9 +735,12 @@ export class PageStore {
 		const adapter = this.app.vault.adapter;
 		try {
 			// Not `path()` alone: a page can still be sitting in the default
-			// folder if a folder change was interrupted. See readPath. Inside
-			// the try because readPath builds paths, and path() asserts.
-			const final = await this.readPath(pageId);
+			// folder if a folder change was interrupted, or because this device's
+			// data.json never named the folder the vault actually uses. See
+			// resolvePath - which also PINS what it finds, so the save that
+			// follows this load writes to the file the load read. Inside the
+			// try because it builds paths, and path() asserts.
+			const final = await this.resolvePath(pageId);
 			if (await adapter.exists(final)) {
 				// Stat BEFORE read, deliberately: if an external writer lands
 				// between the two, the recorded mtime is then OLDER than the
@@ -460,20 +755,28 @@ export class PageStore {
 				if (!result.damaged) {
 					if (st) this.knownMtime.set(pageId, st.mtime);
 					this.knownHash.set(pageId, contentStamp(text));
+					// A LOAD HIT confirms the pin. `resolveFor` has just proven
+					// no copy exists in any other well-known folder, and the
+					// page has now been READ from this one, so it is no longer
+					// merely where this device wrote blind - it is where the
+					// page is. Later resolves stop paying for the extra look.
+					this.provisional.delete(pageId);
 					return result;
 				}
 				// The main file is corrupt. Exactly one recovery case: its own
 				// interrupted save is a complete, current-format page for this
 				// id. Anything less keeps the read-only lock.
 				return (
-					(await this.promoteTmpOverDamaged(pageId, st?.mtime ?? 0, contentStamp(text))) ??
+					(await this.promoteTmpOverDamaged(pageId, final, st?.mtime ?? 0, contentStamp(text))) ??
 					result
 				);
 			}
-			const tmp = this.tmpPath(pageId);
-			if (await adapter.exists(tmp)) {
-				const text = await adapter.read(tmp);
-				const result = parsePage(text, pageId);
+			// No live sidecar. An interrupted save's .tmp is looked for beside
+			// the resolved path first, then beside the page's name in every
+			// other folder it can be served from (findInterruptedSave).
+			const save = await this.findInterruptedSave(pageId, final);
+			if (save !== null) {
+				const { tmp, live, text, result } = save;
 				// PROMOTED, not just read. Recovering the content and leaving
 				// it in the .tmp meant the only copy on disk was still the
 				// scratch file the next save writes to - so that save opened
@@ -487,8 +790,15 @@ export class PageStore {
 				// .tmp nobody is reading.
 				if (!result.damaged) {
 					try {
-						await adapter.rename(tmp, this.path(pageId));
-						const st = await adapter.stat(this.path(pageId)).catch(() => null);
+						// Into the .tmp's OWN folder: a save interrupted in the
+						// other well-known folder comes back there, where the
+						// vault's other devices can see it.
+						await adapter.rename(tmp, live);
+						// The page now exists, so where it exists is settled -
+						// a fact, not a provisional guess.
+						this.resolved.set(pageId, live);
+						this.provisional.delete(pageId);
+						const st = await adapter.stat(live).catch(() => null);
 						if (st) this.knownMtime.set(pageId, st.mtime);
 						this.knownHash.set(pageId, contentStamp(text));
 					} catch (err) {
@@ -516,6 +826,53 @@ export class PageStore {
 	}
 
 	/**
+	 * The interrupted save to recover from when no live sidecar exists, or
+	 * null: the `.tmp` beside `final` (the resolved path) first, then the
+	 * `.tmp` beside the page's name in every other folder a page can be
+	 * served from, in `searchFolders` order.
+	 *
+	 * A page served from the OTHER well-known folder is saved there, beside
+	 * the file the write found (writeNow), and after a restart nothing
+	 * remembers that: the pin is gone, `findSidecar` sees only final names
+	 * and answers the configured folder, and only THAT folder's `.tmp` was
+	 * checked. The intact save next door was never considered, so a page
+	 * whose new bytes sat complete on disk read as absent, and the next
+	 * stroke started a second sidecar beside them.
+	 *
+	 * The first candidate that is a complete page for THIS id wins, so the
+	 * resolved path keeps the precedence it has today and a scratch file for
+	 * some other page is never promoted under this one's name. A candidate
+	 * that will not parse is reported only when no candidate does, and is
+	 * never promoted (load explains why). Costs one `exists` per extra
+	 * folder, only on a load that found no live sidecar.
+	 */
+	private async findInterruptedSave(
+		pageId: string,
+		final: string
+	): Promise<{ tmp: string; live: string; text: string; result: ParseResult } | null> {
+		const adapter = this.app.vault.adapter;
+		const candidates = [final];
+		for (const folder of this.searchFolders()) {
+			const live = this.pathIn(folder, pageId);
+			if (!candidates.includes(live)) candidates.push(live);
+		}
+		let damaged: { tmp: string; live: string; text: string; result: ParseResult } | null = null;
+		for (const live of candidates) {
+			const tmp = this.tmpFor(live);
+			if (!(await adapter.exists(tmp))) continue;
+			const text = await adapter.read(tmp);
+			const result = parsePage(text, pageId);
+			if (result.damaged) {
+				damaged ??= { tmp, live, text, result };
+				continue;
+			}
+			if (result.data.pageId !== pageId) continue;
+			return { tmp, live, text, result };
+		}
+		return damaged;
+	}
+
+	/**
 	 * The newest trashed generation for this page, moved back into place.
 	 *
 	 * Only ever reached when the live path and the .tmp are both absent, so
@@ -527,27 +884,41 @@ export class PageStore {
 	 * A generation that will not parse is left where it is. It may still be
 	 * recoverable by hand, and promoting damage over a page the caller would
 	 * otherwise treat as absent turns a recoverable problem into a locked one.
+	 *
+	 * EVERY well-known folder's trash is searched, and the page is restored
+	 * into the folder whose trash held it - not into the configured one. A
+	 * device configured for `.handwriting` restoring a note whose ink was
+	 * recycled from `handwriting/` used to put the live file in `.handwriting/`,
+	 * where sync cannot see it, while the other device (which had the deletion)
+	 * opened the note blank and started a second sidecar on its first stroke.
 	 */
 	private async restoreFromTrash(pageId: string): Promise<ParseResult | null> {
 		const adapter = this.app.vault.adapter;
 		if (typeof adapter.list !== "function") return null;
-		let files: string[];
-		try {
-			files = (await adapter.list(this.trashDir())).files;
-		} catch {
-			return null; // no trash folder yet, or it cannot be enumerated
-		}
+		const list = adapter.list.bind(adapter);
 		const prefix = `${pageId}-`;
-		const candidates = files
-			.filter((f) => {
+		// Tagged with the folder that owns the trash, because that folder is
+		// where the page goes back to.
+		const candidates: Array<{ file: string; home: string }> = [];
+		for (const home of this.searchFolders()) {
+			let files: string[];
+			try {
+				files = (await list(this.trashDirIn(home))).files;
+			} catch {
+				continue; // no trash there yet, or it cannot be enumerated
+			}
+			for (const f of files) {
 				const name = f.split("/").pop() ?? "";
-				return name.startsWith(prefix) && name.endsWith(".json");
-			})
-			// Newest first. The names carry a wall-clock stamp and a counter,
-			// so lexical order is wrong once the counter reaches two digits;
-			// the generations are few, so this compares the numbers.
-			.sort((a, b) => generationOf(b, prefix) - generationOf(a, prefix));
-		for (const file of candidates) {
+				if (name.startsWith(prefix) && name.endsWith(".json")) candidates.push({ file: f, home });
+			}
+		}
+		// Newest first, ACROSS the folders. The names carry a wall-clock stamp
+		// and a counter, so lexical order is wrong once the counter reaches two
+		// digits; the generations are few, so this compares the numbers. Equal
+		// stamps keep the folder order above, which is the configured folder
+		// first - the same tie-break every other lookup here makes.
+		candidates.sort((a, b) => generationOf(b.file, prefix) - generationOf(a.file, prefix));
+		for (const { file, home } of candidates) {
 			let text: string;
 			try {
 				text = await adapter.read(file);
@@ -556,9 +927,9 @@ export class PageStore {
 			}
 			const parsed = parsePage(text, pageId);
 			if (parsed.damaged || parsed.data.pageId !== pageId) continue;
-			const final = this.path(pageId);
+			const final = this.pathIn(home, pageId);
 			try {
-				await ensureFolder(adapter, this.folder);
+				await ensureFolder(adapter, home);
 				await adapter.rename(file, final);
 			} catch (err) {
 				// The ink is still in the trash and still readable; returning
@@ -567,6 +938,11 @@ export class PageStore {
 				return { ...parsed, recovered: true, problem: "recovered from the ink trash" };
 			}
 			const st = await adapter.stat(final).catch(() => null);
+			// Restored into the folder its own trash belongs to, and that is
+			// now where the page lives: this path is only reached when it lived
+			// nowhere. A file that provably exists: not a provisional pin.
+			this.resolved.set(pageId, final);
+			this.provisional.delete(pageId);
 			if (st) this.knownMtime.set(pageId, st.mtime);
 			this.knownHash.set(pageId, contentStamp(text));
 			this.onRecovered?.(pageId, final);
@@ -596,12 +972,13 @@ export class PageStore {
 	 */
 	private async promoteTmpOverDamaged(
 		pageId: string,
+		/** The file load() actually read - not necessarily the configured one. */
+		final: string,
 		damagedMtime: number,
 		damagedStamp: string
 	): Promise<ParseResult | null> {
 		const adapter = this.app.vault.adapter;
-		const final = this.path(pageId);
-		const tmp = this.tmpPath(pageId);
+		const tmp = this.tmpFor(final);
 
 		// Screening, off the queue. Everything here is proven again in `run`.
 		if (!(await adapter.exists(tmp))) return null;
@@ -651,7 +1028,7 @@ export class PageStore {
 			if (recheck.futureVersion !== undefined) return { kind: "abandoned" };
 			if (recheck.data.pageId !== pageId) return { kind: "abandoned" };
 			// (5) both files are what was inspected. Only now does anything move.
-			const keptAs = await this.freeDamagedPath(pageId, damagedMtime);
+			const keptAs = await this.freeDamagedPath(final, damagedMtime);
 			await adapter.rename(final, keptAs);
 			await adapter.rename(tmp, final);
 			const after = await adapter.stat(final).catch(() => null);
@@ -682,9 +1059,9 @@ export class PageStore {
 	}
 
 	/** A never-taken name for a corrupt main file that is being moved aside. */
-	private async freeDamagedPath(pageId: string, mtime: number): Promise<string> {
+	private async freeDamagedPath(final: string, mtime: number): Promise<string> {
 		const adapter = this.app.vault.adapter;
-		const base = normalizePath(`${this.folder}/${pageId}.damaged-${mtime}`);
+		const base = `${stripJson(final)}.damaged-${mtime}`;
 		let candidate = `${base}.json`;
 		for (let n = 2; await adapter.exists(candidate); n++) {
 			candidate = `${base}-${n}.json`;
@@ -869,7 +1246,12 @@ export class PageStore {
 			// path() asserts on an unsafe id and serializePage can throw on a
 			// malformed page; both must fail into the normal path rather than
 			// out of a visibilitychange handler.
-			const tmp = this.tmpPath(pageId);
+			// The PINNED path, not the configured one: this write must land
+			// beside the file the page actually lives in, or load() would not
+			// look where the freeze left it. Nothing may be awaited here, so
+			// an unresolved page falls back to the configured folder - which
+			// is where an unresolved page would be written anyway.
+			const tmp = this.tmpFor(this.pinnedPath(pageId));
 			const serialized = serializePage(data);
 			return this.app.vault.adapter.write(tmp, serialized);
 		} catch (err) {
@@ -908,26 +1290,40 @@ export class PageStore {
 		this.clearTimers(pageId);
 		await this.writePending(pageId); // no-op when nothing is queued
 		if (this.pending.has(pageId)) {
-			// The flush itself failed (writeNow re-queued the state): the
-			// copy below would then preserve a STALE file while the caller
-			// tells the user it holds today's ink. Refuse instead. The caller
-			// aborts the wipe, and nothing is lost.
-			throw new Error("Handwriting: the newest ink could not be written to disk");
+			// The flush did not land (writeNow re-queued the state): the copy
+			// below would then preserve a STALE file while the caller tells the
+			// user it holds today's ink. Refuse instead. The caller aborts the
+			// wipe, and nothing is lost.
+			//
+			// TWO REASONS IT DID NOT LAND, and the message must not claim the
+			// wrong one. A real write failure is one. The other, since writes
+			// are held across an ink-folder move, is that the move is still
+			// running - the queue is intact, the ink is fine, and trying again
+			// in a moment simply works. Blaming the disk for that sends someone
+			// looking for a fault that is not there.
+			throw new Error(
+				this.migrating
+					? "Handwriting: the ink folder is still moving - try again in a moment"
+					: "Handwriting: the newest ink could not be written to disk"
+			);
 		}
 		const adapter = this.app.vault.adapter;
 		let dest: string | null = null;
 		const run = async (): Promise<void> => {
-			// readPath, like load: the page may be sitting in the other
+			// The resolved path, like load: the page may be sitting in the other
 			// well-known folder (an interrupted migration, or a device that
 			// lost data.json). Preserving only what the CONFIGURED folder
 			// holds meant the safety copy silently covered nothing, right
 			// before the caller wiped the note.
-			const final = await this.readPath(pageId);
+			const final = await this.resolvePath(pageId);
 			if (!(await adapter.exists(final))) return;
-			const trashDir = this.trashDir();
+			// The trash beside the FILE, not beside the configured folder: a
+			// generation dropped into the other folder's trash is invisible to
+			// the restore path that vault's other devices will take.
+			const trashDir = this.trashDirIn(folderOf(final));
 			await ensureFolder(adapter, trashDir);
 			const text = await adapter.read(final);
-			const to = await this.freeTrashPath(pageId);
+			const to = await this.freeTrashPath(pageId, folderOf(final));
 			await adapter.write(to, text);
 			dest = to;
 		};
@@ -994,10 +1390,44 @@ export class PageStore {
 		writer?: PageWriter
 	): Promise<void> {
 		const adapter = this.app.vault.adapter;
+		// The ink folder is being moved. Nothing may be written until the move
+		// and the repoint are done, or it lands in the folder being emptied.
+		// REQUEUE, synchronously and before any await, so the state is never
+		// the queue's only copy for an instant: it goes straight back into
+		// `pending` (unless something newer is already there) and the ordinary
+		// retry timer brings it back. Not a failure - no retry is counted and
+		// nothing is reported.
+		if (this.migrating) {
+			if (!this.pending.has(pageId)) {
+				this.pending.set(pageId, data);
+				this.pendingWriter.set(pageId, writer);
+			}
+			if (!this.timers.has(pageId)) {
+				this.timers.set(
+					pageId,
+					window.setTimeout(() => {
+						this.timers.delete(pageId);
+						runDetached(this.writePending(pageId), `write held for the folder move ${pageId}`);
+					}, WRITE_RETRY_MS)
+				);
+			}
+			return;
+		}
 		try {
-			await ensureFolder(adapter, this.folder);
-			const final = this.path(pageId);
-			const tmp = this.tmpPath(pageId);
+			// WHERE THIS PAGE LIVES, resolved BEFORE anything is written. A
+			// page already loaded is pinned, so this is free; a page written
+			// with no prior load (paste into a fresh note) is looked up here,
+			// which is what makes the read-from-X-write-to-Y fork impossible
+			// by construction rather than by a guard that can be skipped. Only
+			// a page that exists in no well-known folder resolves to the
+			// configured one, which is exactly the "never seen before" rule.
+			const { path: final, found } = await this.resolveFor(pageId);
+			// The folder of THAT file. When the page is being served from the
+			// other well-known folder, ensuring the configured one instead
+			// created an empty directory and left the write's own folder
+			// unchecked.
+			await ensureFolder(adapter, folderOf(final));
+			const tmp = this.tmpFor(final);
 			// A second in-process writer's payload is stale by construction:
 			// it was composed by a document that never saw the other one's
 			// strokes. Union it with the live file BEFORE the tmp is written,
@@ -1025,11 +1455,22 @@ export class PageStore {
 			// has a complete copy of the ink somewhere load() already looks.
 			const serialized = serializePage(effective);
 			await adapter.write(tmp, serialized);
+			// A blind local file this page has just been taken away from is
+			// preserved beside its new home before anything else touches the
+			// folder - never discarded, and never left as a second live sidecar
+			// in a folder nothing syncs.
+			await this.absorbProvisional(pageId, final);
 			if (await adapter.exists(final)) {
 				const st = await adapter.stat(final).catch(() => null);
 				const known = this.knownMtime.get(pageId);
-				let external = st !== null && st.mtime !== known;
-				if (!external && st !== null) {
+				// A stat that FAILS proves nothing, and it used to prove "not
+				// external": the null fell through both checks, and the save
+				// replaced whatever was on disk with no conflict copy. A
+				// metadata failure never grants permission to overwrite. With
+				// no stat, identity has to come from the content, and a file
+				// whose identity cannot be established is preserved.
+				let external = st === null || st.mtime !== known;
+				if (st === null || !external) {
 					const knownHash = this.knownHash.get(pageId);
 					if (knownHash !== undefined) {
 						const cur = await adapter.read(final).catch(() => null);
@@ -1038,7 +1479,7 @@ export class PageStore {
 					}
 				}
 				if (external) {
-					const kept = await this.freeConflictPath(pageId, st?.mtime ?? 0);
+					const kept = await this.freeConflictPath(final, st?.mtime ?? 0);
 					await adapter.rename(final, kept);
 					// NOT announced here (RC4). Everything below can still
 					// throw, and the old message asserted "this session's ink
@@ -1050,6 +1491,19 @@ export class PageStore {
 			if (await adapter.exists(final)) await adapter.remove(final);
 			await adapter.rename(tmp, final);
 			const st = await adapter.stat(final).catch(() => null);
+			// The page provably lives here now, so a page written with no
+			// prior load pins itself the moment its first save lands.
+			this.resolved.set(pageId, final);
+			// But WHAT KIND of pin. A write that found the page nowhere guessed
+			// the configured folder, and that guess must keep being re-checked
+			// against the other well-known folders until something proves it -
+			// otherwise a sidecar sync delivers a moment later is never seen.
+			//
+			// A write NEVER confirms a provisional pin, however many times it
+			// lands: it re-reads nothing and proves nothing except that the file
+			// this device made is still the file this device made. Only a
+			// findSidecar hit or a LOAD clears the mark (resolveFor, load).
+			if (!found) this.provisional.add(pageId);
 			if (st) this.knownMtime.set(pageId, st.mtime);
 			this.knownHash.set(pageId, contentStamp(serialized));
 			// Recorded only once the rename has landed, so it always names the
@@ -1101,12 +1555,46 @@ export class PageStore {
 	}
 
 	/**
+	 * The blind local file a provisional pin has just lost its page to, moved
+	 * to a `.conflict-<mtime>.json` BESIDE THE WINNER.
+	 *
+	 * Two things must both be true and only this does both: the folder that
+	 * cannot sync must stop holding a live sidecar for this id (or it is the
+	 * fork, permanently, with this device's copy the one nobody else sees), and
+	 * the ink in it - written by this device, possibly never read since - must
+	 * not be discarded. So it is treated exactly as the external-revision guard
+	 * treats a foreign revision: preserved under a name that is never already
+	 * taken, and announced through `pendingConflict`, which fires only once the
+	 * save that follows has actually landed.
+	 *
+	 * Failures here are not fatal to the save: the worst case is the blind copy
+	 * staying where it is, which is the state we started in, and the write
+	 * itself still lands on the winner.
+	 */
+	private async absorbProvisional(pageId: string, final: string): Promise<void> {
+		const stale = this.displacedProvisional.get(pageId);
+		if (stale === undefined) return;
+		this.displacedProvisional.delete(pageId);
+		if (stale === final) return;
+		const adapter = this.app.vault.adapter;
+		try {
+			if (!(await adapter.exists(stale))) return;
+			const st = await adapter.stat(stale).catch(() => null);
+			const kept = await this.freeConflictPath(final, st?.mtime ?? 0);
+			await adapter.rename(stale, kept);
+			this.pendingConflict.set(pageId, kept);
+		} catch (err) {
+			console.error("[handwriting] could not preserve a blind local sidecar", pageId, err);
+		}
+	}
+
+	/**
 	 * A same-mtime conflict can want the same conflict name twice. Never
 	 * overwrite an earlier conflict copy; find a free sibling name instead.
 	 */
-	private async freeConflictPath(pageId: string, mtime: number): Promise<string> {
+	private async freeConflictPath(final: string, mtime: number): Promise<string> {
 		const adapter = this.app.vault.adapter;
-		const base = normalizePath(`${this.folder}/${pageId}.conflict-${mtime}`);
+		const base = `${stripJson(final)}.conflict-${mtime}`;
 		let candidate = `${base}.json`;
 		for (let n = 2; await adapter.exists(candidate); n++) {
 			candidate = `${base}-${n}.json`;
@@ -1122,19 +1610,31 @@ export class PageStore {
 	 * construction. Fails closed: a damaged or newer-format source is not
 	 * cloneable (serializing a placeholder would fabricate data), and an
 	 * existing destination is never overwritten. Chained on the write queue.
+	 *
+	 * THE COPY LANDS BESIDE ITS SOURCE. Writing it to the configured folder
+	 * forked the duplicate on the spot in the population this release is for: a
+	 * device configured for `.handwriting` whose ink is all in `handwriting/`
+	 * duplicated a note, wrote `.handwriting/<newId>.json`, and sync - which
+	 * ignores dot-folders - carried the new `.md` and its fresh pageId to the
+	 * other device but not the ink. That device opened the copy blank and its
+	 * first stroke wrote `handwriting/<newId>.json`. Two live sidecars under
+	 * one id, from an ordinary duplicate.
 	 */
 	async clone(fromId: string, toId: string): Promise<"cloned" | "none" | "unreadable" | "exists"> {
 		const adapter = this.app.vault.adapter;
 		let result: "cloned" | "none" | "unreadable" | "exists" = "none";
 		const run = async (): Promise<void> => {
-			// The SOURCE is wherever the page actually is; the destination is
-			// always the configured folder, because that is where writes go.
-			const src = await this.readPath(fromId);
+			// The SOURCE is wherever the page actually is, and the destination
+			// is BESIDE IT: the duplicate belongs to the same family, so it
+			// lives in the same folder and reaches (or does not reach) the
+			// other devices exactly as its source does.
+			const src = await this.resolvePath(fromId);
 			if (!(await adapter.exists(src))) {
 				result = "none";
 				return;
 			}
-			const dest = this.path(toId);
+			const home = folderOf(src);
+			const dest = this.pathIn(home, toId);
 			if (await adapter.exists(dest)) {
 				result = "exists";
 				return;
@@ -1152,10 +1652,14 @@ export class PageStore {
 				return;
 			}
 			const out = serializePage({ ...parsed.data, pageId: toId });
-			await ensureFolder(adapter, this.folder);
-			const tmp = this.tmpPath(toId);
+			await ensureFolder(adapter, home);
+			const tmp = this.tmpFor(dest);
 			await adapter.write(tmp, out);
 			await adapter.rename(tmp, dest);
+			// The destination id is brand new and the file provably exists at
+			// `dest` now, so that is where it lives; record it rather than
+			// making the copy's first save look it up again.
+			this.resolved.set(toId, dest);
 			const st = await adapter.stat(dest).catch(() => null);
 			if (st) this.knownMtime.set(toId, st.mtime);
 			this.knownHash.set(toId, contentStamp(out));
@@ -1200,6 +1704,13 @@ export class PageStore {
 		// The page is gone; a later page under this id is a different page,
 		// and must not be reconciled against a writer that predates it.
 		this.lastWriter.delete(pageId);
+		// Where it lived goes with it, but the path itself is kept for the
+		// recycle below: this method is what makes the file stop being there.
+		const pinned = this.resolved.get(pageId);
+		this.resolved.delete(pageId);
+		// Both are claims about that pin, and the pin is going.
+		this.provisional.delete(pageId);
+		this.displacedProvisional.delete(pageId);
 		this.clearTimers(pageId);
 		// Deleting the NOTE is recoverable (Obsidian's trash); deleting the
 		// ink outright would not be. Recycle the sidecar instead. A restored
@@ -1210,12 +1721,26 @@ export class PageStore {
 		// mid tmp/rename dance, which would re-create the sidecar right after
 		// the recycle moved it: a live ink file for a deleted note.
 		const run = async (): Promise<void> => {
+			// Declared out here so the scratch-file sweep below names the same
+			// file the recycle did, even when the recycle threw.
+			let final: string | undefined = pinned;
 			try {
 				// Wherever the page actually is, like load. Recycling only
 				// what the configured folder holds left the real sidecar
 				// behind for a vault mid-migration, so a deleted note's ink
 				// stayed live under an id nothing carries any more.
-				const final = await this.readPath(pageId);
+				//
+				// And the pin is re-proven first, as resolveFor does: it is a
+				// hint, and sync can have moved the file since it was made.
+				// Trusting it blindly recycled the vanished old path and left
+				// the live sidecar untouched, under an id nothing carries.
+				// Proven here, inside the queued operation, against the disk
+				// at that moment. A page found nowhere keeps its last known
+				// home, so a queued payload is recycled beside where it lived.
+				if (final === undefined || !(await adapter.exists(final))) {
+					const now = await this.findSidecar(pageId);
+					if (now.found || final === undefined) final = now.path;
+				}
 				if (queued !== undefined) {
 					// Recycle unless the queued state is PROVABLY empty, same
 					// rule as the disk path below. A snapshot straight from
@@ -1227,9 +1752,11 @@ export class PageStore {
 						queued.images.length === 0 &&
 						Object.keys(queued.unknownTop).length === 0;
 					if (!empty) {
-						const trashDir = this.trashDir();
-						await ensureFolder(adapter, trashDir);
-						await adapter.write(await this.freeTrashPath(pageId), serializePage(queued));
+						// Beside the file it replaces, so the generation and
+						// the page it came from stay in one folder.
+						const home = folderOf(final);
+						await ensureFolder(adapter, this.trashDirIn(home));
+						await adapter.write(await this.freeTrashPath(pageId, home), serializePage(queued));
 					}
 					// Whatever is on disk is now strictly older than the
 					// generation just recycled (or discarded as empty) above -
@@ -1260,18 +1787,20 @@ export class PageStore {
 					if (empty) {
 						await adapter.remove(final);
 					} else {
-						const trashDir = this.trashDir();
-						await ensureFolder(adapter, trashDir);
+						const home = folderOf(final);
+						await ensureFolder(adapter, this.trashDirIn(home));
 						// Never a name that already exists: no `remove(dest)`
 						// here any more, which is exactly what used to destroy
 						// the previous generation.
-						await adapter.rename(final, await this.freeTrashPath(pageId));
+						await adapter.rename(final, await this.freeTrashPath(pageId, home));
 					}
 				}
 			} catch (err) {
 				console.error("[handwriting] sidecar recycle failed", pageId, err);
 			}
-			for (const p of [this.tmpPath(pageId)]) {
+			// The scratch file beside the page's OWN sidecar, not beside a
+			// configured path the page may never have used.
+			for (const p of final === undefined ? [] : [this.tmpFor(final)]) {
 				try {
 					if (await adapter.exists(p)) await adapter.remove(p);
 				} catch (err) {

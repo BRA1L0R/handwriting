@@ -13,12 +13,32 @@
  * release.
  *
  * These drive a REAL gesture through `penDown`/`penRaw`/`penUp` - not the
- * `showLassoCursor`/`showPanCursor`/`showSpaceCursor` wrappers directly -
- * and check the same evidence the pdf's own suite
- * (`PdfInkController.test.ts`, "stays alive through pan, lasso and space")
- * rests on: the watchdog is re-armed (a fresh `setTimeout`) at pen-down and
- * again on the next raw batch, with no fresh hover sample in between, and
- * the reticle is put away at pen-up rather than left for the watchdog.
+ * `showLassoCursor`/`showSpaceCursor` wrappers directly - and check the same
+ * evidence the pdf's own suite (`PdfInkController.test.ts`, "stays alive
+ * through pan, lasso and space") rests on: the watchdog is re-armed (a fresh
+ * `setTimeout`) at pen-down and again on the next raw batch, with no fresh
+ * hover sample in between, and the reticle is put away at pen-up rather than
+ * left for the watchdog.
+ *
+ * PAN IS THE EXCEPTION, AND IT IS A REVERSAL. This file used to assert that
+ * the pan ring persisted through its drag exactly as the lasso's and the
+ * space divider's do, and the assertion was green for a defect: Alan,
+ * 2026-09-05, on hardware - "pan reticle allows you to like fling it away
+ * from the point of pan and it flickers". Persistence was never the problem;
+ * COORDINATES were. `InlinePenRouter` maps client points through a rect it
+ * freezes at pen-down, and a pan is the one gesture that scrolls the overlay
+ * out from under that rect, so every sample of the drag was mapped a little
+ * further wrong than the last. The ring persisted, and walked away from the
+ * nib while it did.
+ *
+ * So the pan test below pins the OPPOSITE rule (architect, 1.4.12; Alan's to
+ * overturn on screen): the pan drag hides the reticle and wears the grabbing
+ * hand instead, the raw batch does not bring it back, and pen-up restores it
+ * under the pointer's CURRENT position. The lasso and space tests are
+ * untouched - their persistence is real and is still what this file is named
+ * for. The rule itself is a pure function, `penReticleShown` (PenCursor.ts),
+ * unit-tested both ways in `PenCursor.test.ts` alongside a source assertion
+ * that the pan drag's move handler positions nothing.
  *
  * `penCursorEl` is primed by one hover call first, matching the limit each
  * wrapper's own comment states: none of them BUILD the reticle, they only
@@ -46,7 +66,7 @@ import { Camera } from "../camera/Camera";
 import { StrokeFrame } from "./StrokeFrame";
 import { setTipMode } from "./TipMode";
 import { armMouseInkQuietly } from "./MouseInk";
-import { PEN_HOVER_CLASS } from "./PenCursor";
+import { PAN_DRAG_CLASS, PEN_HOVER_CLASS } from "./PenCursor";
 import type { PenSample } from "../input/PointerRouter";
 
 function sample(x: number, y: number): PenSample {
@@ -68,12 +88,17 @@ interface Proto {
 	showPenCursor(this: unknown, s: PenSample, pointerType?: string): void;
 	penDown(this: unknown, s: PenSample, ev: PointerEvent): void;
 	penRaw(this: unknown, s: PenSample[], ev: PointerEvent): void;
-	penUp(this: unknown): void;
+	/** `ev` is the lift; absent on the blur path. The pan branch reads it. */
+	penUp(this: unknown, ev?: PointerEvent): void;
 }
 
 interface Rig {
 	inst: Record<string, unknown>;
 	cursorStyle: Record<string, unknown>;
+	/** The scroller's classes, really tracked: the pan drag swaps two of them. */
+	scrollerClasses: Set<string>;
+	/** The router's rect re-measure, which a pan leaves stale until it runs. */
+	refreshRectSpy: ReturnType<typeof vi.fn>;
 	setTimeoutSpy: ReturnType<typeof vi.fn>;
 	clearTimeoutSpy: ReturnType<typeof vi.fn>;
 	proto: Proto;
@@ -89,6 +114,8 @@ interface Rig {
 function makeRig(): Rig {
 	const noop = (): void => undefined;
 	const cursorStyle: Record<string, unknown> = { display: "none" };
+	const scrollerClasses = new Set<string>();
+	const refreshRectSpy = vi.fn();
 	const setTimeoutSpy = vi.fn(() => 1);
 	const clearTimeoutSpy = vi.fn();
 
@@ -139,11 +166,33 @@ function makeRig(): Rig {
 		hasFocus: true,
 		focus: noop,
 		scrollDOM: {
-			classList: { add: noop, remove: noop },
+			// A REAL class set, unlike the reticle element's below. The look
+			// the ring wears is out of scope here; which cursor the SCROLLER
+			// wears is not - the pan drag hides the reticle, and hiding it
+			// without swapping `cursor: none` for the grabbing hand would
+			// leave the surface with no pointer at all, which is the defect
+			// the third suite in this file exists to refuse.
+			classList: {
+				add: (c: string) => void scrollerClasses.add(c),
+				remove: (c: string) => void scrollerClasses.delete(c),
+			},
 			scrollLeft: 0,
 			scrollTop: 0,
 		},
 	};
+
+	// The rect element the router maps client points through, and the one
+	// `restoreReticleAfterPan` re-reads at release. Zero origin, so a lift at
+	// client (x, y) is a sample at (x, y) and the restore's landing point can
+	// be read straight off the transform.
+	inst.container = { getBoundingClientRect: () => ({ left: 0, top: 0 }) };
+
+	// Only the rect seam is real. The router caches the overlay's client rect
+	// and freezes it for a claimed contact, and a pan is the one gesture that
+	// scrolls the overlay out from under it - so the re-measure at pen-up is
+	// half of "returns with no jump", and the half an abandoned pan needs on
+	// its own.
+	inst.router = { refreshRect: refreshRectSpy, isStroking: false };
 
 	// Stubbed because it reaches the strip, the editor or the camera's
 	// layout inputs and is not the subject here - the same idiom
@@ -159,10 +208,18 @@ function makeRig(): Rig {
 	inst.filePath = (): string | null => null;
 
 	const proto = InkOverlayPlugin.prototype as unknown as Proto;
-	return { inst, cursorStyle, setTimeoutSpy, clearTimeoutSpy, proto };
+	return {
+		inst,
+		cursorStyle,
+		scrollerClasses,
+		refreshRectSpy,
+		setTimeoutSpy,
+		clearTimeoutSpy,
+		proto,
+	};
 }
 
-describe("the note surface's reticle stays alive through pan, lasso and space", () => {
+describe("the note surface's reticle stays alive through lasso and space, and stands down through a pan", () => {
 	beforeEach(() => {
 		setPenReticle(true);
 		// NOT a reset that nulls TipMode's listener singleton (the trap
@@ -199,24 +256,101 @@ describe("the note surface's reticle stays alive through pan, lasso and space", 
 		);
 	});
 
-	it("pan: pen-down and the next raw batch each re-arm the watchdog, and pen-up hides it", () => {
+	it("pan: pen-down puts the reticle away for the grabbing hand, the raw batch leaves it away, and pen-up brings it back under the pointer", () => {
 		const rig = makeRig();
+		// Hover first, as the hardware would: ring up, `cursor: none` on.
 		rig.proto.showPenCursor.call(rig.inst, sample(10, 10));
+		expect(rig.cursorStyle.display).toBe("block");
+		expect(rig.scrollerClasses.has(PEN_HOVER_CLASS)).toBe(true);
 		rig.setTimeoutSpy.mockClear();
 		setTipMode("pan");
 
 		rig.proto.penDown.call(rig.inst, sample(200, 200), evAt(200, 200));
-		expect(rig.setTimeoutSpy, "pen-down did not refresh the reticle").toHaveBeenCalledTimes(1);
-		expect(rig.cursorStyle.display).toBe("block");
+		expect(rig.cursorStyle.display, "the pan kept a ring it cannot position").toBe("none");
+		expect(
+			rig.scrollerClasses.has(PAN_DRAG_CLASS),
+			"the drag hid the reticle and put no cursor in its place"
+		).toBe(true);
+		expect(
+			rig.scrollerClasses.has(PEN_HOVER_CLASS),
+			"`cursor: none` was left on the scroller under the grabbing hand"
+		).toBe(false);
+		expect(
+			rig.setTimeoutSpy,
+			"a watchdog was armed for a reticle that is not on screen"
+		).not.toHaveBeenCalled();
 
+		// The drag itself. `panMove` scrolls the scroller here, which on real
+		// hardware is exactly what walked the frozen rect out of date.
 		rig.proto.penRaw.call(rig.inst, [sample(210, 190)], evAt(210, 190));
-		expect(rig.setTimeoutSpy, "the raw batch did not refresh the reticle").toHaveBeenCalledTimes(2);
-		expect(rig.cursorStyle.display).toBe("block");
+		expect(rig.cursorStyle.display, "the raw batch brought the ring back").toBe("none");
+		expect(rig.scrollerClasses.has(PAN_DRAG_CLASS)).toBe(true);
+
+		// Release, somewhere else again: the ring returns UNDER THE LIFT.
+		rig.proto.penUp.call(rig.inst, evAt(215, 185));
+		expect(rig.cursorStyle.display, "the reticle never came back after the pan").toBe("block");
+		expect(
+			rig.scrollerClasses.has(PAN_DRAG_CLASS),
+			"the grabbing hand outlived the drag"
+		).toBe(false);
+		expect(rig.scrollerClasses.has(PEN_HOVER_CLASS)).toBe(true);
+		// The pan reticle is an 11px-radius ring centred on the sample, and
+		// the rig's overlay rect has a zero origin, so this is the lift point
+		// and not the pen-down point, not the last raw sample, and not either
+		// of them shifted by the scroll the drag just applied.
+		expect(rig.cursorStyle.transform, "the ring came back somewhere the pen is not").toBe(
+			"translate(204px, 174px)"
+		);
+	});
+
+	it("pan: a pan abandoned with no lift still re-measures the rect it left stale", () => {
+		// `finishActiveStroke` (a window blur mid-pan) calls `onPenUp` with no
+		// event, so there is no position and no ring to restore. The rect is
+		// stale ALL THE SAME - the pan scrolled the overlay under it, and the
+		// only other thing that re-measures is a scroll that is not coming -
+		// so the next hover after the blur would put the ring the whole pan
+		// distance from the pen unless this runs.
+		const rig = makeRig();
+		setTipMode("pan");
+		rig.proto.penDown.call(rig.inst, sample(200, 200), evAt(200, 200));
+		rig.proto.penRaw.call(rig.inst, [sample(260, 120)], evAt(260, 120));
+		rig.refreshRectSpy.mockClear();
 
 		rig.proto.penUp.call(rig.inst);
-		expect(rig.cursorStyle.display, "pen-up left the reticle up instead of hiding it").toBe(
+
+		expect(rig.cursorStyle.display, "a ring was invented for a lift that never happened").toBe(
 			"none"
 		);
+		expect(
+			rig.refreshRectSpy,
+			"the abandoned pan left the router mapping through a rect it had scrolled away from"
+		).toHaveBeenCalledTimes(1);
+	});
+
+	it("pan: nothing can paint the ring mid-drag, not even a direct showPenCursor", () => {
+		// The call sites that used to paint it are gone, so this reaches the
+		// gate that keeps them gone - `penReticleShown` read inside
+		// `showPenCursor` itself. A new mode, or a new caller, must not be
+		// able to put a ring back where no coordinate can be right.
+		const rig = makeRig();
+		rig.proto.showPenCursor.call(rig.inst, sample(10, 10));
+		setTipMode("pan");
+		rig.proto.penDown.call(rig.inst, sample(200, 200), evAt(200, 200));
+		expect(rig.cursorStyle.display).toBe("none");
+
+		rig.proto.showPenCursor.call(rig.inst, sample(300, 300));
+
+		expect(rig.cursorStyle.display, "a direct call painted a ring mid-pan").toBe("none");
+		// And it REFUSED rather than hid: hiding here would take the grabbing
+		// hand off and leave the surface with no pointer at all mid-drag.
+		expect(
+			rig.scrollerClasses.has(PAN_DRAG_CLASS),
+			"the gate took the grabbing hand away mid-drag"
+		).toBe(true);
+		expect(
+			rig.scrollerClasses.has(PEN_HOVER_CLASS),
+			"the gate put `cursor: none` back over a hidden reticle"
+		).toBe(false);
 	});
 
 	it("space: pen-down and the next raw batch each re-arm the watchdog, and pen-up hides it", () => {

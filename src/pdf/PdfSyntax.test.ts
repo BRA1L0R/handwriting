@@ -192,11 +192,34 @@ describe("the cross-reference row cap", () => {
 	it(
 		"refuses a cross-reference stream one row past the cap, fast",
 		() => {
-			const start = Date.now();
 			const r = readPdf(bigStreamXref(MAX_XREF_ROWS + 1));
 			expect(r.ok).toBe(false);
 			expect(r.ok || r.reason).toContain(`more than ${MAX_XREF_ROWS} rows`);
-			expect(Date.now() - start).toBeLessThan(1000);
+			// "fast" means refusing without walking the stream: the row count
+			// the loop touched before giving up must sit at the cap, bounded by
+			// a small constant - never by the stream's length, which this bound
+			// does not mention (see readXrefStream's `rowsTouched`).
+			const rowsTouched = r.ok ? -1 : (r.rowsTouched ?? -1);
+			expect(rowsTouched).toBeGreaterThanOrEqual(MAX_XREF_ROWS);
+			expect(rowsTouched).toBeLessThanOrEqual(MAX_XREF_ROWS + 2);
+		},
+		20_000,
+	);
+
+	it(
+		"refuses a stream far past the cap without walking it",
+		() => {
+			// The overshoot must be large: at one row past the cap, a loop that
+			// stops right at the cap and a loop that walks the whole stream both
+			// land on the same rowsTouched, so a small overshoot cannot tell a
+			// short-circuiting parser from one that walked everything.
+			const overshoot = 100_000;
+			const r = readPdf(bigStreamXref(MAX_XREF_ROWS + overshoot));
+			expect(r.ok).toBe(false);
+			expect(r.ok || r.reason).toContain(`more than ${MAX_XREF_ROWS} rows`);
+			const rowsTouched = r.ok ? -1 : (r.rowsTouched ?? -1);
+			expect(rowsTouched).toBeGreaterThanOrEqual(MAX_XREF_ROWS);
+			expect(rowsTouched).toBeLessThanOrEqual(MAX_XREF_ROWS + 2);
 		},
 		20_000,
 	);

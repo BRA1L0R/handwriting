@@ -148,6 +148,19 @@ export class DiagnosticTextModal extends Modal {
 						const done = this.contentEl.createDiv({ cls: "handwriting-upload-done" });
 						done.createSpan({ text: "id " });
 						done.createSpan({ cls: "handwriting-upload-id", text: id });
+						// A BUTTON, not a clickable span: the id is eight
+						// characters a tester has to get into a message from a
+						// tablet, where selecting it by hand is the worst text
+						// gesture there is - and an id that copied on click
+						// without saying so would be a secret nobody finds.
+						const copyId = done.createEl("button", { text: "Copy id" });
+						copyId.addEventListener("click", () => {
+							// NOT `delivered()`: the upload above already
+							// delivered this report and called it. Copying the
+							// id is the tester getting a reference back out,
+							// which delivers nothing.
+							void this.copyToClipboard(id, copyId, "Copy id", false);
+						});
 						summary?.setText("uploaded");
 						new Notice(`Handwriting: uploaded - id ${id}`, 10000);
 					}))
@@ -157,7 +170,9 @@ export class DiagnosticTextModal extends Modal {
 
 		const copy = controls.createEl("button", { text: "Copy", cls: this.upload ? "" : "mod-cta" });
 		copy.addEventListener("click", () => {
-			void this.copyToClipboard(field, copy);
+			// Copying the REPORT is delivery - that is the whole point of the
+			// button when there is no upload - so this one marks it.
+			void this.copyToClipboard(this.text, copy, "Copy", true);
 		});
 
 		const save = controls.createEl("button", { text: "Save to vault" });
@@ -198,20 +213,33 @@ export class DiagnosticTextModal extends Modal {
 	 * user gesture in WKWebView. When the async API is missing or blocked the
 	 * Save to vault button is the fallback; the old execCommand path retired
 	 * with the directory review (both real platforms take the API path).
+	 *
+	 * ONE clipboard path for the whole modal, which is why this takes what to
+	 * copy rather than reading `this.text`: the report and the upload id are
+	 * both copied from here, so the gesture rule, the missing-API fallback and
+	 * the failure Notice are stated once. A second spelling of "how this app
+	 * copies" is what goes stale when a platform changes.
+	 *
+	 * `markDelivered` is the one thing the two callers genuinely differ on.
+	 * Copying the REPORT hands the diagnostics to a human and is the delivery;
+	 * copying the ID after an upload delivers nothing - the upload already
+	 * did, and already called `delivered()`.
 	 */
 	private async copyToClipboard(
-		field: HTMLTextAreaElement,
-		button: HTMLButtonElement
+		text: string,
+		button: HTMLButtonElement,
+		label: string,
+		markDelivered: boolean
 	): Promise<void> {
 		const done = () => {
 			button.setText("Copied");
-			window.setTimeout(() => button.setText("Copy"), 1500);
+			window.setTimeout(() => button.setText(label), 1500);
 		};
 		try {
 			if (navigator.clipboard?.writeText) {
-				await navigator.clipboard.writeText(this.text);
+				await navigator.clipboard.writeText(text);
 				done();
-				this.delivered();
+				if (markDelivered) this.delivered();
 				return;
 			}
 		} catch {

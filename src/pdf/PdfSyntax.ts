@@ -32,8 +32,14 @@
 
 import { inflate, unpredict } from "./Flate";
 
-/** A read that names its reason for failing, because the user is shown it. */
-export type PdfRead<T> = { ok: true; value: T } | { ok: false; reason: string };
+/**
+ * A read that names its reason for failing, because the user is shown it.
+ *
+ * `rowsTouched`, set only by the cross-reference row cap's refusal, is how
+ * many rows the loop had counted when it gave up - a seam so a test can
+ * assert the cap stops the walk instead of timing how long refusal takes.
+ */
+export type PdfRead<T> = { ok: true; value: T } | { ok: false; reason: string; rowsTouched?: number };
 
 /** Bytes as chars, one for one. Chunked: spreading megabytes blows the stack. */
 export function latin1(bytes: Uint8Array): string {
@@ -469,7 +475,11 @@ function readXrefStream(src: Source, at: number): PdfRead<XrefSection> {
 			// split into many small subsections is still one table (design doc
 			// s3 A1).
 			if (rows++ >= MAX_XREF_ROWS) {
-				return { ok: false, reason: `the cross-reference stream declares more than ${MAX_XREF_ROWS} rows` };
+				return {
+					ok: false,
+					reason: `the cross-reference stream declares more than ${MAX_XREF_ROWS} rows`,
+					rowsTouched: rows,
+				};
 			}
 			if (p + width > data.length) {
 				return { ok: false, reason: "the cross-reference stream ends mid-row" };

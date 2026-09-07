@@ -3,9 +3,11 @@ import { Prec } from "@codemirror/state";
 import type { Extension } from "@codemirror/state";
 import { isolateHistory, redo, redoDepth, undo, undoDepth } from "@codemirror/commands";
 import { Notice, Platform, editorInfoField } from "obsidian";
+import { runGatedCommand } from "../CommandPaletteSplit";
 import { Camera } from "../camera/Camera";
 import { CameraState } from "../camera/coordinates";
 import { contentOrigin, contentOriginLeft } from "./ContentOrigin";
+import { anchorTop } from "./DocumentTop";
 import {
 	penContactIntent,
 	releaseTipMode,
@@ -57,15 +59,23 @@ export function inkCanvasReallocs(): number {
 const SCALE_EPSILON = 1e-3;
 
 /**
- * Whole CSS px the content origin must move before `handleResize`'s
- * `unchanged` guard treats it as a real reposition, not rect-measurement
- * wobble. Same shape as `SCALE_EPSILON` and `ScrollBand`'s
- * `BAND_MOVE_EPSILON`: `getBoundingClientRect().left` is fractional, so an
- * exact compare against `lastSyncContentLeft` would fire on sub-pixel noise
- * most ticks - which defeats the guard as completely as never checking at
- * all, re-syncing and re-scheduling a repaint every time `handleResize`
- * runs for an unrelated reason. A whole pixel is the smallest displacement
- * that could ever separate ink from the text under it.
+ * Whole CSS px the content origin must move before it is treated as a real
+ * reposition rather than rect-measurement wobble.
+ *
+ * The COLUMN'S LEFT EDGE, which is the horizontal half of that origin.
+ * Same shape as `SCALE_EPSILON` and `ScrollBand`'s `BAND_MOVE_EPSILON`:
+ * `getBoundingClientRect().left` is fractional, so an exact compare against
+ * `lastSyncContentLeft` would fire on sub-pixel noise most ticks - which
+ * defeats the guard as completely as never checking at all, re-syncing and
+ * re-scheduling a repaint every time `handleResize` runs for an unrelated
+ * reason. A whole pixel is the smallest displacement that could ever
+ * separate ink from the text under it.
+ *
+ * The VERTICAL half is not guarded by a threshold on the measurement:
+ * `syncCamera` compares the camera it just built against the camera the
+ * pixels were drawn with, which is the same exact three-field compare
+ * `repaint` makes about the same question, so this constant does not apply
+ * there.
  */
 const CONTENT_ORIGIN_EPSILON = 1;
 
@@ -75,6 +85,7 @@ const PAN_CURSOR_CLASS = "handwriting-pen-hover-pan";
 import {
 	DEFAULT_TOOLBAR_CORNER,
 	ToolbarCorner,
+	normalizeToolbarCorner,
 } from "./ToolbarCorner";
 import {
 	getPenToolsMode,
@@ -85,12 +96,26 @@ import {
 	pointerRaisesPenTools,
 	releaseMouseInkQuietly,
 } from "./PenToolsMode";
+import { deviceHasTouch } from "./DeviceInput";
 import { computeCanvasSize, countPaintedPixels } from "../diag/Raster";
 import { diagnosticsEnabled } from "../diag/DiagSwitch";
 import { eraserRect, splitStrokeByCircle, strokesHitByCircle } from "../ink/Eraser";
 import { DEFAULT_PEN, HIGHLIGHTER_ALPHA, HIGHLIGHTER_PEN, PenStyle } from "../ink/PenStyle";
 import { clampInkSize } from "../ink/InkSize";
 import { applyInkColor, colorsFor, getInkColorHex } from "../ink/InkColor";
+import {
+	applyInkPreset,
+	forgetInkPreset,
+	inkPresetsFor,
+	starInkPreset,
+} from "../ink/InkPresets";
+import {
+	paintPurgeSentinel,
+	purgeDetected,
+	purgeProbeArmed,
+	purgeProbeDue,
+	readPurgeSentinel,
+} from "../ink/PurgeSentinel";
 import { Point2 } from "../ink/Smoothing";
 import { BBox, InkStroke, InkTool, newStrokeId } from "../ink/Stroke";
 import { StrokeBuilder } from "../ink/StrokeBuilder";
@@ -111,7 +136,9 @@ import {
 	inkEffect,
 	inkHistorySupport,
 	snapHistoryOps,
+	snapReplaceOp,
 } from "./InkHistory";
+import { SnapChip } from "./SnapChip";
 import {
 	InlineSelectionDeleteKeys,
 	removeSelectedInlineStrokes,
@@ -129,8 +156,20 @@ import {
 } from "./MetadataVisibility";
 import { handoffFinishedStroke } from "./StrokeHandoff";
 import { InlineInkStore } from "./InlineInkStore";
+import {
+	EmptyPageNoticeGate,
+	EmptyPageTool,
+	emptyPageNoticeText,
+	inkChangeRearmsNotice,
+} from "./EmptyPageNotice";
 import { focusClaimedPenEditor, setKeyboardFocus } from "./InlineFocus";
-import { HOVER_GHOST_MS, PEN_HOVER_CLASS, penCursorLayout } from "./PenCursor";
+import {
+	HOVER_GHOST_MS,
+	PAN_DRAG_CLASS,
+	PEN_HOVER_CLASS,
+	penCursorLayout,
+	penReticleShown,
+} from "./PenCursor";
 import { normalizeInlinePenPressure } from "./PenPressure";
 import { observeStrokeMax, strokeGain } from "../ink/PressureGain";
 import { embedInkLayerCount, embedInkPrintSwaps } from "./EmbedInk";
@@ -153,7 +192,7 @@ import {
 	setProbeGeometry,
 } from "./PenProbe";
 import { InlinePenRouter, bandEraserIntent } from "./InlinePenRouter";
-import { armMouseInkQuietly, mouseInkEnabled } from "./MouseInk";
+import { armMouseInkQuietly, markToolPicked, mouseInkEnabled } from "./MouseInk";
 import { penInkEnabled } from "./PenInk";
 import { describeEl, setHitProbeContext } from "./PenHitProbe";
 import { Extent, inkFrontier, isScrollableOverflow, ScrollAxisGuard, spacerPosition, surfaceExtents, surfaceOriginInScroller, writeFrontier, ZERO_EXTENT, zoomFrontier } from "./SurfaceExtent";
@@ -275,6 +314,13 @@ export function getInlineTool(): InkTool {
 
 export function setInlineTool(tool: InkTool): void {
 	inlineTool = tool;
+	// THE NIB HALF OF "a tool has been picked" (MouseInk.ts, `toolPicked`).
+	// Here rather than in the two tool commands, the strip's two nib buttons,
+	// the colour commands and the quick-pen chips, because every one of them
+	// ends in this line and a rule written at all six drifts at one of them.
+	// The mouse-draws-from-a-lit-tool grant on a pen-less device reads that
+	// flag; on a device that has seen a pen nothing reads it at all.
+	markToolPicked();
 	// Picking a nib is how you put every other mode away - not just the
 	// eraser. While this cleared one flag of four, "Switch between pen and
 	// highlighter" left the tip panning while announcing a nib change.
@@ -433,22 +479,42 @@ const repaintSurfaces = new Set<() => void>();
  */
 const hideCursorSurfaces = new Set<() => void>();
 
+/**
+ * And the same surfaces need to hear the pen going OFF while a stroke of
+ * theirs is live, because the router refuses new claims without breaking the
+ * one it already made (`InlinePenCallbacks.penOff`). Its own set for the same
+ * reason as the one above: a strip refresh is not a stroke end, and ending a
+ * live stroke on every corner change would take the word out from under a pen
+ * that is still writing.
+ *
+ * The pen-off state was note-only when this fan-out did not exist, so a pdf
+ * had nothing live to end. It is not note-only any more ("why would you take
+ * keyboard mode away from pdf"), and a pdf whose stroke was left running would
+ * hold `activePenId` with the window-capture click suppressor armed behind it
+ * - the failure `abandonActiveStroke` was written for, reached a different
+ * way.
+ */
+const endStrokeSurfaces = new Set<() => void>();
+
 /** Register an extra strip to refresh with the editors. Returns the undo. */
 export function addStripSurface(
 	refresh: () => void,
 	onTipMode?: () => void,
 	onRepaint?: () => void,
-	onHideCursor?: () => void
+	onHideCursor?: () => void,
+	onEndLiveStroke?: () => void
 ): () => void {
 	stripSurfaces.add(refresh);
 	if (onTipMode) tipModeSurfaces.add(onTipMode);
 	if (onRepaint) repaintSurfaces.add(onRepaint);
 	if (onHideCursor) hideCursorSurfaces.add(onHideCursor);
+	if (onEndLiveStroke) endStrokeSurfaces.add(onEndLiveStroke);
 	return () => {
 		stripSurfaces.delete(refresh);
 		if (onTipMode) tipModeSurfaces.delete(onTipMode);
 		if (onRepaint) repaintSurfaces.delete(onRepaint);
 		if (onHideCursor) hideCursorSurfaces.delete(onHideCursor);
+		if (onEndLiveStroke) endStrokeSurfaces.delete(onEndLiveStroke);
 	};
 }
 
@@ -461,6 +527,38 @@ export function setToolbarCorner(corner: ToolbarCorner): void {
 	toolbarCorner = corner;
 	for (const p of instances) p.applyToolbarCorner();
 	refreshStripSurfaces();
+}
+
+/** The placement changed live and has to survive a restart; the plugin owns
+ * data.json, so it registers the write here at load. */
+let persistToolbarCorner: ((corner: ToolbarCorner) => void) | null = null;
+
+export function setPersistToolbarCorner(fn: ((corner: ToolbarCorner) => void) | null): void {
+	persistToolbarCorner = fn;
+}
+
+/**
+ * Move the toolbar and remember it: `applyInkSize`'s shape, for the other
+ * setting a strip can now change on its own.
+ *
+ * ONE ROAD, and this is the whole point of the function. The placement has
+ * two writers since drag-to-anchor (1.4.12) - the settings dropdown and a
+ * drag of the strip's grip - and each of them owes the other's half: a drop
+ * that only called `setToolbarCorner` would move the toolbar until the next
+ * restart and leave the dropdown reading the placement it had before, and one
+ * that only wrote settings would persist a move nobody could see. The
+ * dropdown's `case "toolbarCorner"` (main.ts) calls this, and both strip
+ * hosts wire `MobileToolsHost.setPlacement` to it, so there is nothing to
+ * keep level.
+ *
+ * The value is NORMALISED here rather than trusted, for the same reason
+ * `setStripFoldOrder` normalises: a caller that has not is then safe, and
+ * both of today's callers already had to.
+ */
+export function applyToolbarPlacement(corner: ToolbarCorner): void {
+	const safe = normalizeToolbarCorner(corner);
+	setToolbarCorner(safe);
+	persistToolbarCorner?.(safe);
 }
 
 let penReticleOn = true;
@@ -545,6 +643,22 @@ export function setPersistInkSize(fn: ((tool: InkTool, mult: number) => void) | 
 	persistInkSize = fn;
 }
 
+/**
+ * Set and persist a tool's nib size in one move: `applyInkColor`'s twin for
+ * the other half of a pen (InkColor.ts).
+ *
+ * The pair was already written twice - inline in each strip host's
+ * `setInkSizeMult(tool, mult, commit)` - because `persistInkSize` is module
+ * state here and only this file could reach it. Quick pens (1.4.12 §4) is the
+ * third caller and the first one OUTSIDE this module, and a preset must land
+ * by the same road a slider release does or the two persist differently.
+ * The clamped value is what gets persisted, never the caller's raw number.
+ */
+export function applyInkSize(tool: InkTool, mult: number): void {
+	setInkSizeMult(tool, mult);
+	persistInkSize?.(tool, getInkSizeMult(tool));
+}
+
 export const inlineInk = new InlineInkStore();
 const instances = new Set<InkOverlayPlugin>();
 /** Shared across editors so an A/B session accumulates one summary list. */
@@ -577,7 +691,7 @@ export function refreshPenToolsAll(): void {
 }
 
 /**
- * The pen just went off (or on): end any live stroke on every open NOTE.
+ * The pen just went off (or on): end any live stroke on every open surface.
  *
  * The state can be flipped with the nib on the glass - a hotkey, the palette,
  * or the other hand on the strip - and the router's gate deliberately refuses
@@ -601,11 +715,18 @@ export function refreshPenToolsAll(): void {
  * scroller on every toggle made just after a stroke, which is the lit-nib
  * regression its own header spells out.
  *
- * NOTES ONLY, like the state itself: the pdf keeps inking while the pen is
- * off, so there is nothing there to end.
+ * EVERY SURFACE, like the state itself. This walked `instances` alone while
+ * the pen-off state was note-only; the owner's reversal ("why would you take
+ * keyboard mode away from pdf") gave the pdf a gate of its own, and with it a
+ * live stroke that has to end the same way. `instances` is the editor overlays
+ * and nothing else, so the pdf half comes through `addStripSurface`'s
+ * `onEndLiveStroke` - the same registry the reticle and strip fan-outs use,
+ * and for the reason `stripSurfaces` states: this module is imported BY the
+ * pdf surface, so importing back would close the loop.
  */
-export function endLiveNoteStrokes(): void {
+export function endLiveStrokesEverywhere(): void {
 	for (const p of instances) p.endLiveStroke();
+	for (const end of endStrokeSurfaces) end();
 }
 
 /**
@@ -885,8 +1006,9 @@ export class InkOverlayPlugin {
 	 * Was the pointer that started the CURRENT gesture a mouse?
 	 *
 	 * Byte-for-byte the pdf surface's field of the same name, for its reason:
-	 * the in-gesture reticle wrappers (`showLassoCursor`, `showPanCursor`,
-	 * `showSpaceCursor`) pass no `pointerType` - deliberately and permanently,
+	 * the in-gesture reticle wrappers (`showLassoCursor`, `showSpaceCursor`,
+	 * and `restoreReticleAfterPan`, which is what a pan has instead of one
+	 * since 1.4.12) pass no `pointerType` - deliberately and permanently,
 	 * because the hardware and pen-seen claims belong to the hover and the
 	 * pen-down that already happened, not to every sample of a gesture in
 	 * flight - so the surface has to answer for them from what contact wrote
@@ -905,6 +1027,13 @@ export class InkOverlayPlugin {
 	private rawLastMoveT = 0;
 	private rawLastMoveX = 0;
 	private rawLastMoveY = 0;
+	/**
+	 * The mouse's shape snap: an offer, never a correction. See SnapChip.ts
+	 * for the defect ("it's correcting into a straight line") and the ruling.
+	 * One per surface, created here and never replaced - the chip it holds is
+	 * per-offer and takes itself down.
+	 */
+	private readonly snapChip = new SnapChip();
 
 	// gesture state (one pen contact at a time; mode decided at pen-down)
 	private mode: PenMode = "ink";
@@ -1012,6 +1141,17 @@ export class InkOverlayPlugin {
 	/** The element `originLineObserver` is currently watching, if any. */
 	private originLine: Element | null = null;
 	private repaintQueued = false;
+	/**
+	 * Did nothing but scrolling ask for the queued frame? The purged-canvas
+	 * probe (PurgeSentinel.ts) fires on that frame and no other, because it is
+	 * the one that legitimately draws nothing.
+	 */
+	private repaintScrollOnly = false;
+	/**
+	 * `performance.now()` of the last sentinel readback. -Infinity, not 0, so
+	 * the first one is due immediately rather than 300ms into the session.
+	 */
+	private lastPurgeProbe = Number.NEGATIVE_INFINITY;
 	private presentProbePending = false;
 	private scrollFn: (() => void) | null = null;
 	private wheelFn: ((e: WheelEvent) => void) | null = null;
@@ -1111,6 +1251,20 @@ export class InkOverlayPlugin {
 	private lastSyncRectLeft = 0;
 	private lastSyncRectTop = 0;
 	private lastSyncContentLeft = 0;
+	/**
+	 * Diagnostic only, and NOT the thing to compare a drift against:
+	 * `documentTop` is a SCREEN coordinate (`contentDOM.getBoundingClientRect()
+	 * .top + paddingTop`, negative when scrolled down), so it changes by the
+	 * whole delta on every scroll. The camera origin, which is that number
+	 * minus the band's own rect top, is what stays still through a scroll and
+	 * is what `syncCamera` compares. See the compare there.
+	 *
+	 * The ANCHOR THE CAMERA USED, which is `anchorTop`'s answer and not
+	 * `view.documentTop` verbatim: the two differ only while CodeMirror has
+	 * not measured its own padding yet, and a probe row that reported the
+	 * number the mapping did NOT use would misdescribe exactly the frame the
+	 * probe exists for.
+	 */
 	private lastSyncDocumentTop = 0;
 	private lastSyncScrollLeft = 0;
 	private lastSyncScrollTop = 0;
@@ -1147,6 +1301,27 @@ export class InkOverlayPlugin {
 	// paint present while the glass is blank = presentation/compositor.
 	/** The file this editor was last showing. Ink isolation depends on it. */
 	private lastPath: string | null = null;
+	/**
+	 * What this overlay has already said about an empty page, so an eraser
+	 * scrub - many contacts, one piece of news - says it once. See
+	 * EmptyPageNotice.ts; cleared by ink changes and by a note switch.
+	 *
+	 * REACHED THROUGH A GETTER, and that is not decoration. Half a dozen
+	 * tests in this suite drive real methods on a rig built with
+	 * `Object.create(InkOverlayPlugin.prototype)` - a deliberate technique
+	 * here, since it exercises the shipping code without a DOM - and
+	 * `Object.create` runs NO field initialisers, so a plain `= new
+	 * EmptyPageNoticeGate()` is `undefined` on every one of those rigs. The
+	 * first version of this field was exactly that, and it took out five
+	 * rigs at once (AbandonedGestureStandsDown, InlineEraserSelection,
+	 * RemountFontRef) the moment `resetGestureState` touched it. A getter
+	 * lives on the PROTOTYPE, so a rig gets it for free, and the lazy
+	 * construction means no caller has to know whether it exists yet.
+	 */
+	private emptyNoticeGate: EmptyPageNoticeGate | null = null;
+	private get emptyNotice(): EmptyPageNoticeGate {
+		return (this.emptyNoticeGate ??= new EmptyPageNoticeGate());
+	}
 	/**
 	 * Visual px per layout px for this editor (1 unless something applies a
 	 * CSS zoom/transform). Every conversion between screen geometry and note
@@ -1350,10 +1525,26 @@ export class InkOverlayPlugin {
 				// for a mouse-only user (alan, 2026-09-02).
 				onPenHover: (s, pt) => this.showPenCursor(s, pt),
 				onPenLeave: () => this.hidePenCursor(),
+				// A finger just landed with nothing else on the glass, so a
+				// mouse's hover ring is the only thing that can be lit - and
+				// it is not wanted while the hand writes (alan, 1.4.12: "hide
+				// the mouse reticle when a finger or pen is active"). The
+				// router asks only on that edge, so this cannot blink a pen's
+				// ring; `InlinePenRouter.onHandOnGlass` carries the whole rule.
+				//
+				// `hidePenCursor` and not a narrower hide, deliberately: it is
+				// the one teardown every abandon path already goes through,
+				// and it takes `PEN_HOVER_CLASS`'s `cursor: none` off with the
+				// ring, so the reader is left with the native cursor rather
+				// than with no pointer at all.
+				onHandOnGlass: () => this.hidePenCursor(),
 				onPinch: (phase, ratio, centroid) => this.pinch(phase, ratio, centroid),
 				onPenRaw: (samples, ev) => this.penRaw(samples, ev),
 				onPenMove: (_ev, count) => metrics.recordEvent("move", count, 0, false),
-				onPenUp: () => this.penUp(),
+				// The lift event is PASSED ON - see `penUp`'s own header. The
+				// pan branch reads the pointer's position off it to put the
+				// reticle back where the hand actually is.
+				onPenUp: (ev) => this.penUp(ev),
 			// PEN OFF (PenInk.ts, design §5): the note surface is the only
 			// one that answers this. Off means the router claims nothing, so
 			// the pen is a native pointer here - taps place the caret and
@@ -1497,7 +1688,26 @@ export class InkOverlayPlugin {
 		// Every committed mutation that reaches an event drops the cached
 		// frontier for that note; the two that do not (erase, lasso move)
 		// invalidate by hand at their gesture end. §5g/G1.
-		this.offInkChanged = onInkChanged((p) => this.frontierCache.invalidate(p));
+		// ...and the empty-page refusal it has already made about that note is
+		// spent: ink arriving (or the last of it leaving) is exactly the event
+		// that makes the sentence worth saying again. Same subscription, so
+		// the two cannot drift apart over which notes they heard about.
+		this.offInkChanged = onInkChanged((p) => {
+			this.frontierCache.invalidate(p);
+			// ...but ONLY when ink ARRIVED. The sentence above said "or the
+			// last of it leaving", and that half was wrong on a user's screen:
+			// an eraser scrub re-lands the nib every few hundred ms, each
+			// re-land a fresh pointerdown, so erasing the last stroke re-armed
+			// this gate and the very next landing of the SAME scrub announced
+			// that there was no ink to erase - to the person who had just
+			// erased it (alan, 1.4.12: "flip to erase end worked but it also
+			// gave me the toast for no ink to erase"). Emptying a page is the
+			// one ink change that must NOT make the sentence worth saying
+			// again: the user knows, they did it. Ink arriving still re-arms,
+			// which is the case the gate exists for - a note that gains ink and
+			// later loses it elsewhere should speak again.
+			if (inkChangeRearmsNotice(inlineInk.inkPresence(p))) this.emptyNotice.forget(p);
+		});
 		this.lastPath = this.filePath();
 		this.updateHandwritingPageClass();
 		this.loadInk(this.lastPath);
@@ -1610,6 +1820,27 @@ export class InkOverlayPlugin {
 		const want =
 			this.container !== null &&
 			penToolsVisible(getPenToolsMode(), Platform.isMobileApp, penSeenThisSession());
+		// A strip whose BUILD-TIME answers have moved is rebuilt, not left
+		// standing. `ButtonSpec.shownOn` is read once per strip, and one of
+		// the facts it reads has an edge - the first real pen contact latches
+		// `penHardwareEverSeen`, which is what gives the device a Keyboard
+		// button. (Since 1.4.12 that latch is also restored at load, before
+		// any strip is built, from THIS DEVICE's local store under
+		// `handwriting-device-pen-hardware-seen` - not from settings: an old
+		// `data.json` key is deliberately ignored, because that file syncs
+		// and a pen on one machine is not a pen on this one. So a device
+		// that has already held a pen never reaches this edge at all.) On
+		// mobile the strip already
+		// exists by then (`penToolsVisible` is unconditionally true there), so
+		// the create-or-destroy test below would answer "no change" and the
+		// button would never appear. Dropping the strip here puts it through
+		// the build path on the next line, which is the only path that reads
+		// `shownOn` at all. At most once per session per strip: the latch
+		// cannot go back down and a device does not grow a digitizer.
+		if (want && this.mobileTools?.stale()) {
+			this.mobileTools.destroy();
+			this.mobileTools = null;
+		}
 		if (want === (this.mobileTools !== null)) return;
 		if (!want) {
 			this.mobileTools?.destroy();
@@ -1637,10 +1868,21 @@ export class InkOverlayPlugin {
 					// definitionally equal to Ctrl+Z.
 					if (id === "editor:undo") undo(this.view);
 					else if (id === "editor:redo") redo(this.view);
-					else commands.executeCommandById(id);
+					// The eraser, lasso, insert-space and pan buttons run
+					// commands that "Extra commands for hotkeys" keeps out of
+					// the palette while it is off - executeCommandById would
+					// find nothing and the buttons would be dead on a default
+					// install. `runGatedCommand` holds exactly the actions
+					// that were not registered, so it answers true only for
+					// them (CommandPaletteSplit.ts).
+					else if (!runGatedCommand(id)) commands.executeCommandById(id);
 				}
 			},
 			activeTool: () => getInlineTool(),
+			// The strip was dragged to an anchor: the same road the settings
+			// dropdown takes, so the placement moves everywhere AND survives
+			// a restart. The pdf host wires the identical call.
+			setPlacement: (corner) => applyToolbarPlacement(corner),
 			eraserOn: () => getInlineEraserMode(),
 			eraserWholeStroke: () => getEraserWholeStrokes(),
 			setEraserWholeStroke: (on) => {
@@ -1650,7 +1892,7 @@ export class InkOverlayPlugin {
 			lassoOn: () => getInlineLassoMode(),
 			spaceOn: () => getInlineSpaceMode(),
 			panOn: () => getInlinePanMode(),
-			activeColor: () => getInkColorHex(getInlineTool()),
+			toolColor: (tool) => getInkColorHex(tool as InkTool),
 			eraserRadiusPx: () => getEraserRadiusPx(),
 			setEraserRadiusPx: (px, commit) => {
 				setEraserRadiusPx(px);
@@ -1667,8 +1909,15 @@ export class InkOverlayPlugin {
 			toast: (message) => {
 				new Notice(message);
 			},
-			palette: () => colorsFor(getInlineTool()),
+			paletteFor: (tool) => colorsFor(tool as InkTool),
 			pickColor: (name, hex) => pickStripColor(name, hex),
+			// Quick pens: the list, and the three actions main registered.
+			// Same wiring on the pdf strip, so a preset starred on a note is
+			// the same preset on a pdf.
+			presetsFor: (tool) => inkPresetsFor(tool as InkTool),
+			applyPreset: (tool, index) => applyInkPreset(tool as InkTool, index),
+			starPreset: (tool) => starInkPreset(tool as InkTool),
+			forgetPreset: (tool, index) => forgetInkPreset(tool as InkTool, index),
 			inkSizeMult: (tool) => getInkSizeMult(tool as InkTool),
 			setInkSizeMult: (tool, mult, commit) => {
 				setInkSizeMult(tool as InkTool, mult);
@@ -1681,14 +1930,16 @@ export class InkOverlayPlugin {
 			// module and StripPenChrome.test.ts's sweep is what keeps them
 			// there.
 			setEditorFocus: (focused) => setKeyboardFocus(this.view, focused),
-			// The note is the one surface PenInk.ts actually gates: the flag
-			// says whether the pen inks here, so the button and pill read it
-			// straight (MobileTools.ts's `penInksHere`, design §5).
+			// This router gates on the flag (`penOff` above), so the flag is
+			// the honest answer to "does the pen ink here" - the pdf host
+			// answers the same read for the same reason (MobileTools.ts's
+			// `penInksHere`, design §5).
 			penInksHere: () => penInkEnabled(),
-			// The note is where the Keyboard button means something: PenInk.ts's
-			// flag is real here, so there is a genuine off switch to build the
-			// button for (MobileTools.ts's `penCanTurnOff`).
-			penCanTurnOff: () => true,
+			// The DEVICE's digitizer, not this pane's anything - the rule and
+			// its reasoning live in DeviceInput.ts, and both surfaces read the
+			// one implementation so a phone cannot get a different answer on a
+			// note than it gets on a pdf.
+			hasTouch: () => deviceHasTouch(),
 		});
 		// A strip born mid-session starts in the configured corner, not the
 		// default one: ensurePenTools creates it on the first pen contact,
@@ -1774,6 +2025,9 @@ export class InkOverlayPlugin {
 		this.mobileTools?.destroy();
 		this.mobileTools = null;
 		this.resetGestureState();
+		// A remount puts a genuinely fresh screen in front of the reader, so
+		// the refusal is allowed to speak once more on it.
+		this.emptyNotice.forgetAll();
 		if (this.hostPositionPatched) {
 			this.view.dom.setCssStyles({ position: "" });
 			this.hostPositionPatched = false;
@@ -1817,6 +2071,10 @@ export class InkOverlayPlugin {
 			this.mobileTools?.setCollapsed(true);
 			this.builder = null;
 			this.resetGestureState();
+			// A different note has heard nothing yet, so the empty-page refusal
+			// is news again. Here rather than inside resetGestureState, which an
+			// abandoned gesture also runs - on the same note, mid-scrub.
+			this.emptyNotice.forgetAll();
 			// resetGestureState() only clears the overlay's own drawing state
 			// (mode, selection, drag...). The router is a separate object with
 			// its own gesture memory - an in-flight stroke and the pen-click
@@ -2007,7 +2265,7 @@ export class InkOverlayPlugin {
 
 	/**
 	 * End a stroke that is live right now, committing it. The per-editor half
-	 * of `endLiveNoteStrokes`, whose header carries the whole reasoning; a
+	 * of `endLiveStrokesEverywhere`, whose header carries the whole reasoning; a
 	 * no-op when nothing is live, and no chrome call of its own because
 	 * `finishActiveStroke` reaches `penUp()` through `onPenUp` and that is
 	 * where the strip already comes down.
@@ -2071,7 +2329,7 @@ export class InkOverlayPlugin {
 		// the untransformed box and give the backing store the extra device
 		// pixels the scale demands, so ink stays crisp instead of being
 		// upscaled by the compositor.
-		this.cssScale = effectiveScale({
+		const measuredCssScale = effectiveScale({
 			visualWidth: rect.width,
 			layoutWidth: this.container.offsetWidth,
 			cmScaleX: this.view.scaleX,
@@ -2085,14 +2343,44 @@ export class InkOverlayPlugin {
 		if (this.refFontPx <= 0 && Number.isFinite(fontPx) && fontPx > 0) {
 			this.refFontPx = fontPx;
 		}
-		this.fontZoom = fontZoomFactor(fontPx, this.refFontPx);
-		this.scale = this.cssScale * this.fontZoom;
+		const measuredFontZoom = fontZoomFactor(fontPx, this.refFontPx);
+		// A STROKE IN FLIGHT OWNS ITS COORDINATE FRAME, and `cssScale` is
+		// half of that frame: the router divides every sample by it
+		// (`scaleProvider`, InlinePenRouter.sampleFrom) and the camera that
+		// inverts the result is frozen at pen-down. Writing it here moved the
+		// divisor under a stroke that could not follow, so every sample after
+		// the resize landed at a different note point than the same finger
+		// position did before it - the rest of the letter jumping toward the
+		// top-left, mid-stroke. That is the same shear `scrollFn` refuses by
+		// not refreshing the router's rect mid-stroke and `syncBand` refuses
+		// by returning early, and this method was the one geometry path left
+		// that did it anyway. `UnsettledDocumentTop.test.ts` pins it: a 1.5x
+		// resize under a planted pen moved one client point 66.7 note px.
+		//
+		// Nothing is deferred for long. `syncCamera` re-measures the scale
+		// from its own rect read on every sync rather than trusting anything
+		// cached here (see its comment below), so the first unlocked sync
+		// after pen-up adopts both numbers - which pen-up reaches through the
+		// commit's own repaint. The BACKING below is computed from the
+		// measured values regardless, so canvas resolution is unaffected and
+		// the reallocation path behaves exactly as it did.
+		if (!this.frame.locked) {
+			this.cssScale = measuredCssScale;
+			this.fontZoom = measuredFontZoom;
+			this.scale = this.cssScale * this.fontZoom;
+		}
 		const layoutW = this.container.offsetWidth || rect.width;
 		const layoutH = this.container.offsetHeight || rect.height;
 		// Backing resolution: device px per SCREEN css px. The font zoom is
 		// GEOMETRY (applied by the camera before rasterization), not
 		// resolution. Folding it in here was the part-2 bug's sibling.
-		const backing = this.backingNow(layoutW, layoutH);
+		const backing = backingScale(
+			this.dpr,
+			measuredCssScale,
+			layoutW,
+			layoutH,
+			Platform.isMobileApp
+		);
 		const size = computeCanvasSize(layoutW, layoutH, backing);
 		// Same backing, same box: reallocating would blank five canvases
 		// for nothing (setting width clears a canvas even to the same
@@ -2111,7 +2399,14 @@ export class InkOverlayPlugin {
 		this.cssWidth = size.cssW;
 		this.cssHeight = size.cssH;
 		if (unchanged) {
-			this.router?.refreshRect();
+			// Not while a stroke owns the frame, for the reason below and for
+			// `scrollFn`'s: the rect the router maps through and the camera
+			// that inverts the result froze together at pen-down, and
+			// refreshing one without the other IS the mismatch the frozen
+			// pipeline exists to prevent. The next pen-down refreshes it
+			// (:2776), which is the same guarantee the scroll handler relies
+			// on.
+			if (!this.frame.locked) this.router?.refreshRect();
 			// `ResizeObserver` fires on SIZE changes only. Readable line length
 			// caps `.cm-content` at `--file-line-width` and centres it in the
 			// scroller, so opening or closing a sidebar at constant pane width
@@ -2119,7 +2414,12 @@ export class InkOverlayPlugin {
 			// compared - band, canvas dims and cssWidth/cssHeight all stay put,
 			// and neither ResizeObserver's callback fires either (nothing sized).
 			// This is the only path left that runs on every geometry-relevant
-			// tick, so it is where the shifted origin actually gets noticed.
+			// tick, so it is where a shifted COLUMN actually gets noticed.
+			// The other half of the origin, the document top, is NOT checked
+			// here and could not usefully be: it moves with nothing resizing
+			// at all, so this callback is not reached in its failing case.
+			// `syncCamera` notices that one, against the camera the pixels
+			// were painted with.
 			// Same frame guard as contentResizeObserver's callback: a stroke in
 			// flight owns its coordinate frame and must not have the camera
 			// moved under it.
@@ -2153,7 +2453,11 @@ export class InkOverlayPlugin {
 		this.wet.applyDpr(backing);
 		this.highlightWet.applyDpr(backing);
 		this.tail.applyDpr(backing);
-		this.router?.refreshRect();
+		// Same guard as the unchanged arm's: re-basing the router's rect
+		// mid-stroke shifts every sample after it while the camera stays
+		// frozen. The backings above are reallocated either way - that blanks
+		// pixels, which the repaint below restores, and moves nothing.
+		if (!this.frame.locked) this.router?.refreshRect();
 		this.axisChecked = false;
 		// Reallocation blanked the canvases: the ledger and the camera latch
 		// must both know, or the sync repaint below would paint nothing.
@@ -2216,7 +2520,7 @@ export class InkOverlayPlugin {
 	private backingNow(layoutW?: number, layoutH?: number): number {
 		const w = layoutW ?? this.container?.offsetWidth ?? 0;
 		const h = layoutH ?? this.container?.offsetHeight ?? 0;
-		return backingScale(this.dpr, this.cssScale, w, h);
+		return backingScale(this.dpr, this.cssScale, w, h, Platform.isMobileApp);
 	}
 
 	/**
@@ -2349,7 +2653,8 @@ export class InkOverlayPlugin {
 	 * Pin the camera so world == note surface: the camera holds the surface
 	 * point currently at the overlay's top-left. `documentTop` is CM's public
 	 * "top of the document in screen coordinates", so this is two subtractions.
-	 * No scrollTop bookkeeping; padding is handled by CM.
+	 * No scrollTop bookkeeping; padding is handled by CM - see `anchorTop` for
+	 * the one frame in which CM's own answer for it is not yet true.
 	 */
 	private syncCamera(): void {
 		if (!this.container) return;
@@ -2364,7 +2669,40 @@ export class InkOverlayPlugin {
 		const origin = contentOrigin(this.view.contentDOM);
 		const contentLeft = this.resolveColumnLeft(origin.left);
 		this.watchOriginLine(origin.line, contentLeft);
-		const documentTop = this.view.documentTop;
+		// THE ANCHOR THE TEXT IS LAID OUT WITH, which for one frame is not the
+		// anchor CodeMirror reports.
+		//
+		// `view.documentTop` is `contentDOM.getBoundingClientRect().top +
+		// viewState.paddingTop`, and that second term is a BELIEF: 0 from
+		// construction until CodeMirror's first measure cycle writes the
+		// computed value into it, a cycle reached only from the rAF the
+		// constructor requests. The CSS padding is in force the whole time, so
+		// in that window the top is short by the padding while the text has not
+		// moved at all - and a stroke stored there is stored that far off its
+		// own line, for good, because the store is what persists. Measured on a
+		// real editor at `test/render/UnsettledTopMechanisms.test.ts`: with
+		// Minimal's 8px the belief is 0, the stylesheet says 8, one frame later
+		// the top has moved by exactly 8, and the `.cm-line` has not moved.
+		//
+		// The heal at the end of this method cannot reach it. That compare
+		// re-rasterizes so the picture and the eraser agree about where the ink
+		// IS; it cannot put the ink back on the line, because by then the wrong
+		// number is already in the stored coordinate. This is the half that has
+		// to be right at store time.
+		//
+		// Only the PADDING term is replaced. The rect term passes through
+		// untouched on purpose: when something above `.cm-content` grows, the
+		// content and every line in it move together, so ink stored before it
+		// is still on its line and correcting for that would move correct ink
+		// off the words (mechanism R in the same file).
+		//
+		// `this.contentStyle` is the live `getComputedStyle(contentDOM)` object
+		// `handleResize` already holds and this method already reads `fontSize`
+		// off a few lines down, so the cost is one more property read after the
+		// rects above have forced layout, and no `getComputedStyle` call. Absent
+		// only before the first `handleResize` has run, and `anchorTop` falls
+		// back to CodeMirror's own answer there.
+		const documentTop = anchorTop(this.view, this.contentStyle?.paddingTop);
 		// Measure the SCALE from the same rect read as the camera, every
 		// time, instead of trusting the value handleResize last cached.
 		//
@@ -2445,6 +2783,70 @@ export class InkOverlayPlugin {
 			visualToNote(overlay.top - documentTop, this.scale),
 			this.fontZoom
 		);
+		// THE ORIGIN MOVED SINCE THE PIXELS WERE DRAWN. Ask for the frame that
+		// redraws them.
+		//
+		// Ink is anchored to two numbers and nothing else - the text column's
+		// left edge and the document top - and both of them are in this
+		// camera (`UnsettledDocumentTop.test.ts` derives that identity through
+		// this method and the router). The column has had a compare since
+		// Minimal: `handleResize`'s unchanged arm and `originLineResized`,
+		// both against `lastSyncContentLeft`, both scheduling a repaint. The
+		// document top had NONE, and that was a real defect rather than a
+		// theoretical one. CodeMirror's `viewState.paddingTop` is 0 until its
+		// first measure cycle, and Obsidian's inline title, its properties
+		// block and any font swap all sit ABOVE `.cm-content` and settle on
+		// their own schedule - so on a fresh mount the top moves at a fixed
+		// scroll position, and something above `.cm-content` growing does not
+		// RESIZE `.cm-content`, `.cm-editor` or the watched `.cm-line`. No
+		// observer fires. The camera then adopted the new top at the next
+		// sync for any reason, NOTHING repainted, and committed ink went on
+		// being drawn where the old top put it - so the eraser probed where
+		// the ink is not, found nothing, and returned silently on a page
+		// whose store is not empty (alan, relaying the owner, 1.4.11).
+		//
+		// AGAINST `lastPaintCam`, AND NOT AGAINST `lastSyncDocumentTop`. The
+		// document top is a SCREEN coordinate: `contentDOM
+		// .getBoundingClientRect().top + paddingTop`, which CodeMirror
+		// documents as going negative when the editor is scrolled down. It
+		// moves by the whole delta on every scroll, so comparing it directly
+		// would ask for a repaint on every scrolled frame - and, with a via
+		// that asserts damage, a full re-rasterization of every visible
+		// stroke plus an index rebuild per frame, on a plugin that runs on
+		// e-ink. Measured against the tests below, that cut asked for twelve
+		// repaints where this one asks for two. The camera origin is that
+		// number minus the band's own rect top, and the band lives INSIDE the
+		// scroller, so both terms move together and the origin is exactly
+		// still through a scroll. It moves when the anchor really moved,
+		// which is the event this is for.
+		//
+		// `lastPaintCam` is the camera the committed layer was last drawn
+		// with (set in `repaint`, cleared when a reallocation blanks the
+		// canvases), so this compares what the pixels say against what the
+		// camera now says - exactly, and on the same three fields `repaint`
+		// uses to decide the same question one step later. Absent means
+		// nothing has been painted yet, and nothing painted cannot be stale;
+		// truthiness rather than `!== null` because the prototype-built
+		// fixtures that exercise this method leave the field off entirely,
+		// and "no recorded paint" is the right reading of that too.
+		//
+		// "scroll" as the via ON PURPOSE. It asserts no damage and does not
+		// dirty the index (the index is in world space; the camera cannot
+		// stale it), and `repaint` upgrades ANY camera motion to a full
+		// redraw by itself. So the frame this queues costs a full re-raster
+		// exactly when one is needed, and costs an empty callback when this
+		// call was already inside the repaint that is about to fix it.
+		// The three getters and not `camera.snapshot`: that one spreads a
+		// fresh object every call, and this runs on every scrolled frame.
+		const painted = this.lastPaintCam;
+		if (
+			painted &&
+			(painted.x !== this.camera.x ||
+				painted.y !== this.camera.y ||
+				painted.zoom !== this.camera.zoom)
+		) {
+			this.scheduleRepaint("scroll");
+		}
 	}
 
 	// ---- pen path (frozen pipeline) ----------------------------------------
@@ -2556,7 +2958,18 @@ export class InkOverlayPlugin {
 				// the whole gesture is guaranteed to find nothing, whichever
 				// way the eraser moves; say so once, right here, rather than
 				// leaving the eraser to look dead for however long it drags.
-				new Notice("Handwriting: no ink on the page to erase");
+				//
+				// ONCE PER PAGE, not once per contact, and only when the store
+				// is CERTAIN the page is empty. An empty `eraseFrom` used to
+				// be treated as proof of both, and it is proof of neither: an
+				// eraser scrub re-lands the nib every few hundred ms (each
+				// re-land a fresh pointerdown, and so a fresh toast), and a
+				// note whose sidecar has not been read yet holds zero strokes
+				// here while showing ink on screen. Both halves of Alan's
+				// 1.4.12 report - the spam, and "even though there is" - are
+				// in this one line; the rules are in EmptyPageNotice.ts and
+				// `InlineInkStore.inkPresence`.
+				this.sayIfPageEmpty(here, "erase");
 			}
 			// Stroke or reticle is a property of the ERASER, whichever way
 			// it was reached (eraser end or the mode). The radius still
@@ -2576,11 +2989,18 @@ export class InkOverlayPlugin {
 			// behind the scroll until pen-up.
 			this.frame.cancel();
 			this.panLast = { x: ev.clientX, y: ev.clientY };
-			// Drive the reticle through the pan: nothing else touches
-			// `penCursorEl` once hover has gone quiet, so without this the
-			// 1000ms watchdog (armHoverWatchdog) takes the ring away
-			// mid-drag, same as the eraser and the lasso above.
-			this.showPanCursor(sample);
+			// NO RETICLE THROUGH A PAN, unlike the eraser and the lasso above.
+			// The ring used to be driven from here and from every raw batch,
+			// and it flung itself away from the nib as the drag went on
+			// (alan, 2026-09-05, hardware: "pan reticle allows you to like
+			// fling it away from the point of pan and it flickers"). The whole
+			// mechanism, and the rule that replaced it, is written down once
+			// at `penReticleShown` (PenCursor.ts); the short version is that a
+			// pan is the one gesture that scrolls the overlay out from under
+			// the frozen rect its samples are mapped through, so there is no
+			// coordinate here worth painting. The grabbing hand says what the
+			// ring was there to say.
+			this.beginPanDragCursor();
 			return;
 		}
 		if (intent === "space") {
@@ -2700,10 +3120,14 @@ export class InkOverlayPlugin {
 			return;
 		}
 		if (this.mode === "pan") {
+			// SCROLLS AND NOTHING ELSE. Unlike the lasso and space branches
+			// above, this handler positions no reticle - it is the handler
+			// that made the ring fly, because `samples` are mapped through the
+			// rect the router froze at pen-down and this line is what scrolls
+			// the overlay out from under it. `penReticleShown` (PenCursor.ts)
+			// carries the reasoning and Alan's rule; `PenCursor.test.ts` reads
+			// this branch's source and fails if a reticle call comes back.
 			this.panMove(ev);
-			// Last sample only, same reasoning as lasso and erase.
-			const last = samples[samples.length - 1];
-			if (last) this.showPanCursor(last);
 			return;
 		}
 		if (this.mode === "erase") {
@@ -2860,14 +3284,20 @@ export class InkOverlayPlugin {
 	 * Read-only diagnostic twin of syncCamera: while frameLocked freezes the
 	 * stroke's frame, the difference between this and the live camera is the
 	 * exact on-screen displacement of the ink layer relative to the document.
+	 *
+	 * Through `anchorTop`, for the same reason every other word here says
+	 * "twin": a diagnostic that took its y from a different anchor than the
+	 * camera does would report a displacement of the padding on the one frame
+	 * where the two numbers disagree, and there is nothing displaced there.
 	 */
 	private freshFrame(): { x: number; y: number } | null {
 		if (!this.container) return null;
 		const overlay = this.container.getBoundingClientRect();
 		const contentLeft = this.columnLeft();
+		const documentTop = anchorTop(this.view, this.contentStyle?.paddingTop);
 		return {
 			x: visualToNote(overlay.left - contentLeft, this.scale),
-			y: visualToNote(overlay.top - this.view.documentTop, this.scale),
+			y: visualToNote(overlay.top - documentTop, this.scale),
 		};
 	}
 
@@ -2907,7 +3337,17 @@ export class InkOverlayPlugin {
 		return normalizeInlinePenPressure(raw * this.strokeGain);
 	}
 
-	private penUp(): void {
+	/**
+	 * `ev` is the pointerup/pointercancel that ended the gesture, ABSENT when
+	 * it ended without one (`finishActiveStroke`: a window blur, a note
+	 * switch). This call site used to drop it - `onPenUp: () => this.penUp()`
+	 * - and the pan branch needs it: the one place the pointer's CURRENT
+	 * position exists at release is that event. A blur has no lift and no
+	 * position, which is what `undefined` says, and nothing is synthesised in
+	 * its place (the callback's own header, InlinePenRouter.ts, argues that at
+	 * length for the pdf's final stroke point).
+	 */
+	private penUp(ev?: PointerEvent): void {
 		// Whatever the gesture was, it is over: the frame is live again and
 		// re-reads the editor's current origin.
 		this.frame.end();
@@ -2923,12 +3363,17 @@ export class InkOverlayPlugin {
 		// Shared with the pdf surface (StripPenChrome.ts, §5o).
 		stripPenUp(this.mobileTools);
 		if (this.mode === "pan") {
+			// The mode goes back FIRST, before the reticle is restored below:
+			// `showPenCursor` refuses to paint while `mode` says a pan drag is
+			// live (`penReticleShown`), which is the whole point of that gate.
 			this.mode = "ink";
 			this.panLast = null;
-			// Put the reticle away with the gesture, not the watchdog - a
-			// released pan should not strand its ring on screen for up to a
-			// second.
-			this.hidePanCursor();
+			// Takes the grabbing hand off with it - `hidePenCursor` drops both
+			// scroller classes - so the surface is left in exactly the state a
+			// hover would find it in, and the restore below puts the ring back
+			// under the pointer.
+			this.hidePenCursor();
+			this.restoreReticleAfterPan(ev);
 			this.updateExtent(true);
 			return;
 		}
@@ -3003,15 +3448,33 @@ export class InkOverlayPlugin {
 		// shape it meant (line, triangle, rectangle, circle, ellipse). The
 		// dwell is the request; an ordinary lift never gets here.
 		let snapReplaced: InkStroke | null = null;
+		// A MOUSE'S snap, waiting to be asked for rather than taken. Set only
+		// on the mouse branch below; the offer is made after the commit, since
+		// what the chip replaces is the stroke that has already landed.
+		let snapOffered: InkStroke | null = null;
 		if (shapeSnapOn && strokes.length === 1) {
 			const heldMs = performance.now() - this.rawLastMoveT;
 			if (heldMs >= DWELL_MS) {
 				const snapped = snapStroke(strokes[0]!, true);
 				if (snapped) {
-					// Kept for history: undo UN-SNAPS back to the freehand
-					// (replace inverts to replace), a second undo removes.
-					snapReplaced = strokes[0]!;
-					strokes = [snapped];
+					// A MOUSE NEVER SNAPS ON ITS OWN. The dwell above is not
+					// evidence of intent from a mouse: a mouse sits exactly
+					// where it stopped while the button comes up, so an
+					// ordinary deliberate stroke always clears DWELL_MS and
+					// the figure was being replaced by one nobody asked for
+					// ("it's correcting into a straight line", alan,
+					// 2026-09-05). The same two facts - the hold and a fit the
+					// recognizer will stand behind - become an OFFER instead.
+					// SnapChip.ts carries the reasoning and the ruling; the
+					// pen and the finger below are untouched by it.
+					if (this.mouseStroke) {
+						snapOffered = snapped;
+					} else {
+						// Kept for history: undo UN-SNAPS back to the freehand
+						// (replace inverts to replace), a second undo removes.
+						snapReplaced = strokes[0]!;
+						strokes = [snapped];
+					}
 				}
 			}
 		}
@@ -3122,6 +3585,11 @@ export class InkOverlayPlugin {
 				}
 			},
 		});
+		// The mouse's offer, made only now: the chip replaces a stroke that is
+		// already in the note and already in the history, which is the whole
+		// difference between it and the pen's dwell snap. `stroke` is that
+		// stroke - `strokes` was left exactly as drawn on this branch.
+		if (snapOffered) this.offerSnapChip(path, stroke, snapOffered);
 		// Diagnostics (explicitly enabled only): paint ground truth part 2
 		// (did the commit draw reach the committed backing store?), plus the
 		// frame-desync measure and the COMMIT trace row. Ordinary writing
@@ -3143,6 +3611,78 @@ export class InkOverlayPlugin {
 		this.lastCommitColor = stroke.color;
 		this.lastCommitAt = performance.now();
 		// A second pane on the same note shows the new ink too.
+		this.repaintPath(path);
+		this.updateExtent(true);
+	}
+
+	/**
+	 * Put the Snap button beside a mouse stroke that just landed.
+	 *
+	 * The coordinates are `rawLastMoveX/Y` - the last place the pointer
+	 * actually MOVED, in the overlay container's own space, the same space the
+	 * hover reticle is translated in. For the stroke that raises this chip
+	 * they ARE the end of the stroke: a mouse that dwelled did not move again
+	 * before the button came up, which is the whole reason the dwell fired.
+	 * Using the raw layer rather than the stored points also skips the
+	 * builder's min-distance filter, which discards exactly the stationary
+	 * samples at the end.
+	 */
+	private offerSnapChip(path: string, freehand: InkStroke, snapped: InkStroke): void {
+		const parent = this.container;
+		if (!parent) return;
+		this.snapChip.offer(
+			{
+				parent,
+				// One node OUT from the scroller: the pen router's own
+				// pointerdown is a CAPTURE listener on the scroller itself, and
+				// a second capture listener on the same node would run after
+				// it. SnapChip.ts's header says what that would cost.
+				guardRoot: this.view.dom,
+				scroller: this.view.scrollDOM,
+				keyRoot: this.view.dom.ownerDocument,
+				pane: { width: this.cssWidth, height: this.cssHeight },
+				// The EDITOR's window, not the global one: a popped-out pane
+				// has its own, and a timer from the wrong one is a timer that
+				// keeps running over a closed window.
+				clock: this.winRef,
+			},
+			this.rawLastMoveX,
+			this.rawLastMoveY,
+			() => this.takeSnapOffer(path, freehand, snapped)
+		);
+	}
+
+	/**
+	 * The offer accepted: the freehand comes out, the fitted figure goes in at
+	 * the same depth, and the history gets THE SAME `replace` the pen's dwell
+	 * snap publishes (`snapReplaceOp`, InkHistory.ts).
+	 *
+	 * One op and not two, and that is not a shortcut: the mouse's freehand was
+	 * committed as drawn, so its `add` already went into the history at
+	 * pen-up. The pen's snap has to invent that landing because its freehand
+	 * never reached the store at all. Either way the reader gets the same two
+	 * presses - the first undo un-snaps back to the freehand, the second
+	 * removes it.
+	 *
+	 * REFUSES A STALE OFFER. Between the chip appearing and the click, the
+	 * stroke can be undone or erased from another pane. `findIndex` answering
+	 * -1 means the thing this offer was about is gone, and replacing nothing
+	 * would insert the figure out of nowhere.
+	 */
+	private takeSnapOffer(path: string, freehand: InkStroke, snapped: InkStroke): void {
+		const at = inlineInk.strokes(path).findIndex((s) => s.id === freehand.id);
+		if (at < 0) return;
+		// Same order as `applyInkOp`'s replace leg, for the reason written
+		// there: out first, or the index the op carries names a list that no
+		// longer exists.
+		inlineInk.applyRemove(path, [freehand.id]);
+		inlineInk.applyAdd(path, [snapped], [at]);
+		// The eraser answers from `strokeIndex`, and a swap it never heard
+		// about leaves it hit-testing a stroke that is gone - the 1.4.6 defect
+		// `InlineEraseFresh.test.ts` exists over.
+		this.indexDirty = true;
+		this.dispatchInk(snapReplaceOp(path, freehand, [snapped], at));
+		this.scheduleRepaint();
 		this.repaintPath(path);
 		this.updateExtent(true);
 	}
@@ -3567,6 +4107,23 @@ export class InkOverlayPlugin {
 		// Reticle off: the native cursor stays, so no hover class either.
 		if (!penReticleOn) return;
 		if (!this.penCursorEl) return;
+		// A PAN DRAG PAINTS NO RETICLE - the rule and the defect behind it are
+		// written down at `penReticleShown` (PenCursor.ts). The two call sites
+		// that used to paint it mid-pan are gone, so nothing reaches here
+		// during a pan today; this is the gate that keeps it that way, because
+		// the next mode or the next caller must not be able to reintroduce a
+		// ring whose coordinates cannot be right.
+		//
+		// Returns BEFORE the hover class and the watchdog below, and hides
+		// nothing: the drag already put the ring away and swapped `cursor:
+		// none` for the grabbing hand (`beginPanDragCursor`), and calling
+		// `hidePenCursor` here would take that hand off and leave the surface
+		// with no pointer at all mid-drag.
+		//
+		// `this.mode === "pan"` is the drag state the predicate wants: it is
+		// true exactly while a pan drag is live, and a pan drag is the only
+		// thing the predicate ever refuses.
+		if (!penReticleShown(tipMode(), this.mode === "pan")) return;
 		// IS THE POINTER IN HAND A MOUSE? The watchdog exists for a pen that
 		// leaves HOVER RANGE without sending pointerleave - digitizers differ,
 		// and the reticle is otherwise left on screen for good. A mouse cannot
@@ -3594,6 +4151,39 @@ export class InkOverlayPlugin {
 		// replaced it.
 		const mousePointer =
 			pointerType === "mouse" || (pointerType === undefined && this.mouseStroke);
+		// A HAND IS ON THE GLASS: THE MOUSE PAINTS NOTHING.
+		//
+		// The ruling, alan, 1.4.12: "hide the mouse reticle when a finger or
+		// pen is active". With mouse ink armed a parked mouse is still
+		// HOVERING, so its ring sits wherever the pointer was last left the
+		// whole time a finger flings the page or the pen writes - a marker for
+		// a pointer nobody is using, and on a tablet a smudge on the glass.
+		// `InlinePenRouter.handOnGlass` is the question and carries the terms;
+		// its `onHandOnGlass` is what took the ring down when the finger
+		// landed, and this is what stops the next mouse sample putting one
+		// back before the hand leaves.
+		//
+		// REFUSES, LIKE THE PAN GATE ABOVE, and for the same reason spelled
+		// out there: `PEN_HOVER_CLASS` two lines down is `cursor: none` over
+		// the whole scroller, so painting nothing while ADDING it is the
+		// no-pointer-at-all defect of 2026-09-04. Returning here leaves the
+		// class exactly as the stand-down left it - off - so the reader keeps
+		// the native cursor for as long as the ring is refused.
+		//
+		// AND ABOVE THE WATCHDOG, which is not tidiness either. A refused
+		// mouse sample must not settle a timer it is not going to paint for:
+		// clearing here would take down the guard of a PEN whose ring is on
+		// screen and hovering, and leave it stranded if that pen then left
+		// without a pointerleave - the exact failure `armHoverWatchdog` is the
+		// answer to. The mouse changes nothing on its way past.
+		//
+		// MOUSE INK IS UNTOUCHED. This hides a reticle; it disarms nothing,
+		// refuses no claim, and a mouse that draws still draws.
+		//
+		// `router` is null before `mount()` and stubbed in the surface's unit
+		// rigs, both of which read as "nothing is on the glass" - which is
+		// what the hover behaved as before this rule existed.
+		if (mousePointer && (this.router?.handOnGlass?.() ?? false)) return;
 		// Every branch below returns, so the watchdog is settled here, once.
 		if (mousePointer) this.clearHoverWatchdog();
 		else this.armHoverWatchdog();
@@ -3699,6 +4289,18 @@ export class InkOverlayPlugin {
 	hidePenCursor(): void {
 		this.clearHoverWatchdog();
 		this.view.scrollDOM.classList.remove(PEN_HOVER_CLASS);
+		// The pan drag's grabbing hand comes off wherever the reticle does,
+		// and that is not tidiness: this is the ONE place every abandon path
+		// already passes through. `resetGestureState` (a file switch, an
+		// unmount, a window blur mid-gesture) calls it, `onPenLeave` calls it,
+		// and `hidePenCursorsEverywhere` calls it on every open surface when
+		// mouse ink goes off. A pan drag torn down by any of those would
+		// otherwise leave the scroller wearing `cursor: grabbing` with no
+		// gesture behind it, for the rest of the session - the same shape of
+		// stranded-cursor defect the mouse-ink-off edge was fixed for on
+		// 2026-09-04, and `AbandonedGestureStandsDown.test.ts` is the
+		// neighbouring rule.
+		this.view.scrollDOM.classList.remove(PAN_DRAG_CLASS);
 		if (this.penCursorEl) this.penCursorEl.setCssStyles({ display: "none" });
 	}
 
@@ -3879,22 +4481,90 @@ export class InkOverlayPlugin {
 	/**
 	 * Put the lasso reticle away with the gesture, not the watchdog - a
 	 * released lasso should not strand its ring on screen for up to a
-	 * second. Reuses `hidePenCursor` because lasso, pan and space all paint
+	 * second. Reuses `hidePenCursor` because lasso, space and pan all paint
 	 * through the SAME element hover does (`penCursorEl`), unlike the eraser
-	 * which has its own (`eraserEl`).
+	 * which has its own (`eraserEl`) - pan by hiding it for the length of the
+	 * drag rather than by keeping it lit, but through that element either way.
 	 */
 	private hideLassoCursor(): void {
 		this.hidePenCursor();
 	}
 
-	/** The pan reticle, during a pan gesture. See showLassoCursor. */
-	private showPanCursor(sample: PenSample): void {
-		this.showPenCursor(sample);
+	/**
+	 * Enter the pan drag's cursor state: no reticle, and the grabbing hand
+	 * over the scroller until the drag ends.
+	 *
+	 * There is no `showPanCursor` beside `showLassoCursor` and
+	 * `showSpaceCursor` any more, and its absence is the point. Those two
+	 * exist because a lasso and a space gesture want the ring KEPT ALIVE
+	 * through a drag that produces no hover samples; a pan wants the opposite,
+	 * for the reason `penReticleShown` (PenCursor.ts) sets out - it is the one
+	 * gesture that scrolls the overlay out from under the rect its samples are
+	 * mapped through, so the ring flung itself away from the nib and flickered
+	 * (alan, 2026-09-05, hardware).
+	 *
+	 * `hidePenCursor` FIRST, then the class. It clears the hover watchdog that
+	 * would otherwise fire mid-drag, takes `PEN_HOVER_CLASS`'s `cursor: none`
+	 * off, and removes `PAN_DRAG_CLASS` - so the add below cannot be undone by
+	 * the line above it, and the scroller is left wearing exactly one cursor
+	 * rule. The ring itself is usually already down: `penDown` hides the dot
+	 * for every gesture before it branches.
+	 */
+	private beginPanDragCursor(): void {
+		this.hidePenCursor();
+		this.view.scrollDOM.classList.add(PAN_DRAG_CLASS);
 	}
 
-	/** Put the pan reticle away with the gesture. See hideLassoCursor. */
-	private hidePanCursor(): void {
-		this.hidePenCursor();
+	/**
+	 * Put the reticle back under the pointer as the pan releases, with no
+	 * jump.
+	 *
+	 * WHERE THE POSITION COMES FROM, and why it is right. Two things are stale
+	 * at this moment and both are fixed here, in order. The router caches the
+	 * overlay's client rect at pen-down and refuses to refresh it while a
+	 * contact is claimed (`scrollFn`'s `if (!during)`); a pan spends its whole
+	 * length scrolling the overlay under that frozen rect, and NOTHING
+	 * refreshes it afterwards, because the refresh is wired to the scroll
+	 * event and the scrolling has stopped. So the next hover sample after a
+	 * pan would be mapped through a rect stale by the entire pan - a ring that
+	 * lands the whole scroll distance away from the pen. `refreshRect()`
+	 * closes that, and it is safe here where it is not mid-gesture: the router
+	 * clears `activePenId` BEFORE calling `onPenUp`, so no frozen camera is
+	 * left disagreeing with it.
+	 *
+	 * Then the position itself, from the lift event's client coordinates
+	 * mapped through the overlay's rect READ FRESH on the line below. Same
+	 * element the router just re-measured and the same conversion
+	 * (`visualToNote`, cssScale) its `sampleFrom` uses, so the ring lands in
+	 * exactly the frame every following hover sample will be mapped into.
+	 * That is what makes it a restore rather than a jump: the pointer has not
+	 * moved, the frame is now current, and the first real hover sample paints
+	 * the ring in the same place this one did.
+	 *
+	 * No event, no RESTORE - but the rect is refreshed either way, which is
+	 * why that line sits above the guard. `finishActiveStroke` (a window blur
+	 * mid-pan: alt-tab, a system dialog) ends the gesture with no lift and
+	 * therefore no position, so the ring stays down and the next hover brings
+	 * it back - and that next hover has to be mapped through a rect that
+	 * accounts for the scrolling the pan did, or the ring comes back the whole
+	 * pan distance from the pen. The refresh is what the abandoned pan needs
+	 * MOST, not least.
+	 */
+	private restoreReticleAfterPan(ev?: PointerEvent): void {
+		this.router?.refreshRect();
+		if (!ev || !this.container) return;
+		const rect = this.container.getBoundingClientRect();
+		// No `pointerType`, exactly like the in-gesture wrappers and for their
+		// reason: the hardware and pen-seen claims belong to the hover and the
+		// pen-down that already happened. `mouseStroke` answers for a mouse.
+		this.showPenCursor({
+			x: visualToNote(ev.clientX - rect.left, this.cssScale),
+			y: visualToNote(ev.clientY - rect.top, this.cssScale),
+			pressure: 0,
+			timestamp: ev.timeStamp,
+			tiltX: 0,
+			tiltY: 0,
+		});
 	}
 
 	/** The insert-space divider reticle, during a space gesture. See showLassoCursor. */
@@ -3912,6 +4582,40 @@ export class InkOverlayPlugin {
 	private strokesHere(): readonly InkStroke[] {
 		const path = this.filePath();
 		return path ? inlineInk.strokes(path) : [];
+	}
+
+	/**
+	 * The empty-page refusal, for whichever tool discovered it - the ONE
+	 * place either of them is allowed to say it.
+	 *
+	 * Three things happen here that the two call sites each used to get
+	 * wrong on their own:
+	 *
+	 * 1. CERTAINTY FIRST. An empty stroke list is not evidence the page is
+	 *    empty; it is the store's cache, and until `ensureLoaded` has read
+	 *    the sidecar the cache is empty for every note in the vault. On
+	 *    "unknown" this says nothing and kicks the read instead - which is
+	 *    also what puts the ink on screen, so the user gets their page back
+	 *    rather than a sentence denying it exists.
+	 * 2. ONCE PER EPISODE. `EmptyPageNoticeGate` remembers what has been
+	 *    said, so an eraser scrub's second through twentieth contacts are
+	 *    silent. Cleared when the note's ink changes, or the note does.
+	 * 3. NO PALETTE COMMAND. This raises a Notice and returns. It does not
+	 *    reach `app.commands`, and a source guard
+	 *    (EraserContactSource.test.ts) holds the whole eraser branch to
+	 *    that - the original 1.4.12 report was filed against
+	 *    `delete-all-ink`'s toast, and the first thing worth being able to
+	 *    prove is that a pen contact cannot run a palette command at all.
+	 */
+	private sayIfPageEmpty(path: string | null, kind: EmptyPageTool): void {
+		if (!path) return;
+		const presence = inlineInk.inkPresence(path);
+		if (presence === "unknown") {
+			this.loadInk(path);
+			return;
+		}
+		const text = emptyPageNoticeText(presence, kind);
+		if (text !== null && this.emptyNotice.claim(path, kind)) new Notice(text);
 	}
 
 	private selectionBounds(): BBox | null {
@@ -3946,7 +4650,16 @@ export class InkOverlayPlugin {
 			// it: a fresh loop on a page with no ink at all can never select
 			// anything, whatever shape it ends up drawing, so say so now
 			// rather than let the lasso close over nothing in silence.
-			new Notice("Handwriting: no ink on the page to select");
+			//
+			// And the same gate, for the same reason. Only the eraser was
+			// reported (a lasso is not scrubbed, so it spams less readily),
+			// but the "even though there is" half is identical here - an
+			// unread sidecar makes this branch claim an inked note is empty -
+			// and this file's own test header says the eraser and the lasso
+			// "are the same shape". Leaving one of a declared pair fixed is
+			// how the divergences StripPenChrome.test.ts exists to catch get
+			// started.
+			this.sayIfPageEmpty(this.filePath(), "select");
 		}
 		this.redrawSelectionUI();
 	}
@@ -4328,9 +5041,33 @@ export class InkOverlayPlugin {
 		// leaving the lock held froze the NEXT note's camera and repaints
 		// until its first pen-down. A cancelled frame never leaks forward.
 		this.frame.cancel();
+		// A standing snap offer belongs to the note and the stroke it was made
+		// about, and this method is every way both of those go away: a file
+		// switch, an unmount (which is also what `destroy` and plugin unload
+		// run) and an abandoned gesture. It takes the element out of the tree
+		// AND unhooks the three listeners and the timer, none of which the
+		// container's own removal would reach - they sit on the editor root,
+		// the scroller and the document, all of which outlive this overlay.
+		// Optional-chained because the harnesses that drive `penUp` through
+		// `Object.create(prototype)` never run a field initialiser.
+		this.snapChip?.dismiss();
 		this.builder = null;
 		this.mode = "ink";
 		this.erased = [];
+		// The other three erase-gesture fields, wiped here for the same reason
+		// `erased` is: a file switch, an unmount or an abandoned gesture (window
+		// blur, in-place switch) all reach this method with an erase mid-flight,
+		// and none of them ever reach the erase pen-up that would otherwise be
+		// the only place clearing them. Left alone, `erasePieces` carries the
+		// abandoned gesture's minted ids into the next erase - so a stroke this
+		// NEW gesture cuts for the first time is misread as a survivor rather
+		// than a loss - and `eraseFrom` carries its stale pre-gesture list into
+		// an undo op built for a note that isn't live anymore (deferral 3,
+		// 1.4.10 design doc). `eraseWhole` is reset alongside them because it's
+		// the same gesture's flag and pen-down sets all three together.
+		this.erasePieces.clear();
+		this.eraseFrom = [];
+		this.eraseWhole = false;
 		this.selection.clear();
 		this.lassoPts = [];
 		this.lassoActive = false;
@@ -4348,6 +5085,16 @@ export class InkOverlayPlugin {
 		// `resetGestureState` resets its own.
 		this.mouseStroke = false;
 		this.selectionDeleteKeys.reset();
+		// The empty-page refusal is NOT forgotten here, and that is the point.
+		// This method is the ABANDON path too (`strokeAbandoned`: a window
+		// blur, an alt-tab, a system dialog mid-scrub), and re-arming the gate
+		// there brings back the spam the gate exists to stop - alt-tab away
+		// mid-scrub, come back, scrub on, and the toast says it all over again,
+		// on the same note with the same tool. EmptyPageNotice.ts header lists
+		// what makes the sentence news again, and an interrupted gesture is not
+		// on it. The two callers that really do put a fresh screen in front of
+		// the reader - update()s path-change branch and unmount() - call
+		// emptyNotice.forgetAll() themselves, right after this.
 		this.hidePenCursor();
 		this.hideEraserCursor();
 	}
@@ -4598,7 +5345,16 @@ export class InkOverlayPlugin {
 			this.damage.addAll();
 			this.indexDirty = true;
 		}
-		if (this.repaintQueued || !this.container) return;
+		if (this.repaintQueued) {
+			// A second request folded into the frame already queued. The
+			// purged-canvas probe only fires on a frame that NOTHING but
+			// scrolling asked for, so any other caller joining takes that
+			// away - the frame is now doing work on somebody's behalf.
+			if (via !== "scroll") this.repaintScrollOnly = false;
+			return;
+		}
+		if (!this.container) return;
+		this.repaintScrollOnly = via === "scroll";
 		this.repaintQueued = true;
 		scrollProbeSchedule(via);
 		this.winRef.requestAnimationFrame(() => {
@@ -4644,9 +5400,13 @@ export class InkOverlayPlugin {
 			work = "all";
 		}
 		this.lastPaintCam = { x: cam.x, y: cam.y, zoom: cam.zoom };
+		// The purged-canvas marker, and everything about it, is off unless
+		// this is a mobile surface with diagnostics recording (PurgeSentinel.ts
+		// says why it is not on for everyone yet). Desktop pays one boolean.
+		const probeArmed = purgeProbeArmed(Platform.isMobileApp, diagnosticsEnabled());
 		if (work === "all") {
 			drawCommitted(this.highlightCtx, cam, strokes, this.cssWidth, this.cssHeight, true, "highlighter");
-			drawCommitted(this.committedCtx, cam, strokes, this.cssWidth, this.cssHeight, true, "pen");
+			drawCommitted(this.committedCtx, cam, strokes, this.cssWidth, this.cssHeight, true, "pen", probeArmed);
 		} else if (work.length > 0) {
 			if (this.indexDirty) {
 				this.strokeIndex.rebuild(strokes);
@@ -4656,6 +5416,33 @@ export class InkOverlayPlugin {
 				const hit = this.strokeIndex.query(rect);
 				drawRegion(this.highlightCtx, cam, hit, rect, true, "highlighter");
 				drawRegion(this.committedCtx, cam, hit, rect, true, "pen");
+			}
+			// A damage rect covering the band corner clears the marker, and
+			// `drawRegion` has no reason to know about it. Repainting is
+			// idempotent, so this needs no test for whether it was hit.
+			if (probeArmed) paintPurgeSentinel(this.committedCtx);
+		}
+		// ---- the purge heal (1.4.12-design.md §14, cause B) -----------------
+		// A scroll repaint with no work drew nothing, which is correct while
+		// the camera is still and catastrophic if WebKit has quietly taken the
+		// canvas's pixels: nothing would ask for them again until the band
+		// moved. Read the marker back; a zero means they are gone, and
+		// `scheduleRepaint` with any via but "scroll"/"partial" is what
+		// asserts `damage.addAll()` and puts the world back on screen.
+		if (
+			purgeProbeDue({
+				armed: probeArmed,
+				scrollRepaint: this.repaintScrollOnly,
+				foundWork: work === "all" || work.length > 0,
+				strokeOwnsFrame: this.frame.locked,
+				noteHasInk: strokes.length > 0,
+				now: performance.now(),
+				lastProbe: this.lastPurgeProbe,
+			})
+		) {
+			this.lastPurgeProbe = performance.now();
+			if (purgeDetected(readPurgeSentinel(this.committedCtx))) {
+				this.scheduleRepaint("purge-heal");
 			}
 		}
 		// Selection chrome lives in world coordinates: scrolling and reflow

@@ -14,8 +14,14 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { PenSample } from "../input/PointerRouter";
-import { setMouseInk } from "./MouseInk";
-import { markPenSeen, resetPenToolsForTest } from "./PenToolsMode";
+import { clearToolPicked, markToolPicked, setMouseInk } from "./MouseInk";
+import { resetPenInkForTest, setPenInk } from "./PenInk";
+import {
+	markPenHardwareSeen,
+	markPenSeen,
+	releaseMouseInkQuietly,
+	resetPenToolsForTest,
+} from "./PenToolsMode";
 // The DOM scaffolding lives in test/routerHarness.ts now, shared with the
 // trace replay - one element fake on purpose, so the two suites cannot
 // drift apart and disagree about what the router saw.
@@ -175,25 +181,51 @@ describe("raw-fed ink through the real router (Chromium stream)", () => {
 	});
 });
 
-describe("mouse ink through the real router", () => {
+function mouseEvent(type: string, ts: number, buttons: number, coalesced?: number[]) {
+	const ev = penEvent(type, ts, { buttons, pressure: buttons & 1 ? 0.5 : 0, coalesced });
+	(ev as unknown as Record<string, unknown>).pointerType = "mouse";
+	return ev;
+}
+
+/**
+ * THIS DESCRIBE BLOCK SIMULATES A DEVICE THAT HAS SEEN A PEN, deliberately,
+ * since "button should become the truth" (alan, 2026-09-05) and its own
+ * addendum: on a device that reads as PEN-LESS, the mouse now also acts as
+ * whichever tool is lit, with no `setMouseInk` involved at all. Here the
+ * explicit switch is the only way in, which the addendum leaves untouched
+ * for a device that has seen a pen - and that is what these three pin.
+ *
+ * KEPT BESIDE THE LAUNCH BLOCK BELOW, not instead of it. `markPenHardwareSeen()`
+ * arrived here when "off: the mouse is never touched" started failing under
+ * the addendum, and re-scoping the block to pen devices meant the one case
+ * that mattered most - a pen-less device at launch - stopped being tested at
+ * all, which is how the mouse came to ink a plain drag there for a day.
+ */
+describe("mouse ink through the real router (a device that has seen a pen)", () => {
 	let h: ReturnType<typeof harness>;
 	beforeEach(() => {
 		setMouseInk(false);
+		clearToolPicked();
+		markPenHardwareSeen();
 		h = harness();
 	});
-	afterEach(() => setMouseInk(false));
-
-	function mouseEvent(type: string, ts: number, buttons: number, coalesced?: number[]) {
-		const ev = penEvent(type, ts, { buttons, pressure: buttons & 1 ? 0.5 : 0, coalesced });
-		(ev as unknown as Record<string, unknown>).pointerType = "mouse";
-		return ev;
-	}
+	afterEach(() => {
+		setMouseInk(false);
+		clearToolPicked();
+		resetPenToolsForTest();
+	});
 
 	it("off: the mouse is never touched", () => {
 		h.fire(mouseEvent("pointerdown", 100, 1));
 		expect(h.rec.downs).toBe(0);
 		h.fire(mouseEvent("pointermove", 108, 1, [104, 108]));
 		expect(h.rec.rawCalls.length).toBe(0);
+	});
+
+	it("off, with a tool picked: STILL never touched - a pen device's mouse is left alone", () => {
+		markToolPicked();
+		h.fire(mouseEvent("pointerdown", 100, 1));
+		expect(h.rec.downs).toBe(0);
 	});
 
 	it("on: the left button inks like a pen tip", () => {
@@ -210,6 +242,99 @@ describe("mouse ink through the real router", () => {
 		setMouseInk(true);
 		h.fire(mouseEvent("pointerdown", 100, 2));
 		expect(h.rec.downs).toBe(0);
+	});
+});
+
+/**
+ * THE PEN-LESS DEVICE, STRAIGHT FROM LAUNCH - restored, and this time with
+ * the case that made it fail actually fixed rather than scoped away.
+ *
+ * NO `markPenHardwareSeen()` HERE, on purpose: this is Alan's mouse-only
+ * machine, which has never seen a pen and never will. The whole of the
+ * `mouse-lit-truth` defect was that the router's grant read "a tool is lit"
+ * off the pen-ink switch, whose default is TRUE, so this block's first test
+ * failed - and the fix applied then was to mark a pen, which left the real
+ * device untested. `toolIsLit` (MouseInk.ts) now ANDs in whether a tool has
+ * been PICKED, so the launch answer is honest and this block can say what it
+ * always should have.
+ *
+ * ONE HONEST LIMIT, stated rather than left for the next reader: the harness
+ * router wires no `penOff` callback (routerHarness.ts), so `!this.penOff()`
+ * reads true here whatever `penInkEnabled()` says. The keyboard-mode test
+ * below therefore proves that pen-off UNPICKS - which is what makes the
+ * mouse let go - and not that the router's own pen-ink gate fires; that gate
+ * is a callback the real surfaces supply and MobileTools.test.ts's
+ * `penInksHere: () => false` rigs cover on the strip's side.
+ */
+describe("mouse ink through the real router (a device that has never seen a pen)", () => {
+	let h: ReturnType<typeof harness>;
+	beforeEach(() => {
+		setMouseInk(false);
+		resetPenToolsForTest();
+		resetPenInkForTest();
+		clearToolPicked();
+		h = harness();
+	});
+	afterEach(() => {
+		setMouseInk(false);
+		resetPenToolsForTest();
+		resetPenInkForTest();
+		clearToolPicked();
+	});
+
+	it("at launch the mouse is never touched - a plain drag is the editor's, and selects text", () => {
+		h.fire(mouseEvent("pointerdown", 100, 1));
+		expect(h.rec.downs).toBe(0);
+		h.fire(mouseEvent("pointermove", 108, 1, [104, 108]));
+		expect(h.rec.rawCalls.length).toBe(0);
+	});
+
+	it("after a pick the mouse IS claimed - the lit tool is what it draws with", () => {
+		markToolPicked();
+		h.fire(mouseEvent("pointerdown", 100, 1));
+		expect(h.rec.downs).toBe(1);
+		h.fire(mouseEvent("pointermove", 108, 1, [104, 108]));
+		expect(fedTimestamps(h.rec.rawCalls)).toEqual([104, 108]);
+	});
+
+	it("after a put-down it is not claimed again", () => {
+		markToolPicked();
+		// The one place the mouse put-down is written; both of the strip's
+		// put-down branches reach it through the host's disarm wrapper.
+		releaseMouseInkQuietly();
+		h.fire(mouseEvent("pointerdown", 100, 1));
+		expect(h.rec.downs).toBe(0);
+	});
+
+	it("pen-off unpicks: keyboard mode, then back, does not resume drawing", () => {
+		markToolPicked();
+		setPenInk(false);
+		setPenInk(true);
+		h.fire(mouseEvent("pointerdown", 100, 1));
+		expect(h.rec.downs).toBe(0);
+	});
+
+	it("a restart with a tool restored claims; a restart with nothing restored does not", () => {
+		// A RESTART is a fresh module state, which is what the resets in
+		// `beforeEach` above are: nothing picked, and the mouse selects text.
+		h.fire(mouseEvent("pointerdown", 100, 1));
+		expect(h.rec.downs).toBe(0);
+		// A restore that lights a tool goes through the same two setters
+		// every pick goes through (`setInlineTool`/`setTipMode`), so it
+		// arrives here as a pick and drawing resumes with no arm step.
+		// NOTHING IN THE PLUGIN RESTORES A TOOL TODAY - the nib and the tip
+		// mode are both session state, so today's restart is the first half
+		// of this test and only the first half; `markToolPicked()` stands in
+		// for the restore a later slice would add.
+		markToolPicked();
+		h.fire(mouseEvent("pointerdown", 200, 1));
+		expect(h.rec.downs).toBe(1);
+	});
+
+	it("the explicit switch still wins on its own, with nothing picked", () => {
+		setMouseInk(true);
+		h.fire(mouseEvent("pointerdown", 100, 1));
+		expect(h.rec.downs).toBe(1);
 	});
 });
 

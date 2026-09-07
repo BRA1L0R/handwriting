@@ -105,8 +105,46 @@ export const MAX_ZOOM_BACKING = 2;
  * than that limit on purpose, because five of these exist per editor
  * (committed, wet, tail, and the two highlighter layers): at 4 bytes a pixel
  * this ceiling is about 200MB for the set, and the naive limit would be over
- * 300MB on a tablet. Chosen so no UNZOOMED pane on any plausible display is
- * touched - only magnification can reach it.
+ * 300MB on a tablet.
+ *
+ * WHAT THIS COMMENT USED TO CLAIM, and it was never true: "chosen so no
+ * UNZOOMED pane on any plausible display is touched - only magnification can
+ * reach it". Full-screen editors pass it unzoomed on ordinary hardware. A
+ * 1920x1500 band (a maximised 4K pane at 200% scaling: a 1000px scroller
+ * plus `bandFor`'s 250 of margin each way) is 2.9M layout px, which at dpr 2
+ * asks for 11.5M device px. The old floor then handed such panes their full
+ * device ratio back anyway, so the budget could only ever trade away the
+ * plugin's own pinch.
+ *
+ * The other half of 1.4.12-design.md §14 - a tall band at dpr 3 reaching
+ * WebKit's ~16.7M per-canvas ceiling with no zoom at all, 1400x900 already
+ * asking 11.3M - is HYPOTHETICAL, and has to be read as one. Every SHIPPING
+ * iPad reports devicePixelRatio 2; dpr 3 is iPhone. At dpr 2 an iPad band is
+ * ~1.8M CSS px against this budget's 2.5M threshold (MAX_BACKING_AREA /
+ * dpr^2), so it never reaches the cap at all.
+ *
+ * Those figures are arithmetic, not recollection, and this paragraph is why
+ * they have to be. The revision before this one cited "a 1920x1720 band ...
+ * at dpr 2", which cannot exist: a 4K viewport at 200% is 1920x1080, and a
+ * 1720-tall band needs an 1147px scroller (`bandFor`: clientHeight + 2 *
+ * clamp(0.25 * clientHeight, 120, 320), so 1.5x the scroller here). A
+ * 1920x1720 band IS reachable at 150% scaling - and dpr there is 1.5, so
+ * 7.4M device px, comfortably under this budget and never trimmed. Wrong in
+ * both directions at once, and it shipped as the justification for a change
+ * that cost every large retina desktop 20-40% of its linear ink resolution.
+ *
+ * ON MOBILE, since that fix, this number is a real ceiling on every axis: a
+ * pane over budget rasterises at whatever scale fits, the device ratio
+ * included. The cost is bounded and visible - slightly softer ink on the
+ * largest, densest panes - and it is exactly the cost the old floor was
+ * hiding behind a canvas that might silently never allocate.
+ *
+ * ON DESKTOP the floor stays, because the ceiling it was hiding does not
+ * exist there. Electron has no equivalent of WebKit's silent per-canvas
+ * refusal, so resolution a desktop pane gives up here buys nothing at all.
+ * Bounding the device ratio everywhere cost a 5K pane at 200% about 30% of
+ * its linear ink resolution, and a 6K XDR nearly 40%, to dodge a limit that
+ * is not on that machine. `backingScale` takes a `mobile` flag for this.
  */
 export const MAX_BACKING_AREA = 10_000_000;
 
@@ -125,27 +163,57 @@ export const MAX_BACKING_AREA = 10_000_000;
  * disappears is a bug report nobody can reproduce.
  *
  * Pass the layout box to get the area cap; without it only the zoom cap
- * applies, which is what every pre-existing caller wants.
+ * applies, which is what every pre-existing caller wants. Pass `mobile` for
+ * the STRICT form of the cap, which bounds the DEVICE ratio as well as the
+ * zoom because iOS is where a canvas can be refused outright; desktop keeps
+ * its device pixels and trades away magnification only. Both default off, so
+ * a caller that passes neither means exactly what it always meant.
+ *
+ * The platform arrives as a parameter rather than an `import { Platform }`
+ * on purpose: this module has no imports and its tests are pure arithmetic,
+ * and the one production call site (`InkOverlay.backingNow`) is already in a
+ * file that imports Platform.
  */
 export function backingScale(
 	dpr: number,
 	scale: number,
 	layoutW = 0,
-	layoutH = 0
+	layoutH = 0,
+	mobile = false
 ): number {
 	const d = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
 	let b = d * Math.min(clampScale(scale), MAX_ZOOM_BACKING);
 	if (layoutW > 0 && layoutH > 0 && Number.isFinite(layoutW) && Number.isFinite(layoutH)) {
 		const area = layoutW * b * layoutH * b;
 		if (area > MAX_BACKING_AREA) {
-			// Only the ZOOM's share of the resolution is ever spent. The
-			// floor is what this pane would use unzoomed, so a dense display
-			// (dpr 3 at 100%) keeps every device pixel it has today and only
-			// magnification can be traded away. Without the floor the budget
-			// quietly downgraded ordinary editors on high-dpi hardware -
-			// caught by the test that pins exactly that.
-			const floor = d * Math.min(1, clampScale(scale));
-			b = Math.max(floor, b * Math.sqrt(MAX_BACKING_AREA / area));
+			// The scale at which this pane EXACTLY fills the budget.
+			//
+			// Written as a plain square root rather than `b * sqrt(MAX/area)`
+			// because with `area = layoutW * layoutH * b^2` that expression
+			// reduces to exactly this - the `b` cancels. Same number, one
+			// fewer place to get it wrong.
+			const trimmed = Math.sqrt(MAX_BACKING_AREA / (layoutW * layoutH));
+			// ON MOBILE take it flat, which bounds the DEVICE ratio as well
+			// as the zoom. That is an iOS fact and not a preference: WebKit
+			// refuses a per-canvas allocation past ~16.7M device px and does
+			// it SILENTLY, and a tall band at a high dpr can reach that
+			// ceiling with no zoom applied at all (1.4.12-design.md §14).
+			// This CAN land below the device ratio, and on a big enough pane
+			// below 1 - soft ink at a known scale, instead of an allocation
+			// WebKit may refuse without saying so.
+			//
+			// ON DESKTOP floor it at what this pane would use UNZOOMED, so a
+			// dense display at 100% keeps every device pixel it has and only
+			// magnification is ever traded away. Electron has no equivalent
+			// of WebKit's silent refusal, so resolution surrendered here buys
+			// nothing: bounding the device ratio on desktop too cost a 5K
+			// pane at 200% about 30% of its linear ink resolution for a
+			// ceiling that machine does not have. Without this floor the
+			// budget quietly downgrades ordinary editors on high-dpi
+			// hardware; ZoomScale.test.ts keeps a TRIPWIRE on exactly that,
+			// and a change that makes it fail is a question, not a licence to
+			// rewrite it.
+			b = mobile ? trimmed : Math.max(d * Math.min(1, clampScale(scale)), trimmed);
 		}
 	}
 	return b > 0 && Number.isFinite(b) ? b : 1;

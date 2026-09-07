@@ -435,6 +435,167 @@ describe("a blur with a finger down strands no touch bookkeeping", () => {
 	});
 });
 
+/**
+ * Deferral (2), 1.4.10-design.md §17: a pinch (or a resting finger) spanning
+ * an abandon with no pen stroke live - the pdf controller's in-place document
+ * switch runs `abandonActiveStroke()` unconditionally, and a pinch can be
+ * mid-flight when it fires.
+ *
+ * Before this fix the four touch-map clears at the end of
+ * `abandonActiveStroke()` (`touchesAtStrokeStart`/`touchPos`/`liveTouchIds`/
+ * `guardTouches`) ran whenever anything was live, stroke or not. A switch
+ * with two fingers down and no stroke wiped all four while the assist/pinch
+ * quartet (`assistPointerId`, `assistEngaged`, `pinchLive`, `paroleId`)
+ * survived untouched - the pinch's second contact vanished from the touch
+ * maps while the assist kept panning on the first, the two halves of the
+ * touch model disagreeing about what was still down.
+ *
+ * Fix (a) (of the two the deferral wrote down; (b), also clearing the
+ * assist/pinch quartet alongside the maps, was rejected - a parked branch,
+ * 1.4.10-fix-abandon-assist, tried standing the assist down on abandon and
+ * un-protected a contact still on the glass) gates the four clears on
+ * `hadStroke`: no claimed pen contact means nothing here belonged to a
+ * stroke, so a touch-only abandon leaves the maps exactly as a blur does.
+ */
+describe("abandonActiveStroke with touch contacts but no pen stroke (deferral 2, §17)", () => {
+	/** A finger's pointerdown - same shape as the blur-block's own helper. */
+	const fingerDown = (el: unknown, pointerId: number, x = 300, y = 400) =>
+		({
+			type: "pointerdown",
+			pointerType: "touch",
+			pointerId,
+			isPrimary: true,
+			target: el,
+			clientX: x,
+			clientY: y,
+			pressure: 0.5,
+			buttons: 1,
+			button: 0,
+			timeStamp: 50,
+			tiltX: 0,
+			tiltY: 0,
+			width: 20,
+			height: 20,
+			preventDefault: () => {},
+			stopPropagation: () => {},
+		}) as unknown as PointerEvent;
+
+	/** Its parallel TouchEvent - the only thing `liveTouchIds` is fed from. */
+	const fingerTouchStart = (el: unknown, identifier: number) =>
+		({
+			type: "touchstart",
+			target: el,
+			changedTouches: [{ identifier }],
+			preventDefault: () => {},
+			stopPropagation: () => {},
+		}) as unknown as PointerEvent;
+
+	it("two contacts down, no stroke: abandon returns false and both contacts are still known", () => {
+		const h = harness();
+		h.fire(fingerDown(h.el, 21, 300, 400));
+		h.fireWin(fingerTouchStart(h.el, 21));
+		// Second finger: `touchPos.size === 2` on this pointerdown is exactly
+		// what `pointerDown()` reads to start the pinch (`beginPinch`).
+		h.fire(fingerDown(h.el, 22, 340, 420));
+		h.fireWin(fingerTouchStart(h.el, 22));
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const p = h.router as any;
+		expect(p.touchPos.size, "harness never registered both fingers").toBe(2);
+		expect(p.liveTouchIds.size).toBe(2);
+		expect(p.guardTouches.size).toBe(2);
+		expect(h.router.isStroking, "no pen stroke was ever claimed").toBe(false);
+
+		expect(
+			h.router.abandonActiveStroke(),
+			"a touch-only abandon must report no stroke was torn down"
+		).toBe(false);
+
+		expect(p.touchPos.size, "the pinch's contacts were forgotten").toBe(2);
+		expect(p.touchPos.has(21), "the first contact's position was forgotten").toBe(true);
+		expect(p.touchPos.has(22), "the second contact's position was forgotten").toBe(true);
+		expect(p.liveTouchIds.has(21)).toBe(true);
+		expect(p.liveTouchIds.has(22)).toBe(true);
+		expect(p.guardTouches.has(21)).toBe(true);
+		expect(p.guardTouches.has(22)).toBe(true);
+
+		// The pinch itself still resolves geometry afterward: a touchmove for
+		// the second id is not treated as a fresh, ungrounded contact.
+		const move = {
+			type: "pointermove",
+			pointerType: "touch",
+			pointerId: 22,
+			isPrimary: true,
+			target: h.el,
+			clientX: 360,
+			clientY: 440,
+			pressure: 0.5,
+			buttons: 1,
+			button: 0,
+			timeStamp: 60,
+			tiltX: 0,
+			tiltY: 0,
+			width: 20,
+			height: 20,
+			preventDefault: () => {},
+			stopPropagation: () => {},
+		} as unknown as PointerEvent;
+		expect(() => h.fire(move)).not.toThrow();
+		expect(p.touchPos.get(22)).toEqual({ x: 360, y: 440 });
+	});
+	/**
+	 * The other half of gating the clears on `hadStroke`: a contact that is
+	 * never cleared is a contact that can be STALE. A pointerup that never
+	 * arrives (an OS gesture steals the pointer, the pane is hidden mid
+	 * contact, a popout closes under a finger) leaves one map entry behind
+	 * for the life of the router, and that entry alone keeps
+	 * `hasLiveGesture` true forever - so every later note switch and every
+	 * later window blur reached `restoreGuardStyle()` and stripped the
+	 * standing `touch-action: none` a frame before the next pen could exist.
+	 * That is the lit-nib regression, reached by a stale finger instead of
+	 * the stale tail the block below pins. The guard/ownership teardown now
+	 * hangs off a pen gesture being torn down, not off `hasLiveGesture`.
+	 */
+	it("a stale touch contact with no stroke leaves the standing guard armed", () => {
+		const h = harness();
+		h.fire(fingerDown(h.el, 21, 300, 400));
+		h.fireWin(fingerTouchStart(h.el, 21));
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const p = h.router as any;
+		expect(p.guardApplied, "the finger never armed the standing guard").toBe(true);
+		expect(h.el.style.touchAction).toBe("none");
+
+		// The lift never arrives; the entry is stale from here on.
+		expect(h.router.abandonActiveStroke(), "no stroke was torn down").toBe(false);
+		expect(
+			h.el.style.touchAction,
+			"the standing guard was pulled out from under the next pen"
+		).toBe("none");
+		expect(p.guardApplied).toBe(true);
+
+		// And it stays armed for every later switch, not just the first.
+		h.router.abandonActiveStroke();
+		h.router.abandonActiveStroke();
+		expect(h.el.style.touchAction).toBe("none");
+		expect(p.guardApplied).toBe(true);
+	});
+
+	it("a live stroke still releases the guard on abandon", () => {
+		const h = harness();
+		h.fire(penEvent("pointerdown", 100));
+		expect(h.router.isStroking).toBe(true);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const p = h.router as any;
+		expect(p.guardApplied, "a claimed stroke arms the guard").toBe(true);
+
+		expect(h.router.abandonActiveStroke(), "a stroke WAS torn down").toBe(true);
+
+		expect(p.guardApplied, "a torn-down stroke must still release the guard").toBe(false);
+		expect(h.el.style.touchAction).toBe("");
+	});
+});
+
 describe("the ownership tail expires honestly (residual b)", () => {
 	/**
 	 * `2e880b4` added the "nothing live -> true no-op" predicate so a note
@@ -629,6 +790,61 @@ describe("InlinePenRouter.abandonActiveStroke's return value (the strip-chrome f
 		h.router.abandonActiveStroke();
 
 		expect(h.rec.ups).toBe(0);
+	});
+
+	/**
+	 * `hadStroke` true alongside a touch contact - today's behaviour, pinned
+	 * so fix (a) above (gating the four touch-map clears on `hadStroke`)
+	 * cannot accidentally widen into "never clear the touch maps": a stroke
+	 * that WAS live must still wipe them, same as before this fix.
+	 */
+	it("true with a touch contact present: the touch maps are still cleared", () => {
+		const h = harness();
+		const fingerDown = {
+			type: "pointerdown",
+			pointerType: "touch",
+			pointerId: 21,
+			isPrimary: true,
+			target: h.el,
+			clientX: 300,
+			clientY: 400,
+			pressure: 0.5,
+			buttons: 1,
+			button: 0,
+			timeStamp: 50,
+			tiltX: 0,
+			tiltY: 0,
+			width: 20,
+			height: 20,
+			preventDefault: () => {},
+			stopPropagation: () => {},
+		} as unknown as PointerEvent;
+		const fingerTouchStart = {
+			type: "touchstart",
+			target: h.el,
+			changedTouches: [{ identifier: 21 }],
+			preventDefault: () => {},
+			stopPropagation: () => {},
+		} as unknown as PointerEvent;
+
+		h.fire(fingerDown);
+		h.fireWin(fingerTouchStart);
+		h.fire(penEvent("pointerdown", 100));
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const p = h.router as any;
+		expect(p.touchPos.size, "harness never registered the finger").toBe(1);
+		expect(p.liveTouchIds.size).toBe(1);
+		expect(p.guardTouches.size).toBe(1);
+		expect(h.router.isStroking).toBe(true);
+
+		expect(h.router.abandonActiveStroke()).toBe(true);
+
+		expect(h.router.isStroking).toBe(false);
+		expect(p.touchesAtStrokeStart.size, "touchesAtStrokeStart survived a real abandon").toBe(0);
+		expect(p.touchPos.size, "touchPos survived a real abandon").toBe(0);
+		expect(p.liveTouchIds.size, "liveTouchIds survived a real abandon").toBe(0);
+		expect(p.guardTouches.size, "guardTouches survived a real abandon").toBe(0);
 	});
 });
 

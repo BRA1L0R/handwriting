@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { clearToolPicked, toolPickedHere } from "./MouseInk";
 import {
 	penContactIntent,
 	releaseTipMode,
@@ -11,7 +12,38 @@ import {
 } from "./TipMode";
 
 describe("TipMode", () => {
-	beforeEach(() => resetTipModeForTest());
+	beforeEach(() => {
+		resetTipModeForTest();
+		clearToolPicked();
+	});
+
+	/**
+	 * THE TIP HALF OF "a tool has been picked" (MouseInk.ts, `toolPicked`),
+	 * which the mouse-draws-from-a-lit-tool grant reads on a pen-less device.
+	 * It is set HERE, in the one setter every tip tool ends in, rather than
+	 * in the four commands and four strip buttons that reach it - so this IS
+	 * the wiring, and without a test it is a claim in a comment.
+	 */
+	it("changing the tip mode is a pick", () => {
+		expect(toolPickedHere()).toBe(false);
+		toggleTipMode("eraser", true);
+		expect(toolPickedHere()).toBe(true);
+	});
+
+	it("turning a mode OFF is a pick too - the tip goes back to the nib, which is a tool", () => {
+		toggleTipMode("lasso", true);
+		clearToolPicked();
+		toggleTipMode("lasso", false);
+		expect(tipMode()).toBe("nib");
+		expect(toolPickedHere()).toBe(true);
+	});
+
+	it("a no-op toggle picks nothing - nothing moved", () => {
+		toggleTipMode("pan", true);
+		clearToolPicked();
+		toggleTipMode("pan", true);
+		expect(toolPickedHere()).toBe(false);
+	});
 
 	it("starts on the nib", () => {
 		expect(tipMode()).toBe("nib");

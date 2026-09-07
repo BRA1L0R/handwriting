@@ -24,6 +24,7 @@ vi.mock("obsidian", () => ({
 }));
 
 import { PageStore } from "./PageStore";
+import { changeFolder, migrateInkFolder } from "./InkFolder";
 import { PageData, emptyPage, parsePage } from "../model/PageData";
 
 // ---- fake filesystem --------------------------------------------------------
@@ -45,8 +46,11 @@ class FakeAdapter {
 	 */
 	writeStarts: string[] = [];
 	log: string[] = [];
+	/** Every path `exists` was asked about, in order. Reset with `.length = 0`. */
+	existsCalls: string[] = [];
 
 	async exists(path: string): Promise<boolean> {
+		this.existsCalls.push(path);
 		return this.files.has(path) || this.dirs.has(path);
 	}
 	async read(path: string): Promise<string> {
@@ -167,6 +171,39 @@ function trashGenerations(pageId: string): string[] {
 /** The contents of every trash generation for a page. */
 function trashContents(pageId: string): string[] {
 	return trashGenerations(pageId).map((p) => fake.files.get(p) ?? "");
+}
+
+/** Every trash generation for a page under a NAMED ink folder's trash. */
+function trashGenerationsIn(folder: string, pageId: string): string[] {
+	return [...fake.files.keys()]
+		.filter((p) => p.startsWith(`${folder}/trash/${pageId}-`) && p.endsWith(".json"))
+		.sort();
+}
+
+function trashContentsIn(folder: string, pageId: string): string[] {
+	return trashGenerationsIn(folder, pageId).map((p) => fake.files.get(p) ?? "");
+}
+
+/**
+ * The disk the OTHER device sees. Obsidian Sync ignores dot-folders - that is
+ * the whole reason the ink folder is a setting - so anything this plugin puts
+ * under `.handwriting/` never leaves the machine that wrote it.
+ */
+function syncedCopy(src: FakeAdapter): FakeAdapter {
+	const out = new FakeAdapter();
+	for (const [p, text] of src.files) {
+		if (p.split("/").some((seg) => seg.startsWith("."))) continue;
+		out.files.set(p, text);
+		out.mtimes.set(p, src.mtimes.get(p) ?? 1);
+	}
+	return out;
+}
+
+/** Every LIVE sidecar for a page on a disk - trash generations excluded. */
+function liveSidecars(disk: FakeAdapter, pageId: string): string[] {
+	return [...disk.files.keys()]
+		.filter((p) => p.endsWith(`/${pageId}.json`) && !p.includes("/trash/"))
+		.sort();
 }
 
 afterEach(() => {
@@ -1119,16 +1156,292 @@ describe("the ink folder fallback runs both ways", () => {
 		expect((await store.load("p1"))?.data.strokes.map((s) => s.id)).toEqual(["mine"]);
 	});
 
-	it("writes to the configured folder even when it read from the other one", async () => {
-		// The fallback is a READ fallback. A write that followed the read
-		// would migrate files by accident, one page at a time, with no
-		// record of it.
+	// THE FORK ITSELF. Read from handwriting/, write to .handwriting/, and
+	// one page id has two files that diverge forever, on two devices that
+	// each read their own first. This case used to be asserted the other way
+	// round ("writes to the configured folder even when it read from the
+	// other one"), on the reasoning that a read fallback must not migrate
+	// files by accident. It migrates nothing: the page is not moved, it is
+	// left where it already is, and what that prevents is a SECOND file.
+	it("writes a page back to the folder it was FOUND in - one id, one sidecar", async () => {
 		fake.files.set("handwriting/p1.json", JSON.stringify(pageWith("p1", "s1")));
 		fake.mtimes.set("handwriting/p1.json", 42);
 		await store.load("p1");
 		await store.saveNow("p1", pageWith("p1", "s2"));
-		expect(fake.files.has(".handwriting/p1.json")).toBe(true);
-		expect(fake.files.get("handwriting/p1.json")).toContain("s1");
+		const sidecars = [...fake.files.keys()].filter((p) => p.endsWith("/p1.json"));
+		expect(sidecars).toEqual(["handwriting/p1.json"]);
+		expect(fake.files.get("handwriting/p1.json")).toContain("s2");
+	});
+
+	it("the guard stats the file that EXISTS, even with no load before the write", async () => {
+		// Paste into a fresh note: the first write of the session, with no
+		// load to resolve the page first. The revision sitting in the other
+		// folder still has to be preserved rather than left to diverge.
+		fake.files.set("handwriting/p1.json", JSON.stringify(pageWith("p1", "theirs")));
+		fake.mtimes.set("handwriting/p1.json", 42);
+		const kept: string[] = [];
+		store.onConflict = (_id, keptAs) => kept.push(keptAs);
+		await store.saveNow("p1", pageWith("p1", "mine"));
+		expect(kept).toEqual(["handwriting/p1.conflict-42.json"]);
+		expect(fake.files.get("handwriting/p1.conflict-42.json")).toContain("theirs");
+		expect(fake.files.get("handwriting/p1.json")).toContain("mine");
+		expect(fake.files.has(".handwriting/p1.json")).toBe(false);
+	});
+
+	it("a page that exists in no folder at all is written to the configured one", async () => {
+		await store.saveNow("p2", pageWith("p2", "fresh"));
+		expect(fake.files.get(".handwriting/p2.json")).toContain("fresh");
+		expect(fake.files.has("handwriting/p2.json")).toBe(false);
+	});
+
+	it("after the folder setting changes, a NEW page goes to the new folder", async () => {
+		store.useInkFolder("handwriting");
+		await store.saveNow("p3", pageWith("p3", "fresh"));
+		expect(fake.files.get("handwriting/p3.json")).toContain("fresh");
+		expect(fake.files.has(".handwriting/p3.json")).toBe(false);
+	});
+
+	it("a folder change re-resolves a page the migration moved", async () => {
+		// changeFolder migrates the files and THEN repoints the store, so a
+		// path resolved before the move names a file that is no longer there.
+		// useInkFolder drops them; keeping them would send this write back
+		// into the folder the migration had just emptied.
+		fake.files.set(".handwriting/p1.json", JSON.stringify(pageWith("p1", "s1")));
+		fake.mtimes.set(".handwriting/p1.json", 42);
+		await store.load("p1");
+		fake.files.set("handwriting/p1.json", fake.files.get(".handwriting/p1.json")!);
+		fake.mtimes.set("handwriting/p1.json", 42);
+		fake.files.delete(".handwriting/p1.json");
+		store.useInkFolder("handwriting");
+		await store.saveNow("p1", pageWith("p1", "s2"));
+		expect(fake.files.get("handwriting/p1.json")).toContain("s2");
+		expect(fake.files.has(".handwriting/p1.json")).toBe(false);
+	});
+});
+
+describe("a pin is a hint, not a fact — resolvePath revalidates it", () => {
+	// resolved[] used to be trusted blind. A sidecar that sync moved or
+	// removed under an open session then had its next write recreate it at
+	// the stale pin: a second live file under the same id, exactly the fork
+	// the pin map exists to prevent.
+	const X = ".handwriting/p1.json"; // where the pin was set
+	const Y = "handwriting/p1.json"; // where the other device put it
+
+	it("revalidates a pin sync moved out from under an open session", async () => {
+		fake.files.set(X, JSON.stringify(pageWith("p1", "s1")));
+		fake.mtimes.set(X, 42);
+		await store.load("p1"); // pins X
+
+		// Sync: the other device migrated the note. X is gone, Y exists now.
+		fake.files.delete(X);
+		fake.mtimes.delete(X);
+		fake.files.set(Y, JSON.stringify(pageWith("p1", "remote")));
+		fake.mtimes.set(Y, 50);
+
+		await store.saveNow("p1", pageWith("p1", "s2"));
+
+		const sidecars = [...fake.files.keys()].filter((p) => p.endsWith("/p1.json"));
+		expect(sidecars).toEqual([Y]);
+		expect(fake.files.get(Y)).toContain("s2");
+
+		// The pin now says Y: what the store watches for an external change is
+		// the file it just wrote, not the vacated X.
+		expect(await store.externallyChanged("p1")).toBe(false);
+		fake.externalWrite(Y, serialize("p1", "THEIRS"));
+		expect(await store.externallyChanged("p1")).toBe(true);
+	});
+
+	it("trusts a pin whose file is still there — no re-scan of the well-known folders", async () => {
+		fake.files.set(X, JSON.stringify(pageWith("p1", "s1")));
+		fake.mtimes.set(X, 42);
+		await store.load("p1"); // pins X
+
+		// A decoy sitting in the OTHER well-known folder: if resolvePath
+		// re-scanned instead of trusting the pin, it would find this and
+		// misreport where the page lives.
+		fake.files.set(Y, JSON.stringify(pageWith("p1", "decoy")));
+		fake.mtimes.set(Y, 43);
+
+		fake.existsCalls.length = 0;
+		await store.saveNow("p1", pageWith("p1", "s2"));
+
+		expect(fake.existsCalls).not.toContain(Y);
+		expect(fake.files.get(X)).toContain("s2");
+		expect(fake.files.get(Y)).toContain("decoy"); // untouched
+	});
+
+	it("keeps the pin when the page is found nowhere, and writes there", async () => {
+		fake.files.set(X, JSON.stringify(pageWith("p1", "s1")));
+		fake.mtimes.set(X, 42);
+		await store.load("p1"); // pins X
+
+		// Removed everywhere: no live copy in any well-known folder.
+		fake.files.delete(X);
+		fake.mtimes.delete(X);
+
+		await store.saveNow("p1", pageWith("p1", "s2"));
+
+		const sidecars = [...fake.files.keys()].filter((p) => p.endsWith("/p1.json"));
+		expect(sidecars).toEqual([X]);
+		expect(fake.files.get(X)).toContain("s2");
+	});
+});
+
+describe("a pin made by a blind write is provisional, not a fact", () => {
+	// The fresh-install ordering sync actually produces: the note arrives
+	// before its sidecar. Adoption ran with neither ink folder present and
+	// chose `.handwriting`; the user opened the page (nothing found, correctly
+	// unpinned) and drew, so the write created AND PINNED `.handwriting/X.json`
+	// - and from then on resolvePath short-circuited on that pin, so the real
+	// sidecar landing in `handwriting/` a moment later was never looked for.
+	// Two live sidecars for good, with this device's copy the one that can
+	// never sync back.
+
+	it("a sidecar arriving after this device wrote blind takes the page over", async () => {
+		expect(await store.load("X")).toBeNull(); // nothing anywhere; not pinned
+		await store.saveNow("X", pageWith("X", "local")); // the first stroke, written blind
+		expect(fake.files.has(".handwriting/X.json")).toBe(true);
+
+		// Sync delivers the page's real sidecar, into the folder it can see.
+		fake.externalWrite("handwriting/X.json", serialize("X", "synced"));
+
+		const conflicts: string[] = [];
+		store.onConflict = (_id, keptAs) => conflicts.push(keptAs);
+		await store.saveNow("X", pageWith("X", "local-2"));
+
+		// ONE live sidecar, and it is the synced one.
+		expect(liveSidecars(fake, "X")).toEqual(["handwriting/X.json"]);
+		expect(fake.files.get("handwriting/X.json")).toContain("local-2");
+		// The blind local file was preserved BESIDE the winner, not discarded
+		// and not left where nothing can see it. So was the revision sync
+		// delivered: no ink this sequence touched is gone.
+		const preserved = [...fake.files.keys()].filter((p) => p.includes("X.conflict-"));
+		expect(preserved.every((p) => p.startsWith("handwriting/"))).toBe(true);
+		const kept = preserved.map((p) => fake.files.get(p) ?? "").join("|");
+		expect(kept).toContain('"local"');
+		expect(kept).toContain("synced");
+		// And the user was told, once.
+		expect(conflicts.length).toBe(1);
+	});
+
+	it("a reload confirms a provisional pin, and the extra look stops", async () => {
+		await store.saveNow("X", pageWith("X", "local")); // blind: provisional
+
+		// Still provisional, so the resolve keeps asking whether the real copy
+		// has arrived next door. A second blind write proves nothing.
+		fake.existsCalls.length = 0;
+		await store.saveNow("X", pageWith("X", "local-1b"));
+		expect(fake.existsCalls).toContain("handwriting/X.json");
+
+		// A LOAD reads the pinned file and finds nothing elsewhere: confirmed.
+		expect((await store.load("X"))?.data.strokes.map((s) => s.id)).toEqual(["local-1b"]);
+		fake.existsCalls.length = 0;
+		await store.saveNow("X", pageWith("X", "local-2"));
+		expect(fake.existsCalls).not.toContain("handwriting/X.json");
+		expect(liveSidecars(fake, "X")).toEqual([".handwriting/X.json"]);
+	});
+
+	it("a genuinely new page on a single-folder vault behaves exactly as before", async () => {
+		await store.saveNow("fresh", pageWith("fresh", "s1"));
+		await store.saveNow("fresh", pageWith("fresh", "s2"));
+		expect(fake.files.get(".handwriting/fresh.json")).toContain("s2");
+		expect(liveSidecars(fake, "fresh")).toEqual([".handwriting/fresh.json"]);
+		expect([...fake.files.keys()].filter((p) => p.startsWith("handwriting/"))).toEqual([]);
+		expect(fake.log.filter((l) => l.startsWith("write "))).toEqual([
+			"write .handwriting/fresh.json.tmp",
+			"write .handwriting/fresh.json.tmp",
+		]);
+	});
+
+	it("an ordinary pin still costs exactly one exists per resolve", async () => {
+		// The whole price of this: one extra `exists` on resolves of
+		// PROVISIONAL pins. A load-hit pin is untouched.
+		fake.files.set(".handwriting/p1.json", JSON.stringify(pageWith("p1", "s1")));
+		fake.mtimes.set(".handwriting/p1.json", 42);
+		await store.load("p1");
+		fake.existsCalls.length = 0;
+		await store.externallyChanged("p1"); // a resolve, and nothing else
+		expect(fake.existsCalls).toEqual([".handwriting/p1.json"]);
+
+		await store.saveNow("p2", pageWith("p2", "blind")); // provisional
+		fake.existsCalls.length = 0;
+		await store.externallyChanged("p2");
+		expect(fake.existsCalls).toEqual([".handwriting/p2.json", "handwriting/p2.json"]);
+	});
+});
+
+describe("a folder change holds writes until the files have moved", () => {
+	// `changeFolder` settles the queue first, but settling drains it ONCE: the
+	// move that follows spans a list plus a rename per file, with the store
+	// still pointed at `from` and every pin intact. A stroke landing there
+	// recreated the sidecar in the folder being emptied - the pin's file had
+	// been renamed away, and `findSidecar` cannot see a CUSTOM destination, so
+	// `pinned ?? path` named `from/p1.json` and the write made it. `repoint`
+	// then cleared the pins, the next resolve served the older migrated copy,
+	// and the newest ink sat orphaned in a folder the user believes is empty.
+	it("a write scheduled mid-migration lands in the destination, once, with the newest data", async () => {
+		fake.dirs.add(".handwriting"); // the folder migrateInkFolder will enumerate
+		fake.files.set(".handwriting/p1.json", JSON.stringify(pageWith("p1", "old")));
+		fake.mtimes.set(".handwriting/p1.json", 42);
+		await store.load("p1"); // pinned at .handwriting/p1.json
+
+		const outcome = await changeFolder(
+			{
+				settle: async () => {
+					await store.flush();
+					return !store.busy;
+				},
+				holdWrites: () => store.holdWrites(),
+				releaseWrites: () => store.releaseWrites(),
+				migrate: async (from, to) => {
+					const result = await migrateInkFolder(fake, from, to);
+					// THE PEN, after the file has been renamed away and before
+					// the repoint: the store is still pointed at `from`, and
+					// the pin still names the file the migration just moved.
+					store.schedule("p1", pageWith("p1", "newest"));
+					await vi.advanceTimersByTimeAsync(800); // the debounce fires
+					return result;
+				},
+				repoint: (to) => store.useInkFolder(to),
+				persist: async () => {},
+			},
+			".handwriting",
+			"assets/ink"
+		);
+		expect(outcome.kind).toBe("moved");
+
+		await settle(); // the held write comes back
+		expect(fake.files.get("assets/ink/p1.json")).toContain("newest");
+		expect(fake.files.has(".handwriting/p1.json")).toBe(false);
+		expect(liveSidecars(fake, "p1")).toEqual(["assets/ink/p1.json"]);
+		// Once. The hold requeues the state; it does not duplicate the write.
+		expect(fake.log.filter((l) => l === "write assets/ink/p1.json.tmp").length).toBe(1);
+	});
+
+	it("the hold is released even when the migration throws", async () => {
+		fake.files.set(".handwriting/p1.json", JSON.stringify(pageWith("p1", "old")));
+		fake.mtimes.set(".handwriting/p1.json", 42);
+		await expect(
+			changeFolder(
+				{
+					settle: async () => true,
+					holdWrites: () => store.holdWrites(),
+					releaseWrites: () => store.releaseWrites(),
+					migrate: async () => {
+						throw new Error("disk full");
+					},
+					repoint: (to) => store.useInkFolder(to),
+					persist: async () => {},
+				},
+				".handwriting",
+				"assets/ink"
+			)
+		).rejects.toThrow("disk full");
+
+		// A failed move must not leave the plugin unable to save at all.
+		store.schedule("p1", pageWith("p1", "after"));
+		await settle();
+		expect(fake.files.get(".handwriting/p1.json")).toContain("after");
 	});
 });
 
@@ -1298,21 +1611,29 @@ describe("every path finds the page, not just load()", () => {
 		fake.mtimes.set(OTHER, 42);
 	});
 
-	it("remove recycles the copy that exists, wherever it is", async () => {
+	it("remove recycles the copy that exists, into the trash BESIDE it", async () => {
 		await store.remove("p1");
 		expect(fake.files.has(OTHER)).toBe(false);
-		expect(trashContents("p1")[0]).toContain("s1");
+		// One trash per ink folder. Recycling into `.handwriting/trash/` - the
+		// configured folder's - hid the generation from every device that can
+		// only see `handwriting/`, and the restore then planted the live file
+		// in the dot-folder too.
+		expect(trashContentsIn("handwriting", "p1")).toEqual([expect.stringContaining("s1")]);
+		expect(trashGenerations("p1")).toEqual([]);
 	});
 
-	it("preserve copies the page that exists, not an absent one", async () => {
+	it("preserve copies the page that exists, into the trash BESIDE it", async () => {
 		const kept = await store.preserve("p1");
 		expect(kept).not.toBeNull();
+		expect(kept!.startsWith("handwriting/trash/")).toBe(true);
 		expect(fake.files.get(kept!)).toContain("s1");
+		expect(trashGenerations("p1")).toEqual([]);
 	});
 
-	it("clone reads the page that exists and writes to the configured folder", async () => {
+	it("clone writes the duplicate BESIDE its source, not into the configured folder", async () => {
 		expect(await store.clone("p1", "p2")).toBe("cloned");
-		expect(fake.files.get(".handwriting/p2.json")).toContain("s1");
+		expect(fake.files.get("handwriting/p2.json")).toContain("s1");
+		expect(fake.files.has(".handwriting/p2.json")).toBe(false);
 		// The source is untouched, wherever it was.
 		expect(fake.files.has(OTHER)).toBe(true);
 	});
@@ -1325,6 +1646,91 @@ describe("every path finds the page, not just load()", () => {
 		// so live reload silently stopped for exactly the vaults the read
 		// fallback exists for.
 		expect(await store.externallyChanged("p1")).toBe(true);
+	});
+});
+
+describe("a page's whole family stays in the folder the page lives in", () => {
+	// The population this release is for: a device upgraded from 1.4.x whose
+	// data.json still says `.handwriting` while every sidecar sits in
+	// `handwriting/`. Reads and writes already follow the file. The names
+	// BUILT from the configured folder did not, and each one plants a live
+	// second sidecar for a page that lives next door.
+
+	it("duplicating a note cannot fork it: the copy lands where sync can carry it", async () => {
+		fake.files.set("handwriting/src.json", JSON.stringify(pageWith("src", "s1")));
+		fake.mtimes.set("handwriting/src.json", 42);
+		expect(await store.clone("src", "dup")).toBe("cloned");
+
+		// Sync carries `handwriting/` and the duplicate's .md with its fresh
+		// pageId. It does not carry `.handwriting/`.
+		const disk2 = syncedCopy(fake);
+		const two = new PageStore({ vault: { adapter: disk2 } }, "handwriting", () => trashClock);
+
+		// Device 2 opens the copy. Before this, the clone had gone to
+		// `.handwriting/dup.json`, so the note opened BLANK here and the first
+		// stroke below started a second live sidecar under the same id.
+		expect((await two.load("dup"))?.data.strokes.map((s) => s.id)).toEqual(["s1"]);
+		await two.saveNow("dup", pageWith("dup", "s2"));
+
+		expect(liveSidecars(disk2, "dup")).toEqual(["handwriting/dup.json"]);
+		expect(liveSidecars(fake, "dup")).toEqual(["handwriting/dup.json"]);
+	});
+
+	it("deleting and restoring a note cannot fork it: the ink comes back where it was", async () => {
+		fake.files.set("handwriting/p1.json", JSON.stringify(pageWith("p1", "keepme")));
+		fake.mtimes.set("handwriting/p1.json", 42);
+		await store.load("p1");
+		await store.remove("p1"); // the note is deleted; the ink is recycled
+		expect(fake.files.has("handwriting/p1.json")).toBe(false);
+
+		const back = await store.load("p1"); // the note comes back
+		expect(back?.data.strokes.map((s) => s.id)).toEqual(["keepme"]);
+
+		// Sync carried the DELETION of handwriting/p1.json to device 2, and now
+		// carries the restore. Before this, the restore wrote
+		// `.handwriting/p1.json`, which never leaves this machine: device 2
+		// opened the note blank and its first stroke recreated the sidecar.
+		const disk2 = syncedCopy(fake);
+		const two = new PageStore({ vault: { adapter: disk2 } }, "handwriting", () => trashClock);
+		expect((await two.load("p1"))?.data.strokes.map((s) => s.id)).toEqual(["keepme"]);
+		await two.saveNow("p1", pageWith("p1", "next"));
+
+		expect(liveSidecars(disk2, "p1")).toEqual(["handwriting/p1.json"]);
+		expect(liveSidecars(fake, "p1")).toEqual(["handwriting/p1.json"]);
+	});
+
+	it("recycle and restore round-trip a page next door without touching the configured folder", async () => {
+		fake.files.set("handwriting/p1.json", JSON.stringify(pageWith("p1", "s1")));
+		fake.mtimes.set("handwriting/p1.json", 42);
+		await store.load("p1");
+		await store.remove("p1");
+		expect(trashContentsIn("handwriting", "p1")).toEqual([expect.stringContaining("s1")]);
+
+		expect((await store.load("p1"))?.data.strokes.map((s) => s.id)).toEqual(["s1"]);
+		expect(fake.files.has("handwriting/p1.json")).toBe(true);
+		expect(trashGenerationsIn("handwriting", "p1")).toEqual([]);
+
+		await store.saveNow("p1", pageWith("p1", "s2"));
+		expect(liveSidecars(fake, "p1")).toEqual(["handwriting/p1.json"]);
+		// Not one byte, and not one directory, under the configured folder.
+		expect([...fake.files.keys()].filter((p) => p.startsWith(".handwriting"))).toEqual([]);
+		expect([...fake.dirs].filter((d) => d.startsWith(".handwriting"))).toEqual([]);
+	});
+
+	it("a single-folder vault is unchanged: trash, restore and clone where they always were", async () => {
+		fake.files.set(".handwriting/p1.json", JSON.stringify(pageWith("p1", "s1")));
+		fake.mtimes.set(".handwriting/p1.json", 42);
+		await store.load("p1");
+		await store.remove("p1");
+		expect(trashGenerations("p1")).toEqual([".handwriting/trash/p1-5000000.json"]);
+
+		expect((await store.load("p1"))?.data.strokes.map((s) => s.id)).toEqual(["s1"]);
+		expect(fake.files.has(".handwriting/p1.json")).toBe(true);
+		expect(trashGenerations("p1")).toEqual([]);
+
+		expect(await store.clone("p1", "p2")).toBe("cloned");
+		expect(fake.files.get(".handwriting/p2.json")).toContain("s1");
+		expect([...fake.files.keys()].filter((p) => p.startsWith("handwriting/"))).toEqual([]);
 	});
 });
 
@@ -1366,5 +1772,84 @@ describe("a bare .tmp recovery becomes a real sidecar", () => {
 		expect(r?.damaged).toBe(true);
 		expect(fake.files.has(".handwriting/p1.json")).toBe(false);
 		expect(fake.files.has(".handwriting/p1.json.tmp")).toBe(true);
+	});
+});
+
+describe("listIds enumerates every folder a page can be served from", () => {
+	// The READ-side half of the fork. load() has resolved across both
+	// well-known folders for a while, but listIds enumerated only the
+	// configured one - so on a device whose data.json names .handwriting
+	// while the ink sits in handwriting/, pdf instance resolution saw no
+	// candidates at all: a document that already had ink was called a fresh
+	// copy, and nextInstanceId handed it an id the unseen sidecar next door
+	// already owned.
+	const sidecar = (id: string) => JSON.stringify(pageWith(id, `${id}-ink`));
+
+	it("lists only the configured folder's ids when that is the only folder", async () => {
+		fake.files.set(".handwriting/pdf-aa.json", sidecar("pdf-aa"));
+		fake.files.set(".handwriting/pdf-aa-2.json", sidecar("pdf-aa-2"));
+		fake.files.set(".handwriting/pdf-bb.json", sidecar("pdf-bb"));
+		// Not sidecars, and never were.
+		fake.files.set(".handwriting/pdf-aa.conflict-42.json", "{}");
+		fake.files.set(".handwriting/pdf-aa.damaged-42.json", "{}");
+		fake.files.set(".handwriting/pdf-aa.json.tmp", "{}");
+		// handwriting/ does not exist here, so its list() throws ENOENT -
+		// which must cost nothing rather than emptying the answer.
+		expect(await store.listIds("pdf-aa")).toEqual(["pdf-aa", "pdf-aa-2"]);
+	});
+
+	it("unions the two well-known folders when the instances are split across them", async () => {
+		fake.files.set(".handwriting/pdf-aa.json", sidecar("pdf-aa"));
+		fake.files.set("handwriting/pdf-aa-2.json", sidecar("pdf-aa-2"));
+		fake.files.set("handwriting/pdf-bb.json", sidecar("pdf-bb"));
+		expect((await store.listIds("pdf-aa")).sort()).toEqual(["pdf-aa", "pdf-aa-2"]);
+	});
+
+	it("unions both well-known folders from a CUSTOM configured folder too", async () => {
+		store.useInkFolder("assets/ink");
+		fake.files.set("assets/ink/pdf-aa.json", sidecar("pdf-aa"));
+		fake.files.set(".handwriting/pdf-aa-2.json", sidecar("pdf-aa-2"));
+		fake.files.set("handwriting/pdf-aa-3.json", sidecar("pdf-aa-3"));
+		expect((await store.listIds("pdf-aa")).sort()).toEqual(["pdf-aa", "pdf-aa-2", "pdf-aa-3"]);
+	});
+
+	it("returns an id present in BOTH folders once, and the configured folder is the copy that loads", async () => {
+		fake.files.set(".handwriting/pdf-aa.json", JSON.stringify(pageWith("pdf-aa", "mine")));
+		fake.mtimes.set(".handwriting/pdf-aa.json", 42);
+		fake.files.set("handwriting/pdf-aa.json", JSON.stringify(pageWith("pdf-aa", "theirs")));
+		fake.mtimes.set("handwriting/pdf-aa.json", 43);
+		// One page id, one page - listing it twice would hand chooseInstance
+		// two candidates for one sidecar.
+		expect(await store.listIds("pdf-aa")).toEqual(["pdf-aa"]);
+		// Which file that id is served from is resolvePath's answer, not
+		// listIds': unchanged, the configured folder wins.
+		expect((await store.load("pdf-aa"))?.data.strokes.map((s) => s.id)).toEqual(["mine"]);
+	});
+
+	it("a folder that will not enumerate is skipped, not fatal", async () => {
+		fake.files.set(".handwriting/pdf-aa.json", sidecar("pdf-aa"));
+		fake.files.set("handwriting/pdf-aa-2.json", sidecar("pdf-aa-2"));
+		const real = fake.list.bind(fake);
+		fake.list = async (path: string) => {
+			if (path === "handwriting") throw new Error("EACCES injected");
+			return real(path);
+		};
+		expect(await store.listIds("pdf-aa")).toEqual(["pdf-aa"]);
+	});
+
+	it("an adapter with no list() yields none rather than throwing", async () => {
+		// list() is optional on the adapter (an exotic platform, a test
+		// double): resolution degrades to "first instance", it does not fail.
+		const noList = {
+			exists: async () => true,
+			read: async () => "",
+			write: async () => {},
+			rename: async () => {},
+			remove: async () => {},
+			mkdir: async () => {},
+			stat: async () => null,
+		};
+		const bare = new PageStore({ vault: { adapter: noList } }, ".handwriting");
+		expect(await bare.listIds("pdf-aa")).toEqual([]);
 	});
 });

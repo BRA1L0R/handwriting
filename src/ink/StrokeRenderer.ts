@@ -10,6 +10,7 @@ import { flattenStroke, RibbonPt } from "./Ribbon";
 import { centerlineSmoothed, flattenStrokeShaped, inkShapingEnabled } from "./InkShape";
 import { fillRibbon } from "./RibbonRenderer";
 import { InkPoint, InkStroke } from "./Stroke";
+import { paintPurgeSentinel } from "./PurgeSentinel";
 import { strokeRev } from "./StrokeRev";
 
 /**
@@ -323,7 +324,14 @@ export function drawCommitted(
 	viewportCssWidth: number,
 	viewportCssHeight: number,
 	ribbon = false,
-	tool?: InkStroke["tool"]
+	tool?: InkStroke["tool"],
+	/**
+	 * Leave the purged-canvas marker behind (PurgeSentinel.ts). Off for every
+	 * caller but the inline overlay's committed layer, and off there too
+	 * unless the surface is mobile with diagnostics recording - the clear
+	 * above is what makes repainting it here mandatory rather than optional.
+	 */
+	sentinel = false
 ): void {
 	ctx.clearRect(0, 0, viewportCssWidth, viewportCssHeight);
 	const worldLeft = cam.x;
@@ -345,4 +353,5 @@ export function drawCommitted(
 		}
 		drawStroke(ctx, cam, s, undefined, ribbon);
 	}
+	if (sentinel) paintPurgeSentinel(ctx);
 }

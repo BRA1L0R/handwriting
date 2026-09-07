@@ -37,6 +37,7 @@ import { InkOverlayPlugin, inlineInk } from "./InkOverlay";
 import { resetTipModeForTest, setTipMode } from "./TipMode";
 import { SelectionModel } from "../objects/SelectionModel";
 import { InkStroke } from "../ink/Stroke";
+import type { InlineInkHost } from "./InlineInkStore";
 
 function stroke(id: string): InkStroke {
 	return {
@@ -83,6 +84,14 @@ function makeEraseRig(path: string) {
 	view.startFrameTicker = () => undefined;
 	view.showEraserCursor = () => undefined;
 	view.eraseAt = eraseAt;
+	// The real one reaches `ensureLoaded` and `runDetached`. What matters
+	// here is only WHETHER the refusal goes and reads instead of speaking.
+	const loadInk = vi.fn();
+	view.loadInk = loadInk;
+	// Nothing to set up for the notice gate: it is a prototype getter that
+	// builds itself on first use, precisely so a rig like this one - which
+	// runs no field initialisers - still gets the real thing. The spam fix
+	// IS the gate, so a fake here would test nothing.
 
 	const proto = InkOverlayPlugin.prototype as unknown as {
 		penDown(this: unknown, sample: unknown, ev: unknown): void;
@@ -94,6 +103,31 @@ function makeEraseRig(path: string) {
 			proto.penDown.call(view, sample, ev);
 		},
 		eraseAt,
+		loadInk,
+		/**
+		 * What an INTERRUPTED gesture runs: `strokeAbandoned` (window blur,
+		 * alt-tab, a system dialog mid-scrub) is `resetGestureState` plus
+		 * chrome and layer clears, none of which touch the notice gate.
+		 *
+		 * The extra fields are the ones this method reads and the erase rig
+		 * above has no reason to carry; the two cursor hiders reach the real
+		 * editor DOM, which no rig in this file has.
+		 */
+		abandonGesture() {
+			view.erasePieces = new Set();
+			view.selectionDeleteKeys = { reset: () => undefined };
+			view.hidePenCursor = () => undefined;
+			view.hideEraserCursor = () => undefined;
+			(
+				InkOverlayPlugin.prototype as unknown as {
+					resetGestureState(this: unknown): void;
+				}
+			).resetGestureState.call(view);
+		},
+		/** What a note switch runs beside it, and an abandon does not. */
+		switchNotes() {
+			(view.emptyNotice as { forgetAll(): void }).forgetAll();
+		},
 	};
 }
 
@@ -112,6 +146,7 @@ function makeLassoRig(path: string) {
 	view.filePath = () => path;
 	view.lassoActive = false;
 	view.lassoPts = [];
+	view.loadInk = vi.fn();
 
 	const proto = InkOverlayPlugin.prototype as unknown as {
 		lassoDown(this: unknown, sample: unknown): void;
@@ -140,6 +175,41 @@ describe("empty-page notices on the note surface", () => {
 		// The gesture still proceeds - only the warning is new - so the real
 		// hit test still runs and finds nothing on its own, the same as today.
 		expect(rig.eraseAt).toHaveBeenCalledTimes(1);
+	});
+
+	it("a gesture abandoned mid-scrub does not make the refusal news again", () => {
+		// Alt-tab away mid-scrub and come back: same note, same tool, same
+		// answer. `resetGestureState` used to end with `forgetAll()`, and
+		// `strokeAbandoned` runs it - so a blur re-armed the toast that the
+		// gate exists to say only once. `EmptyPageNotice.ts`'s header lists
+		// what makes the sentence news again; an interrupted gesture is not
+		// on the list.
+		setTipMode("eraser");
+		const rig = makeEraseRig("blurred-erase.md");
+
+		rig.penDown();
+		expect(notices.messages).toEqual(["Handwriting: no ink on the page to erase"]);
+
+		rig.abandonGesture();
+		rig.penDown();
+
+		expect(notices.messages).toEqual(["Handwriting: no ink on the page to erase"]);
+	});
+
+	it("a note switch still makes it news again", () => {
+		// The other half: what moved out of `resetGestureState` still runs
+		// where a genuinely fresh screen goes up.
+		setTipMode("eraser");
+		const rig = makeEraseRig("switched-erase.md");
+
+		rig.penDown();
+		rig.switchNotes();
+		rig.penDown();
+
+		expect(notices.messages).toEqual([
+			"Handwriting: no ink on the page to erase",
+			"Handwriting: no ink on the page to erase",
+		]);
 	});
 
 	it("eraser on a note that already has ink stays quiet", () => {
@@ -171,5 +241,126 @@ describe("empty-page notices on the note surface", () => {
 		rig.lassoDown();
 
 		expect(notices.messages).toEqual([]);
+	});
+
+	/**
+	 * Alan, hardware, 1.4.12, on `vault test 2`: "holding ctrl and touching
+	 * eraser end to screen spams toast notification - there is no ink on the
+	 * note to erase, even though there is".
+	 *
+	 * The notice above was correct to exist and correct to fire at the
+	 * gesture's own discovery. What it got wrong was assuming a gesture is a
+	 * contact. An eraser is scrubbed, and the router's own pen-down branch
+	 * says what that means: "Eraser scrubbing lifts and re-lands the nib
+	 * every few hundred ms". Each re-land is a fresh pointerdown, a fresh
+	 * penDown, and used to be a fresh toast - so one piece of news arrived
+	 * twenty times, each copy running its own timeout.
+	 *
+	 * Ctrl is not read by any code on this path (`penContactIntent` takes
+	 * buttons, button and the strip mode, and nothing else); it is simply
+	 * what the other hand was holding. The scrub is the whole mechanism, so
+	 * that is what these drive.
+	 */
+	it("an eraser scrub says it once, not once per contact", () => {
+		setTipMode("eraser");
+		const rig = makeEraseRig("scrubbed.md");
+
+		for (let i = 0; i < 20; i++) rig.penDown();
+
+		expect(notices.messages).toEqual(["Handwriting: no ink on the page to erase"]);
+		// The gesture itself is untouched - only the talking is rationed.
+		expect(rig.eraseAt).toHaveBeenCalledTimes(20);
+	});
+
+	it("a lasso repeated on the same empty note says it once too", () => {
+		setTipMode("lasso");
+		const rig = makeLassoRig("scrubbed-lasso.md");
+
+		rig.lassoDown();
+		rig.lassoDown();
+		rig.lassoDown();
+
+		expect(notices.messages).toEqual(["Handwriting: no ink on the page to select"]);
+	});
+
+	it("silence is per note, not a global mute", () => {
+		setTipMode("eraser");
+		const a = makeEraseRig("scrub-a.md");
+		const b = makeEraseRig("scrub-b.md");
+
+		a.penDown();
+		a.penDown();
+		b.penDown();
+
+		// Two notes, two refusals - not four, and not one. The gate's own
+		// path keying is pinned directly in EmptyPageNotice.test.ts; what
+		// this adds is that a second surface is not silenced by the first.
+		expect(notices.messages).toEqual([
+			"Handwriting: no ink on the page to erase",
+			"Handwriting: no ink on the page to erase",
+		]);
+	});
+});
+
+/**
+ * The "even though there is" half.
+ *
+ * `inlineInk.strokes(path)` is a CACHE of the sidecar, filled by an async
+ * `ensureLoaded`. On a note whose sidecar has not been read yet it is empty
+ * for a note that is covered in ink - which is exactly the state a pane in a
+ * synced vault is in for the first moments after it opens, and exactly the
+ * sentence Alan called wrong. The refusal now requires certainty
+ * (`InlineInkStore.inkPresence`), and answers "not looked up yet" by going
+ * and looking.
+ *
+ * The host attached here answers `null` for every path but the one under
+ * test, which is the same "certainly empty" verdict the hostless describes
+ * above rely on - so it cannot change what they assert if the file is ever
+ * reordered.
+ */
+describe("the refusal never speaks about a note the store has not read", () => {
+	const UNREAD = "unread-but-inked.md";
+
+	class Host implements InlineInkHost {
+		readPageId(path: string): string | null {
+			return path === UNREAD ? "page-1" : null;
+		}
+		async claimId(_path: string, proposedId: string): Promise<{ pageId: string }> {
+			return { pageId: proposedId };
+		}
+		async loadSidecar(): Promise<null> {
+			return null;
+		}
+		scheduleSidecar(): void {}
+		notify(): void {}
+	}
+
+	beforeEach(() => {
+		resetTipModeForTest();
+		notices.messages = [];
+		inlineInk.attachHost(new Host());
+	});
+	afterEach(() => resetTipModeForTest());
+
+	it("stays quiet and goes and reads instead", () => {
+		setTipMode("eraser");
+		const rig = makeEraseRig(UNREAD);
+
+		rig.penDown();
+
+		expect(notices.messages).toEqual([]);
+		expect(rig.loadInk).toHaveBeenCalledWith(UNREAD);
+	});
+
+	it("and still refuses on a note that is certainly empty", () => {
+		// No page id means no sidecar can exist, so this one IS certain -
+		// the fix must not have bought silence by going mute everywhere.
+		setTipMode("eraser");
+		const rig = makeEraseRig("certainly-empty.md");
+
+		rig.penDown();
+
+		expect(notices.messages).toEqual(["Handwriting: no ink on the page to erase"]);
+		expect(rig.loadInk).not.toHaveBeenCalled();
 	});
 });

@@ -24,11 +24,19 @@
  * flipped for one paragraph yesterday; the state defaults to ON at every
  * launch and the worst a forgotten toggle costs is a relaunch.
  *
- * NOTE SURFACES ONLY. The note overlay passes `penOff: () => !penInkEnabled()`
- * to its router; the pdf surface passes nothing and keeps inking. The 4c
- * user's own words are that they type with the Boox recogniser and want the
- * plugin on PDFs - there is no keyboard use case on a PDF, and taking the pen
- * away there would answer a request nobody made.
+ * EVERY INK SURFACE, pdfs included. Both surfaces pass the same predicate to
+ * their router - `penOff: () => !penInkEnabled()` - so one switch answers for
+ * the pane the user is looking at, whichever it is.
+ *
+ * This was note-only for two days and the owner reversed it: "i think the dude
+ * was having trouble with his keyboard coming up on pdf when he didnt want it
+ * to? so why would you take keyboard mode away from pdf". The reasoning that
+ * excluded pdfs - that there is nothing to type into on one - was the wrong
+ * half of the question. The state is not "give the note to the keyboard", it
+ * is "stop claiming the pen", and a reader who wants their pen to select text,
+ * follow a link or reach a form field on a pdf is asking the same thing the
+ * two e-ink users asked. A switch that works on one surface and silently does
+ * nothing on the other is the surprise; one rule for both is not.
  *
  * MOUSE INK IS UNTOUCHED. `mouseActsAsPen` (MouseInk.ts) is a different
  * question with a different answer: this is about the pen the router claims,
@@ -40,14 +48,33 @@
  * can read it without either importing the other.
  */
 
+import { clearToolPicked } from "./MouseInk";
+
 let enabled = true;
 
 export function penInkEnabled(): boolean {
 	return enabled;
 }
 
+/**
+ * OFF ALSO PUTS THE TOOL DOWN (2026-09-05, the tightening of "the button is
+ * the truth"). "A tool is lit" is now pen ink enabled AND a tool picked
+ * (`toolIsLit`, MouseInk.ts), and keyboard mode is the user saying the tip
+ * does nothing here - so it unpicks rather than merely masking. The
+ * difference shows on the way BACK: masking would have keyboard mode off,
+ * then on again, come up still drawing with a tool nobody re-picked, on a
+ * pen-less device where that grant is the whole of the mouse's claim.
+ *
+ * MOUSE INK, the explicit switch, is untouched by this exactly as the header
+ * above says - `clearToolPicked` writes neither `enabled` here nor
+ * MouseInk's own flag. Only the derived grant moves.
+ *
+ * Importing MouseInk.ts is safe and stays safe: it imports nothing at all,
+ * which is the shape both files were given for this reason.
+ */
 export function setPenInk(on: boolean): void {
 	enabled = on;
+	if (!on) clearToolPicked();
 }
 
 /**

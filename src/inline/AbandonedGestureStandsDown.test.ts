@@ -75,6 +75,15 @@ function makeRig() {
 	inst.cssHeight = 600;
 	inst.selection = new SelectionModel();
 	inst.erased = [{ id: "s1" }];
+	// Mid-abandoned-erase: this gesture had already cut "s1" into two
+	// survivor pieces before the window blur (or in-place switch) that
+	// abandoned it. Neither piece ever saw a pen-up, so `erasePieces` and
+	// `eraseFrom` have no other place to be cleared - the same story this
+	// file already tells for `erased`, extended to the two fields pen-down
+	// fills alongside it (grep `this.eraseFrom = ` in InkOverlay.ts).
+	inst.erasePieces = new Set(["piece-a", "piece-b"]);
+	inst.eraseFrom = [{ id: "s1" }];
+	inst.eraseWhole = true;
 	inst.lassoPts = [{ x: 1, y: 1 }];
 	inst.lassoActive = true;
 	inst.dragFrom = { x: 0, y: 0 };
@@ -157,6 +166,22 @@ describe("the note surface stands its own gesture down when a stroke is abandone
 		expect(rig.inst.spaceLineY).toBe(null);
 		expect(rig.inst.dragFrom).toBe(null);
 		expect(rig.inst.panLast).toBe(null);
+	});
+
+	it("clears the abandoned erase gesture's own bookkeeping, not just `erased`", () => {
+		// `erased` (what a completed gesture would report as lost) was always
+		// cleared here. `erasePieces` (ids this gesture minted) and `eraseFrom`
+		// (the note's stroke list from before the cut) were not - so an erase
+		// abandoned mid-cut left them holding the OLD note's ids and list for
+		// whatever erase gesture ran next, on whatever note was open by then.
+		// `eraseWhole` rides along because pen-down sets all three together.
+		const rig = makeRig();
+
+		rig.proto.strokeAbandoned.call(rig.inst);
+
+		expect((rig.inst.erasePieces as Set<string>).size).toBe(0);
+		expect(rig.inst.eraseFrom).toEqual([]);
+		expect(rig.inst.eraseWhole).toBe(false);
 	});
 
 	it("clears the wet layers, so the abandoned stroke stops being painted", () => {

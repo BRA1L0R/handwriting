@@ -20,6 +20,8 @@
  * and PenToolsMode.ts are shaped this way.
  */
 
+import { markToolPicked } from "./MouseInk";
+
 export type TipMode = "nib" | "eraser" | "lasso" | "space" | "pan";
 
 let mode: TipMode = "nib";
@@ -46,6 +48,20 @@ export function tipModeHeld(): boolean {
 export function setTipMode(next: TipMode): void {
 	if (mode === next) return;
 	mode = next;
+	// THE TIP HALF of "a tool has been picked" (MouseInk.ts, `toolPicked`);
+	// `setInlineTool` (InkOverlay.ts) is the nib half. Between them they are
+	// the whole of the tool state, which is why the flag is set from the two
+	// setters rather than from the eraser, lasso, insert-space and pan
+	// commands, their four strip buttons and the Escape hatch that all end
+	// here. BOTH DIRECTIONS on purpose: toggling a mode off hands the tip
+	// back to the nib, which is still a tool in hand, and the one caller for
+	// whom that is NOT true - a mouse putting a tool down - unpicks
+	// explicitly afterwards (`releaseMouseInkQuietly`, PenToolsMode.ts,
+	// which the strip reaches after its exec, not before).
+	//
+	// MouseInk.ts imports nothing, so this cannot be the cycle this file's
+	// DOM-free shape exists to avoid.
+	markToolPicked();
 	listener?.();
 }
 

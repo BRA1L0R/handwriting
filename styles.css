@@ -225,12 +225,35 @@
 
 /* Strip grouping: modes (pick one) | selection actions | history. A hairline
    rather than a gap, so the row does not grow on a phone where it already
-   wraps. Height comes from the button box, not a fixed number. */
+   wraps. Height comes from the button box, not a fixed number.
+
+   NINE PIXELS WIDE, WITH THE HAIRLINE DOWN ITS MIDDLE, and not a 1px rule
+   with a 4px margin either side - which is what this was, and which looked
+   identical. `layoutOverflow` (MobileTools.ts) prices the row by summing
+   `offsetWidth` over every node on it, and offsetWidth EXCLUDES MARGIN: three
+   dividers hid 24px from that sum, so the plan called rows a fit that were up
+   to 24px too wide, `flex-wrap: wrap` took the overflow, and the next
+   demotion made it fit again. Dragging one pane from 520px to 116px, two
+   pixels a frame, walked the strip through fits, wraps, fits, wraps - back
+   from two rows to one at 460, 426, 392 and 358 - which is "it also still
+   flickers when narrowing the window with window slider" (alan, 2026-09-06).
+   The strip's own padding hid another 8px; see `layoutOverflow`.
+
+   Same nine pixels on screen and the same hairline in the middle of them; the
+   difference is that the box now reports them. Nothing on the strip's row may
+   carry a horizontal margin, for this reason. */
 .handwriting-mobile-tools-divider {
 	align-self: stretch;
-	width: 1px;
-	margin: 6px 4px;
-	background-color: var(--background-modifier-border);
+	width: 9px;
+	margin: 6px 0;
+	background-color: transparent;
+	background-image: linear-gradient(
+		var(--background-modifier-border),
+		var(--background-modifier-border)
+	);
+	background-size: 1px 100%;
+	background-position: center;
+	background-repeat: no-repeat;
 	flex: 0 0 auto;
 }
 
@@ -253,6 +276,66 @@
 .cm-scroller.handwriting-pen-hover,
 .cm-scroller.handwriting-pen-hover * {
 	cursor: none;
+}
+
+/*
+ * The Snap offer (SnapChip.ts). A mouse never snaps a shape on its own; when
+ * it pauses at the end of a stroke the recognizer would accept, this small
+ * pill appears just past the end point and offers.
+ *
+ * IT IS THE ONE PRESSABLE THING INSIDE THE OVERLAY, which is
+ * `pointer-events: none` from end to end so ink never eats a click meant for
+ * the text underneath. The element sets `pointer-events: auto` on ITSELF
+ * inline, so this sheet cannot hand that exemption to anything else in there
+ * by widening a selector later.
+ *
+ * A BORDER, NOT A COLOUR, is what marks it out - the rule this repo's e-ink
+ * chrome already follows (`.handwriting-preset-chip.is-current`): on a Boox
+ * the accent and the surface are two greys, so anything relying on hue alone
+ * disappears. The border carries the shape, the background carries the
+ * separation from whatever ink is under it, and both are theme variables so
+ * light and dark are the same rule rather than two.
+ *
+ * `cursor: pointer` with `!important`: the scroller wears `cursor: none` over
+ * itself AND every descendant while the pen or an inking mouse hovers (the
+ * rule directly above), which is exactly the state this chip appears in.
+ * Without the override the button would be the one control in the plugin you
+ * cannot see your pointer on.
+ */
+.handwriting-snap-chip {
+	position: absolute;
+	z-index: 13;
+	padding: 3px 9px;
+	font-size: 11px;
+	line-height: 1.3;
+	white-space: nowrap;
+	color: var(--text-normal);
+	background: var(--background-secondary);
+	border: 1px solid var(--text-muted);
+	border-radius: 9px;
+	box-shadow: var(--shadow-s, 0 2px 8px rgba(0, 0, 0, 0.15));
+	cursor: pointer !important;
+	/* Kills the double-tap zoom delay if a finger ever reaches one. */
+	touch-action: manipulation;
+	/* Never a focus stop (tabindex is -1), so it never wears a focus ring
+	   either; the border is the whole of its outline. */
+	outline: none;
+	-webkit-user-select: none;
+	user-select: none;
+}
+
+/* While a pan drag holds the page. The reticle is deliberately NOT painted
+   through a pan - it flung itself away from the nib and flickered, because a
+   pan is the one gesture that scrolls the overlay out from under the frozen
+   rect its samples are mapped through (alan, 2026-09-05, hardware; the whole
+   mechanism is at penReticleShown, src/inline/PenCursor.ts). Something has to
+   be under the hand in its place, or the rule above leaves the surface with no
+   pointer at all: the grabbing hand, which needs no coordinate to be right
+   about. InkOverlay swaps this class for handwriting-pen-hover at pan-down and
+   back at pen-up, so the two never fight over the cascade. */
+.cm-scroller.handwriting-pan-drag,
+.cm-scroller.handwriting-pan-drag * {
+	cursor: grabbing;
 }
 
 .handwriting-eraser-cursor {
@@ -314,6 +397,18 @@
 .pdf-viewer-container.handwriting-pdf-hover,
 .pdf-viewer-container.handwriting-pdf-hover * {
 	cursor: none;
+}
+
+/* While a pan drag holds the page, and only then. The note surface's twin,
+   handwriting-pan-drag, and the same reasoning: a pan paints no reticle
+   (penReticleShown, src/inline/PenCursor.ts), and hiding one without
+   answering for the cursor would leave the rule above's `cursor: none` over
+   nothing at all. The grabbing hand needs no coordinate to be right about.
+   PdfInkController SWAPS this class for handwriting-pdf-hover at pan-down and
+   back at the end of the drag, so the two never fight over the cascade. */
+.pdf-viewer-container.handwriting-pdf-pan-drag,
+.pdf-viewer-container.handwriting-pdf-pan-drag * {
+	cursor: grabbing;
 }
 
 /* Eraser and lasso show their reach rather than a nib: a dot that lies about
@@ -498,6 +593,49 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	left: calc(env(safe-area-inset-left, 0px) + 8px);
 }
 
+/* THE TWO MIDDLES (1.4.12).
+
+   CENTRED WITH AUTO MARGINS, NOT WITH A TRANSFORM, and the reason is not
+   taste. `applyHeaderClearance` (MobileTools.ts) sets an INLINE transform on
+   these very two elements to dodge the pane's three-dots menu, and it writes
+   the whole property rather than composing with it - so a `translateX(-50%)`
+   living in this stylesheet would be silently erased every time the strip
+   dodged, on every setCorner and every collapse. Auto margins cannot be
+   clobbered that way, and they leave `transform` free for the dodge (and for
+   the drag-to-anchor slice that follows this one, which animates with it).
+
+   `width: fit-content` is what makes the auto margins centre rather than
+   stretch: an absolutely positioned box with both `left` and `right` set and
+   an automatic width fills the space between them. The pill already has a
+   fixed 34px width, so it centres without needing it, but it is stated for
+   both so the two cannot drift apart.
+
+   No safe-area term on the horizontal: a centred strip is equidistant from
+   both edges, and the insets that matter in landscape are reported on both
+   sides at once, so centring is already clear of them. The vertical carries
+   the same unconditional env() as every corner - and it matters more here
+   than anywhere, because a notched phone's island is centred too, which is
+   exactly where a top-middle strip sits. */
+.handwriting-mobile-tools.handwriting-corner-top-center,
+.handwriting-pen-pill.handwriting-corner-top-center {
+	top: calc(env(safe-area-inset-top, 0px) + 8px);
+	left: 0;
+	right: 0;
+	width: fit-content;
+	margin-left: auto;
+	margin-right: auto;
+}
+
+.handwriting-mobile-tools.handwriting-corner-bottom-center,
+.handwriting-pen-pill.handwriting-corner-bottom-center {
+	bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+	left: 0;
+	right: 0;
+	width: fit-content;
+	margin-left: auto;
+	margin-right: auto;
+}
+
 /* Android pulls the notification shade from the very top edge, and that
    gesture beats anything drawn under it - a top-corner toolbar at 8px was
    simply untappable (boox go 6, 2026-08-30). The 48px clears that gesture
@@ -516,7 +654,9 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 .handwriting-android .handwriting-mobile-tools.handwriting-corner-top-right,
 .handwriting-android .handwriting-pen-pill.handwriting-corner-top-right,
 .handwriting-android .handwriting-mobile-tools.handwriting-corner-top-left,
-.handwriting-android .handwriting-pen-pill.handwriting-corner-top-left {
+.handwriting-android .handwriting-pen-pill.handwriting-corner-top-left,
+.handwriting-android .handwriting-mobile-tools.handwriting-corner-top-center,
+.handwriting-android .handwriting-pen-pill.handwriting-corner-top-center {
 	top: calc(env(safe-area-inset-top, 0px) + 48px);
 }
 
@@ -564,8 +704,44 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	bottom: calc(env(safe-area-inset-bottom, 0px) + 15px);
 	left: calc(env(safe-area-inset-left, 0px) + 15px);
 }
+/* The middles need only the VERTICAL half of the concentric adjustment: the
+   pill is centred by the base rule above and stays centred whatever its size,
+   so there is no horizontal offset to correct. The centring itself is
+   deliberately not restated here - one home for it, and these rules override
+   only what they name. */
+.handwriting-pen-pill.handwriting-corner-top-center {
+	top: calc(env(safe-area-inset-top, 0px) + 11px);
+	/* RE-ASSERTED against the centring rule above, which sets
+	   `width: fit-content` on the strip AND the pill so the strip
+	   shrink-wraps for its auto margins. The pill does not need it -
+	   it is a fixed circle and centres on those margins alone - and
+	   inheriting it shrank the circle to the width of the chevron
+	   inside it: a 34px-tall ellipse under the 50% radius (alan,
+	   2026-09-05, on bottom middle: "the icon is all squished").
+	   Only the two middles could show it; the corners set no width. */
+	width: 34px;
+}
+.handwriting-pen-pill.handwriting-corner-bottom-center {
+	bottom: calc(env(safe-area-inset-bottom, 0px) + 11px);
+	/* RE-ASSERTED against the centring rule above, which sets
+	   `width: fit-content` on the strip AND the pill so the strip
+	   shrink-wraps for its auto margins. The pill does not need it -
+	   it is a fixed circle and centres on those margins alone - and
+	   inheriting it shrank the circle to the width of the chevron
+	   inside it: a 34px-tall ellipse under the 50% radius (alan,
+	   2026-09-05, on bottom middle: "the icon is all squished").
+	   Only the two middles could show it; the corners set no width. */
+	width: 34px;
+}
+.is-mobile .handwriting-pen-pill.handwriting-corner-top-center {
+	top: calc(env(safe-area-inset-top, 0px) + 15px);
+}
+.is-mobile .handwriting-pen-pill.handwriting-corner-bottom-center {
+	bottom: calc(env(safe-area-inset-bottom, 0px) + 15px);
+}
 .handwriting-android .handwriting-pen-pill.handwriting-corner-top-right,
-.handwriting-android .handwriting-pen-pill.handwriting-corner-top-left {
+.handwriting-android .handwriting-pen-pill.handwriting-corner-top-left,
+.handwriting-android .handwriting-pen-pill.handwriting-corner-top-center {
 	top: calc(env(safe-area-inset-top, 0px) + 55px);
 }
 /* ---- mobile tool strip ---- */
@@ -608,6 +784,103 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	opacity: 0.92;
 }
 
+/* ---- the grip, and dragging the strip to an anchor (1.4.12) ---- */
+
+/* THE HANDLE, at the strip's leading end. Six dots is the convention for
+   "pick this up" everywhere from a phone's widget sheet to Apple's pencil
+   palette, and the alternative - making the whole strip draggable - is not
+   available here: the strip is thirteen buttons, and a drag that could start
+   on one of them would move the toolbar every time a tool press swiped.
+
+   `touch-action: none` ON THE HANDLE ONLY. It is what stops the browser
+   claiming a finger drag for a scroll before the pointermove handler ever
+   sees it, and it must not go on the strip: the strip's buttons want the
+   double-tap-zoom suppression `manipulation` gives them and nothing more,
+   and a strip-wide `none` would be Handwriting turning off native gestures
+   over chrome it does not need them for.
+
+   The dots are a background on a fixed-size child rather than six elements:
+   a 6px grid over a 12x18 window is exactly two columns of three. */
+.handwriting-tools-grip {
+	flex: 0 0 auto;
+	width: 24px;
+	align-self: stretch;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: 8px;
+	cursor: grab;
+	touch-action: none;
+}
+
+/* `--text-muted`, not `--text-faint`. The faintest token a theme has is what
+   a theme dims things it wants you to skip past, and on alan's screen a
+   1.6px dot in it came out invisible - his screenshot of the strip's leading
+   edge shows the fold chevron and no handle at all. The grip is the one
+   control you have to FIND before you can use it. Same finding as the
+   recording dot's an hour earlier, and the same rule holds: still a TOKEN, so
+   a theme that chose a deliberate palette still wins - it is the wrong token
+   that is being fixed, not the fact of using one. The radius goes with it;
+   2px on a 6px tile still leaves 2px of gap between dots. */
+.handwriting-tools-grip-dots {
+	width: 12px;
+	height: 18px;
+	background-image: radial-gradient(circle at 50% 50%, var(--text-muted) 1.25px, transparent 1.35px);
+	background-size: 6px 6px;
+	background-position: center;
+	background-repeat: repeat;
+}
+
+/* The cursor is the only thing that says a drag is in progress on a desktop,
+   and `grabbing` has to beat `grab` from the rule above rather than sit
+   beside it - hence the compound selector. On the pill the whole control is
+   the handle, so the class lands on it directly. */
+.handwriting-tools-grip:active,
+.handwriting-mobile-tools.is-dragging .handwriting-tools-grip {
+	cursor: grabbing;
+}
+
+.handwriting-pen-pill.is-dragging {
+	cursor: grabbing;
+}
+
+/* THE LIFTED LOOK. Shadow and opacity only: the scale rides in the inline
+   transform that `paintTransform` (MobileTools.ts) composes, because a
+   `transform` declared here would be replaced whole by the first
+   actions-row dodge - the trap `CornerSafeArea.test.ts` pins the middles
+   against. Pops are closed on drag start, so nothing hangs off the strip
+   while it is in the air. */
+.handwriting-mobile-tools.is-dragging,
+.handwriting-pen-pill.is-dragging {
+	box-shadow: var(--shadow-l, 0 8px 24px rgba(0, 0, 0, 0.28));
+	opacity: 1;
+}
+
+/* THE LAST FEW PX, from where the strip was let go to where the anchor put
+   it. On for the length of the flight and taken off again (ANCHOR_FLIGHT_MS,
+   MobileTools.ts), so the actions-row dodge - which writes the same property
+   on a resize - is never animated.
+
+   It replaces the strip's resting `transition` for those few frames rather
+   than extending it, and that is deliberate: the property this overrides is
+   the pen-down FADE, and a strip cannot be flying to an anchor and stepping
+   aside for a nib at the same moment. If a contact does land mid-flight the
+   fade is instant instead of 60ms, which is the correct priority. */
+.handwriting-mobile-tools.is-anchoring,
+.handwriting-pen-pill.is-anchoring {
+	transition: transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* Reduced motion gets the destination and not the trip. The class still goes
+   on and comes off exactly as it does otherwise, so there is one code path
+   and no `matchMedia` read anywhere in the strip. */
+@media (prefers-reduced-motion: reduce) {
+	.handwriting-mobile-tools.is-anchoring,
+	.handwriting-pen-pill.is-anchoring {
+		transition: none;
+	}
+}
+
 /* Hover only where hover exists: on glass these states stick to whatever was
    tapped last and read as a second active tool. */
 @media (hover: hover) {
@@ -645,6 +918,28 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	touch-action: manipulation;
 }
 
+/* Nothing in MobileTools.ts sets `el.hidden` today - Delete selection,
+   Lasso: copy selection and Lasso: paste dim instead (`is-disabled`/
+   `aria-disabled`), the owner's ruling after trying the hide on vault
+   test 2 and asking for the buttons back (2026-09-05). Kept anyway for
+   whichever button next needs `el.hidden`: `display: flex` two rules up
+   is an AUTHOR rule, and an author rule wins over the user-agent default
+   `[hidden] { display: none }` regardless of selector specificity or
+   source order, so without this override a hidden button would stay
+   laid out and painted - dimmed, hoverable, a not-allowed cursor on
+   hover - exactly what shipped to vault test 2 on 1.4.12-dev before this
+   override existed. `!important` outranks that `display: flex` outright
+   rather than relying on source order (source order alone would be
+   fragile against the block above being reordered later). */
+/* Scoped to `.handwriting-mobile-tool` only - not a general `[hidden]`
+   reset. `MobileTools.test.ts` pins this exact selector against the live
+   cascade, so widening it to a bare `[hidden]` rule would need that test
+   updated too. The near-identical twin below (`.handwriting-fold-reset`)
+   is scoped the same way, for its own class, for the same reason. */
+.handwriting-mobile-tool[hidden] {
+	display: none !important;
+}
+
 /*
  * setIcon svgs carry no width/height attributes: their whole rendered size
  * is `svg.svg-icon { width: var(--icon-size) }` (obsidian app.css). If
@@ -677,33 +972,85 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	opacity: 0.35;
 }
 
-/* Slider pops: a vertical drop-down under its tool button (up = bigger,
-   vertical-lr + rtl; the -webkit-appearance fallback covers webkit builds
-   that predate vertical writing-mode on range inputs), with a live value
-   readout underneath - on glass without hover there is no other feedback.
-   Positioned per-show in refresh(), wrap-safe. */
+/*
+ * Slider pops: the drop-down under a tool button. Positioned per-show in
+ * refresh(), wrap-safe.
+ *
+ * ONE FLAT COLUMN (1.4.12): a full-width horizontal slider, a hairline, the
+ * saved pens, a hairline, the palette. It used to lead with the slider stood
+ * on end in a 28x104 slot and a live number under it, and those two alone
+ * were taller than every other row in the pop put together. Flat, the pop
+ * loses about a third of its height and gains a thumb's worth of width, and
+ * the point of the whole control is that it stays out of the way: "it's
+ * supposed to be small and out of the way, the UI, that's why people like
+ * it" (alan, 2026-09-05).
+ *
+ * A DECLARED WIDTH, not shrink-to-fit. The pop had no width of its own, so
+ * its width was whatever its widest child measured - which made the pop slide
+ * sideways under a dragging finger whenever the number under the slider
+ * gained or lost a character (alan, hardware, 2026-09-02: "like the slider is
+ * just vibrating"), and made it jump 28px wider the moment a fourth pen was
+ * starred. The number is gone, but a declared width is what makes both
+ * structurally impossible rather than merely unlikely: `hangUnder` re-centres
+ * the pop from its measured `offsetWidth` on every refresh, and that
+ * measurement is now a constant.
+ *
+ * 144px is not a new size - it is the width this pop ALREADY reached with
+ * four pens saved, when a full preset row of five 22px chips on 6px gaps
+ * (134px) was the widest child it had. So the pop is never wider than what
+ * ships today; it has simply stopped changing. Inside it, a 126px content
+ * box holds every row: the preset row packs its five cells into exactly that
+ * (22px chips on 4px gaps), the palette spreads its 4 x 22px grid across the
+ * same span, and the slider takes the whole 126 as travel, against the 96px
+ * the rotated slot gave it.
+ *
+ * FULLY OPAQUE, where it used to be 0.92. Translucency over a page is exactly
+ * what a palette must not have - a swatch showing page text or ink through
+ * itself is not showing its colour, which is the one thing it is for - and on
+ * e-ink there is no compositing worth the name, so the alpha only ever greyed
+ * the border. The shadow and the border say "floating"; the fill says
+ * "readable".
+ */
 .handwriting-slider-pop {
 	display: none;
 	position: absolute;
 	will-change: transform;
-	/* layout+style only: the rotated slider paints outside its layout box
-	   by design, and paint containment clips it (and the value readout). */
+	/* layout+style only, NOT paint: the current swatch and the current preset
+	   chip are marked by a box-shadow ring that paints outside their own
+	   boxes, and paint containment would clip the ring off the row's end
+	   chips. */
 	contain: layout style;
 	top: 100%;
 	margin-top: 4px;
 	flex-direction: column;
 	align-items: center;
-	gap: 4px;
-	padding: 8px 4px 6px;
+	gap: 6px;
+	/* Even all round. The end chip of a full preset row sits flush against
+	   the content box and wears a 3.5px `is-current` ring, so the side
+	   padding is also that ring's clearance from the border. */
+	padding: 8px;
+	/* Stated rather than inherited: the declared width above is the number the
+	   whole pop is laid out against, and it must mean the same thing whatever
+	   box model the host's stylesheet happens to be handing out. */
+	box-sizing: border-box;
+	width: 144px;
 	background: var(--background-secondary);
 	border: 1px solid var(--background-modifier-border);
 	border-radius: 10px;
 	box-shadow: var(--shadow-s, 0 2px 8px rgba(0, 0, 0, 0.15));
-	opacity: 0.92;
 	/* Same reason as the slider inside it: a contact landing on the pop's
 	   padding and sliding onto the track must not spend the first few
 	   millimetres being considered as a scroll. */
 	touch-action: none;
+}
+
+/* The hairline between the pop's sections. Its own element rather than a
+   border-top on the row below, so a row that is momentarily empty takes its
+   rule with it instead of leaving one hanging over nothing. */
+.handwriting-pop-rule {
+	width: 100%;
+	height: 1px;
+	background: var(--background-modifier-border);
 }
 
 /* In a bottom corner the strip sits at the screen edge, so anything hung
@@ -711,7 +1058,8 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
    (alan, 2026-08-31). Bottom corners hang their pops and the tooltip
    ABOVE the strip instead. */
 .handwriting-mobile-tools.handwriting-corner-bottom-right .handwriting-slider-pop,
-.handwriting-mobile-tools.handwriting-corner-bottom-left .handwriting-slider-pop {
+.handwriting-mobile-tools.handwriting-corner-bottom-left .handwriting-slider-pop,
+.handwriting-mobile-tools.handwriting-corner-bottom-center .handwriting-slider-pop {
 	top: auto;
 	bottom: 100%;
 	margin-top: 0;
@@ -719,7 +1067,8 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 }
 
 .handwriting-mobile-tools.handwriting-corner-bottom-right .handwriting-strip-tip,
-.handwriting-mobile-tools.handwriting-corner-bottom-left .handwriting-strip-tip {
+.handwriting-mobile-tools.handwriting-corner-bottom-left .handwriting-strip-tip,
+.handwriting-mobile-tools.handwriting-corner-bottom-center .handwriting-strip-tip {
 	top: auto;
 	bottom: 100%;
 	margin-top: 0;
@@ -731,33 +1080,37 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 }
 
 /*
- * Vertical by ROTATION, deliberately. Native vertical range inputs are a
- * compatibility minefield: chromium removed -webkit-appearance:
- * slider-vertical (129), writing-mode on range landed late everywhere, and
- * older webkit has neither - both a chromium 150 and an old ipados build
- * rendered the "vertical" slider horizontal on release day. A transform
- * renders identically on every engine ever shipped, and pointer hit-testing
- * follows the transform natively. Right end points UP, so up = bigger.
+ * The size slider, LEFT THE WAY THE ENGINE DRAWS IT: horizontal.
+ *
+ * It used to be stood on end with `transform: rotate(-90deg)` inside a 28x104
+ * slot, and the rotation was chosen carefully - native vertical range inputs
+ * are a compatibility minefield (chromium removed -webkit-appearance:
+ * slider-vertical in 129, writing-mode on range landed late everywhere, and
+ * both a chromium 150 and an old ipados build rendered the "vertical" slider
+ * horizontal on release day), where a transform renders identically on every
+ * engine ever shipped. None of that argument is wrong. What it cost is the
+ * point: a 104px-tall slot for a control 22px of which is the thumb, in a pop
+ * whose whole job is to be small, and a drag axis that runs across the
+ * narrowest dimension of the thing you are holding the device by.
+ *
+ * Flat, the same slider is one 22px row, has 126px of travel where the slot
+ * gave it 96, and needs no compatibility argument at all - horizontal is what
+ * a range input is.
+ *
+ * TWO CLASSES on purpose: app.css styles `input[type='range']` (0,1,1), which
+ * beats a single class, and its `width: 100px` silently won here before.
  */
-.handwriting-slider-slot {
-	position: relative;
-	width: 28px;
-	height: 104px;
-}
-
 .handwriting-slider-pop .handwriting-eraser-slider {
-	position: absolute;
-	left: 50%;
-	top: 50%;
-	/* Two classes on purpose: app.css styles `input[type='range']`
-	   (0,1,1), which beats a single class - its width: 100px and 4px
-	   track height silently won here, and the rotated slider spilled
-	   12px past both ends of the old margin-derived slot (the thumb
-	   crossed the pop's border at max). The slot div is the layout
-	   truth; the input just centers inside it. */
-	width: 96px;
+	-webkit-appearance: none;
+	appearance: none;
+	width: 100%;
+	/* The row's height is the THUMB's, so the finger's target is the full
+	   row and not the 4px track under it. */
+	height: 22px;
 	margin: 0;
-	transform: translate(-50%, -50%) rotate(-90deg);
+	padding: 0;
+	background: none;
+	border: none;
 	/*
 	 * none, not manipulation. `manipulation` drops the double-tap-zoom wait
 	 * but still PERMITS panning, so on a control you drag, the compositor has
@@ -773,6 +1126,101 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	 * The buttons keep `manipulation` on purpose - they are taps.
 	 */
 	touch-action: none;
+	cursor: pointer;
+}
+
+/* The track. Drawn rather than inherited: app.css's own range styling is a
+   theme's to change, and a pop that is 142px wide by agreement cannot have a
+   track whose height a theme decides. */
+/* The track BOX is the thumb's height and the visible 4px line is painted
+   down the middle of it with a background - the same construction as
+   `.handwriting-mobile-tools-divider`, which is a 9px box with a 1px hairline
+   centred in it, and for the same reason.
+
+   The box used to BE the 4px line, and the thumb was pulled onto its centre
+   line by hand with `margin-top: -7px`, i.e. `(4 - 18) / 2`. That arithmetic
+   is only exact while the box renders at exactly 4 device pixels. On a
+   fractional device pixel ratio the painted track snaps to a whole number of
+   device pixels and the hand-computed offset no longer halves it, so the knob
+   sits off the line by the rounding error - which is what alan sees on orion
+   ("look at the dot, it's off center") and what a dev machine at ratio 1
+   never shows. Two equal boxes centre at any ratio, zoom or engine, with no
+   number to get wrong. */
+.handwriting-slider-pop .handwriting-eraser-slider::-webkit-slider-runnable-track {
+	height: 18px;
+	background-color: transparent;
+	background-image: linear-gradient(
+		var(--background-modifier-border),
+		var(--background-modifier-border)
+	);
+	background-size: 100% 4px;
+	background-position: center;
+	background-repeat: no-repeat;
+	border: none;
+}
+
+.handwriting-slider-pop .handwriting-eraser-slider::-moz-range-track {
+	height: 18px;
+	background-color: transparent;
+	background-image: linear-gradient(
+		var(--background-modifier-border),
+		var(--background-modifier-border)
+	);
+	background-size: 100% 4px;
+	background-position: center;
+	background-repeat: no-repeat;
+	border: none;
+}
+
+/*
+ * The thumb, at 18px - a real finger target, which is the whole reason the
+ * slider was unrotated. It is FILLED with the accent and RINGED against the
+ * pop, the same two-layer trick the current swatch and the current preset
+ * chip use: on e-ink the accent and the border are two greys, so the thumb
+ * has to differ from its track in SIZE and SHAPE and not only in colour.
+ *
+ * NO `margin-top`. A webkit thumb is positioned from the track's top edge,
+ * not its middle, so the offset that centres it is `(track - thumb) / 2` -
+ * and the track above is now the thumb's own height, which makes that zero at
+ * every device pixel ratio. The firefox pair below never carried an offset
+ * (`::-moz-range-thumb` is centred on its track by the engine) and must not
+ * gain one: the bug was webkit's alone.
+ */
+.handwriting-slider-pop .handwriting-eraser-slider::-webkit-slider-thumb {
+	-webkit-appearance: none;
+	appearance: none;
+	width: 18px;
+	height: 18px;
+	border-radius: 50%;
+	background: var(--interactive-accent);
+	border: 2px solid var(--background-secondary);
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+	margin-top: 0;
+	/*
+	 * NOT POSITIONED BY THE HOST. Obsidian's own stylesheet places every
+	 * range thumb itself - `position: relative; top: var(--slider-thumb-y)`
+	 * on this same pseudo-element, an upward shift (-6px on desktop, -9px
+	 * on mobile) computed for ITS 6px track and ITS thumb. This rule is the
+	 * more specific, so every property it declares wins and every property
+	 * it does not is still the host's: with no `position` here the host's
+	 * shift landed on top of the equal-height boxes above, on every machine,
+	 * at every scale, in every theme, a radius above the line (alan and a
+	 * second user, 2026-09-06). `static` makes `top` inert whatever its
+	 * value, which is the point: no counter-offset, because a number here
+	 * would be right only until the host's number moved - the same mistake
+	 * `margin-top: -7px` was. The firefox pair below never had the host's
+	 * shift (the host rule is webkit-only) and must not gain a correction.
+	 */
+	position: static;
+}
+
+.handwriting-slider-pop .handwriting-eraser-slider::-moz-range-thumb {
+	width: 18px;
+	height: 18px;
+	border-radius: 50%;
+	background: var(--interactive-accent);
+	border: 2px solid var(--background-secondary);
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
 }
 
 /* Stroke | Reticle chips at the top of the eraser's pop. */
@@ -800,24 +1248,28 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	border-color: var(--interactive-accent);
 }
 
-/* Color swatches: a row of the active tool's palette; current one ringed. */
 /*
+ * Colour swatches: THIS NIB's palette, inside THIS NIB's size pop, current
+ * one ringed.
+ *
+ * They used to be a pop of their own, hung under an "Ink color" strip
+ * button. That button is gone - "13 buttons is too much, especially on
+ * phone" (alan, 2026-09-05) - and its cycle moved in here, so a nib's pop is
+ * now the one place that answers both questions a nib has: how big, and what
+ * colour. `.handwriting-color-pop` and its `:not(.is-showing)` pair went
+ * with the button; the row below rides its parent pop's own `is-showing`,
+ * which is why it needs no display rule of its own and cannot repeat that
+ * pop's history of staying painted while shut.
+ *
  * Eight swatches in a deterministic 4 x 2, not a row told to fold inside a
  * pixel budget. The budget was guessed against a 22px swatch on a desktop and
  * came out two-wide in a three-wide box on an ipad: any platform that pads or
  * sizes differently gets a different answer, and none of them are checkable
- * from here. A column count cannot drift.
+ * from here. A column count cannot drift. Carried over unchanged: the
+ * highlighter's five swatches fill the first row and half the second, which
+ * is the same shape at a smaller count.
  */
-/* Two classes each, because the base rules carry two: the single-class
-   grid rule silently OUTRANKED the base display:none (later at equal
-   specificity), so a closed palette stayed painted - with its stale
-   swatches - forever. Masked for weeks by strip teardown; found the first
-   night a strip lived long enough (alan, pen taps, 2026-08-31). */
-.handwriting-color-pop:not(.is-showing) {
-	display: none;
-}
-
-.handwriting-color-pop.is-showing {
+.handwriting-pop-colors {
 	display: grid;
 	/* Fixed, not auto: an `auto` track's minimum is content-based, and an
 	   empty swatch button's content-based minimum is near zero, so a pop
@@ -826,10 +1278,102 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	   circles (batendalyn, Boox Tab XC, 2026-09-02). A fixed 22px track
 	   cannot be squeezed by anything short of an explicit resize. */
 	grid-template-columns: repeat(4, 22px);
+	/* SPREAD to the pop's content box, not centred in it. The tracks stay a
+	   fixed 22px - the free space goes into the gutters, so nothing here can
+	   squeeze a swatch into an oval - and the row then starts and ends
+	   exactly where the hairline above it does, and exactly where a full
+	   preset row does. Centred, the 106px grid sat inside a 134px box with
+	   14px of slack a side, and the two rows visibly disagreed about where
+	   the pop's edges were. */
+	width: 100%;
+	justify-content: space-between;
 	justify-items: center;
 	align-items: center;
-	gap: 6px;
-	padding: 8px;
+	row-gap: 6px;
+	/* No margin and no rule of its own any more: the pop draws its hairlines
+	   as elements (`.handwriting-pop-rule`) and spaces its rows with its own
+	   `gap`, so this row states its grid and nothing else. */
+}
+
+/**
+ * Quick pens (1.4.12 §10): the chip row at the top of a nib's pop, above the
+ * swatches.
+ *
+ * A FLEX ROW, not the swatches' fixed grid, and the difference is the point:
+ * the swatch grid is a fixed 4x22px because a palette is a known eight and a
+ * squeezed track drew ovals on a Boox (see above). This row holds one to five
+ * children, its own count changes as pens are starred and forgotten, and it
+ * must not reserve four empty cells on a fresh install - the pop would gain a
+ * blank strip for a feature nobody had used.
+ *
+ * A FULL ROW IS THE POP'S WIDTH, and that is now deliberate rather than
+ * incidental: five 22px cells on 6px gaps come to 134px, which is exactly the
+ * pop's content box, so the row fills it at five and centres itself at fewer.
+ * It cannot wrap, and it cannot widen the pop, so starring a fourth pen no
+ * longer changes the shape of the thing under the finger.
+ */
+.handwriting-pop-presets {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	justify-content: center;
+	/* 4px, tighter than the swatch grid's gutters on purpose: five 22px cells
+	   and four gaps have to come to the pop's 126px content box exactly, and
+	   a packed row of pens is a different thing from a spread palette. */
+	gap: 4px;
+	/* Full width so a SHORT row still centres on the pop's middle rather
+	   than on whatever the row happens to measure. */
+	width: 100%;
+}
+
+.handwriting-preset-chip,
+.handwriting-preset-star {
+	/* The swatch's cell, so a chip and a swatch are the same target: 22px
+	   is what the pop's width was measured against. */
+	width: 22px;
+	height: 22px;
+	padding: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 50%;
+	background: transparent;
+	box-shadow: none;
+	cursor: pointer;
+}
+
+/**
+ * The dot inside the chip, whose diameter is the preset's width multiplier
+ * (`presetDotPx`). Sized inline, not here: the number is a decision the pure
+ * model makes and a test reads, and a stylesheet cannot be handed a
+ * multiplier.
+ */
+.handwriting-preset-dot {
+	border-radius: 50%;
+	/* The chip's own border is the ring; the dot needs none of its own, or a
+	   white preset would wear two circles. */
+	pointer-events: none;
+}
+
+/**
+ * The pen in hand. A RING, not a colour change: this row is read on e-ink,
+ * where the accent and the border are two greys, so the current chip has to
+ * differ in SHAPE as well - the double shadow draws a gap and then a solid
+ * ring, the same two-layer trick the current swatch uses so the two rows say
+ * "this one" the same way.
+ */
+.handwriting-preset-chip.is-current {
+	box-shadow: 0 0 0 2px var(--background-secondary), 0 0 0 3.5px var(--interactive-accent);
+}
+
+.handwriting-preset-star {
+	color: var(--text-muted);
+}
+
+.handwriting-preset-star svg {
+	width: 14px;
+	height: 14px;
 }
 
 .handwriting-color-swatch {
@@ -846,27 +1390,161 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	box-shadow: 0 0 0 2px var(--background-secondary), 0 0 0 3.5px var(--interactive-accent);
 }
 
-.handwriting-slider-val {
-	font-size: 11px;
-	/* tabular-nums is a REQUEST, not a guarantee. Georgia has old-style
-	   figures and no `tnum` feature, so the declaration silently does
-	   nothing there and the digits are genuinely unequal - 4.734px for `1`
-	   against 6.766px for `0`. The readout is padded to a constant
-	   character count, which cannot save a label whose characters are not
-	   constant width, so a serif interface theme reproduced the pop-width
-	   judder this padding exists to stop. Pinning the font is what makes
-	   the padding mean anything; monospace is already this stylesheet's
-	   choice for every other numeric readout. */
-	font-family: var(--font-monospace);
+/*
+ * The slider's current value, on its own row under the track.
+ *
+ * It is BACK (the owner, 2026-09-06: "as well"; a second user: "if the number
+ * is there then it is easier to set on ones liking") - and it is not the
+ * readout that went in 1.4.12. That one had no box of its own inside a pop
+ * that had no width of its own, so every change in the digits' width was a
+ * change in the pop's width, and the pop moved under the finger. The pop
+ * declares its width now, so nothing it holds can move it; and this box has
+ * a FIXED width of its own besides, so the track above it does not depend
+ * on the digits either - belt and braces, each measured separately in
+ * test/render/PopGeometry.test.ts.
+ *
+ * 4ch is the widest value any of the three sliders can hold: the pen's
+ * "6.56"-shaped values (its 0.66px min is off the 0.1 grid, so its values
+ * carry two decimals), against the eraser's and highlighter's two digits.
+ * `ch` is the advance of a digit, so with tabular figures four of them hold
+ * any four-character value; a face that ignores `tnum` can jitter the
+ * glyphs inside the box, not the box. Not `min-width`: a floor can be
+ * exceeded, and an exceeded floor is exactly the width change this rule is
+ * here to make impossible. Overflow, should a face ever be that wide,
+ * paints outside the box and moves nothing.
+ *
+ * The mode chip's type - 10px, 1.4, the muted token - so the pop keeps to
+ * one scale. No unit: nothing else in the pop carries a caption.
+ */
+.handwriting-slider-num {
+	font-size: 10px;
+	line-height: 1.4;
+	color: var(--text-muted);
 	font-variant-numeric: tabular-nums;
-	/* The readout floats over the PAGE, not over strip chrome - muted gray
-	   on a white note was unreadable (glass, 2026-08-31). Normal text on a
-	   chip of the strip's own background, whatever the theme. */
-	color: var(--text-normal);
-	background: var(--background-secondary);
-	border: 1px solid var(--background-modifier-border);
-	border-radius: 6px;
-	padding: 1px 6px;
+	width: 6ch;
+	flex: none;
+	text-align: center;
+	white-space: nowrap;
+	overflow: visible;
+}
+
+/* ---- the folded second row ---- */
+
+/*
+ * "More": the chevron at the end of the row, and the row it opens.
+ *
+ * The strip already wrapped when it did not fit (`flex-wrap: wrap`, above,
+ * "Phones: the row is wider than the screen wants; wrap instead of clip"),
+ * which kept every button reachable and let the pane decide which ones went
+ * below the fold. This replaces that accident with a decision: named buttons
+ * fold, in a fixed order, behind a control that says there is more (alan,
+ * 2026-09-05, on the second row: "if it's really what other phones do i'm
+ * more comfortable with it").
+ *
+ * BOTH ELEMENTS ALWAYS EXIST and neither is painted unless the row actually
+ * overflowed - `is-more-needed`, set by `layoutOverflow` from a real
+ * measurement. Desktops and tablets never see either.
+ */
+.handwriting-tools-more {
+	display: none;
+}
+
+.handwriting-mobile-tools.is-more-needed .handwriting-tools-more {
+	display: flex;
+}
+
+/* `width: 100%` on a wrapping flex row is what MAKES the second row a second
+   row: it cannot share a line with anything, so the buttons above it keep one
+   line and this starts another. No `flex-basis`, which would be a hint the
+   row's own content could argue with. */
+.handwriting-mobile-tools-more {
+	display: none;
+	width: 100%;
+	/*
+	 * CENTRED under the first row. The row is `width: 100%` by construction
+	 * (see above), so it is always exactly as wide as the strip while holding
+	 * fewer buttons than the row above it - which means there is always
+	 * leftover space, and the only question is where it goes. Packed to one
+	 * end, all of it collects on the other and the strip reads as a rectangle
+	 * with a bite out of one corner: "blocks are uneven" (alan, 2026-09-05,
+	 * with a screenshot). Split evenly, the two rows share a centreline and
+	 * the fold reads as one block.
+	 *
+	 * Alignment only. Which buttons fold, and in what order, is `overflowPlan`
+	 * and is untouched by this.
+	 */
+	justify-content: center;
+	gap: 2px;
+	/* Clear of the row above by the same 2px gap the row uses internally,
+	   plus a hairline, so the fold reads as a fold rather than as the strip
+	   having grown taller. */
+	margin-top: 4px;
+	padding-top: 4px;
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.handwriting-mobile-tools.is-more-open .handwriting-mobile-tools-more {
+	display: flex;
+}
+
+/* ---- the strip that will not fit on one line at all ---- */
+
+/*
+ * THE WRAPPED STRIP, as a grid.
+ *
+ * Below the width where `overflowPlan` runs out of buttons to fold, the row
+ * is wider than the pane whatever it does. `flex-wrap: wrap` above is the
+ * failsafe that catches that, and left to itself it is a bad one: it packs
+ * each line greedily, so the lines come out different lengths, the last one
+ * holds whatever was left over, and the GROUP DIVIDERS - a hairline that
+ * means "these three belong together" in ONE row - end up standing at the
+ * end of lines they divide nothing on. Alan, with a screenshot (2026-09-06):
+ * "hide the dividers whenver the strip is wrapped and thenmake the wrap an
+ * even grid".
+ *
+ * `is-wrapped` is set by `layoutOverflow` from `plan.fits` - the plan's own
+ * report that it could not make the row fit - and never from the strip's
+ * measured height, which is an output of this very layout. `--hw-strip-cols`
+ * and `--hw-strip-cell` are written beside it, both derived from numbers that
+ * pass was already holding: the pane's width and the collapse button's box.
+ * The cell comes from the code rather than from a number repeated here
+ * because a theme that resizes the buttons must resize the columns with them,
+ * and a stylesheet cannot be told what a button measured.
+ */
+.handwriting-mobile-tools.is-wrapped {
+	display: grid;
+	grid-template-columns: repeat(var(--hw-strip-cols, 2), var(--hw-strip-cell, 32px));
+	/* The tracks are exactly as wide as the strip, so this decides nothing
+	   today; it is here so a theme that widens the strip centres the grid in
+	   it rather than dropping it against one edge. */
+	justify-content: center;
+}
+
+/* The whole of the owner's first sentence. Hidden rather than made
+   transparent: a divider that still occupies a cell is a hole in the grid,
+   and this state's cells are counted, not measured. */
+.handwriting-mobile-tools.is-wrapped .handwriting-mobile-tools-divider {
+	display: none;
+}
+
+/* The grip is 24px in a row and a whole cell in the grid: a 24px handle
+   left-aligned in a 32px column is the "half-width" the brief rules out, and
+   a wider handle on a narrow pane is the one place extra target is free. */
+.handwriting-mobile-tools.is-wrapped .handwriting-tools-grip {
+	width: auto;
+}
+
+/* An inline-block blockified into a grid item fills its cell and lays its
+   glyph out from the left; the dot is a dot and belongs in the middle of the
+   cell the count gave it. */
+.handwriting-mobile-tools.is-wrapped .handwriting-recording-dot {
+	justify-self: center;
+}
+
+/* The folded row spans the grid the way `width: 100%` made it span the flex
+   line: it is a row, not a cell, and it must not be dealt a column. */
+.handwriting-mobile-tools.is-wrapped .handwriting-mobile-tools-more {
+	grid-column: 1 / -1;
 }
 
 /* Collapsed: the strip yields to a single pill (PencilKit's move). Both
@@ -900,7 +1578,14 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	box-shadow: none;
 	color: var(--text-muted);
 	opacity: 0.92;
-	touch-action: manipulation;
+	/* `none`, not `manipulation`, since 1.4.12: the pill IS the drag handle
+	   while the strip is folded away, and a finger drag on it has to reach
+	   the pointermove handler rather than being claimed by the browser for a
+	   scroll. Strictly stronger than what it replaces - `none` suppresses the
+	   double-tap zoom delay `manipulation` was here for, and the rest of it
+	   besides - and it is the HANDLE, not the strip, so the rule the grip's
+	   comment gives for keeping `none` off the strip is not weakened. */
+	touch-action: none;
 }
 
 .handwriting-pen-pill.is-showing {
@@ -1308,8 +1993,18 @@ body.handwriting-active-page .status-bar {
 .handwriting-recording-dot {
 	display: none;
 	/* Accent, not alarm-red: a red pulse read as surveillance to the
-	   very people the friendly tooltip exists for. */
-	color: var(--text-accent);
+	   very people the friendly tooltip exists for.
+
+	   `--interactive-accent`, NOT `--text-accent`. Both are the theme's
+	   accent, but `--text-accent` is the LINK colour and plenty of themes
+	   neutralise it - on alan's own theme it resolved grey for the whole
+	   pulse (2026-09-06: "grey all the way through"), which is the one
+	   thing a recording indicator may not be. `--interactive-accent` is the
+	   colour the app paints its own switches and buttons with, so a theme
+	   that keeps any accent at all keeps this one. Still the THEME's colour:
+	   nothing here hardcodes a purple, because a theme that chose a
+	   deliberate accent should win. */
+	color: var(--interactive-accent);
 	font-size: 12px;
 	padding: 0 6px;
 	align-self: center;
@@ -1377,4 +2072,451 @@ body.handwriting-boox .handwriting-recording-dot {
 body.handwriting-boox .handwriting-mobile-tool:active:not(.is-disabled),
 body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
 	transform: none;
+}
+
+/*
+ * "THE COMMANDS IT ADDS" (settings > Handwriting > Commands).
+ *
+ * "this is hilariously dense" (alan, 2026-09-06): the row printed all
+ * forty-three gated command names as one comma run. The list stays - it is the
+ * only place a user can see what there is to bind - and reads as one short line
+ * per kind, a label and its names, built by `renderGatedCommands`.
+ *
+ * ONE TEXT FLOW PER LINE, not a label column and a names column. A column of
+ * labels would have to be as wide as "Save current highlighter as preset",
+ * which is most of a phone-width settings pane, and the names beside it would
+ * then wrap to one word a line. Inline, a line wraps like the sentence it is,
+ * and the hanging indent keeps the label the leftmost thing on it at any width.
+ */
+.handwriting-gated-row {
+	/* Under the row's name, not in the control column: there is no widget on
+	   this row, and lines do not belong in a column sized for a toggle. */
+	display: block;
+}
+
+.handwriting-gated-row .setting-item-control:empty {
+	display: none;
+}
+
+.handwriting-gated-list {
+	margin-top: 6px;
+	max-width: 600px;
+	font-size: var(--font-ui-smaller, 12px);
+	line-height: 1.45;
+}
+
+.handwriting-gated-group {
+	padding-left: 1em;
+	text-indent: -1em;
+}
+
+.handwriting-gated-group + .handwriting-gated-group {
+	margin-top: 2px;
+}
+
+.handwriting-gated-label {
+	color: var(--text-normal);
+	font-weight: var(--font-medium, 500);
+}
+
+.handwriting-gated-names {
+	color: var(--text-muted);
+}
+
+/*
+ * THE MORE BUTTON's order (settings > Handwriting > Toolbar).
+ *
+ * Alan, on the third mock: "it's too wide" - so the card and the preview box
+ * are capped at 600px and left-aligned under the setting name, and the list is
+ * as wide as its own widest row (see `.handwriting-fold-list`). Nothing here
+ * spans the settings column. Every colour is a theme variable, so both themes
+ * and every community theme are covered without a second block.
+ *
+ * E-INK: the dragged row is lifted by a THICKER border and a shadow, never by
+ * colour alone. A boox renders the accent as one more shade of grey, and a drag
+ * whose only cue is a hue is a drag with no cue at all on the devices this
+ * plugin is most used on.
+ */
+.handwriting-fold-order-row {
+	/* The control goes UNDER the name, not into the narrow control column a
+	   settings row would otherwise squeeze it into. */
+	display: block;
+}
+
+/* That column is empty on this row - there is no toggle or dropdown to put in
+   it - and an empty flex box still takes its margins, which reads as a gap
+   nobody put there. */
+.handwriting-fold-order-row .setting-item-control:empty {
+	display: none;
+}
+
+.handwriting-fold-order {
+	margin-top: 12px;
+}
+
+.handwriting-fold-card {
+	max-width: 600px;
+	padding: 16px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	background: var(--background-primary);
+}
+
+.handwriting-fold-head {
+	font-weight: var(--font-semibold, 600);
+	font-size: var(--font-ui-smaller, 12px);
+	margin-bottom: 2px;
+}
+
+.handwriting-fold-cap,
+.handwriting-fold-preview-width {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller, 12px);
+}
+
+/* ---- the six that are always shown ---- */
+.handwriting-fold-fixed-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	min-width: 0;
+	margin-bottom: 16px;
+}
+
+/* The strip's own class, with only what makes a strip a strip undone: it is
+   not floating over a note here, so it is not positioned, not raised and not
+   translucent. Everything else - the size, the radius, the border, the theme's
+   surface - is inherited from the toolbar's own rules, which is the point. */
+.handwriting-fold-fixed-bar {
+	position: static;
+	flex: 0 0 auto;
+	flex-wrap: nowrap;
+	max-width: none;
+	opacity: 1;
+	box-shadow: none;
+	contain: none;
+	will-change: auto;
+	transition: none;
+}
+
+/* "the first row of icons is not colored in" - they are now: full text colour,
+   and the two nibs carry their real ink inline, which wins over this. */
+.handwriting-fold-fixed-btn {
+	color: var(--text-normal);
+	pointer-events: none;
+}
+
+/* ---- the list ---- */
+
+/*
+ * AS WIDE AS ITS WIDEST ROW, AND NO WIDER.
+ *
+ * "why is there so much space still on the right" (alan, 2026-09-06). The list
+ * was a 400px block and the rows filled it, so a row saying "Pan" drew a border
+ * three hundred pixels past the word - five rows deep, under a pill of six
+ * icons that is exactly as wide as its own content, which is what made the
+ * emptiness impossible to miss. It is the ruling he already gave this control
+ * one level out ("it is the whole thing look to the right", which capped the
+ * card at 600px), applied to the rows inside it.
+ *
+ * `fit-content` rather than a smaller fixed width: the labels are the strip's
+ * own button names, they differ by device - "Keyboard mode (pen input off)" is
+ * built only where a pen has been seen - and any number typed here would be
+ * wrong on some of them. The rows stay a SINGLE width (they are stretch items
+ * in a column, so they all take the widest one's) because the dashed line spans
+ * the list and a ragged right edge under a straight line reads as a mistake.
+ *
+ * The floor is what stops the answer becoming a sliver: a row is a drag handle
+ * and a drop target before it is a label, and a list of "Pan" and "Redo" would
+ * otherwise shrink to a couple of centimetres. `min()` so a settings pane
+ * narrower than the floor still gets a list inside its own card rather than one
+ * hanging out of the side of it.
+ *
+ * COSTS NOTHING PER FRAME. This is intrinsic sizing of a six-row list, done at
+ * layout; a drag moves rows with `transform` alone and never reads or writes a
+ * width, so nothing here is on the dragging path.
+ */
+.handwriting-fold-list {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	/* 16px of room at the foot so the line has somewhere to sit when nothing
+	   is behind More and it drops below the last row. */
+	padding: 6px 0 16px;
+	width: fit-content;
+	min-width: min(200px, 100%);
+	max-width: 400px;
+}
+
+.handwriting-fold-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	height: 36px;
+	padding: 0 10px 0 6px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	background: var(--background-secondary);
+	min-width: 0;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.handwriting-fold-row {
+		transition: transform 150ms cubic-bezier(0.2, 0.7, 0.3, 1);
+	}
+}
+
+/* The row under the finger: 2px where the others have 1, plus elevation. The
+   thickness is the half that survives greyscale. Its transform is written by
+   the drag itself, so it must not be animated back to where it came from.
+
+   THE PADDING PAYS FOR THE BORDER, one pixel a side. The list is as wide as
+   its widest row's border box, so a row that grew 2px on pick-up would widen
+   the list, the dashed line and every other row at the moment a grip went
+   down - measured at 222.75px at rest against 224.75px dragging before this
+   line existed. Keeping the box the same size is also what keeps the pick-up
+   off the layout path entirely. */
+.handwriting-fold-row.is-dragging {
+	border-width: 2px;
+	padding: 0 9px 0 5px;
+	border-color: var(--interactive-accent);
+	background: var(--background-primary);
+	box-shadow: var(--shadow-l, 0 8px 22px rgba(0, 0, 0, 0.35));
+	transition: none;
+	z-index: 5;
+}
+
+.handwriting-fold-index {
+	flex: 0 0 auto;
+	width: 12px;
+	text-align: right;
+	color: var(--text-faint);
+	font-size: var(--font-ui-smaller, 12px);
+	font-variant-numeric: tabular-nums;
+	user-select: none;
+}
+
+.handwriting-fold-grip {
+	flex: 0 0 auto;
+	width: 24px;
+	height: 28px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 0;
+	border: none;
+	box-shadow: none;
+	background: transparent;
+	color: var(--text-muted);
+	border-radius: 4px;
+	cursor: grab;
+	/* ON THE GRIP ALONE. The list itself has to keep scrolling under a finger;
+	   only the handle may swallow the gesture. */
+	touch-action: none;
+}
+
+.handwriting-fold-grip:active {
+	cursor: grabbing;
+}
+
+.handwriting-fold-grip:focus-visible,
+.handwriting-fold-reset:focus-visible {
+	outline: 2px solid var(--interactive-accent);
+	outline-offset: 1px;
+}
+
+@media (hover: hover) {
+	.handwriting-fold-grip:hover {
+		color: var(--text-normal);
+		background: var(--background-modifier-hover);
+	}
+}
+
+.handwriting-fold-icon {
+	flex: 0 0 auto;
+	display: flex;
+	align-items: center;
+	color: var(--text-normal);
+}
+
+.handwriting-fold-icon .svg-icon,
+.handwriting-fold-grip .svg-icon {
+	width: var(--icon-size, 18px);
+	height: var(--icon-size, 18px);
+}
+
+.handwriting-fold-name {
+	flex: 1 1 auto;
+	min-width: 0;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	font-size: var(--font-ui-small, 13px);
+}
+
+/*
+ * THE LINE, and it is drawn at EVERY width.
+ *
+ * "what happened to the purple line, it syas everything fits on this screen at
+ * the botttm, i read that to mean all 6 of those tools are going to appear on
+ * the fold" - a line that vanished whenever nothing moved took the only mark of
+ * where the split is off the list. So it is always there: in the gap under the
+ * last row that stays, and BELOW the last row entirely when they all stay.
+ *
+ * Positioned from a count, never inserted between two rows, so it costs the
+ * list no layout and a drag never has to step over it. 6px of top padding, then
+ * one 36px row plus its 4px gap for each row that stays, less half a gap to sit
+ * the line in the middle of it.
+ */
+.handwriting-fold-line {
+	position: absolute;
+	left: 0;
+	right: 0;
+	height: 0;
+	z-index: 4;
+	pointer-events: none;
+	border-top: 1px dashed var(--interactive-accent);
+	top: calc(6px + 40px * var(--handwriting-fold-keep, 6) - 2px);
+}
+
+/* It says what lives under it. From the stylesheet rather than a text node, so
+   the list holds nothing but rows. */
+.handwriting-fold-line::after {
+	content: "More";
+	position: absolute;
+	right: 0;
+	top: 3px;
+	color: var(--interactive-accent);
+	font-size: 10.5px;
+	font-weight: var(--font-semibold, 600);
+	letter-spacing: 0.02em;
+	line-height: 1;
+}
+
+/* Everything stays: the line drops clear of the last row rather than sitting in
+   a gap that is not there, into the padding kept for it. */
+.handwriting-fold-list.is-nofold .handwriting-fold-line {
+	top: calc(6px + 40px * var(--handwriting-fold-keep, 6) + 2px);
+}
+
+.handwriting-fold-cap {
+	margin: 0;
+}
+
+.handwriting-fold-foot {
+	display: flex;
+	align-items: center;
+	gap: 8px 12px;
+	flex-wrap: wrap;
+	margin-top: 14px;
+}
+
+.handwriting-fold-reset {
+	background: none;
+	border: none;
+	box-shadow: none;
+	padding: 2px 4px;
+	margin-left: -4px;
+	color: var(--text-accent);
+	font-size: var(--font-ui-smaller, 12px);
+	cursor: pointer;
+	border-radius: 4px;
+}
+
+/* The same twin as `.handwriting-mobile-tool[hidden]` above, scoped to
+   `.handwriting-fold-reset` only - not a general `[hidden]` reset. This
+   button carries no author `display`, but nothing here guarantees a
+   theme never adds one, and the reset button hides itself outright now
+   rather than dimming - see FoldOrderControl.ts. A third button that
+   needs this shape gets its own scoped copy the same way. */
+.handwriting-fold-reset[hidden] {
+	display: none !important;
+}
+
+/* ---- the preview ---- */
+.handwriting-fold-preview {
+	max-width: 600px;
+	margin-top: 16px;
+	padding: 16px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	background: var(--background-primary);
+}
+
+.handwriting-fold-preview-head {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 8px;
+	flex-wrap: wrap;
+	margin-bottom: 12px;
+}
+
+.handwriting-fold-preview-title {
+	font-weight: var(--font-semibold, 600);
+	font-size: var(--font-ui-small, 13px);
+}
+
+.handwriting-fold-preview-width {
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+/* The stage clips; the pane inside it is the DETECTED width whatever the
+   settings pane can spare, because that width is the measurement the strip
+   folds against. Only the painting is scaled, from the top left so the scaled
+   box still starts where the stage does. */
+.handwriting-fold-preview-stage {
+	overflow: hidden;
+}
+
+.handwriting-fold-preview-pane {
+	position: relative;
+	/* CONTENT-BOX, deliberately, against Obsidian's global border-box: the
+	   inline width written on this pane is the DETECTED width, and the strip
+	   inside reads its parent's clientWidth. Under border-box the 1px border
+	   each side would be subtracted from that, so the preview would fold at two
+	   pixels narrower than the pane it is claiming to be - invisible except at
+	   the boundary, which is the one place a preview has to be right. */
+	box-sizing: content-box;
+	height: 156px;
+	transform-origin: top left;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 10px;
+	background: var(--background-secondary);
+	overflow: hidden;
+}
+
+/* Inert: only the More chevron may be pressed. The host behind this strip
+   already does nothing (previewStripHost), and this is the other half - a
+   settings tab must not open a size pop or collapse the toolbar by being
+   hovered. */
+.handwriting-fold-preview-pane .handwriting-mobile-tool {
+	pointer-events: none;
+}
+
+/* The pill the strip collapses to is NOT a .handwriting-mobile-tool, so the
+   rule above does not reach it; a click on it calls setCollapsed and writes the
+   session's collapsed state for every real strip in the window. */
+.handwriting-fold-preview-pane .handwriting-pen-pill {
+	pointer-events: none;
+}
+
+.handwriting-fold-preview-pane .handwriting-tools-more {
+	pointer-events: auto;
+}
+
+/* Narrow (a phone's settings, a 360px pane): the card keeps its padding down
+   and the fixed row scrolls rather than shrinking its buttons. Nothing reflows
+   into a second height. */
+@media (max-width: 400px) {
+	.handwriting-fold-card,
+	.handwriting-fold-preview {
+		padding: 12px;
+	}
+
+	.handwriting-fold-fixed-row {
+		overflow-x: auto;
+	}
 }

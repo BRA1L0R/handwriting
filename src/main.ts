@@ -1,4 +1,16 @@
-import { requestUrl, App, MarkdownRenderChild, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, SettingDefinitionItem, TAbstractFile, TFile, WorkspaceLeaf, normalizePath } from "obsidian";
+import { requestUrl, App, Command, MarkdownRenderChild, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, SettingDefinitionItem, TAbstractFile, TFile, WorkspaceLeaf, normalizePath } from "obsidian";
+import {
+	clearGatedCommandAction,
+	clearGatedCommandActions,
+	gatedCommandActionIds,
+	gatedCommands,
+	inkColorNames,
+	type PaletteCommand,
+	planGatedCommands,
+	runGatedCommand,
+	setGatedCommandAction,
+	setRetiredCommandAction,
+} from "./CommandPaletteSplit";
 import { formatHost } from "./diag/PlatformCapabilities";
 import { CameraState } from "./camera/coordinates";
 import { HANDWRITING_PAGE_VIEW_TYPE, HandwritingHost, HandwritingPageView } from "./view/HandwritingPageView";
@@ -9,7 +21,8 @@ import {
 import { HANDWRITING_PEN_LAB_VIEW_TYPE, PenLabView } from "./view/PenLabView";
 import {
 	addStripSurface,
-	endLiveNoteStrokes,
+	applyToolbarPlacement,
+	endLiveStrokesEverywhere,
 	hidePenCursorsEverywhere,
 	copyInlineInkMetrics,
 	copyInlineZoomReport,
@@ -44,10 +57,12 @@ import {
 	setPersistEraserMode,
 	setPersistEraserRadius,
 	setPersistInkSize,
+	setPersistToolbarCorner,
 	setShapeSnap,
 	setToolbarCorner,
 } from "./inline/InkOverlay";
 import { destroyProbeMarkers } from "./inline/PenProbe";
+import { armForegroundRepaint } from "./inline/ForegroundRepaint";
 import { captureInlinePenTrace, clearInlinePenTrace, formatInlinePenTrace } from "./inline/InlinePenRouter";
 import {
 	clearHitProbe,
@@ -60,8 +75,12 @@ import { surfaceExtents } from "./inline/SurfaceExtent";
 import { claimMarkdown, reassignMarkdown } from "./inline/InlineClaim";
 import { INK_SIZE_STEPS, clampInkSize, nextInkSize } from "./ink/InkSize";
 import { DEFAULT_ERASER_RADIUS_PX, clampEraserRadius, nextEraserSize } from "./ink/EraserSize";
-import { setPressureSensitivity, pressureSensitivityEnabled } from "./ink/PenStyle";
+import { setPressureSensitivity } from "./ink/PenStyle";
 import { setInkShaping } from "./ink/InkShape";
+import { InkPreset, normalizeInkPresets, setInkPresets } from "./ink/InkPresets";
+import { installInkPresetActions } from "./ink/InkPresetHost";
+import { registerInkPresetCommands } from "./ink/InkPresetCommands";
+import { ownedNoticeHiders } from "./OwnedNotices";
 import {
 	HIGHLIGHTER_COLORS,
 	PEN_COLORS,
@@ -84,7 +103,6 @@ import {
 	mouseInkEnabled,
 	setMouseInk,
 } from "./inline/MouseInk";
-import { penInkEnabled, setPenInk } from "./inline/PenInk";
 import { setPrediction, setPredictionEink } from "./inline/StrokePrediction";
 import { PaperStyle, nextPaperStyle, normalizePaperStyle, paperClass } from "./inline/Paper";
 import { inkToSvg } from "./ink/SvgExport";
@@ -95,11 +113,12 @@ import { bytesOf } from "./pdf/PdfSyntax";
 import { createFreshFile } from "./export/CreateFreshFile";
 import { clipboardSize } from "./inline/InkClipboard";
 import {
-	attachEmbedInk,
+	attachEmbedInkOnceReady,
 	disarmPrintSwaps,
 	teardownEmbedInk,
 	embedInkChanged,
-	embedInkRootFor,
+	embedInkDiagLine,
+	initEmbedInkDiagnostics,
 	initEmbedInkRefresh,
 } from "./inline/EmbedInk";
 import { notifyInkChanged, onInkChanged } from "./inline/InkEvents";
@@ -108,14 +127,33 @@ import {
 	clearPenHardwareSeen,
 	getPenToolsMode,
 	markPenSeen,
+	penHardwareSeen,
 	penSeenThisSession,
 	nextPenToolsMode,
 	normalizePenToolsMode,
+	persistPenHardwareSeenToStore,
+	restorePenHardwareEverSeenFromStore,
+	setPenHardwareStore,
 	setPenToolsMode,
+	setPersistPenHardwareSeen,
+	shouldRaiseStripOnPenOff,
 } from "./inline/PenToolsMode";
+// The strip owns the fold list: the ids, their default order, and the rule
+// that makes a saved order safe to use all live beside the row they describe -
+// and `PEN_INK_TOGGLE`, the keyboard button's id, which outlived the palette
+// command of the same name because saved fold orders are written in it.
+import {
+	DEFAULT_FOLD_ORDER,
+	PEN_INK_TOGGLE,
+	normalizeFoldOrder,
+	setStripFoldOrder,
+} from "./inline/MobileTools";
+import { PenCommandHost, penOnOff, togglePenInput } from "./inline/PenCommand";
+import { FoldOrderControl, previewStripHost } from "./inline/FoldOrderControl";
 import { DiagnosticTextModal, showDiagnosticText } from "./diag/DiagnosticTextModal";
 import { pdfInkReport } from "./pdf/PdfInkReport";
 import { PdfInkController } from "./pdf/PdfInkController";
+import { clearPdfPanTrace, formatPdfPanTrace } from "./pdf/PdfPanTrace";
 import { calibrationStrokes } from "./pdf/PdfCalibration";
 import { PdfInkStore } from "./pdf/PdfInkStore";
 import {
@@ -142,6 +180,7 @@ import {
 	normalizeInkFolder,
 	SYNCED_INK_FOLDER,
 } from "./persistence/InkFolder";
+import { findSplitInk, splitInkReportText, type SplitInkReport } from "./persistence/SplitInk";
 import {
 	DEFAULT_TOOLBAR_CORNER,
 	TOOLBAR_CORNER_LABELS,
@@ -205,6 +244,18 @@ interface HandwritingSettings {
 	inkFolder: string;
 	/** Which corner the floating pen toolbar parks in. Default top-right. */
 	toolbarCorner: ToolbarCorner;
+	/**
+	 * The order the strip's buttons leave the first row in when the pane is
+	 * too narrow for all of them (alan, 2026-09-05: "maybe we can have a way
+	 * you can rearrange the symbols in the fold list").
+	 *
+	 * Command ids, and only ids that are allowed to fold - see
+	 * `normalizeFoldOrder` in MobileTools.ts, which is what makes a file
+	 * written by any build safe to read here. The default is
+	 * `DEFAULT_FOLD_ORDER`, not restated in this file, so the ids have one
+	 * home.
+	 */
+	stripFoldOrder: string[];
 	/** Selected ink color per tool (v0.13.6), hex. */
 	inkColors: { pen: string; highlighter: string };
 	/**
@@ -235,6 +286,13 @@ interface HandwritingSettings {
 	/** One command per colour and per nib size, for hotkeys. */
 	colorSizeCommands: boolean;
 	/**
+	 * Quick pens (1.4.12 §4): the starred colour+size pairs, flat across both
+	 * tools with each tool's own slot order preserved. Empty until somebody
+	 * stars one - the feature costs a fresh install nothing but one small row
+	 * inside a pop it already had.
+	 */
+	penPresets: InkPreset[];
+	/**
 	 * The version whose notes this vault has already been shown. Null until
 	 * a release with notes has been seen. A brand new install is told apart
 	 * by whether a settings file existed at all rather than trusting this.
@@ -263,8 +321,14 @@ const DEFAULT_SETTINGS: HandwritingSettings = {
 	shapeSnap: true,
 	devDiagnostics: false,
 	colorSizeCommands: false,
+	penPresets: [],
 	lastSeenVersion: null,
 	toolbarCorner: DEFAULT_TOOLBAR_CORNER,
+	// A COPY, not the exported array itself: this object is handed out as the
+	// starting point for a vault's settings and is written through, and a
+	// shared reference would let one vault's reorder rewrite the default every
+	// other read of it sees.
+	stripFoldOrder: [...DEFAULT_FOLD_ORDER],
 	inkFolder: DEFAULT_INK_FOLDER,
 };
 
@@ -288,52 +352,6 @@ const DEFAULT_SETTINGS: HandwritingSettings = {
  */
 function reloadStride(quietTicks: number): number {
 	return Math.min(5, 1 + Math.floor(quietTicks / 5));
-}
-
-/**
- * Attach ink to a rendered section once its root can be found, retrying
- * across animation frames when it cannot be found immediately.
- *
- * The synchronous case - a root found on the first try - is the common one
- * and stays synchronous on purpose: an export renders the note and then
- * serializes it right away, and a picture taken before a promise resolves
- * has already lost its ink. The retry only exists as a safety net for a
- * build of Obsidian that hands the post-processor no containerEl at all, so
- * embedInkRootFor has nothing but the section itself to climb from and the
- * section is not attached yet. Rather than give up, this waits for the
- * section to land in the tree - up to 30 frames, about half a second - and
- * tries again once it has. Returns a canceller for child.onunload, so a
- * section that unloads mid-wait does not go on scheduling frames forever.
- */
-function attachEmbedInkOnceReady(
-	el: HTMLElement,
-	container: HTMLElement | null,
-	path: string,
-	strokes: () => readonly InkStroke[]
-): () => void {
-	const root = embedInkRootFor(el, container);
-	if (root) {
-		attachEmbedInk(root, path, strokes());
-		return () => {};
-	}
-	const view = el.ownerDocument.defaultView ?? window;
-	let handle: number | null = null;
-	let frame = 0;
-	const tick = () => {
-		handle = null;
-		if (el.isConnected) {
-			const lateRoot = embedInkRootFor(el, container);
-			if (lateRoot) attachEmbedInk(lateRoot, path, strokes());
-			return;
-		}
-		frame++;
-		if (frame >= 30) return;
-		handle = view.requestAnimationFrame(tick);
-	};
-	handle = view.requestAnimationFrame(tick);
-	return () => {
-		if (handle !== null) view.cancelAnimationFrame(handle);
-	};
 }
 
 /** The slice of node's `fs` this needs, typed locally to avoid node typings. */
@@ -376,6 +394,176 @@ async function openRangedFile(fullPath: string): Promise<RangedHandle> {
 	};
 }
 
+/**
+ * The pen-off toggle's Notice text, and nothing else: state -> message, no
+ * Notice, no DOM. Split out from the command below so the wording can be
+ * pinned by a plain test - see `ownedNotice` just after it for the half that
+ * actually owns a Notice and rewrites it in place.
+ */
+export function penToggleNoticeText(on: boolean): string {
+	return on ? "Handwriting: pen ink active" : "Handwriting: keyboard mode - pen ink paused, tap to type";
+}
+
+/**
+ * One toggle's Notice, rewritten on every press instead of stacked.
+ *
+ * Alan, hardware report: "when spamming the toast for keyboard doesnt have
+ * the current state last". Obsidian Notices queue, and each one runs its own
+ * timeout - so five quick presses of the keyboard button left five toasts on
+ * screen that expire in the order they were created, and the OLDEST one is
+ * the last still standing, naming a state the pen has not been in for four
+ * presses. The fix is not a queue to drain faster; it is a toggle that owns
+ * exactly one Notice and overwrites it.
+ *
+ * DEAD-NOTICE DETECTION: `notice?.noticeEl?.isConnected`, the ordinary DOM
+ * answer to "is this element still attached to the document". Obsidian's
+ * Notice carries no "am I still showing" flag of its own, and real Obsidian
+ * detaches `noticeEl` from the document when a Notice's timeout fires or it
+ * is dismissed by hand - so a disconnected `noticeEl` means the Notice is
+ * already gone, and rewriting it would show nothing at all, which is worse
+ * than the bug this is fixing. `noticeEl` is documented `@deprecated Use
+ * messageEl instead` (obsidian.d.ts) for writing a message, but it is still
+ * the element Obsidian attaches and removes, so it remains the right thing
+ * to ask whether it is connected.
+ *
+ * THE PROBE ITSELF MUST NOT THROW: `notice?.noticeEl?.isConnected`, not
+ * `notice && notice.noticeEl.isConnected`. `noticeEl` is the deprecated half
+ * of the type - exactly the property a future Obsidian drops - and this
+ * repo's own test double (test/obsidian-stub.ts's `Notice`) already has no
+ * `noticeEl` at all today. The callback on the other side of this check is a
+ * toggle button, so a read that throws does not just cost one toast, it
+ * leaves the button looking broken. Optional-chained, a missing `noticeEl`
+ * reads as `undefined` - falsy - so `hide()` is skipped and a fresh Notice is
+ * still constructed: today's stacking behaviour for that one case, never an
+ * exception in front of a user.
+ *
+ * RESTARTING THE TIMEOUT: this does not call `setMessage`. obsidian.d.ts
+ * documents it only as "Change the message of this notice", nothing about
+ * the timer, and the one runtime this repo can see - test/obsidian-stub.ts's
+ * `Notice` - is `export class Notice {}`, an empty class with no method on it
+ * at all. Neither artifact says setMessage restarts the auto-hide clock, so
+ * this does not claim that it does. Instead it hides the still-showing
+ * Notice and constructs a fresh one, which is guaranteed a full new timeout
+ * because the constructor's own `duration` parameter says so (obsidian.d.ts)
+ * - correct whether or not setMessage would also have worked.
+ *
+ * Returns a shower function rather than exposing the slot it closes over:
+ * called once per toggle, at module load (below), so each toggle keeps its
+ * OWN Notice - pressing Eraser and then Lasso is two different pieces of
+ * news, not one toggle's stale repeat of the other - while the rewrite-or-
+ * recreate rule itself is written exactly once instead of five times.
+ */
+/**
+ * Every owned slot's hider, in creation order, lives in `OwnedNotices.ts` -
+ * a leaf module rather than a const here.
+ *
+ * A Notice outlives the plugin that made it: it is Obsidian's DOM, on
+ * Obsidian's own timeout, and disabling or reloading the plugin between the
+ * last toggle and that timeout left the final toast standing - naming a
+ * state of a plugin that is no longer running. The slots are module scope
+ * and closed over, so `onunload` cannot reach them one by one; the shared
+ * array is how it reaches all of them at once, and it stays correct as slots
+ * are added.
+ *
+ * SHARED rather than private here since 1.4.12: the quick-pen presets own a
+ * Notice too (`ownedPresetNotice`, ink/InkPresetHost.ts) and a private array
+ * was one unload could not reach. See that module's header for why the
+ * registry moved out instead of main.ts exporting a registrar.
+ */
+function ownedNotice(): (message: string) => void {
+	let notice: Notice | null = null;
+	// The rewrite half and the unload half are the same act - put down
+	// whatever this slot is still showing - so they are the same function.
+	const clear = (): void => {
+		if (notice?.noticeEl?.isConnected) notice.hide();
+		notice = null;
+	};
+	ownedNoticeHiders.push(clear);
+	return (message: string) => {
+		clear();
+		notice = new Notice(message);
+	};
+}
+
+/**
+ * The six rapid-fire toggles whose Notice names an on/off (or on/fallback)
+ * state, each with its own owned Notice: the pen-input switch - `Pen on / off`
+ * and the strip's keyboard button, which write the same flag and therefore
+ * share this one slot - and the four tip modes beside it on the strip - eraser,
+ * lasso, insert space and pan - that already share `tipModeOffNotice` for
+ * their OFF wording and now share this for how the toast behaves under a
+ * spammed button; and `mouse-ink-toggle`, which is not a strip button but is
+ * the same defect shape (Alan: "when spamming the toast for keyboard doesnt
+ * have the current state last" describes this toggle just as well - it is a
+ * hotkey, and a hotkey spams faster than a finger). Six separate slots, not
+ * one shared: pressing Mouse and then Pen must read as two different pieces
+ * of news, not one toggle's stale repeat of the other.
+ */
+const showPenToggleNotice = ownedNotice();
+const showEraserToggleNotice = ownedNotice();
+const showLassoToggleNotice = ownedNotice();
+const showSpaceToggleNotice = ownedNotice();
+const showPanToggleNotice = ownedNotice();
+const showMouseInkToggleNotice = ownedNotice();
+
+/**
+ * Put every owned Notice down. Unload's half of `ownedNotice`.
+ */
+function hideOwnedNotices(): void {
+	for (const hide of ownedNoticeHiders) hide();
+}
+
+/**
+ * Everything the pen-input rule (PenCommand.ts) needs and cannot reach: the
+ * nib, the four tip modes, and the chrome that follows the switch.
+ *
+ * ONE OBJECT FOR BOTH PATHS - the `Pen on / off` command and the strip's
+ * keyboard button - so neither can grow its own idea of what picking a pen
+ * means or what has to be redrawn afterwards.
+ *
+ * `afterFlip` is the OLD `pen-ink-toggle` callback's tail, moved here
+ * unchanged and in its own order; its comments are the reason each line is
+ * there and none of them has stopped being true:
+ *
+ *   - the live stroke first, before any chrome. The switch can be hit with
+ *     the nib on the glass, and the router's gate refuses new claims without
+ *     breaking the one it already made. `endLiveStrokesEverywhere` commits it
+ *     rather than dropping it, and the pdf half rides the strip registry.
+ *   - the pen UI on the ON side unconditionally, the rule every tool command
+ *     follows, and it matters most here because the strip is the way BACK.
+ *     OFF raises it only once a real pen has been seen on this device (alan,
+ *     "and hide") - `shouldRaiseStripOnPenOff` is `penHardwareSeen`, not
+ *     `penSeenThisSession`, and PenToolsMode.ts says why.
+ *   - OFF strands a hover reticle exactly as mouse ink going off does: no
+ *     further hover samples will arrive to redraw from, so the ring and
+ *     `cursor: none` would sit there until the watchdog happened to fire.
+ *
+ * SESSION ONLY, still. Nothing here writes data.json, deliberately and unlike
+ * `mouse-ink-toggle`: pen input defaults to ON at every launch so nobody opens
+ * the app tomorrow to a plugin that looks broken (design §5).
+ */
+const penInkCommandHost: PenCommandHost = {
+	tool: () => getInlineTool(),
+	tipMode: () =>
+		getInlineEraserMode() || getInlineLassoMode() || getInlineSpaceMode() || getInlinePanMode(),
+	pickPen: () => {
+		// Picking a nib is also the exit from eraser and lasso modes: on the
+		// strip, Pen LOOKS like the way out, so it has to be.
+		setInlineTool("pen");
+		setInlineEraserMode(false);
+		setInlineLassoMode(false);
+		setInlineSpaceMode(false);
+		setInlinePanMode(false);
+	},
+	afterFlip: (on: boolean) => {
+		endLiveStrokesEverywhere();
+		if (on || shouldRaiseStripOnPenOff(penHardwareSeen())) markPenSeen();
+		refreshPenToolsAll();
+		refreshAllStrips();
+		if (!on) hidePenCursorsEverywhere();
+	},
+};
+
 export default class HandwritingPlugin extends Plugin implements HandwritingHost {
 	store!: PageStore;
 	settings: HandwritingSettings = { ...DEFAULT_SETTINGS };
@@ -389,6 +577,14 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	private settingsWriting: Promise<void> | null = null;
 	/** Files we are mid-swap on, so layout events don't fight each other. */
 	private swapping = new Set<string>();
+	/**
+	 * Every gated command's definition, by bare id, as `addGatedCommand` saw it.
+	 *
+	 * Kept because "Extra commands for hotkeys" is a live switch now: turning it
+	 * back on has to hand the same definitions to `addCommand` again, and onload
+	 * is the only place that knows them. See `applyGatedCommandRegistration`.
+	 */
+	private readonly gatedCommandDefs = new Map<string, Command>();
 
 	/**
 	 * Attach an ink controller to every open PDF view, and drop the ones whose
@@ -533,6 +729,14 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				// the way the note surface reaches it: a narrow cast behind a
 				// typeof guard, and nothing happens if it is absent.
 				(commandId) => {
+					// A strip button whose command sits behind "Extra commands
+					// for hotkeys" has no entry in the registry while the
+					// setting is off, and executeCommandById would do nothing
+					// at all. `runGatedCommand` holds exactly the actions that
+					// were kept OUT of the palette, so it answers true only in
+					// that case: the setting hides commands, it does not
+					// remove tools. See CommandPaletteSplit.ts.
+					if (runGatedCommand(commandId)) return;
 					const commands = (this.app as unknown as {
 						commands?: { executeCommandById(id: string): void };
 					}).commands;
@@ -1027,6 +1231,21 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			load: (key) => this.app.loadLocalStorage(key) as string | null,
 			save: (key, value) => this.app.saveLocalStorage(key, value),
 		});
+		// The pen-hardware latch is per DEVICE for the same reason and through
+		// the same door: data.json syncs, so a Surface's pen would otherwise
+		// teach a mouse-only desktop that it has one and put a Keyboard button
+		// on a machine that can never use it. Registered HERE, above the
+		// `await this.loadSettings()` below, because the restore inside
+		// `loadSettings` reads through this seam.
+		setPenHardwareStore({
+			// `string | boolean | null`, and the cast is the honest one: the
+			// declared return is `string | null`, but `loadLocalStorage` reads
+			// back through a JSON decode in some versions and hands the stored
+			// `"true"` over as the boolean. The restore accepts both spellings
+			// (PenToolsMode.ts); narrowing it here would only hide that.
+			load: (key) => this.app.loadLocalStorage(key) as string | boolean | null,
+			save: (key, value) => this.app.saveLocalStorage(key, value),
+		});
 		initPressureGain(Platform.isIosApp ? IOS_WEBKIT_CEILING : 0);
 		this.store = new PageStore(this.app);
 		// Persistence must never fail silently: a write that keeps failing
@@ -1133,7 +1352,20 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// EmbedInk.ts for why "on load" no longer means "attached to the
 		// document" - the virtualised preview renderer loads a section's
 		// child before inserting the section, so the root is resolved from
-		// the section OR the renderer's own container, whichever is usable.
+		// the section, or the renderer's own container, or by waiting for
+		// the section to land. Which of the three applies is a property of
+		// the reader's Obsidian, not of ours, so all three are covered.
+		//
+		// One line per section that resolved (or failed to resolve) a root,
+		// naming the route it came by. Off unless developer diagnostics is on,
+		// and the LINE is only built when it is - the sink takes the pieces.
+		// This exists for reports from machines we cannot get at: it separates
+		// "your renderer never gave us a root" from "we attached and drew
+		// nothing", which are different bugs with the same symptom.
+		initEmbedInkDiagnostics((via, path, waitedMs) => {
+			if (!this.settings.devDiagnostics) return;
+			console.log(embedInkDiagLine(via, path, waitedMs));
+		});
 		this.registerMarkdownPostProcessor((el, ctx) => {
 			const path = ctx.sourcePath;
 			if (!path || !path.endsWith(".md")) return;
@@ -1150,6 +1382,17 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 					: null;
 			const child = new MarkdownRenderChild(el);
 			let cancelRetry: (() => void) | null = null;
+			// The child can unload while the sidecar load below is still in
+			// flight, and the `.then` would then start a wait nothing holds a
+			// canceller for. Recorded rather than inferred from cancelRetry,
+			// which is still null at exactly that moment.
+			let childUnloaded = false;
+			const attach = () => {
+				if (childUnloaded) return;
+				cancelRetry = attachEmbedInkOnceReady(el, container, path, () =>
+					inlineInk.strokes(path)
+				);
+			};
 			child.onload = () => {
 				// Synchronously when the ink is already in the session, which
 				// it is whenever the note is open. An export renders the note
@@ -1160,21 +1403,18 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				if (inlineInk.isLoaded(path)) {
 					// Registered even with zero strokes: a note drawn on
 					// AFTER its embed rendered still gains ink live.
-					cancelRetry = attachEmbedInkOnceReady(el, container, path, () =>
-						inlineInk.strokes(path)
-					);
+					attach();
 					return;
 				}
 				runDetached(
-					inlineInk.ensureLoaded(path).then(() => {
-						cancelRetry = attachEmbedInkOnceReady(el, container, path, () =>
-							inlineInk.strokes(path)
-						);
-					}),
+					inlineInk.ensureLoaded(path).then(attach),
 					"render ink into an embed"
 				);
 			};
-			child.onunload = () => cancelRetry?.();
+			child.onunload = () => {
+				childUnloaded = true;
+				cancelRetry?.();
+			};
 			ctx.addChild(child);
 		});
 		// Embed layers stop going stale: every persisted gesture repaints the
@@ -1298,25 +1538,24 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				);
 			}, 1000)
 		);
-		// The nib on ordinary notes: pen or highlighter. A property of the tip,
-		// not a mode. The eraser end and the side button keep their hardware meanings.
+		// THE ONE PEN COMMAND (1.4.12). Alan, 2026-09-05: "there are two of
+		// these Handwriting: Pen and Handwriting: toggle pen input on/off - i
+		// think that's stupid there should only be one" -> "Pen on / off like
+		// Mouse on / off". This kept the `inline-tool-pen` id, so a hotkey
+		// bound to the old `Pen` still resolves; `pen-ink-toggle` left the
+		// palette entirely, and only the palette - see `penInkCommandHost`
+		// above and the `setRetiredCommandAction` call below for the strip's
+		// keyboard button, which still flips the same switch by that same id.
+		//
+		// The rule is PenCommand.ts's, not this file's, so it can be tested
+		// without an Obsidian; what stays here is the chrome the rule cannot
+		// reach and the Notice, which is the pen toggle's own owned slot -
+		// this command IS that toggle now, so it does not get a seventh.
 		this.addCommand({
 			id: "inline-tool-pen",
-			name: "Pen",
+			name: "Pen on / off",
 			callback: () => {
-				// Asking for a pen tool is asking for the pen UI: without
-				// this, the command worked invisibly when no pen had been seen
-				// and the palette appeared to do nothing.
-				markPenSeen();
-				refreshPenToolsAll();
-				// Picking a nib is also the exit from eraser and lasso modes:
-				// on the strip, Pen LOOKS like the way out, so it has to be.
-				setInlineTool("pen");
-				setInlineEraserMode(false);
-				setInlineLassoMode(false);
-				setInlineSpaceMode(false);
-				setInlinePanMode(false);
-				new Notice("Handwriting: pen");
+				showPenToggleNotice(penToggleNoticeText(penOnOff(penInkCommandHost)));
 			},
 		});
 		// The eraser used to need a pen with an eraser end. Plenty of pens do
@@ -1327,7 +1566,23 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// selection, so it stays off until someone without a pen asks for it.
 		this.addCommand({
 			id: "mouse-ink-toggle",
-			name: "Mouse",
+			name: "Mouse on / off",
+			// DECISION, "button should become the truth" addendum (2026-09-05):
+			// on a pen-less device with a tool lit, this command's OFF press is
+			// a NO-OP for whether the mouse actually draws. `mouseActsAsPen`
+			// (MouseInk.ts) ORs this command's `enabled` flag with the derived
+			// pen-less grant (`mouseDrawsFromLitTool`) precisely so a device
+			// that has never seen a pen keeps drawing with whatever tool is lit
+			// regardless of this flag - so toggling `enabled` off here leaves
+			// the mouse still drawing via that grant, and the "Handwriting:
+			// cursor" toast below is not fully true in that one case.
+			// DELIBERATELY NOT CHANGED to compensate (e.g. by also turning pen
+			// input off): every brief in this session repeats "leave
+			// `mouse-ink-toggle` as the explicit override... exactly as it is",
+			// and reaching into `setPenInk` from here to make the toast true
+			// again would be exactly the opposite of that instruction. Left as
+			// a stated, deliberate no-op rather than a silently-discovered one;
+			// see the handoff for the same note.
 			callback: () => {
 				const on = !mouseInkEnabled();
 				setMouseInk(on);
@@ -1351,65 +1606,27 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				// `applyMouseInkUiFanout` for both halves and why each needs
 				// what it calls.
 				this.applyMouseInkUiFanout(on);
-				// Named after the TOOL the mouse now holds, nothing else - no
-				// "(mouse ink on)" rider. The mouse is a pen; a pen picking
-				// up the highlighter says "highlighter" (alan, 2026-08-31).
-				// The tip's CLAIM, not just the nib: armed while erasing,
-				// "pen" would be a lie.
-				const tip = getInlineEraserMode()
-					? "eraser"
-					: getInlineLassoMode()
-						? "lasso"
-						: getInlineSpaceMode()
-							? "insert space"
-							: getInlinePanMode()
-								? "pan"
-								: getInlineTool();
-				new Notice(on ? `Handwriting: ${tip}` : "Handwriting: cursor");
-			},
-		});
-		// The pen itself, on or off. Not a tool: `InkTool` has no off value and
-		// should not grow one (PenInk.ts). Off hands the pen back to the app
-		// on NOTES - taps place the caret, and on a touch device that is what
-		// raises the software keyboard, which is the whole of what two e-ink
-		// users asked for. PDFs keep inking.
-		this.addCommand({
-			id: "pen-ink-toggle",
-			name: "Pen: on / off",
-			callback: () => {
-				const on = !penInkEnabled();
-				setPenInk(on);
-				// SESSION ONLY. Nothing is written to data.json, deliberately
-				// and unlike `mouse-ink-toggle` beside it: the state defaults
-				// to ON at every launch so nobody opens the app tomorrow to a
-				// plugin that looks broken (design §5). This is the one tool
-				// command with no `persistSettings` call, and that absence is
-				// the decision rather than an omission.
+				// NAMES THE STATE - not a device, not a tool (alan,
+				// 2026-09-05: "maybe Handwriting: ink" "instead of
+				// handwriting: pen when you select handwriting: mouse in
+				// command palette").
 				//
-				// The live stroke FIRST, before any chrome: the toggle can be
-				// hit with the nib on the glass, and the router's gate refuses
-				// new claims without breaking the one it already made. See
-				// `endLiveNoteStrokes` for why it commits rather than drops.
-				endLiveNoteStrokes();
-				// Asking for the pen BY NAME raises the pen UI, the same rule
-				// every tool command follows - and it matters more here than
-				// anywhere else, because the strip is the way BACK. Someone
-				// who turns the pen off on a desktop that has never seen pen
-				// hardware would otherwise have no visible switch to turn it
-				// on again. `markPenSeen` never gets cleared by this feature
-				// for the same reason.
-				markPenSeen();
-				refreshPenToolsAll();
-				refreshAllStrips();
-				// OFF strands a reticle, exactly as mouse ink going off does:
-				// the pen may be hovering right now, the surface will get no
-				// further hover samples to redraw from, and the ring plus
-				// `cursor: none` would sit there until the hover watchdog
-				// happened to fire. See `hidePenCursorsEverywhere`.
-				if (!on) hidePenCursorsEverywhere();
-				new Notice(
-					on ? "Handwriting: pen on" : "Handwriting: pen off - the pen types now"
-				);
+				// This used to name the TOOL the mouse had picked up, under
+				// the 2026-08-31 ruling that a pen holding the highlighter
+				// says "highlighter". That ruling still governs the pen and
+				// highlighter tool commands; it is superseded HERE, and only
+				// here, because what this toggle turns on was never about the
+				// mouse: "what if we are Handwriting: mouse drawing on and
+				// then the dude touches with a pen?". After the switch,
+				// whatever touches the glass inks - so a device or a nib in
+				// the message is wrong the moment a pen arrives, while "ink"
+				// is the state itself and stays true for everything in the
+				// room. Echoing the command's own name ("mouse drawing on")
+				// was considered and rejected for the same reason.
+				//
+				// The OFF word is unchanged, and `tipModeOffNotice` matches
+				// it deliberately - read its doc comment before editing it.
+				showMouseInkToggleNotice(on ? "Handwriting: ink" : "Handwriting: cursor");
 			},
 		});
 		this.addCommand({
@@ -1425,14 +1642,6 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			},
 		});
 		this.addCommand({
-			id: "pressure-recalibrate",
-			name: "Pen pressure: recalibrate",
-			callback: () => {
-				resetPressureCalibration();
-				new Notice("Handwriting: pressure relearns from your next strokes");
-			},
-		});
-		this.addCommand({
 			id: "paper-cycle",
 			name: "Paper: none / lines / grid / dots",
 			callback: () => {
@@ -1443,53 +1652,97 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				new Notice(`Handwriting: paper ${next}`);
 			},
 		});
-		this.addCommand({
+		// THE SPLIT (1.4.12). "Extra commands for hotkeys" gates REGISTRATION -
+		// what the palette lists and what a hotkey can bind - and nothing else.
+		// EXACTLY ONE of the two routes is live per command: registered here, or
+		// filed with `setGatedCommandAction` for the strip - filed for the ones
+		// kept OUT of the palette, and only those. The pen toolbar's own eraser,
+		// lasso, insert-space and pan buttons run these ids through
+		// `executeCommandById`, so un-registering them alone would have left four
+		// dead buttons on a default install; filing an action for a command the
+		// palette DOES hold would give the strip a second answer for it. (An
+		// earlier version of this comment said the action was filed "either way",
+		// which the two lines below have never done.) See CommandPaletteSplit.ts,
+		// which also holds the table the settings row and the test read, so the
+		// list under the switch is the list that registers here - and
+		// `planGatedCommands`, which keeps the one-route rule when the switch
+		// moves without a reload.
+		clearGatedCommandActions();
+		this.gatedCommandDefs.clear();
+		// THE ONE ID THE PALETTE NO LONGER HOLDS, filed here because the strip
+		// still names it. `pen-ink-toggle` left the palette in 1.4.12 (alan:
+		// "there should only be one"), but the keyboard button's `commandId`,
+		// `DEFAULT_FOLD_ORDER` and every fold order already saved to disk are
+		// all written in it, so the button's `exec` still arrives with it in
+		// hand. `setRetiredCommandAction` answers it forever and is invisible
+		// to the "Extra commands for hotkeys" plan - which would otherwise
+		// unfile it the moment the switch went on and leave the button dead.
+		// See CommandPaletteSplit.ts's `retired` map for that trap in full.
+		//
+		// The button's MEANING is unchanged: flip the pen-input switch, and
+		// nothing else. It is only built where a pen has been seen, and a pen
+		// user coming back from typing is not asking to have the highlighter
+		// taken out of their hand - so this is `togglePenInput`, not the
+		// command's `penOnOff`. One flag either way, so the two never disagree.
+		setRetiredCommandAction(PEN_INK_TOGGLE, () => {
+			showPenToggleNotice(penToggleNoticeText(togglePenInput(penInkCommandHost)));
+		});
+		const addGatedCommand = (cmd: Command): void => {
+			// Copied, and copied BEFORE registration. `addCommand` hands the
+			// command back (obsidian.d.ts) and the palette shows these under the
+			// plugin's own id and name, so a definition that has been through it
+			// once is not one to hand back to it later.
+			this.gatedCommandDefs.set(cmd.id, { ...cmd });
+			if (this.settings.colorSizeCommands) this.addCommand(cmd);
+			else if (cmd.callback) setGatedCommandAction(cmd.id, cmd.callback);
+		};
+		addGatedCommand({
 			id: "inline-tool-eraser",
-			name: "Eraser: toggle",
+			name: "Toggle eraser on / off",
 			callback: () => {
 				const on = !getInlineEraserMode();
 				setInlineEraserMode(on);
 				this.enterTipMode(on);
-				new Notice(on ? "Handwriting: eraser" : this.tipModeOffNotice());
+				showEraserToggleNotice(on ? "Handwriting: eraser" : this.tipModeOffNotice());
 			},
 		});
 		// Lasso as a mode: the side button was the only way in, and every
 		// apple pencil and every mouse lacks one. Exclusive with the eraser.
-		this.addCommand({
+		addGatedCommand({
 			id: "inline-tool-lasso",
-			name: "Lasso: toggle",
+			name: "Toggle lasso on / off",
 			callback: () => {
 				const on = !getInlineLassoMode();
 				setInlineLassoMode(on);
 				this.enterTipMode(on);
-				new Notice(on ? "Handwriting: lasso" : this.tipModeOffNotice());
+				showLassoToggleNotice(on ? "Handwriting: lasso" : this.tipModeOffNotice());
 			},
 		});
 		// Insert space as a mode, same shape as lasso: plant a divider with
 		// the tip, drag down to open room, drag up to close it. Pen exits.
-		this.addCommand({
+		addGatedCommand({
 			id: "inline-tool-space",
-			name: "Insert space: toggle",
+			name: "Toggle insert space on / off",
 			callback: () => {
 				const on = !getInlineSpaceMode();
 				setInlineSpaceMode(on);
 				this.enterTipMode(on);
-				new Notice(on ? "Handwriting: insert space" : this.tipModeOffNotice());
+				showSpaceToggleNotice(on ? "Handwriting: insert space" : this.tipModeOffNotice());
 			},
 		});
 		// Pan as a mode: touch already pans by finger, but a pen on glass had
 		// no way to move the page without marking it.
-		this.addCommand({
+		addGatedCommand({
 			id: "inline-tool-pan",
-			name: "Pan: toggle",
+			name: "Toggle pan on / off",
 			callback: () => {
 				const on = !getInlinePanMode();
 				setInlinePanMode(on);
 				this.enterTipMode(on);
-				new Notice(on ? "Handwriting: pan" : this.tipModeOffNotice());
+				showPanToggleNotice(on ? "Handwriting: pan" : this.tipModeOffNotice());
 			},
 		});
-		this.addCommand({
+		addGatedCommand({
 			id: "eraser-size-cycle",
 			name: "Eraser size: next",
 			callback: () => {
@@ -1499,37 +1752,34 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				);
 			},
 		});
-		this.addCommand({
-			id: "ink-shaping-toggle",
-			name: "Pressure sensitivity: toggle",
-			callback: () => {
-				const on = !pressureSensitivityEnabled();
-				runDetached(this.applyPressureSensitivity(on), "save the pressure setting", () =>
-					new Notice(
-						"Handwriting: pressure sensitivity changed for this session, but the setting could not be saved."
-					)
-				);
-			},
-		});
 		// Nib sizes (OneNote-style): three steps on the ACTIVE tool, plus a
 		// cycle command for a hotkey. Applies from the next stroke; persisted.
 		// Eleven per-colour and per-size entries buried the pen commands:
 		// the palette shows the same colours as swatches you can see, and
 		// the cycle commands cover the rest. Behind a setting for anyone who
 		// wants one hotkey per colour.
-		if (this.settings.colorSizeCommands)
-			for (const step of INK_SIZE_STEPS) {
-				this.addCommand({
-					id: `ink-size-${step.name}`,
-					name: `Ink size: ${step.name}`,
-					callback: () => {
-						runDetached(this.setInkSize(step.mult, step.name), "save the ink size", () =>
-							new Notice("Handwriting: the ink size changed, but the setting could not be saved.")
-						);
-					},
-				});
-			}
-		this.addCommand({
+		// Quick pens' sixteen entries (design §10), behind the same switch as
+		// every other per-value command and registered from their own file so
+		// this gains one line rather than sixteen blocks.
+		//
+		// Through `addGatedCommand`, not `this.addCommand` behind a second
+		// reading of `colorSizeCommands`: the switch is spelled ONCE in this
+		// method, which is the whole point of the helper. `registerInkPresetCommands`
+		// only wants something with `addCommand`, so the helper stands in as
+		// that host and the preset table needs no knowledge of the split.
+		registerInkPresetCommands({ addCommand: addGatedCommand });
+		for (const step of INK_SIZE_STEPS) {
+			addGatedCommand({
+				id: `ink-size-${step.name}`,
+				name: `Ink size: ${step.name}`,
+				callback: () => {
+					runDetached(this.setInkSize(step.mult, step.name), "save the ink size", () =>
+						new Notice("Handwriting: the ink size changed, but the setting could not be saved.")
+					);
+				},
+			});
+		}
+		addGatedCommand({
 			id: "ink-size-cycle",
 			name: "Ink size: next",
 			callback: () => {
@@ -1543,12 +1793,13 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// acting on the ACTIVE tool, the same model as the size commands. A name
 		// the active tool's palette lacks reports instead of guessing.
 		{
-			const names = [
-				...new Set([...PEN_COLORS, ...HIGHLIGHTER_COLORS].map((c) => c.name)),
-			];
-			if (this.settings.colorSizeCommands) {
+			// The union, from the split table rather than spelled again here:
+			// the settings row prints these names and this loop registers
+			// them, and one list is the only way those two stay equal.
+			const names = inkColorNames();
+			{
 				for (const name of names) {
-					this.addCommand({
+					addGatedCommand({
 						id: `ink-color-${name}`,
 						name: `Ink color: ${name}`,
 						callback: () => {
@@ -1577,7 +1828,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				// highlighting in that color. Its own palette's names only,
 				// so there is no wrong-tool case to report.
 				for (const c of HIGHLIGHTER_COLORS) {
-					this.addCommand({
+					addGatedCommand({
 						id: `highlighter-color-${c.name}`,
 						name: `Highlighter color: ${c.name}`,
 						callback: () => {
@@ -1792,7 +2043,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// applications (the SVG export is for leaving the vault).
 		this.addCommand({
 			id: "delete-selected-ink",
-			name: "Delete selected ink",
+			name: "Lasso: delete selection",
 			checkCallback: (checking) => {
 				const surface = this.activeInkSurface();
 				if (!surface) return false;
@@ -1811,7 +2062,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		});
 		this.addCommand({
 			id: "copy-selected-ink",
-			name: "Copy selected ink",
+			name: "Lasso: copy selection",
 			checkCallback: (checking) => {
 				const surface = this.activeInkSurface();
 				if (!surface) return false;
@@ -1829,7 +2080,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		});
 		this.addCommand({
 			id: "cut-selected-ink",
-			name: "Cut selected ink",
+			name: "Lasso: cut selection",
 			checkCallback: (checking) => {
 				const surface = this.activeInkSurface();
 				if (!surface) return false;
@@ -1847,7 +2098,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		});
 		this.addCommand({
 			id: "paste-ink",
-			name: "Paste ink",
+			name: "Lasso: paste",
 			checkCallback: (checking) => {
 				// Listed whenever a note or PDF is open: a paste hidden by an
 				// empty clipboard reads as broken, and the empty case can just
@@ -1881,17 +2132,18 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				// reads as "does not exist" to someone searching for it.
 				const file = this.app.workspace.getActiveFile();
 				if (!file || file.extension !== "md") return false;
-				if (!checking) {
-					if (!inlineInk.hasInk(file.path)) {
-						new Notice("Handwriting: no ink on this note");
-					} else {
-						this.confirmDeleteAllInk(file.path);
-					}
-				}
+				if (!checking) this.deleteAllInkOrSaySo(file.path);
 				return true;
 			},
 		});
 		this.addCommand({
+			id: "check-split-ink",
+			name: "Check for ink split across folders",
+			callback: () => {
+				void this.reportSplitInk();
+			},
+		});
+		addGatedCommand({
 			id: "ink-color-cycle",
 			name: "Ink color: next",
 			callback: () => {
@@ -1907,7 +2159,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// strip's swatches. These two each always mean their tool, and
 		// choosing the color picks the tool up (pickUpNib) - one command
 		// from anything to drawing in that color.
-		this.addCommand({
+		addGatedCommand({
 			id: "highlighter-color-cycle",
 			name: "Highlighter color: next",
 			callback: () => {
@@ -1918,7 +2170,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				);
 			},
 		});
-		this.addCommand({
+		addGatedCommand({
 			id: "pen-color-cycle",
 			name: "Pen color: next",
 			callback: () => {
@@ -1944,20 +2196,6 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				setInlineSpaceMode(false);
 				setInlinePanMode(false);
 				new Notice("Handwriting: highlighter");
-			},
-		});
-		this.addCommand({
-			id: "inline-tool-toggle",
-			name: "Pen / highlighter: switch",
-			callback: () => {
-				// Asking for a pen tool is asking for the pen UI: without
-				// this, the command worked invisibly when no pen had been seen
-				// and the palette appeared to do nothing.
-				markPenSeen();
-				refreshPenToolsAll();
-				const next = getInlineTool() === "pen" ? "highlighter" : "pen";
-				setInlineTool(next);
-				new Notice(`Handwriting: ${next}`);
 			},
 		});
 		// The pen lifecycle trace. To capture one failing stroke: turn
@@ -2253,6 +2491,36 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				},
 			});
 		}
+		// What this plugin costs on a moving pdf (PdfPanTrace.ts): one row per
+		// Pan-tool move, and - since 1.4.12 - one per NATIVE scroll of the
+		// viewer, which is the half a pan trace could never see. The command
+		// keeps the name it was registered under; the rows say which kind
+		// they are.
+		//
+		// The same pan measured on this desktop showed nothing at all, so the
+		// columns that matter are the ones a desktop mouse could not vary -
+		// the pointerType holding the page and whether Chromium delivered the
+		// batch coalesced - beside the handler time and the wait for the next
+		// animation frame.
+		if (this.settings.devDiagnostics) {
+			this.addCommand({
+				id: "copy-pdf-pan-trace",
+				name: "Diagnostics: show PDF pan trace",
+				callback: () => {
+					showDiagnosticText(this.app, "Handwriting PDF pan trace", formatPdfPanTrace());
+				},
+			});
+		}
+		if (this.settings.devDiagnostics) {
+			this.addCommand({
+				id: "clear-pdf-pan-trace",
+				name: "Diagnostics: clear PDF pan trace",
+				callback: () => {
+					clearPdfPanTrace();
+					new Notice("Handwriting: PDF pan trace cleared");
+				},
+			});
+		}
 
 		// The probe view is the whole point of this build, and a registered view
 		// with nothing to open it is unreachable: there is no UI in Obsidian for
@@ -2267,65 +2535,19 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			});
 		}
 
-		this.addCommand({
-			id: "new-page",
-			name: "New canvas page",
-			callback: () => {
-				runDetached(this.newPage(), "create a canvas page");
-			},
-		});
-		this.addCommand({
-			id: "open-as-canvas",
-			name: "Open note on the canvas",
-			checkCallback: (checking) => {
-				const file = this.app.workspace.getActiveFile();
-				if (!file || file.extension !== "md") return false;
-				if (!checking) {
-					runDetached(this.openAsHandwriting(file), `open ${file.path} on the canvas`, () =>
-						new Notice("Handwriting: could not open this note on the canvas.")
-					);
-				}
-				return true;
-			},
-		});
-		this.addCommand({
-			id: "open-as-markdown",
-			name: "Open canvas page as Markdown",
-			checkCallback: (checking) => {
-				const leaf = this.app.workspace.getMostRecentLeaf();
-				const isHandwriting = leaf?.view instanceof HandwritingPageView;
-				if (!isHandwriting || !leaf) return false;
-				if (!checking) {
-					const file = (leaf.view as HandwritingPageView).file;
-					// Remember the choice. Without this, a note carrying the
-					// `handwriting:` marker gets swapped straight back to the canvas by
-					// the file-open handler, and "Open as Markdown" looks broken.
-					if (file) this.preferMarkdown.add(file.path);
-					runDetached(
-						leaf.setViewState({
-							type: "markdown",
-							state: { file: file?.path, mode: "source" },
-						}),
-						"open a canvas page as Markdown",
-						() => new Notice("Handwriting: could not open this page as Markdown.")
-					);
-				}
-				return true;
-			},
-		});
-		for (const tool of ["pen", "highlighter", "eraser", "lasso"] as const) {
-			this.addCommand({
-				id: `tool-${tool}`,
-				name: `Canvas tool: ${tool}`,
-				checkCallback: (checking) => {
-					const view = this.activeHandwritingView();
-					if (!view) return false;
-					if (!checking) view.setTool(tool);
-					return true;
-				},
-			});
-		}
-
+		// THE CANVAS COMMANDS ARE GONE FROM THE PALETTE (1.4.12). Alan: "just
+		// take out the canvas commands completely for now". Seven entries -
+		// New canvas page, Open note on the canvas, Open canvas page as
+		// Markdown and the four `Canvas tool:` ones - for a surface the manual
+		// calls early and rough, sitting in the same list as the export and
+		// flatten commands people came for.
+		//
+		// Only the registrations went. `newPage`, `openAsHandwriting`,
+		// `activeHandwritingView` and the `preferMarkdown` set are all still
+		// here, and the view still opens for any note carrying
+		// `handwriting: page` in its frontmatter - which is how a canvas page
+		// is reached now, and how one gets made. They come back when canvas is
+		// a feature rather than an experiment.
 
 		// Route Handwriting-marked notes to the canvas view.
 		this.registerEvent(
@@ -2468,6 +2690,18 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				// calls this.
 				() => {
 					for (const c of this.pdfInk.values()) c.hideCursor();
+				},
+				// And the pen going OFF mid-stroke has to end that stroke on a
+				// PDF the same way it does on a note, now that this surface
+				// honours the state at all: the router refuses the NEXT claim
+				// and never breaks the one it holds, so without this a pdf
+				// stroke claimed a moment before the toggle would keep
+				// `activePenId` set with the click suppressor armed behind it.
+				// See `endLiveStrokesEverywhere` (InkOverlay.ts), which is what
+				// calls this, and `PdfInkController.endLiveStroke` for why it
+				// commits the stroke rather than dropping it.
+				() => {
+					for (const c of this.pdfInk.values()) c.endLiveStroke();
 				}
 			)
 		);
@@ -2506,6 +2740,30 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			if (document.visibilityState === "hidden") this.flushOnHide();
 		});
 		this.registerDomEvent(window, "pagehide", () => this.flushOnHide());
+
+		// ---- foreground repaint (1.4.12 §14) ----------------------------------
+		// The mirror of the flush above, on the way BACK. WebKit reclaims a
+		// canvas's pixels under memory pressure and says nothing, and a
+		// backgrounded or screen-locked app is where that is most likely; the
+		// scroll repaint draws nothing while the camera is still, so purged
+		// ink stayed gone until the band moved or the note was reopened -
+		// exactly the iPad report, and exactly why switching notes "fixed" it.
+		// All three events for the same reason the flush takes two: iOS fires
+		// none of them reliably on its own. `armForegroundRepaint` coalesces
+		// them into one repaint per return and hands back its own teardown,
+		// which `register` calls on unload.
+		//
+		// `isMobileApp` GATES REGISTRATION ITSELF (auditor, 2026-09-05): this
+		// call used to add all three listeners unconditionally, so every
+		// desktop alt-tab back into Obsidian re-rasterised every visible
+		// stroke on every open pane, for a WebKit purge desktop never has.
+		// See `ForegroundHost.isMobileApp`.
+		this.register(
+			armForegroundRepaint(
+				{ doc: document, win: window, isMobileApp: Platform.isMobileApp },
+				() => repaintAllInkOverlays()
+			)
+		);
 
 		// ---- duplicate page-id watch (v0.13.6) --------------------------------
 		// A page id must map to exactly one note; copying a note copies the id.
@@ -2787,17 +3045,6 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		);
 	}
 
-	private async applyPressureSensitivity(on: boolean): Promise<void> {
-		setPressureSensitivity(on);
-		this.settings.pressureSensitivity = on;
-		// Render-time law: a repaint restyles every committed stroke.
-		repaintAllInkOverlays();
-		await this.persistSettings();
-		new Notice(
-			on ? "Handwriting: pressure sensitivity on" : "Handwriting: pressure sensitivity off"
-		);
-	}
-
 	/**
 	 * Selecting a color picks up its tool: choosing "highlighter yellow" is
 	 * reaching for the yellow highlighter, not annotating a preference for
@@ -2856,6 +3103,42 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		this.settings.eraserRadiusPx = clampEraserRadius(radiusPx);
 		await this.persistSettings();
 		new Notice(`Handwriting: eraser ${name}`);
+	}
+
+	/**
+	 * "Delete all ink" once the command has decided the note qualifies:
+	 * either the confirm dialog, or the refusal that says why not.
+	 *
+	 * THE REFUSAL MUST NOT BE A GUESS. `hasInk` is a read of the session
+	 * cache, and the cache is empty for every note whose sidecar has not been
+	 * read yet - so on a note opened moments ago, or one this pane has never
+	 * shown, the old code answered "Handwriting: no ink on this note" about a
+	 * note full of ink. `inkPresence` separates "certainly empty" from "not
+	 * looked up yet" (InlineInkStore.inkPresence), and the second one is
+	 * answered by GOING AND LOOKING: one `ensureLoaded`, then the same
+	 * decision on real information. The load is the cheap path in the common
+	 * case - a note with no `handwriting-page-id` is already "none" off a
+	 * metadata lookup, no file I/O - so this costs a read exactly when a read
+	 * is the only honest way to answer.
+	 *
+	 * Deliberately still LISTED on every note, per the command's own comment:
+	 * the fix is to stop lying in the refusal, not to hide the command.
+	 */
+	private deleteAllInkOrSaySo(path: string): void {
+		if (inlineInk.inkPresence(path) === "unknown") {
+			runDetached(
+				inlineInk.ensureLoaded(path).then(() => this.deleteAllInkNow(path)),
+				`read ink before deleting all of it on ${path}`
+			);
+			return;
+		}
+		this.deleteAllInkNow(path);
+	}
+
+	/** The decision itself, on information already in hand. */
+	private deleteAllInkNow(path: string): void {
+		if (inlineInk.hasInk(path)) this.confirmDeleteAllInk(path);
+		else new Notice("Handwriting: no ink on this note");
 	}
 
 	/** "Delete all ink": confirm first. The count in the dialog is live. */
@@ -2980,6 +3263,28 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	// Not private: HandwritingSettingTab is the mode's second writer
 	// (a9bf181) and calls this through `this.plugin`, the same access
 	// `applyBooxMode` already gets for the same reason.
+	/**
+	 * The settings side of the fold order: write it, apply it, save it.
+	 *
+	 * THE CONTROL THAT CALLS THIS IS NOT BUILT YET - it waits on the owner
+	 * choosing between arrows and drag handles, and the strip is the most
+	 * visible part of the plugin ("we must be painstaking in our design"), so
+	 * the shape of it is not a builder's call. The writer is here so that
+	 * slice adds a row and nothing else, and so the model can be exercised
+	 * before the UI exists.
+	 *
+	 * Normalises rather than trusting its caller: a control handing over a
+	 * reordered array is exactly the place a duplicate or a dropped id would
+	 * come from, and `setStripFoldOrder` re-folds every open strip the moment
+	 * this returns.
+	 */
+	applyStripFoldOrder(order: readonly string[]): void {
+		const next = normalizeFoldOrder(order);
+		this.settings.stripFoldOrder = next;
+		setStripFoldOrder(next);
+		runDetached(this.persistSettings(), "save the toolbar fold order");
+	}
+
 	applyMouseInkUiFanout(on: boolean): void {
 		if (on) {
 			markPenSeen();
@@ -3089,6 +3394,10 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// the Android toolbar clearance CSS armed.
 		document.body.classList.remove("handwriting-android");
 		destroyProbeMarkers();
+		// The last toggle's toast is Obsidian's DOM on Obsidian's timeout, so
+		// a plugin disabled or reloaded inside that timeout left a toast on
+		// screen naming the state of something no longer running.
+		hideOwnedNotices();
 		// The print swap arms itself once per window and the guard is a WeakSet
 		// in module scope, which a reload replaces - leaving the previous pair
 		// on the window, calling into the old module on every print.
@@ -3401,6 +3710,77 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	}
 
 	/**
+	 * Look for notes whose ink ended up in two folders, and show what was
+	 * found. LOOKS ONLY - see SplitInk.ts. The adapter handed to the
+	 * detector carries exists, list and read and nothing else, so no code
+	 * path from this command can write, rename, create or delete anything.
+	 *
+	 * The three outcomes are deliberately three DIFFERENT reports. "Could
+	 * not look" must never render as "nothing found": a vault whose adapter
+	 * will not enumerate is exactly the vault most likely to be carrying the
+	 * fork, and telling its owner they are clean is the worst answer
+	 * available.
+	 */
+	private async reportSplitInk(): Promise<void> {
+		const adapter = this.app.vault.adapter;
+		let report: SplitInkReport;
+		try {
+			report = await findSplitInk(
+				{
+					exists: (p) => adapter.exists(p),
+					list:
+						typeof adapter.list === "function" ? (p) => adapter.list(p) : undefined,
+					read: (p) => adapter.read(p),
+				},
+				this.settings.inkFolder
+			);
+		} catch (err) {
+			// Even a thrown scan is an "I could not look", never a clean bill.
+			console.error("[handwriting] split-ink check failed", err);
+			report = {
+				folders: [],
+				scanned: 0,
+				split: [],
+				identicalOnly: 0,
+				unreadable: [],
+				enumerable: false,
+			};
+		}
+		const names = this.noteNamesForPages(report.split.map((p) => p.pageId));
+		new DiagnosticTextModal(
+			this.app,
+			"Ink split across folders",
+			splitInkReportText(report, names)
+		).open();
+		new Notice(
+			!report.enumerable
+				? "Handwriting: could not list this vault, so nothing was checked"
+				: report.split.length === 0
+					? "Handwriting: no ink is split across folders"
+					: "Handwriting: ink is split across folders - nothing was changed"
+		);
+	}
+
+	/**
+	 * Vault paths for the notes carrying these page ids.
+	 *
+	 * The sweep is over every markdown file's cached frontmatter, so it runs
+	 * ONLY for pages already known to be split - never once per sidecar. On
+	 * a clean vault (the overwhelmingly common case) the id list is empty
+	 * and this returns without touching the file list at all.
+	 */
+	private noteNamesForPages(pageIds: string[]): Map<string, string> {
+		const out = new Map<string, string>();
+		const wanted = new Set(pageIds);
+		if (wanted.size === 0) return out;
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			const id = this.recentPageIdFor(file);
+			if (id !== undefined && wanted.has(id) && !out.has(id)) out.set(id, file.path);
+		}
+		return out;
+	}
+
+	/**
 	 * Say once, per note, that its `handwriting-page-id` cannot be used.
 	 *
 	 * Once, because readPageId runs on every attach and every frontmatter
@@ -3447,10 +3827,19 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	 * files have not reached; moving without settling could race a debounced
 	 * write into the folder being emptied.
 	 *
-	 * None of that ordering is load-bearing for the user's data, and it must
-	 * not be: `PageStore.readPath` falls back to the default folder, so a move
-	 * interrupted anywhere - including a settings save that never lands -
-	 * leaves every page readable from wherever it actually is.
+	 * HOW MUCH AN INTERRUPTION COSTS, corrected 2026-09-05 - the sentence
+	 * here used to promise that it cost nothing, and named a `readPath` that
+	 * has not existed for some time. The truth is narrower and depends on
+	 * where the ink was going. Between the TWO WELL-KNOWN folders, an
+	 * interruption anywhere still leaves every page readable, because
+	 * resolution searches both. To a CUSTOM folder it does not: resolution
+	 * searches the configured folder and the two well-known ones, so if the
+	 * files reach `assets/ink` and the settings save never lands, the next
+	 * launch is still configured for the old folder, finds nothing, and shows
+	 * empty pages. NOTHING IS LOST - the sidecars are sitting in the folder
+	 * the move put them in - and setting the folder to that destination in
+	 * Settings brings every page back. See `changeFolder` (InkFolder.ts) for
+	 * the same statement beside the code that does the moving.
 	 */
 	async changeInkFolder(raw: string): Promise<void> {
 		const next = normalizeInkFolder(raw);
@@ -3466,6 +3855,14 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 					await this.store.flush();
 					return !this.store.busy;
 				},
+				// Settling drains the queue ONCE. The move that follows spans a
+				// list plus a rename per file with the store still pointed at
+				// the old folder, so a stroke landing in that window used to
+				// recreate the sidecar in the folder being emptied - and the
+				// repoint then made the older migrated copy the one that loads.
+				// Held writes requeue and land in the DESTINATION instead.
+				holdWrites: () => this.store.holdWrites(),
+				releaseWrites: () => this.store.releaseWrites(),
 				migrate: (from, to) => migrateInkFolder(this.app.vault.adapter, from, to),
 				repoint: (to) => this.store.useInkFolder(to),
 				persist: async (to) => {
@@ -3500,7 +3897,27 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// An update always leaves one behind, so this - not a missing
 		// lastSeenVersion - is what tells a new user from an updating one.
 		this.freshInstall = raw === null;
+		// EVERY KEY THIS BUILD DOES NOT KNOW RIDES THROUGH (auditor, 1.4.12).
+		// The literal below is the WHOLE object `persistSettings` writes -
+		// `saveData(this.settings)`, not a merge - so a key the literal does
+		// not mention was not merely unread here, it was ERASED from data.json
+		// by the first save of anything. A vault synced between a newer build
+		// and this one, or between two parallel branches, lost the other
+		// build's settings that way: the older build silently reset them.
+		//
+		// So the raw file is spread FIRST and every key this build does know
+		// is written OVER it below. That order is the whole guarantee: a raw
+		// value can never shadow a normalised one, so each known key keeps
+		// exactly the normalisation it has here, and only keys with no line
+		// below survive from `raw` untouched.
+		//
+		// Guarded, because `loadData` returns whatever the file parsed to. A
+		// missing file (null), an array or a bare primitive is not a settings
+		// object and carries nothing forward - spreading a string would spill
+		// its characters in under numeric keys.
+		const carried = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
 		this.settings = {
+			...carried,
 			cameras: raw?.cameras && typeof raw.cameras === "object" ? raw.cameras : {},
 			inkSizes: {
 				pen: clampInkSize(raw?.inkSizes?.pen ?? 1),
@@ -3537,7 +3954,40 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			shapeSnap: raw?.shapeSnap !== false,
 			devDiagnostics: raw?.devDiagnostics === true,
 			colorSizeCommands: raw?.colorSizeCommands === true,
+			// Not trusted a byte: `normalizeInkPresets` drops entries it
+			// cannot read, clamps the two fields that have real fallbacks,
+			// and caps each tool at its four slots.
+			penPresets: normalizeInkPresets(raw?.penPresets),
+			// There is deliberately no `penHardwareEverSeen` here any more. The
+			// pen latch is a fact about a DEVICE and data.json syncs, so it
+			// moved to this device's local store (`setPenHardwareStore` in
+			// `onload`) on 2026-09-05: a Surface's pen was teaching a
+			// mouse-only desktop that it had one. An old data.json that still
+			// carries `penHardwareEverSeen: true` is IGNORED here - it may be
+			// another machine's.
+			//
+			// IGNORED IS NOT DELETED, and since the `...carried` spread at the
+			// top of this literal that distinction is real on disk too: the
+			// key rides through from `raw` untouched and `persistSettings()`
+			// writes it straight back, so this device's next save PRESERVES
+			// it. That is what the spread is for - a machine still running a
+			// build that DOES read the old key keeps its latch when this build
+			// saves the file, instead of having it dropped by a build that
+			// never wanted it. (Earlier drafts of this comment said the
+			// opposite, correctly for the code as it then stood: the literal
+			// was built field-by-field with nothing carried through, so the
+			// next save of anything overwrote data.json with an object that
+			// never had the key.)
+			//
+			// Carrying it costs this device nothing, because nothing here
+			// reads it back: the local store is the only source
+			// `restorePenHardwareEverSeenFromStore` trusts, and no other
+			// reader of the key exists in this build.
 			toolbarCorner: normalizeToolbarCorner(raw?.toolbarCorner),
+			// Not trusted a byte, and it cannot be: a fold order is the one
+			// setting whose value names buttons, so a file from another build
+			// can name one this build does not have or miss one it does.
+			stripFoldOrder: normalizeFoldOrder(raw?.stripFoldOrder),
 			inkFolder: normalizeInkFolder(raw?.inkFolder),
 			lastSeenVersion: typeof raw?.lastSeenVersion === "string" ? raw.lastSeenVersion : null,
 		};
@@ -3558,8 +4008,31 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		if (this.freshInstall) {
 			this.settings.inkFolder = await adoptInkFolder(this.app.vault.adapter);
 		}
+		// THE PEN LATCH, RESTORED, and restored HERE - inside the awaited
+		// `loadSettings`, which `onload` awaits before
+		// `registerEditorExtension(inkOverlayExtension())`. That ordering is
+		// the whole feature: `ButtonSpec.shownOn` is read ONCE per strip, so a
+		// restore that arrived after the first strip was built would leave a
+		// pen device without its Keyboard button until something else happened
+		// to rebuild the strip - exactly the defect the persistence is for.
+		//
+		// `restorePenHardwareEverSeenFromStore`, deliberately NOT
+		// `markPenHardwareSeen`: a load is not a contact. It sets the latch
+		// alone, leaving the present-tense flags (`penHardware`, `penSeen`)
+		// untouched and firing no first-contact announcement. PenToolsMode.ts
+		// spells out why each of those matters.
+		//
+		// It reads the DEVICE's local store, not `this.settings`: the latch
+		// left data.json on 2026-09-05 because that file syncs. A synced
+		// `penHardwareEverSeen: true` from another machine is ignored here.
+		restorePenHardwareEverSeenFromStore();
 		setPenToolsMode(this.settings.penTools);
 		setToolbarCorner(this.settings.toolbarCorner);
+		// Beside the corner, and for the same reason: both are strip facts the
+		// settings own, and both must be in place before a surface builds its
+		// first strip - a fold order applied after the fact would leave the
+		// first pane of the session folding in the default order.
+		setStripFoldOrder(this.settings.stripFoldOrder);
 		// The store is constructed before settings are read, so it starts on
 		// the default folder and is pointed at the real one here - before any
 		// note is opened, so nothing ever reads from the wrong place.
@@ -3572,6 +4045,15 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		setPersistEraserMode((on) => {
 			this.settings.eraserMode = on ? "stroke" : "reticle";
 			runDetached(this.persistSettings(), "save the eraser mode");
+		});
+		// Drag-to-anchor's half of the placement (1.4.12). The strip can move
+		// itself now, so the setting has a writer that is not the settings
+		// tab, and `applyToolbarPlacement` calls this one for BOTH of them -
+		// the dropdown included, which is why its case in `setControlValue`
+		// no longer writes the field itself.
+		setPersistToolbarCorner((corner) => {
+			this.settings.toolbarCorner = corner;
+			runDetached(this.persistSettings(), "save the toolbar placement");
 		});
 		// No writer for mouse ink beside these four, and its absence is the
 		// rule rather than an omission: a quiet arm is for this session only
@@ -3586,6 +4068,25 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			this.settings.inkSizes[tool] = clampInkSize(mult);
 			runDetached(this.persistSettings(), "save the ink size");
 		});
+		// The pen latch's writer. NOT data.json any more: it writes this
+		// DEVICE's local store, because the file syncs and the fact does not
+		// travel (see `setPenHardwareStore` in `onload`).
+		//
+		// Reached from a `setTimeout(0)` that PenToolsMode schedules on the
+		// first pen contact this device ever makes, never from the pen-down
+		// itself - see `schedulePersistPenHardwareSeen` there. Registered
+		// during `loadSettings`, which `onload` awaits before any surface
+		// exists, so no contact can arrive before this seam is filled.
+		//
+		// No early return and no Notice, and neither is an omission. The write
+		// is a synchronous local-store save rather than a vault file, so there
+		// is nothing to await, nothing to conflict with, and nothing a reader
+		// could act on if it failed. The once-per-session guard that the early
+		// return used to provide lives where it always really lived: a device
+		// already latched by the restore never reaches here, because
+		// `schedulePersistPenHardwareSeen` fires on the false-to-true edge
+		// only.
+		setPersistPenHardwareSeen(persistPenHardwareSeenToStore);
 		// The pdf store writes through the same PageStore as notes: same
 		// debounce, same conflict guard, same trash, same ink folder. Only the
 		// id shape and the surface tag differ.
@@ -3612,6 +4113,17 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		});
 		setInkSizeMult("pen", this.settings.inkSizes.pen);
 		setInkSizeMult("highlighter", this.settings.inkSizes.highlighter);
+		// Quick pens: the list the chips draw, then the three actions they
+		// call. The bodies live in InkPresetHost.ts (design §4); all this
+		// owns is the settings copy and the save.
+		setInkPresets(this.settings.penPresets);
+		installInkPresetActions({
+			list: () => this.settings.penPresets,
+			save: (next) => {
+				this.settings.penPresets = [...next];
+				runDetached(this.persistSettings(), "save the ink presets");
+			},
+		});
 		setPressureSensitivity(this.settings.pressureSensitivity);
 		this.applyBooxMode();
 		setInkColorHex("pen", this.settings.inkColors.pen);
@@ -3647,6 +4159,103 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// Boox mode - without this, a showing PDF dot cleared only via the
 		// 1s hide timer or the next unrelated fan-out (Z addendum).
 		refreshAllStrips();
+	}
+
+	/**
+	 * The gated ids that are in the palette right now.
+	 *
+	 * Derived rather than tallied, because the two halves are complements and
+	 * the module already keeps one of them: every gated command is registered
+	 * OR holds a strip fallback, so "registered" is the table minus the filed
+	 * ones. `addGatedCommand` leaves load in exactly that state and
+	 * `planGatedCommands` preserves it, which is what makes one stored set
+	 * enough for both. CommandPaletteSplit.test.ts pins the assumption
+	 * underneath it ("gives every gated command a callback"): a gated command
+	 * with no `callback` could be filed nowhere, and would be miscounted here
+	 * as registered.
+	 */
+	private registeredGatedCommandIds(): string[] {
+		const mirrored = new Set(gatedCommandActionIds());
+		return [...this.gatedCommandDefs.keys()].filter((id) => !mirrored.has(id));
+	}
+
+	/** The app's command registry, if this Obsidian exposes one. */
+	private appCommandRegistry(): { removeCommand?(id: string): void } | undefined {
+		return (this.app as unknown as { commands?: { removeCommand?(id: string): void } }).commands;
+	}
+
+	/**
+	 * Whether "Extra commands for hotkeys" can be turned OFF without a reload.
+	 *
+	 * Turning it ON never needs anything but `addCommand`. Turning it off needs
+	 * un-registration, and that is the half worth checking for: `removeCommand`
+	 * is on `Plugin` in obsidian.d.ts (since 1.7.2, below this plugin's
+	 * minAppVersion) but is reached through a `typeof` guard anyway, because a
+	 * type declaration is a claim about the API, not about the app someone is
+	 * running. Where neither route exists the row keeps its reload sentence and
+	 * the plan leaves the palette alone - see `planGatedCommands`.
+	 */
+	gatedCommandRemovalAvailable(): boolean {
+		if (typeof this.removeCommand === "function") return true;
+		return typeof this.appCommandRegistry()?.removeCommand === "function";
+	}
+
+	/**
+	 * Take one gated command out of the palette.
+	 *
+	 * Two spellings, because the id form is the undocumented part. `addCommand`
+	 * is handed the BARE id and prefixes it, so `Plugin.removeCommand` - its
+	 * counterpart - is given the bare id; the app's own registry is keyed by the
+	 * prefixed id, the form `executeCommandById` is called with everywhere in
+	 * this plugin. Whichever is the real route, the other names a command that
+	 * is not registered, and removing one of those is a no-op rather than an
+	 * error. Cheaper than being wrong: a command left in the palette while its
+	 * action was filed for the strip is the one state the split forbids.
+	 */
+	private removeGatedCommand(id: string): void {
+		if (typeof this.removeCommand === "function") this.removeCommand(id);
+		const registry = this.appCommandRegistry();
+		if (typeof registry?.removeCommand === "function") {
+			registry.removeCommand(`${this.manifest.id}:${id}`);
+		}
+	}
+
+	/**
+	 * Move the gated commands to wherever the switch now points, live.
+	 *
+	 * The decision is `planGatedCommands`, which is pure and tested; this is the
+	 * executor and holds no rules of its own. ADDS BEFORE DROPS, both ways
+	 * round: the new route is in place before the old one goes, so a strip
+	 * button pressed between two of these loops still finds an answer, and the
+	 * worst a half-applied flip can do is hold both routes for the length of a
+	 * synchronous call rather than neither.
+	 *
+	 * Hotkeys survive it. Obsidian keys a custom hotkey by command id, not by
+	 * the command object, so a key bound to `handwriting:inline-tool-eraser`
+	 * finds it again when the same id is registered a second time.
+	 */
+	applyGatedCommandRegistration(): void {
+		const plan = planGatedCommands({
+			registered: this.registeredGatedCommandIds(),
+			mirrored: gatedCommandActionIds(),
+			want: this.settings.colorSizeCommands,
+			canRemove: this.gatedCommandRemovalAvailable(),
+			ids: this.gatedCommandDefs.keys(),
+		});
+		for (const id of plan.toRegister) {
+			const cmd = this.gatedCommandDefs.get(id);
+			if (!cmd) continue;
+			// A fresh object every time, for the reason `addGatedCommand` copies
+			// the definition in the first place.
+			const fresh: Command = { ...cmd };
+			this.addCommand(fresh);
+		}
+		for (const id of plan.toMirror) {
+			const run = this.gatedCommandDefs.get(id)?.callback;
+			if (run) setGatedCommandAction(id, run);
+		}
+		for (const id of plan.toUnmirror) clearGatedCommandAction(id);
+		for (const id of plan.toRemove) this.removeGatedCommand(id);
 	}
 
 	/** Settings-tab writes: persist now, quietly. */
@@ -3786,6 +4395,139 @@ type SettingKey = keyof HandwritingSettings;
 
 const SUPPORT_LINE = "Handwriting is free. i'm still working on it almost every night.";
 
+/** One line under "Extra commands for hotkeys": a label and its names. */
+export interface GatedCommandGroup {
+	/** The quiet label the line opens with. */
+	readonly label: string;
+	/** The ids on it, in table order. Every gated id is on exactly one line. */
+	readonly ids: readonly string[];
+	/** What the line prints, with the wording the label already carries taken off. */
+	readonly names: readonly string[];
+}
+
+/**
+ * WHICH LINE A GATED COMMAND GOES ON, from its id.
+ *
+ * "this is hilariously dense" (alan, 2026-09-06). The row under the switch
+ * printed all forty-three names as one comma run. The list itself stays - it is
+ * how anyone knows what there is to bind, and hiding it behind a disclosure
+ * would leave the switch asking "which commands?" with no answer - but it reads
+ * as a few short lines now, one per kind.
+ *
+ * FROM THE IDS, not from a second list of names. `PaletteCommand` has no kind
+ * field, and adding membership by hand here would be exactly the drift
+ * CommandPaletteSplit.ts exists to prevent: a colour added to `PEN_COLORS`
+ * reaches this list through `gatedCommands()` and lands on the "Ink color" line
+ * because its id starts that way, with nothing to update here. An id that
+ * matches no rule still appears, under "Other" - a command may never fall out
+ * of the list silently - and the test pins that bucket empty, so an id shape
+ * nobody wrote a rule for is a red test rather than a shrug in the UI.
+ *
+ * ORDER MATTERS IN ONE PLACE: `ink-size-cycle` and `ink-color-cycle` both start
+ * the way the per-value ids do, so the cycles are claimed first.
+ */
+const GATED_GROUPS: ReadonlyArray<{ label: string; holds: (id: string) => boolean }> = [
+	{ label: "Tool toggles", holds: (id) => id.startsWith("inline-tool-") },
+	{ label: "Cycles", holds: (id) => id.endsWith("-cycle") },
+	{ label: "Ink size", holds: (id) => id.startsWith("ink-size-") },
+	{ label: "Ink color", holds: (id) => id.startsWith("ink-color-") },
+	{ label: "Highlighter color", holds: (id) => id.startsWith("highlighter-color-") },
+	{ label: "Pen preset", holds: (id) => id.startsWith("ink-preset-pen-") },
+	{ label: "Save current pen as preset", holds: (id) => id.startsWith("ink-preset-save-pen-") },
+	{ label: "Highlighter preset", holds: (id) => id.startsWith("ink-preset-highlighter-") },
+	{
+		label: "Save current highlighter as preset",
+		holds: (id) => id.startsWith("ink-preset-save-highlighter-"),
+	},
+];
+
+/** Where every rule has failed. Empty in this build; see `GATED_GROUPS`. */
+const GATED_OTHER = "Other";
+
+/**
+ * How many leading characters every one of these names shares, cut back so the
+ * cut never lands inside a word.
+ *
+ * The boundary rule is the whole of it: a common prefix of "Ink color: bl"
+ * across two blues is real and useless, so the count walks back to the last
+ * character that is not a letter or a digit. One name shares nothing with
+ * itself, so a group of one keeps its whole name.
+ */
+function sharedHead(names: readonly string[]): number {
+	if (names.length < 2) return 0;
+	const first = names[0] ?? "";
+	let n = first.length;
+	for (const name of names) {
+		let i = 0;
+		while (i < n && i < name.length && name[i] === first[i]) i++;
+		n = i;
+	}
+	while (n > 0 && /[A-Za-z0-9]/.test(first[n - 1] ?? "")) n--;
+	return n;
+}
+
+/** The same from the other end: " on / off", ": next". */
+function sharedTail(names: readonly string[]): number {
+	if (names.length < 2) return 0;
+	const first = names[0] ?? "";
+	let n = first.length;
+	for (const name of names) {
+		let i = 0;
+		while (i < n && i < name.length && name[name.length - 1 - i] === first[first.length - 1 - i]) i++;
+		n = i;
+	}
+	while (n > 0 && /[A-Za-z0-9]/.test(first[first.length - n] ?? "")) n--;
+	return n;
+}
+
+/**
+ * The names a line prints: each one with the wording the whole group shares
+ * taken off, so "Ink color: blue, Ink color: black, ..." becomes a label and
+ * "blue, black, ...".
+ *
+ * ALL OR NOTHING. If any name would come back empty - a group whose members are
+ * one word apart, or one whose head and tail overlap - the full names are kept.
+ * A line that is longer than it needs to be is a nuisance; a line with a blank
+ * in it is a lie about what the palette holds.
+ */
+function trimmedNames(names: readonly string[]): string[] {
+	const head = sharedHead(names);
+	const tail = sharedTail(names);
+	if (head + tail === 0) return [...names];
+	const short = names.map((name) => name.slice(head, name.length - tail).trim());
+	return short.every((name) => name.length > 0) ? short : [...names];
+}
+
+/**
+ * The gated commands as lines. Pure: it takes the table, so a test can hand it
+ * an id nobody has written a rule for and see where that lands.
+ */
+export function gatedCommandGroups(commands: readonly PaletteCommand[] = gatedCommands()): GatedCommandGroup[] {
+	const buckets = new Map<string, PaletteCommand[]>();
+	for (const command of commands) {
+		const rule = GATED_GROUPS.find((g) => g.holds(command.id));
+		const label = rule?.label ?? GATED_OTHER;
+		const bucket = buckets.get(label);
+		if (bucket) bucket.push(command);
+		else buckets.set(label, [command]);
+	}
+	// The rules' order, then whatever "Other" caught, rather than the order the
+	// ids happened to arrive in: the lines read tool toggles first and quick
+	// pens last, which is the order the palette registers them in.
+	const labels = [...GATED_GROUPS.map((g) => g.label), GATED_OTHER];
+	const out: GatedCommandGroup[] = [];
+	for (const label of labels) {
+		const bucket = buckets.get(label);
+		if (!bucket || bucket.length === 0) continue;
+		out.push({
+			label,
+			ids: bucket.map((c) => c.id),
+			names: trimmedNames(bucket.map((c) => c.name)),
+		});
+	}
+	return out;
+}
+
 /**
  * The device-level knobs, most of which already existed as commands. The
  * strip's sliders stay the source of truth for sizes and colors, so those
@@ -3797,11 +4539,34 @@ const SUPPORT_LINE = "Handwriting is free. i'm still working on it almost every 
  * hand. Neither path has a row the other lacks.
  */
 class HandwritingSettingTab extends PluginSettingTab {
+	/**
+	 * The fold-order control, while the tab is open.
+	 *
+	 * Held so it can be given back. It owns a real `MobileTools` - five
+	 * capturing document listeners, a resize observer and an entry in the
+	 * strip registry - and a forgotten one would be re-folded forever on behalf
+	 * of a settings pane that had closed.
+	 */
+	private foldOrder: FoldOrderControl | null = null;
+
 	constructor(
 		app: App,
 		private plugin: HandwritingPlugin
 	) {
 		super(app, plugin);
+	}
+
+	/**
+	 * The tab closed, or Obsidian moved to another one.
+	 *
+	 * Belt and braces with the `destroy()` at the top of `renderFoldOrder`:
+	 * this is the hook that fires on the classic painter's own lifecycle, and
+	 * the destroy-before-build there is what covers a renderer that draws the
+	 * row again without ever calling this.
+	 */
+	hide(): void {
+		this.foldOrder?.destroy();
+		this.foldOrder = null;
 	}
 
 	getSettingDefinitions(): SettingDefinitionItem<SettingKey>[] {
@@ -3815,7 +4580,15 @@ class HandwritingSettingTab extends PluginSettingTab {
 						desc:
 							"Line width follows how hard you press. Off gives an even line; " +
 							"strokes still thin with speed and taper at the ends. Default on.",
-						control: { type: "toggle", key: "pressureSensitivity" },
+						// The command palette used to carry two separate commands for
+						// this row - "Pressure sensitivity: toggle" and "Pen pressure:
+						// recalibrate" - and Alan ruled both out of the palette
+						// (2026-09-05: "pressure sensitivity... those are all
+						// settings"). The toggle keeps going through `control`'s own
+						// path (`getControlValue`/`setControlValue`, same as every
+						// other row); `render` only adds the button beside it, the
+						// same escape hatch `renderSyncButton` below uses.
+						render: (setting) => this.renderPressureSensitivity(setting),
 					},
 					{
 						name: "Ink prediction",
@@ -3899,13 +4672,34 @@ class HandwritingSettingTab extends PluginSettingTab {
 						},
 					},
 					{
-						name: "Toolbar corner",
-						desc: "Where the floating pen toolbar sits. Default top right.",
+						name: "Toolbar placement",
+						desc: "Where the pen toolbar and its pill sit. Default top right.",
+						// "Corner" is what this row was called for two releases and
+						// what the setting is still named in data.json, so it stays
+						// searchable: the settings search indexes name, desc and
+						// aliases and nothing else, and a rename with no alias makes
+						// the old wording stop matching the row it belongs to. It is
+						// also no longer strictly true - two of the six placements
+						// are not corners - which is the whole reason for the rename.
+						aliases: ["toolbar corner", "corner", "middle", "anchor", "position"],
 						control: {
 							type: "dropdown",
 							key: "toolbarCorner",
 							options: Object.fromEntries(TOOLBAR_CORNER_LABELS.map(({ value, label }) => [value, label])),
 						},
+					},
+					{
+						name: "Toolbar buttons",
+						desc:
+							"Drag to set which buttons stay when the toolbar is small. " +
+							"The bottom of the list disappears first.",
+						// `render` rather than a `control`: there is no toggle or
+						// dropdown shape for a reorderable list, and the two are
+						// mutually exclusive on one row (obsidian.d.ts's
+						// `SettingDefinitionRender`), which is the same reason
+						// `renderPressureSensitivity` and `renderSupport` are
+						// written this way.
+						render: (setting) => this.renderFoldOrder(setting),
 					},
 					{
 						name: "Pen reticle",
@@ -3949,20 +4743,66 @@ class HandwritingSettingTab extends PluginSettingTab {
 				heading: "Commands",
 				items: [
 					{
-						name: "Hotkeys for colors and sizes",
-						// The name this row carried until 1.4.6. Settings search
+						name: "Extra commands for hotkeys",
+						// Every name this row has carried. Settings search
 						// indexes name, desc and aliases and nothing else, so a
 						// rename with no alias makes the old wording match
 						// nothing - and someone who updates, types what they
 						// remember and finds an empty list concludes the toggle
 						// was removed rather than renamed. The sync row below
-						// carries six aliases for the same reason.
-						aliases: ["A command per color and size", "command per color", "per color command"],
+						// carries six aliases for the same reason. 1.4.6's name
+						// is the first entry; 1.4.11's is the last.
+						aliases: [
+							"A command per color and size",
+							"command per color",
+							"per color command",
+							"Hotkeys for colors and sizes",
+						],
 						desc:
-							"Adds a separate command for every ink color and nib size, so each one can " +
-							"take its own hotkey. Off by default - the palette button and the cycle " +
-							"commands already reach both. Takes effect after the plugin reloads.",
+							"Adds the tool toggles (eraser, lasso, insert space, pan), the color and size " +
+							"cycles, a separate command per ink color and nib size, and a pair per quick-pen " +
+							"slot (wear it, or save the pen in hand into it), so each can take its own " +
+							"hotkey. Off by default - the pen toolbar reaches all of them, and they " +
+							"crowded out the export and flatten commands." +
+							// The switch is live (setControlValue -> the plugin's
+							// applyGatedCommandRegistration), so the reload sentence it
+							// carried since 1.4.6 would now be a lie - except on an
+							// Obsidian with no way to un-register a command, where
+							// turning it off really does wait for a reload. Asked at
+							// render time, so the row says what is true of the app it is
+							// being drawn in.
+							(this.plugin.gatedCommandRemovalAvailable()
+								? ""
+								: " Turning it off takes effect after the plugin reloads."),
 						control: { type: "toggle", key: "colorSizeCommands" },
+					},
+					{
+						// Directly under the switch, ON OR OFF, because the
+						// question the switch raises is "which commands?" and
+						// a list you can only see by turning something on and
+						// reloading is no answer. Rendered from the same table
+						// registration reads (CommandPaletteSplit.ts), so it
+						// cannot drift from what the palette actually gets.
+						//
+						// Its own row rather than more text on the one above:
+						// `control` and `render` are mutually exclusive on a
+						// single definition (obsidian.d.ts's
+						// SettingDefinitionRender), and both renderers - 1.13's
+						// declarative one and this file's `paint()` fallback -
+						// draw a bare name+desc row the same way.
+						name: "The commands it adds",
+						// Out of search deliberately: the switch above owns the
+						// terms, and two hits for one control reads as two
+						// controls.
+						searchable: false,
+						// A few short labelled lines rather than one comma run
+						// of forty-three names ("this is hilariously dense",
+						// alan, 2026-09-06). `render` rather than `desc` for the
+						// same reason the fold-order row uses it: a desc is one
+						// string, and these are lines. The grouping is
+						// `gatedCommandGroups`, above the class, and it still
+						// reads the shared table.
+						render: (setting) => this.renderGatedCommands(setting),
 					},
 				],
 			},
@@ -4111,6 +4951,15 @@ class HandwritingSettingTab extends PluginSettingTab {
 				break;
 			case "colorSizeCommands":
 				s.colorSizeCommands = on;
+				// Live, not "after the plugin reloads": the gated commands go into
+				// the palette or out of it now, and their strip fallbacks move the
+				// other way in the same call, so the toolbar keeps working in both
+				// states. The decision is `planGatedCommands` (pure, tested); this
+				// is the same shape as every other case here - apply live, then
+				// save. Turning it OFF is the half that needs `removeCommand`, and
+				// the row's own description keeps the reload sentence where that is
+				// missing.
+				this.plugin.applyGatedCommandRegistration();
 				break;
 			case "devDiagnostics":
 				s.devDiagnostics = on;
@@ -4141,10 +4990,21 @@ class HandwritingSettingTab extends PluginSettingTab {
 				break;
 			}
 			case "toolbarCorner": {
-				const corner = normalizeToolbarCorner(str);
-				s.toolbarCorner = corner;
-				setToolbarCorner(corner);
-				break;
+				// ONE ROAD with drag-to-anchor (1.4.12). This case used to do
+				// the two halves itself - write `s.toolbarCorner`, call
+				// `setToolbarCorner` - and a strip dragged to a new anchor
+				// owes exactly the same two. `applyToolbarPlacement`
+				// (InkOverlay.ts) is that pair, and both strip hosts call it,
+				// so the dropdown and the drag cannot end up doing different
+				// things to the same setting.
+				//
+				// RETURNS rather than breaks: the persist hook registered in
+				// `loadSettings` has already written data.json, and falling
+				// through to the tail's `saveSettingsNow` would write the
+				// same object a second time - see `persistSettings` on why
+				// this plugin has exactly one road to that file.
+				applyToolbarPlacement(normalizeToolbarCorner(str));
+				return;
 			}
 			case "penReticle":
 				s.penReticle = on;
@@ -4210,6 +5070,36 @@ class HandwritingSettingTab extends PluginSettingTab {
 		}
 	}
 
+	/**
+	 * The toggle and the "Pen pressure: recalibrate" command, now both here.
+	 *
+	 * The toggle is the ordinary `control` path drawn by hand: everything
+	 * `paint()`'s own `type === "toggle"` branch does (`getControlValue` for
+	 * the seed value, `setControlValue` on change, which is the exact call
+	 * `pressureSensitivity`'s case in `setControlValue` always made - the
+	 * command used to reach the same two calls through `applyPressureSensitivity`
+	 * instead), reproduced here because `render` and `control` are mutually
+	 * exclusive on one row (obsidian.d.ts's `SettingDefinitionRender`) and a
+	 * button can only be added to this row through `render`.
+	 *
+	 * The button runs exactly what the removed `pressure-recalibrate` command
+	 * ran, notice included: `resetPressureCalibration()` then the same
+	 * "relearns from your next strokes" text, word for word.
+	 */
+	private renderPressureSensitivity(setting: Setting): void {
+		setting.addButton((btn) =>
+			btn.setButtonText("Recalibrate").onClick(() => {
+				resetPressureCalibration();
+				new Notice("Handwriting: pressure relearns from your next strokes");
+			})
+		);
+		setting.addToggle((t) => {
+			t.setValue(this.getControlValue("pressureSensitivity") === true).onChange((v) => {
+				this.setControlValue("pressureSensitivity", v);
+			});
+		});
+	}
+
 	// One button, not a path field. "Where should the ink live" is not a
 	// question anyone wants asked - the only reason to move it is that
 	// Obsidian Sync skips hidden folders, so the control offers exactly
@@ -4245,6 +5135,58 @@ class HandwritingSettingTab extends PluginSettingTab {
 					);
 				})
 		);
+	}
+
+	/**
+	 * The fold-order list, drawn full-width BELOW the row's name.
+	 *
+	 * A reorderable list does not fit the narrow control column a settings row
+	 * gives its widget, so the row itself is turned into a block and the control
+	 * appended under the name - the same escape hatch `renderSupport` takes for
+	 * a different reason. The control caps its own width; the row does not
+	 * stretch it (alan, on the third mock: "it's too wide").
+	 */
+	private renderFoldOrder(setting: Setting): void {
+		setting.settingEl.addClass("handwriting-fold-order-row");
+		// A second render of the same row would otherwise leave the first
+		// control's preview strip alive in the registry.
+		this.foldOrder?.destroy();
+		this.foldOrder = new FoldOrderControl(setting.settingEl, {
+			order: () => this.plugin.settings.stripFoldOrder,
+			apply: (order) => this.plugin.applyStripFoldOrder(order),
+			corner: () => this.plugin.settings.toolbarCorner,
+			previewHost: previewStripHost({
+				toolColor: (tool) => getInkColorHex(tool as InkTool),
+				paletteFor: (tool) => colorsFor(tool as InkTool),
+				recordingOn: () => diagnosticsEnabled(),
+			}),
+		});
+	}
+
+	/**
+	 * The commands behind the switch, one short line per kind.
+	 *
+	 * Under the row's name rather than in the narrow control column, the same
+	 * escape hatch `renderFoldOrder` takes: there is no widget on this row, and
+	 * a block of lines does not belong in a column sized for a toggle.
+	 *
+	 * The lines come from `gatedCommandGroups()`, which reads the same table
+	 * registration reads - the property that makes this list worth printing at
+	 * all - so nothing here knows a command name.
+	 *
+	 * Idempotent: 1.13 re-evaluates the definitions on `update()` and can call
+	 * this again on a row it has already drawn, and a second pass must not
+	 * leave two lists.
+	 */
+	private renderGatedCommands(setting: Setting): void {
+		setting.settingEl.addClass("handwriting-gated-row");
+		setting.settingEl.querySelector(".handwriting-gated-list")?.remove();
+		const list = setting.settingEl.createDiv({ cls: "handwriting-gated-list" });
+		for (const group of gatedCommandGroups()) {
+			const line = list.createDiv({ cls: "handwriting-gated-group" });
+			line.createSpan({ cls: "handwriting-gated-label", text: `${group.label}: ` });
+			line.createSpan({ cls: "handwriting-gated-names", text: group.names.join(", ") });
+		}
 	}
 
 	private renderSupport(setting: Setting): void {

@@ -1,22 +1,52 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { MobileTools, nibIsLit, type MobileToolsHost } from "./MobileTools";
+import css from "../../styles.css?raw";
+import mainSrc from "../main.ts?raw";
+import stripSrc from "./MobileTools.ts?raw";
+import deviceSrc from "./DeviceInput.ts?raw";
+import { codeOnly } from "../CodeOnly";
+import {
+	DEFAULT_FOLD_ORDER,
+	MobileTools,
+	nibIsLit,
+	normalizeFoldOrder,
+	type MobileToolsHost,
+} from "./MobileTools";
+import { type InkPreset } from "../ink/InkPresets";
+// The two base widths the px sliders are built from. Imported rather than
+// copied so the expected multipliers below are the ones the constructor
+// really divides by, not two numbers that were true when this was written.
+import { DEFAULT_PEN, HIGHLIGHTER_PEN } from "../ink/PenStyle";
+import { deviceHasTouch, setHasTouchForTest } from "./DeviceInput";
 // markPenHardwareSeen, not markPenSeen: these tests want "a pen exists", and
 // markPenSeen only means "show the strip" - it is set by every tool command,
 // which is exactly the confusion that left the nib light stuck on for three
 // releases. See PenToolsMode.ts's `penHardware`.
 import {
 	clearPenHardwareSeen,
+	// The pen-less half of the router's mouse grant; the regression pin at the
+	// foot of this file composes the router's own expression rather than
+	// restating it (see `InlinePenRouter.mouseActsAsPen`).
+	deviceHasNeverSeenAPen,
 	markPenHardwareSeen,
 	markPenSeen,
+	penHardwareEverSeen,
+	penHardwareSeen,
 	penSeenThisSession,
+	releaseMouseInkQuietly,
 	resetPenToolsForTest,
+	restorePenHardwareEverSeen,
 } from "./PenToolsMode";
 import {
 	armMouseInkQuietly,
+	clearToolPicked,
 	consumeMousePutDown,
 	disarmMouseInkQuietly,
+	markToolPicked,
+	mouseActsAsPen,
 	mouseInkEnabled,
 	setMouseInk,
+	toolIsLit,
+	toolPickedHere,
 } from "./MouseInk";
 import { penInkEnabled, resetPenInkForTest, setPenInk } from "./PenInk";
 
@@ -41,6 +71,26 @@ vi.mock("obsidian", async (importOriginal) => {
 });
 
 /**
+ * EVERY TEST IN THIS FILE STARTS AT LAUNCH, with no tool picked.
+ *
+ * `toolPicked` (MouseInk.ts) is module state exactly as the three pen flags
+ * in PenToolsMode.ts are, and this file both READS it - through `nibIsLit`
+ * and the strip's three mouse branches - and WRITES it, every time a click
+ * runs an exec that reaches `setInlineTool`/`setTipMode` or hits the strip's
+ * own "give the mouse this tool" branch. Left to leak, one describe's click
+ * would hand the next one a device where a tool is already lit, and on a
+ * pen-less device (which `resetPenToolsForTest()` makes every describe here)
+ * that is the difference between the strip's arm branch and its put-down
+ * branch: the SAME click does the opposite thing. Three tests in this file
+ * failed that way before this hook existed.
+ *
+ * File-level rather than repeated per describe, so a describe added later
+ * cannot forget it; the ones that WANT a lit tool say `markToolPicked()`
+ * inside the test, where it reads as setup rather than as inheritance.
+ */
+beforeEach(() => clearToolPicked());
+
+/**
  * nibIsLit is the pure seam that fell out of splitting the light's predicate
  * from the click chain's (design doc 1.4.6 §6a, "the pen button unhilights
  * when the mouse hands the tool back"): pin it directly with a fake host.
@@ -52,13 +102,17 @@ vi.mock("obsidian", async (importOriginal) => {
 const fakeHost = (over: Partial<MobileToolsHost> = {}): MobileToolsHost => ({
 	exec: () => {},
 	activeTool: () => "pen",
+	// Drag to anchor: a no-op by default, so every strip a test builds still
+	// behaves exactly as it did. The drag tests at the foot of this file pass
+	// a spy and read what it was handed.
+	setPlacement: () => {},
 	eraserOn: () => false,
 	eraserWholeStroke: () => false,
 	setEraserWholeStroke: () => {},
 	lassoOn: () => false,
 	spaceOn: () => false,
 	panOn: () => false,
-	activeColor: () => "#000000",
+	toolColor: () => "#000000",
 	eraserRadiusPx: () => 10,
 	setEraserRadiusPx: () => {},
 	inkSizeMult: () => 1,
@@ -72,18 +126,24 @@ const fakeHost = (over: Partial<MobileToolsHost> = {}): MobileToolsHost => ({
 	toast: () => {},
 	recordingOn: () => false,
 	hasInkSelection: () => false,
-	palette: () => [],
+	paletteFor: () => [],
 	pickColor: () => {},
+	// Quick pens: no starred pens by default, so every strip a test builds
+	// still has the row it had before this feature - one star chip and
+	// nothing else.
+	presetsFor: () => [],
+	applyPreset: () => {},
+	starPreset: () => {},
+	forgetPreset: () => {},
 	setEditorFocus: () => {},
-	// Note-surface default: most of this file's hosts stand in for the
-	// overlay, where PenInk.ts's flag is the real answer. Tests exercising
-	// the pdf surface's `() => true` override pass their own.
+	// What BOTH real surfaces answer (InkOverlay.ts and PdfInkController.ts):
+	// the flag is the honest read wherever the router gates on it. Tests that
+	// want a host disagreeing with the global pass their own.
 	penInksHere: () => penInkEnabled(),
-	// Note-surface default, same reasoning: most of this file's hosts stand
-	// in for the overlay, which has a genuine off switch to build the
-	// Keyboard button for. Tests exercising the pdf surface's `() => false`
-	// override pass their own.
-	penCanTurnOff: () => true,
+	// A MOUSE-ONLY device by default, so the strip a test gets is the full
+	// one and every existing assertion about button order still describes the
+	// strip it was written against. Tests about the phone's strip pass true.
+	hasTouch: () => false,
 	...over,
 });
 
@@ -95,10 +155,74 @@ describe("nibIsLit", () => {
 		expect(nibIsLit(fakeHost({ activeTool: () => "pen", mouseInkOn: () => false }), "pen")).toBe(true);
 	});
 
-	it("is dark for a mouse user with mouse ink off and no pen seen", () => {
+	/**
+	 * CHANGED, 2026-09-05: "button should become the truth" and its addendum
+	 * reverse this exact case. BEFORE this assertion asserted `false` -
+	 * "a mouse user with mouse ink off and no pen seen is dark". Alan's own
+	 * symptom that started this whole ruling was the INVERSE of that
+	 * (button lit, mouse not drawing), and the fix `InlinePenRouter
+	 * .mouseActsAsPen` already ships is: on exactly this device (pen-less,
+	 * pen input on, a tool nominally selected), the mouse NOW draws with
+	 * whichever tool is lit, with no arm step - so a dark button here would
+	 * be lying the OTHER way. NOW asserts `true`.
+	 *
+	 * FALSIFIABILITY (would this still turn red if `nibIsLit` reverted to
+	 * reading `penSeenThisSession()`?): NO, and it structurally cannot -
+	 * this is a call about the FRESH-SESSION state that was reset just
+	 * above, where `penSeenThisSession()` and `penHardwareSeen()` are BOTH
+	 * false, so a reverted first disjunct would read no differently here
+	 * than the correct one does. That divergence only exists once hardware
+	 * has been marked and then cleared while session-seen stays latched -
+	 * exactly the paired tests below, which is where that regression check
+	 * still lives, isolated from this new rule via `penInksHere: () =>
+	 * false`. This test is not, and was never, a regression guard for the
+	 * classic 1.4.6-1.4.8 bug; it pins the addendum's own new baseline.
+	 */
+	/**
+	 * CHANGED AGAIN, 2026-09-05, and the setup is the whole of the change:
+	 * `markToolPicked()` is new here. The assertion still says `true` and
+	 * the rule it pins is still the addendum's, but the case it describes
+	 * was, as written, a device STRAIGHT FROM LAUNCH with nothing picked -
+	 * and it asserted the button was lit there, which is exactly the
+	 * `mouse-lit-truth` defect stated as a test. `nibIsLit` read "a tool is
+	 * lit" from `penInksHere()` alone, whose default is TRUE, so this passed
+	 * for the wrong reason and pinned the wrong behaviour: on that device a
+	 * plain left-drag inked instead of selecting text, and this test said
+	 * the light was right to say so. The pick is what "a tool is lit" always
+	 * meant; it just had nothing to read it from until now.
+	 */
+	it("is lit for a mouse user with mouse ink off and no pen seen, ONCE A TOOL IS PICKED", () => {
+		markToolPicked();
+		expect(nibIsLit(fakeHost({ activeTool: () => "pen", mouseInkOn: () => false }), "pen")).toBe(
+			true
+		);
+	});
+
+	/**
+	 * THE OTHER HALF OF THE SAME PAIR, and the one the case above was
+	 * silently standing in for: same device, same switches, nothing picked.
+	 * ADDED for `mouse-lit-truth` - the launch state had no test at all,
+	 * which is how a light that lied about it shipped.
+	 */
+	it("is DARK at launch for that same mouse user - nothing picked, nothing lit", () => {
 		expect(nibIsLit(fakeHost({ activeTool: () => "pen", mouseInkOn: () => false }), "pen")).toBe(
 			false
 		);
+	});
+
+	/**
+	 * A SECOND CASE of the same new rule, for symmetry with the pen: ADDED,
+	 * not a rewrite of an existing assertion. The `markToolPicked()` is the
+	 * same correction the pen case above carries.
+	 */
+	it("is lit for a mouse user on the highlighter too, pen-less, no arm, once picked", () => {
+		markToolPicked();
+		expect(
+			nibIsLit(
+				fakeHost({ activeTool: () => "highlighter", mouseInkOn: () => false }),
+				"highlighter"
+			)
+		).toBe(true);
 	});
 
 	// ALAN'S RULE, 2026-09-03: the light is dark "until you touch with your
@@ -106,6 +230,32 @@ describe("nibIsLit", () => {
 	// the hardware flag latched for the whole session, so once he had used his
 	// pen the button stayed lit however often mouse ink was switched off - by
 	// hand it read as stuck, and no amount of toggling could make it go dark.
+	//
+	// UNCHANGED IN OUTCOME, 2026-09-06 - and the setup LOST a field it had
+	// only briefly. It carried `penInksHere: () => false` (keyboard mode) as
+	// isolation against the pen-less grant `mouseDrawsFromLitTool`, which at
+	// the time read the present-tense `penHardwareSeen()` and so flipped true
+	// the instant `clearPenHardwareSeen()` ran, masking the first disjunct.
+	// TWO things have since removed the need and one of them forbids it:
+	// `deviceHasNeverSeenAPen()` was repointed onto the never-cleared session
+	// LATCH (see the CLOSED test below), which `markPenHardwareSeen()` here
+	// sets for good, so the grant cannot fire in this test at all; and since
+	// `nibIsLit`'s first disjunct is `penDrawsHere` - hardware AND
+	// `h.penInksHere()` - keyboard mode would now zero the very disjunct this
+	// test exists to isolate, and the test would pass on nothing. Pen input
+	// reads ON here, which is also the honest setting for "a pen user
+	// switching mouse ink off".
+	//
+	// FALSIFIABILITY (would this still turn red if `nibIsLit` reverted to
+	// reading `penSeenThisSession()`?): YES, unchanged. `markPenHardwareSeen()`
+	// sets BOTH flags; `clearPenHardwareSeen()` clears only the hardware one,
+	// deliberately leaving `penSeenThisSession()` latched true (the toolbar
+	// must not disappear). So a reverted first disjunct would read
+	// `penSeenThisSession()` = true here and this test would see `true`
+	// where the correct code (and this assertion) says `false` - exactly
+	// the three-release regression this test exists to catch, still caught.
+	// Nothing else can carry the last assertion: mouse ink is off and the
+	// pen-less grant is latched out, so the first disjunct is the whole answer.
 	it("goes dark when mouse ink is turned off, even after a pen has been seen", () => {
 		markPenHardwareSeen();
 		const off = fakeHost({ activeTool: () => "pen", mouseInkOn: () => false });
@@ -114,6 +264,11 @@ describe("nibIsLit", () => {
 		expect(nibIsLit(off, "pen")).toBe(false);
 	});
 
+	// UNCHANGED IN OUTCOME, and it drops the same stale `penInksHere: () =>
+	// false` for the same two reasons as the test above - this one adds the
+	// RECOVERY half (a real pen contact relights it). Falsifiability: YES,
+	// same argument - the middle assertion (`false`) is where a reverted
+	// first disjunct would read `penSeenThisSession()` = true and go red.
 	it("comes back on the next pen contact - the whole of 'until you touch with your pen'", () => {
 		markPenHardwareSeen();
 		clearPenHardwareSeen();
@@ -122,6 +277,39 @@ describe("nibIsLit", () => {
 		// Both surfaces call this on every real pen contact.
 		markPenHardwareSeen();
 		expect(nibIsLit(off, "pen")).toBe(true);
+	});
+
+	/**
+	 * CHANGED, once this branch rebased onto the tip carrying the persisted
+	 * latch (`penHardwareEverSeen()`): this test used to be named
+	 * "LIMIT: relights via the pen-less grant right after mouse-ink-off" and
+	 * asserted `true` at the end - `deviceHasNeverSeenAPen()` read the
+	 * present-tense `penHardwareSeen()`, which `clearPenHardwareSeen` (every
+	 * mouse-ink-off) puts back to false, so the addendum's own grant
+	 * incorrectly re-fired and relit the button. Repointing
+	 * `deviceHasNeverSeenAPen()` onto the session latch - never cleared by
+	 * `clearPenHardwareSeen()` - closes that hole: the realistic,
+	 * undisguised case (no forced `penInksHere`, pen input reads ON, the
+	 * honest common case) now goes dark exactly as Alan's original "off at
+	 * any point" ruling (2026-09-03) asked, with no conflict between the two
+	 * rulings left. NOW asserts `false`, and is named for what it now
+	 * proves.
+	 */
+	it("CLOSED: stays dark after mouse-ink-off, for a device that has held a pen this session", () => {
+		// A TOOL IS PICKED, and this line is what keeps the test honest. What
+		// it pins is that `deviceHasNeverSeenAPen()` reads the session LATCH,
+		// so the pen-less grant cannot re-fire after `clearPenHardwareSeen()`.
+		// With nothing picked the file-level `clearToolPicked()` makes
+		// `toolIsLit` false, the grant is false whatever the latch says, and
+		// the last assertion holds for the wrong reason - it would stay green
+		// with the latch fix reverted. Picking a tool puts the latch back in
+		// charge of the answer.
+		markToolPicked();
+		markPenHardwareSeen();
+		const off = fakeHost({ activeTool: () => "pen", mouseInkOn: () => false });
+		expect(nibIsLit(off, "pen")).toBe(true);
+		clearPenHardwareSeen();
+		expect(nibIsLit(off, "pen")).toBe(false);
 	});
 
 	it("leaves the TOOLBAR alone - clearing the light must not take the strip away", () => {
@@ -216,9 +404,11 @@ class FakeDoc {
 	}
 	removeEventListener(): void {}
 	/** Fire a DOCUMENT-level handler: the strip releases a held slider here,
-	 * because a drag very often ends with the pointer off the input. */
+	 * because a drag very often ends with the pointer off the input. `type`
+	 * is on the event because the drag's document-level end reads it to tell
+	 * a lift from a cancel. */
 	fire(type: string, ev: Record<string, unknown> = {}): void {
-		const event = { preventDefault: (): void => {}, pointerType: "mouse", ...ev };
+		const event = { type, preventDefault: (): void => {}, pointerType: "mouse", ...ev };
 		for (const fn of this.listeners.get(type) ?? []) fn(event);
 	}
 	/** Run every frame callback `refresh()` queued, including any queued by one. */
@@ -239,9 +429,12 @@ class FakeEl {
 	readonly listeners = new Map<string, Array<(ev: unknown) => void>>();
 	textContent = "";
 	value = "";
-	/** `el.hidden`, as the strip's `hideWhenDisabled` path writes it directly
-	 * (`refreshNow`, MobileTools.ts) - not a class, so it needs its own field
-	 * rather than riding `classes`. */
+	/** Mocks the DOM `hidden` property - not a class, so it needs its own
+	 * field rather than riding `classes`. Nothing in `MobileTools.ts` writes
+	 * it today: Delete selection, Lasso: copy selection and Lasso: paste dim
+	 * instead of hiding (the owner's ruling after trying the hide on vault
+	 * test 2, 2026-09-05 - see "the selection group dims rather than hides"
+	 * below). Kept for whichever button first needs it. */
 	hidden = false;
 	readonly offsetWidth = 0;
 	readonly offsetLeft = 0;
@@ -282,6 +475,15 @@ class FakeEl {
 		return this.children[0] ?? null;
 	}
 	insertBefore(node: FakeEl, ref: FakeEl | null): FakeEl {
+		// DETACH FIRST, which the DOM does and this fake used to not:
+		// `insertBefore` MOVES a node that is already a child rather than
+		// adding a second copy of it. `MobileTools` builds the eraser's mode
+		// chips with `createDiv` (which appends) and then insertBefore's them
+		// to the front, so the eraser's pop read as chips, slider, chips here
+		// and as chips, slider in a browser. Nothing asserted the pop's whole
+		// shape before, so the extra child sat unnoticed.
+		const had = this.children.indexOf(node);
+		if (had >= 0) this.children.splice(had, 1);
 		const at = ref ? this.children.indexOf(ref) : -1;
 		if (at < 0) this.children.push(node);
 		else this.children.splice(at, 0, node);
@@ -299,9 +501,29 @@ class FakeEl {
 	setCssStyles(styles: Record<string, string>): void {
 		Object.assign(this.style, styles);
 	}
-	/** Zeros: nothing here asserts on where an open pop is placed. */
-	getBoundingClientRect(): { left: number; right: number; width: number } {
-		return { left: 0, right: 0, width: 0 };
+	/**
+	 * Zeros by default: nothing here asserts on where an open pop is placed.
+	 * SETTABLE since drag-to-anchor, because the drop rule is answered from
+	 * boxes and a strip whose every edge is zero cannot express a drag at
+	 * all - a test that wants a real pane, a real strip and a real actions
+	 * row writes them here.
+	 */
+	rect = { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+	getBoundingClientRect(): { left: number; top: number; right: number; bottom: number; width: number; height: number } {
+		return this.rect;
+	}
+	/**
+	 * Pointer capture, recorded rather than performed. The strip takes it on
+	 * the handle so the gesture keeps arriving once the finger leaves the
+	 * 24px of grip it started on; there is no retargeting to model here, so
+	 * what a test can read is that it was asked for and given back.
+	 */
+	captured: number | null = null;
+	setPointerCapture(id: number): void {
+		this.captured = id;
+	}
+	releasePointerCapture(id: number): void {
+		if (this.captured === id) this.captured = null;
 	}
 	addClass(c: string): void {
 		this.classes.add(c);
@@ -344,6 +566,7 @@ class FakeEl {
 	/** Fire the handlers the strip registered, the way a real click would. */
 	fire(type: string, ev: Record<string, unknown> = {}): void {
 		const event = {
+			type,
 			preventDefault: (): void => {},
 			stopPropagation: (): void => {},
 			pointerType: "mouse",
@@ -649,6 +872,21 @@ describe("MobileTools: a refresh does not write into the slider under a finger",
 		/** What `hangUnder` writes for `away` once the finger has lifted. */
 		awayShown: string;
 	}
+	/**
+	 * The readout's format, RESTATED here rather than imported from the
+	 * component: one decimal where the control's step is fractional, none
+	 * where it is whole, and the px unit. A test that asked the component
+	 * how it formats and then checked it formatted that way would pass on
+	 * any format at all.
+	 */
+	const DECIMALS: Record<string, number> = {
+		"Eraser size": 0,
+		"Pen size": 1,
+		"Highlighter size": 0,
+	};
+	const shown = (aria: string, v: string): string =>
+		`${Number(v).toFixed(DECIMALS[aria] ?? 0)}px`;
+
 	const ROWS: Row[] = [
 		// (20 - 3) / 1 = 17 steps up from the eraser's own min.
 		{ aria: "Eraser size", dragTo: "20", away: 40, awayShown: "40" },
@@ -666,6 +904,15 @@ describe("MobileTools: a refresh does not write into the slider under a finger",
 		stored: () => number;
 		moveUnderTheDrag: (to: number) => void;
 		refreshes: () => number;
+		/**
+		 * How many times the host's own size setter has been called.
+		 *
+		 * The readout is painted from the same event that reports the value,
+		 * so the count is what says the paint was ADDED to that path rather
+		 * than wired into it twice - a second call per input event would
+		 * double every preview the page draws under the pop.
+		 */
+		sets: () => number;
 	}
 
 	/** A strip with the named slider's pop open and a live store behind it. */
@@ -676,6 +923,7 @@ describe("MobileTools: a refresh does not write into the slider under a finger",
 		const sizes: Record<string, number> = { pen: 1, highlighter: 1 };
 		const eraser = { on: false, radius: 10 };
 		let refreshes = 0;
+		let sets = 0;
 		const host = fakeHost({
 			// refreshNow reads this first, so it counts the refreshes that
 			// actually ran - a test that asserted "unchanged" after nothing
@@ -687,9 +935,15 @@ describe("MobileTools: a refresh does not write into the slider under a finger",
 			activeTool: () => nib,
 			eraserOn: () => eraser.on,
 			eraserRadiusPx: () => eraser.radius,
-			setEraserRadiusPx: (px: number) => void (eraser.radius = px),
+			setEraserRadiusPx: (px: number) => {
+				sets++;
+				eraser.radius = px;
+			},
 			inkSizeMult: (tool: string) => sizes[tool] ?? 1,
-			setInkSizeMult: (tool: string, mult: number) => void (sizes[tool] = mult),
+			setInkSizeMult: (tool: string, mult: number) => {
+				sets++;
+				sizes[tool] = mult;
+			},
 		});
 		const strip = new MobileTools(pane as unknown as HTMLElement, host);
 		const pop = popFor(pane, aria);
@@ -715,77 +969,276 @@ describe("MobileTools: a refresh does not write into the slider under a finger",
 			if (aria === "Eraser size") eraser.radius = to;
 			else sizes[nib] = to;
 		};
-		return { doc, strip, pop, input, stored, moveUnderTheDrag, refreshes: () => refreshes };
+		return {
+			doc,
+			strip,
+			pop,
+			input,
+			stored,
+			moveUnderTheDrag,
+			refreshes: () => refreshes,
+			sets: () => sets,
+		};
 	};
 
 	/**
-	 * THE defect Alan can see, and the one that tells the three sliders
-	 * apart.
+	 * THE FLAT POP (1.4.12): what the pop is MADE OF, and in what order.
 	 *
-	 * The pop is a centered column whose width is its widest child - the
-	 * value chip - and `hangUnder` re-centres it from its own measured
-	 * `offsetWidth` on every refresh, with a `Math.max(0, right)` clamp that
-	 * makes it grow leftward only once it reaches the strip's edge. So a
-	 * chip that changes width slides the whole pop, and the slider inside
-	 * it, sideways under the finger.
+	 * The pop used to lead with a `.handwriting-slider-slot` - a 28x104 div
+	 * holding the range input turned a quarter turn - and carry a live
+	 * `.handwriting-slider-val` readout under it. Between them they were
+	 * taller than every other row in the pop put together, in a control whose
+	 * whole point is to stay out of the way. The SLOT is gone for good: the
+	 * slider is one flat row across the pop's own width.
 	 *
-	 * The old formatter dropped trailing zeros, so the pen's label lost and
-	 * regained a character at every whole number: counted off the real
-	 * constructions, pen 12 width changes across its range, highlighter 1,
-	 * eraser 1. That asymmetry is the whole reason Alan named the pen and
-	 * not the other two, and no account based on the px<->mult rounding can
-	 * produce it - that one is near-symmetric (53% of pen steps, 48% of
-	 * highlighter steps) and would have had him reporting both.
+	 * THE NUMBER IS BACK, and it is a different element (the owner,
+	 * 2026-09-06: "as well"). `.handwriting-slider-num`, on its own row
+	 * directly under the track, in a box of its own with a fixed width - not
+	 * `.handwriting-slider-val`, which had no box and set the pop's width
+	 * between them. So the assertions that the OLD class is nowhere in the
+	 * pop still hold, and still say something: they say the readout that
+	 * juddered did not come back with the readout that did. The pen's pop
+	 * reads slider, value, saved pens, palette; the eraser's, chips, slider,
+	 * value.
 	 *
-	 * There is no layout in this suite, so this cannot measure a rendered
-	 * pop. It asserts the property that MAKES the width constant instead:
-	 * every label a slider can produce is the same run of digit-width
-	 * glyphs. Fixed decimals keep the point from appearing and disappearing;
-	 * U+2007 FIGURE SPACE is by definition a digit's width, which is exactly
-	 * what the chip's `tabular-nums` has already equalised.
+	 * STRUCTURE, not geometry: this suite has no layout, so the sizes are
+	 * measured in a real engine by `test/render/PopGeometry.test.ts` - which
+	 * is also where "the digits cannot move the track" is settled, because
+	 * that is a claim about widths and this file has none. What is checkable
+	 * here is that the parts exist, are in the right order, are direct
+	 * children of the pop rather than nested in a slot, and that the slider
+	 * keeps its own range, step and name.
 	 */
-	describe("the value chip keeps one width across the whole range", () => {
-		for (const row of ROWS) {
-			it(`shows ${row.aria} at a single width, every step of the way`, () => {
-				const rig = rigFor(row.aria);
-				const val = rig.pop.children.find((k) =>
-					k.classes.has("handwriting-slider-val")
-				);
-				if (!val) throw new Error(`no value chip for ${row.aria}`);
+	describe("the pop is flat: no rotated slot, and the value on its own row", () => {
+		/** The classes of a pop's children, in order, sliders named. */
+		const shapeOf = (pop: FakeEl): string[] =>
+			pop.children.map((k) => {
+				if (k.tag === "input") return `input[${k.getAttribute("type")}]`;
+				return [...k.classes].join(".");
+			});
 
+		for (const row of ROWS) {
+			it(`builds ${row.aria} as a flat row, not a rotated slot`, () => {
+				const rig = rigFor(row.aria);
+				const shape = shapeOf(rig.pop);
+				// The two removed parts, by the exact class names the
+				// stylesheet used to reach them by.
+				expect(shape.join(" ")).not.toContain("handwriting-slider-slot");
+				expect(shape.join(" ")).not.toContain("handwriting-slider-val");
+				// And nowhere DEEPER either: a slot moved one level down is
+				// still a slot, and the shape above only reads direct
+				// children.
+				expect(rig.pop.querySelector(".handwriting-slider-slot")).toBeNull();
+				expect(rig.pop.querySelector(".handwriting-slider-val")).toBeNull();
+				// The input is the pop's own child now, which is what lets a
+				// stylesheet give it the pop's full width.
+				expect(rig.pop.children.some((k) => k.tag === "input")).toBe(true);
+			});
+		}
+
+		it("reads slider, value, rule, saved pens, rule, palette", () => {
+			const rig = rigFor("Pen size");
+			expect(shapeOf(rig.pop)).toEqual([
+				"input[range]",
+				"handwriting-slider-num",
+				"handwriting-pop-rule",
+				"handwriting-pop-presets",
+				"handwriting-pop-rule",
+				"handwriting-pop-colors",
+			]);
+		});
+
+		/**
+		 * The eraser's pop shares the container and carries mode chips where a
+		 * nib carries colours. It gets no rules, because it has no sections to
+		 * divide: chips, then the slider.
+		 */
+		it("gives the eraser its chips and its slider, and no hairlines", () => {
+			const rig = rigFor("Eraser size");
+			expect(shapeOf(rig.pop)).toEqual([
+				"handwriting-mode-chips",
+				"input[range]",
+				"handwriting-slider-num",
+			]);
+		});
+
+		/**
+		 * The rotated slot is gone; the RANGE it held is not. A redesign that
+		 * quietly clipped a slider's travel would be invisible in a shape
+		 * assertion, and these are the numbers the pen and highlighter
+		 * multiplier bounds are converted into.
+		 */
+		for (const row of ROWS) {
+			it(`keeps ${row.aria}'s own range and step`, () => {
+				const rig = rigFor(row.aria);
 				const min = Number(rig.input.getAttribute("min"));
 				const max = Number(rig.input.getAttribute("max"));
 				const step = Number(rig.input.getAttribute("step"));
-				// Preconditions: a real range, walked at its own grain.
 				expect(max).toBeGreaterThan(min);
 				expect(step).toBeGreaterThan(0);
-
-				const labels: string[] = [];
-				for (let v = min; v <= max + 1e-9; v = Math.round((v + step) * 1000) / 1000) {
-					rig.input.value = String(v);
-					rig.input.fire("input");
-					labels.push(val.textContent);
-				}
-				// The walk has to have actually happened, and have crossed
-				// the places the width used to change - a whole number for
-				// the pen, and 9->10 for the other two.
-				expect(labels.length).toBeGreaterThan(20);
-				expect(labels.some((l) => l.includes("1"))).toBe(true);
-
-				// The defect: more than one length here is a pop that
-				// changes width, which is a pop that moves.
-				const widths = new Set(labels.map((l) => l.length));
-				expect([...widths]).toHaveLength(1);
-				// And the same glyph SHAPE, not just the same count: a
-				// digit, a figure space and a period are three different
-				// widths, so "1px" padded to five characters would satisfy a
-				// length check and still be narrower than "0.7px".
-				const shapes = new Set(
-					labels.map((l) => l.replace(/\d/g, "#").replace(/\u2007/g, "#"))
-				);
-				expect([...shapes]).toHaveLength(1);
+				// The name a screen reader says. The readout under the track
+				// is a value, not a name: it says "20" and never "Eraser
+				// size", so this attribute is still the whole of the label.
+				expect(rig.input.getAttribute("aria-label")).toBe(row.aria);
 			});
 		}
+	});
+
+	/**
+	 * THE NUMBER UNDER THE TRACK.
+	 *
+	 * "If the number is there then it is easier to set on ones liking" and "it
+	 * will be difficult to remember one like" (a second user, 2026-09-06),
+	 * ruled in by the owner the same day. On glass there is no hover, so a
+	 * slider with no readout tells the user what it holds only by where the
+	 * thumb happens to be.
+	 *
+	 * What this file can check is the WIRING: that the readout exists, that it
+	 * says the input's own value rather than a number recomputed beside it,
+	 * that it follows both routes the input's value changes by - the finger,
+	 * and the refresh that writes the control once the finger lifts - and that
+	 * adding it changed nothing about what the host is told. What it cannot
+	 * check is the widths, which is the whole of why the previous readout was
+	 * deleted; those are measured in a real engine by
+	 * `test/render/PopGeometry.test.ts`.
+	 */
+	describe("the slider shows its own value", () => {
+		/**
+		 * The base width each slider's px value is divided by to get the
+		 * multiplier the host stores; null where the value IS the stored
+		 * number (the eraser's slider is identity px).
+		 */
+		const BASE: Record<string, number | null> = {
+			"Eraser size": null,
+			"Pen size": DEFAULT_PEN.baseWidth,
+			"Highlighter size": HIGHLIGHTER_PEN.baseWidth,
+		};
+
+		/** The readout, and the assertion that there is one to read. */
+		const numOf = (rig: Rig, aria: string): FakeEl => {
+			const num = rig.pop.querySelector(".handwriting-slider-num");
+			expect(num, `the ${aria} pop has no readout`).not.toBeNull();
+			return num!;
+		};
+
+		for (const row of ROWS) {
+			it(`shows ${row.aria}'s value at both ends of its range and while dragged`, () => {
+				const rig = rigFor(row.aria);
+				const num = numOf(rig, row.aria);
+				// The ends off the input's OWN attributes: a readout tested
+				// only in the middle of a range says nothing about the two
+				// values a user actually reaches for.
+				const min = rig.input.getAttribute("min");
+				const max = rig.input.getAttribute("max");
+				expect(min, `${row.aria} has no min`).not.toBeNull();
+				expect(max, `${row.aria} has no max`).not.toBeNull();
+				for (const v of [min!, max!, row.dragTo]) {
+					rig.input.fire("pointerdown");
+					rig.input.value = v;
+					rig.input.fire("input");
+					// PIXELS, ROUNDED TO THE STEP. This asserted the raw string
+					// the control holds until the owner ruled otherwise; the pen
+					// is the row that proves the rounding does something, since
+					// its 3.36 shows as "3.4px".
+					expect(num.textContent).toBe(shown(row.aria, v));
+				}
+			});
+		}
+
+		for (const row of ROWS) {
+			it(`follows the refresh that writes ${row.aria} once the finger lifts`, () => {
+				const rig = rigFor(row.aria);
+				const num = numOf(rig, row.aria);
+
+				// MID-DRAG the control belongs to the finger, so a refresh
+				// writes nothing - and the readout says what the control
+				// holds, which is the dragged value and not the stored one.
+				rig.input.fire("pointerdown");
+				rig.input.value = row.dragTo;
+				rig.input.fire("input");
+				rig.moveUnderTheDrag(row.away);
+				rig.strip.refreshNow();
+				expect(rig.input.value).toBe(row.dragTo);
+				expect(num.textContent).toBe(shown(row.aria, rig.input.value));
+
+				// The finger lifts, the guard releases, and the next refresh
+				// writes the control from the store. The readout has to come
+				// with it: this is the one route that changes the value
+				// without an `input` event ever firing.
+				rig.doc.fire("pointerup");
+				rig.moveUnderTheDrag(row.away);
+				rig.strip.refreshNow();
+				expect(rig.input.value).toBe(row.awayShown);
+				expect(num.textContent).toBe(shown(row.aria, row.awayShown));
+			});
+		}
+
+		/**
+		 * THE NEGATIVE CONTROL. The readout is painted from the input event
+		 * that already reports the value, so the thing to prove is that it
+		 * was added to that path and not wired into it a second time: the
+		 * host hears the same number it heard before, exactly once.
+		 */
+		for (const row of ROWS) {
+			it(`reports ${row.aria} to the host once, unchanged, with the readout present`, () => {
+				const rig = rigFor(row.aria);
+				const num = numOf(rig, row.aria);
+
+				const before = rig.sets();
+				rig.input.fire("pointerdown");
+				rig.input.value = row.dragTo;
+				rig.input.fire("input");
+				expect(rig.sets() - before, "one input event, one setter call").toBe(1);
+				expect(num.textContent).toBe(shown(row.aria, row.dragTo));
+
+				// And the VALUE is the one `dropSlider` was converting at
+				// 58f4345: the eraser's slider is identity px, and the two
+				// nibs' is `pxToMult` - px over the nib's base width, rounded
+				// to 3dp so the float noise in a non-integer base cannot leak
+				// into the stored multiplier.
+				const base = BASE[row.aria];
+				expect(base, `${row.aria} has no base recorded here`).not.toBeUndefined();
+				const want =
+					base === null
+						? Number(row.dragTo)
+						: Math.round((Number(row.dragTo) / base!) * 1000) / 1000;
+				expect(rig.stored()).toBe(want);
+			});
+		}
+
+		/**
+		 * NO LAYOUT READ ON THE DRAG PATH. This runs on every input event of
+		 * a drag, and a measurement here would flush style under the finger -
+		 * which is the shape of the stall the pop's `touch-action` was set to
+		 * fix. Read off the source through `codeOnly`, so a mention of one of
+		 * these in a comment cannot satisfy or break it.
+		 */
+		const src = codeOnly(stripSrc).replace(/\r\n/g, "\n");
+
+		it("paints the readout with one textContent write and no measurement", () => {
+			const at = src.indexOf("const paintValue = (");
+			expect(at, "paintValue is gone from MobileTools.ts").toBeGreaterThan(-1);
+			const end = src.indexOf("};", at);
+			expect(end, "paintValue's body has no end").toBeGreaterThan(at);
+			const body = src.slice(at, end);
+			expect(body).toContain("textContent");
+			expect(body).not.toMatch(
+				/offsetWidth|getBoundingClientRect|getComputedStyle|ResizeObserver|requestAnimationFrame/
+			);
+		});
+
+		it("paints it from the input event that already reports the value", () => {
+			const at = src.indexOf('input.addEventListener("input"');
+			expect(at, "the slider's input listener is gone").toBeGreaterThan(-1);
+			const end = src.indexOf("});", at);
+			expect(end, "the input listener has no end").toBeGreaterThan(at);
+			const body = src.slice(at, end);
+			expect(body).toContain("paintValue(parts)");
+			// Byte for byte what the listener reported before the readout
+			// existed: the paint is an addition to this path, not a change
+			// to it.
+			expect(body).toContain("onValue(Number(input.value), false)");
+		});
 	});
 
 	for (const row of ROWS) {
@@ -1048,9 +1501,30 @@ describe("MobileTools: the nib light follows mouse ink going off", () => {
 				mouseInk.value = true;
 				markPenSeen();
 			},
+			// ISOLATION, MOVED 2026-09-06 out of `penInksHere` and into the
+			// wrapper that always owed it. This describe block tests whether
+			// the CLICK-driven arm/disarm cycle drives the light through
+			// `mouseInkOn()`; `clearPenHardwareSeen()` here flips
+			// `deviceHasNeverSeenAPen()` back true on this pen-less rig, so
+			// without something putting the tool down the pen-less grant
+			// (`mouseDrawsFromLitTool`) relights the button on its own and
+			// masks what the test is exercising. That used to be neutralised
+			// with `penInksHere: () => false` (keyboard mode) on the host -
+			// which now zeroes the FIRST disjunct too (`penDrawsHere`), so
+			// the second test below could no longer see a real pen light
+			// anything and went red on the true statement it pins.
+			//
+			// `clearToolPicked()` is the honest fix and was always the more
+			// faithful rig: the real wrapper both surfaces wire here is
+			// `releaseMouseInkQuietly` (PenToolsMode.ts), which calls
+			// `disarmMouseInkQuietly` AND `clearToolPicked` - putting a tool
+			// down with a mouse unpicks it. Modelling only half of it was the
+			// reason the grant re-fired at all. Pen input now reads ON, as it
+			// does for the user this describe is about.
 			disarmMouseInkQuietly: () => {
 				mouseInk.value = false;
 				clearPenHardwareSeen();
+				clearToolPicked();
 			},
 			toast: (message: string) => {
 				toasts.push(message);
@@ -1195,17 +1669,103 @@ describe("MobileTools: hover previews a nib that can ink, and no other", () => {
 		return { doc, strip, btn, mouseInk, armed };
 	};
 
-	it("a plain mouse with ink off is offered nothing", () => {
-		// Alan's case exactly. Pen is the nominal tool, so isActive is true
-		// and the old gate opened the pop; nothing inks, so isLit is false and
-		// the button is dark. Both are asserted, because a test that checked
-		// only the pop could pass on a build where the button lit as well.
+	/**
+	 * CHANGED, 2026-09-05: "button should become the truth" and its addendum.
+	 * BEFORE, both assertions here were the OTHER way - dark, and hover
+	 * offered nothing - documented in this test's own comment as "Alan's
+	 * case exactly", meaning the ORIGINAL bug this whole ruling reverses: a
+	 * plain mouse, pen-less, no explicit arm. `InlinePenRouter
+	 * .mouseActsAsPen` now genuinely lets this mouse ink with the nominal
+	 * tool, so a dark button offering no preview would be exactly the stale
+	 * reading the ruling exists to fix - the preview must follow the same
+	 * truth the light does, or hovering a nib that genuinely inks would
+	 * offer nothing while the identical, explicitly-armed case two tests
+	 * below gets its slider. NOW asserts the mirror of that case: lit, and
+	 * the hover opens the size slider exactly as an armed mouse's does.
+	 *
+	 * FALSIFIABILITY: this test was never a hardware-vs-session regression
+	 * guard (it never marks or clears hardware seen) and still is not -
+	 * that guard lives in the `nibIsLit` unit tests (MobileTools.test.ts's
+	 * own `describe("nibIsLit", ...)`), not here. This one now pins the
+	 * addendum's positive, end-to-end (DOM + hover) case; see the test
+	 * below for the negative one it used to be, isolated to where it still
+	 * genuinely applies (keyboard mode).
+	 */
+	/**
+	 * CHANGED AGAIN, 2026-09-05 (`mouse-lit-truth`), and again the SETUP is
+	 * the change: `markToolPicked()` is new, the two assertions are not.
+	 * As written this described a device at LAUNCH with nothing picked, and
+	 * asserted it was lit and previewing - which is the defect itself, since
+	 * that same state also inked a plain left-drag that should have selected
+	 * text. "A tool is lit" is pen ink enabled AND a tool picked; picking one
+	 * here is what makes the sentence this test's name asserts actually true.
+	 * The launch state it used to cover is now pinned, dark, in the test
+	 * below it.
+	 */
+	it("a plain mouse with ink off is offered the preview once a tool is picked", () => {
+		markToolPicked();
+		const { doc, strip, btn } = rig();
+		doc.flushFrames();
+		expect(btn.classes.has("is-active")).toBe(true);
+		btn.fire("pointerenter", { pointerType: "mouse" });
+		doc.flushFrames();
+		expect(strip.openNibSlider).toBe("pen");
+	});
+
+	/**
+	 * ADDED for `mouse-lit-truth`: the same plain mouse STRAIGHT FROM LAUNCH.
+	 * Nothing picked, so nothing inks, so the button is dark and the hover
+	 * offers nothing - and the router, reading the same predicate, leaves the
+	 * drag to the editor. The pair above and here is the whole rule in the
+	 * DOM: the preview follows the light follows the draw.
+	 */
+	it("a plain mouse at launch is offered nothing - no tool has been picked yet", () => {
 		const { doc, strip, btn } = rig();
 		doc.flushFrames();
 		expect(btn.classes.has("is-active")).toBe(false);
 		btn.fire("pointerenter", { pointerType: "mouse" });
 		doc.flushFrames();
 		expect(strip.openNibSlider).toBe(null);
+	});
+
+	/**
+	 * ADDED: the genuine negative case the test above used to stand in for.
+	 * `penInksHere: () => false` is keyboard mode - the tip does nothing at
+	 * all, pen or mouse - so neither `penHardwareSeen()`,
+	 * `h.mouseInkOn()` nor the new pen-less grant can be true, and a mouse
+	 * hovering a nib that genuinely cannot ink is still offered nothing.
+	 */
+	it("a plain mouse in keyboard mode is offered nothing - nothing inks there, pen-less grant included", () => {
+		const { doc, strip, btn } = rig({ penInksHere: () => false });
+		doc.flushFrames();
+		expect(btn.classes.has("is-active")).toBe(false);
+		btn.fire("pointerenter", { pointerType: "mouse" });
+		doc.flushFrames();
+		expect(strip.openNibSlider).toBe(null);
+	});
+
+	/**
+	 * ADDED 2026-09-06 with "unlit while the keyboard mode is on", because the
+	 * light going out MOVES this gate too and an unpinned consequence is how
+	 * a rule gets tidied back apart later. The hover branch reads the render
+	 * path's own `spec.isLit ?? spec.isActive`, so darkening the nib in
+	 * keyboard mode also stops the size slider previewing there - and that is
+	 * the same ruling arriving at the same answer by the road it already
+	 * takes, not a side effect: the pop previews what the tip can DO, and in
+	 * keyboard mode a pen does nothing. The mouse's version of this case is
+	 * the test above; this is the PEN device, the only one that has the
+	 * Keyboard button at all, and the only one where the old code left the
+	 * button lit and the slider dropping for a pen that could not draw.
+	 */
+	it("a PEN in keyboard mode is offered nothing either - the pop previews what the tip can do", () => {
+		markPenHardwareSeen();
+		const { doc, strip, btn } = rig({ penInksHere: () => false });
+		doc.flushFrames();
+		expect(btn.classes.has("is-active")).toBe(false);
+		// A pen reaches this branch: only touch is turned away above it.
+		btn.fire("pointerenter", { pointerType: "pen" });
+		doc.flushFrames();
+		expect(strip.openNibSlider, "keyboard mode dropped a size slider").toBe(null);
 	});
 
 	it("a mouse with ink armed still gets its preview", () => {
@@ -1676,6 +2236,117 @@ describe("MobileTools: a mouse click on the ACTIVE nib is for this session", () 
 });
 
 /**
+ * THE PUT-DOWN ON A DEVICE THAT HAS NEVER SEEN A PEN, with `mouseInkOn()`
+ * FALSE THE WHOLE TIME - the second half of `mouse-lit-truth`.
+ *
+ * A palette or hotkey pick on such a device makes the mouse draw through the
+ * DERIVED grant, which arms nothing: `mouseInkOn()` stays false. All three of
+ * the strip's mouse branches asked exactly that flag, so the lit button could
+ * not put itself down - clicking it fell through to the arm branch or to a
+ * plain exec, and the only exit left was the pen-ink toggle, whose button is
+ * hidden on precisely these devices (`shownOn`, MobileTools.ts). They ask
+ * `mouseDrawsHere` now, which is either switch.
+ *
+ * `mouseInkOn: () => false` is hard-wired in the rig rather than modelled, so
+ * a regression cannot pass by quietly arming the old flag instead.
+ */
+describe("MobileTools: the put-down works on a pen-less device with nothing armed", () => {
+	beforeEach(() => {
+		resetPenToolsForTest();
+		resetPenInkForTest();
+		setMouseInk(false);
+	});
+	afterEach(() => {
+		setMouseInk(false);
+		clearToolPicked();
+	});
+
+	const rig = (over: Partial<MobileToolsHost> = {}) => {
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		const toasts: string[] = [];
+		const execs: string[] = [];
+		const armed: string[] = [];
+		/** What the exec'd command's own Notice would have said (main.ts's
+		 * `tipModeOffNotice`): true means it read the put-down flag and
+		 * substituted "Handwriting: cursor" for the nib's name. */
+		const saidCursor: boolean[] = [];
+		const host = fakeHost({
+			activeTool: () => "pen",
+			mouseInkOn: () => false,
+			armMouseInkQuietly: () => armed.push("quiet"),
+			// What InkOverlay.ts wires: the one place the mouse put-down is
+			// written (`releaseMouseInkQuietlyEverywhere`).
+			disarmMouseInkQuietly: () => releaseMouseInkQuietly(),
+			exec: (id: string) => {
+				execs.push(id);
+				saidCursor.push(consumeMousePutDown());
+			},
+			toast: (message: string) => toasts.push(message),
+			...over,
+		});
+		new MobileTools(pane as unknown as HTMLElement, host);
+		doc.flushFrames();
+		return { doc, pane, toasts, execs, armed, saidCursor };
+	};
+
+	it("clicking the lit nib puts it down, with mouseInkOn() false throughout", () => {
+		markToolPicked(); // what "Handwriting: Pen" from the palette leaves behind
+		const { doc, pane, toasts, execs, armed } = rig();
+		const btn = pane.findByTipLabel("Pen");
+		if (!btn) throw new Error("no Pen button was built");
+		expect(btn.classes.has("is-active")).toBe(true);
+
+		btn.fire("click", { pointerType: "mouse" });
+		doc.flushFrames();
+
+		// The put-down branch, not the arm branch and not a plain exec.
+		expect(armed).toEqual([]);
+		expect(execs).toEqual([]);
+		expect(toasts).toEqual(["Handwriting: cursor"]);
+		// And the mouse is genuinely back to text: the router reads this
+		// same flag through `toolIsLit`.
+		expect(toolPickedHere()).toBe(false);
+		expect(btn.classes.has("is-active")).toBe(false);
+	});
+
+	it("the eraser's put-down runs too, and the exec's toast is corrected to 'cursor'", () => {
+		markToolPicked();
+		const { doc, pane, execs, saidCursor, armed } = rig({ eraserOn: () => true });
+		const btn = pane.findByTipLabel("Eraser");
+		if (!btn) throw new Error("no Eraser button was built");
+
+		btn.fire("click", { pointerType: "mouse" });
+		doc.flushFrames();
+
+		expect(execs).toEqual(["handwriting:inline-tool-eraser"]);
+		// ONE toast, the command's, saying the right words - not two.
+		expect(saidCursor).toEqual([true]);
+		expect(armed).toEqual([]);
+		expect(toolPickedHere()).toBe(false);
+	});
+
+	it("at launch the same click picks instead, and the NEXT one puts it down", () => {
+		const { doc, pane, toasts, armed } = rig();
+		const btn = pane.findByTipLabel("Pen");
+		if (!btn) throw new Error("no Pen button was built");
+		// Nothing picked yet, so nothing is lit and nothing is being put down.
+		expect(btn.classes.has("is-active")).toBe(false);
+
+		btn.fire("click", { pointerType: "mouse" });
+		doc.flushFrames();
+		expect(armed).toEqual(["quiet"]);
+		expect(toasts).toEqual(["Handwriting: pen"]);
+		expect(toolPickedHere()).toBe(true);
+
+		btn.fire("click", { pointerType: "mouse" });
+		doc.flushFrames();
+		expect(toasts).toEqual(["Handwriting: pen", "Handwriting: cursor"]);
+		expect(toolPickedHere()).toBe(false);
+	});
+});
+
+/**
  * The Keyboard button: the pen-off switch on the strip (design §5, PenInk.ts).
  *
  * Two e-ink reports behind it - "I couldn't see how to toggle it off or
@@ -1689,10 +2360,20 @@ describe("MobileTools: the Keyboard button hands the note to the keyboard", () =
 	beforeEach(() => {
 		resetPenToolsForTest();
 		resetPenInkForTest();
+		// A DEVICE THAT HAS HELD A PEN, since 1.4.12: the button is only built
+		// once real pen hardware has been seen this session (alan: "yeah mouse
+		// only users should never see it, i think"). Every test below is about
+		// what the button DOES once it exists, so each one needs the device
+		// that has it - the absence rule itself is pinned in its own block
+		// further down. `markPenHardwareSeen`, not `markPenSeen`: only the
+		// former sets the latch, which is the entire point of the latch.
+		markPenHardwareSeen();
 	});
 	afterEach(() => resetPenInkForTest());
 
-	const build = (): {
+	const build = (
+		over: Partial<MobileToolsHost> = {}
+	): {
 		doc: FakeDoc;
 		pane: FakeEl;
 		strip: MobileTools;
@@ -1713,6 +2394,10 @@ describe("MobileTools: the Keyboard button hands the note to the keyboard", () =
 				if (id === "handwriting:pen-ink-toggle") setPenInk(!penInkEnabled());
 			},
 			setEditorFocus: (on: boolean) => void focused.push(on),
+			// The overrides go LAST so a test can say which nib is in hand;
+			// nothing below overrides `exec`, which is the road every one of
+			// them needs.
+			...over,
 		});
 		const strip = new MobileTools(pane as unknown as HTMLElement, host);
 		return { doc, pane, strip, execed, focused };
@@ -1736,7 +2421,7 @@ describe("MobileTools: the Keyboard button hands the note to the keyboard", () =
 	it("closes the tip group: after Pan, before the selection divider", () => {
 		const { pane } = build();
 		const labels = row(pane);
-		const at = labels.indexOf("Keyboard");
+		const at = labels.indexOf("Keyboard mode (pen input off)");
 		expect(at, "the Keyboard button was not built").toBeGreaterThan(-1);
 		// Its own group, not a new one: no divider between Pan and it, and
 		// the next divider is the selection group's.
@@ -1747,7 +2432,7 @@ describe("MobileTools: the Keyboard button hands the note to the keyboard", () =
 
 	it("is dark while the pen inks and lit while the pen is off", () => {
 		const { doc, pane, strip } = build();
-		const btn = pane.findByTipLabel("Keyboard");
+		const btn = pane.findByTipLabel("Keyboard mode (pen input off)");
 		if (!btn) throw new Error("no Keyboard button was built");
 		// The light means "the keyboard has the note", so it is the one button
 		// that is lit precisely when nothing else on its row can be.
@@ -1758,17 +2443,18 @@ describe("MobileTools: the Keyboard button hands the note to the keyboard", () =
 		expect(btn.classes.has("is-active")).toBe(true);
 	});
 
-	it("reads penInksHere from the host, not the global - pdf's pen stays dark whatever the note's flag says", () => {
-		// The pdf surface answers `penInksHere: () => true` unconditionally
-		// (PdfInkController.ts): the flag PenInk.ts carries is note-only, and
-		// this is the regression it guards - the button used to read the
-		// global straight and lit "pen off" on the pdf strip while its own
-		// pen kept inking.
+	it("reads penInksHere from the host, so a surface that keeps inking keeps its light out", () => {
+		// The seam itself, still the button's only source of truth. Both real
+		// surfaces answer `penInkEnabled()` today (the note overlay and, since
+		// the owner's reversal, PdfInkController), so this drives it from the
+		// host side rather than from the flag: a host that says the pen still
+		// inks must leave the light out however the global reads, and a host
+		// that says it does not must light it.
 		const doc = new FakeDoc();
 		const pane = new FakeEl("div", doc);
 		const alwaysInks = fakeHost({ penInksHere: () => true });
 		const strip = new MobileTools(pane as unknown as HTMLElement, alwaysInks);
-		const btn = pane.findByTipLabel("Keyboard");
+		const btn = pane.findByTipLabel("Keyboard mode (pen input off)");
 		if (!btn) throw new Error("no Keyboard button was built");
 
 		setPenInk(false);
@@ -1780,7 +2466,7 @@ describe("MobileTools: the Keyboard button hands the note to the keyboard", () =
 		const pane2 = new FakeEl("div", doc2);
 		const neverInks = fakeHost({ penInksHere: () => false });
 		const strip2 = new MobileTools(pane2 as unknown as HTMLElement, neverInks);
-		const btn2 = pane2.findByTipLabel("Keyboard");
+		const btn2 = pane2.findByTipLabel("Keyboard mode (pen input off)");
 		if (!btn2) throw new Error("no Keyboard button was built");
 
 		strip2.refreshNow();
@@ -1788,38 +2474,37 @@ describe("MobileTools: the Keyboard button hands the note to the keyboard", () =
 		expect(btn2.classes.has("is-active")).toBe(true);
 	});
 
-	it("is not built at all on a surface with no off switch to give it - no keyboard use case on a pdf", () => {
-		// penCanTurnOff answers a different question than penInksHere above:
-		// not "is the pen off right now" but "could this surface ever turn it
-		// off". The pdf host answers false (PdfInkController.ts) - not a
-		// dimmed button, an absent one, per the owner's ruling after he
-		// pressed it on a pdf and got "pen off" while his pen kept inking.
+	it("is built on every strip - the pdf's included - and lit there while the pen is off", () => {
+		// The reversal of `penCanTurnOff`/`shownOn`, which for one commit kept
+		// this button off the pdf strip entirely: "i think the dude was having
+		// trouble with his keyboard coming up on pdf when he didnt want it to?
+		// so why would you take keyboard mode away from pdf". Nothing asks a
+		// host whether the button belongs any more, so the row is the same row
+		// on every surface. Driven with the answer PdfInkController now gives
+		// - `penInksHere: () => penInkEnabled()` - so the assertion is about
+		// the pdf strip and not about a host shape no surface has.
 		const doc = new FakeDoc();
 		const pane = new FakeEl("div", doc);
-		const canToggle = fakeHost();
-		new MobileTools(pane as unknown as HTMLElement, canToggle);
-		const withButton = row(pane).filter((l) => l !== "|");
+		const pdfHost = fakeHost({ penInksHere: () => penInkEnabled() });
+		const strip = new MobileTools(pane as unknown as HTMLElement, pdfHost);
 
-		const doc2 = new FakeDoc();
-		const pane2 = new FakeEl("div", doc2);
-		const cannotToggle = fakeHost({ penCanTurnOff: () => false });
-		new MobileTools(pane2 as unknown as HTMLElement, cannotToggle);
-		const withoutButton = row(pane2).filter((l) => l !== "|");
+		const labels = row(pane).filter((l) => l !== "|");
+		expect(labels).toContain("Keyboard mode (pen input off)");
+		const btn = pane.findByTipLabel("Keyboard mode (pen input off)");
+		if (!btn) throw new Error("the pdf strip carries no Keyboard button");
+		expect(btn.classes.has("is-active")).toBe(false);
 
-		expect(withButton).toContain("Keyboard");
-		expect(pane2.findByTipLabel("Keyboard")).toBeNull();
-		expect(withoutButton).not.toContain("Keyboard");
-		// One button fewer, nothing else disturbed: no button starts a group
-		// where the Keyboard button stood, so it leaves no divider behind it
-		// either (row() above already excludes dividers from this count, but
-		// the point is nothing else in the row moved).
-		expect(withoutButton.length).toBe(withButton.length - 1);
-		expect(withoutButton).toEqual(withButton.filter((l) => l !== "Keyboard"));
+		setPenInk(false);
+		strip.refreshNow();
+		doc.flushFrames();
+		expect(btn.classes.has("is-active"), "the pdf strip's keyboard button stayed dark").toBe(
+			true
+		);
 	});
 
 	it("execs the toggle and takes the keyboard inside the same click", () => {
 		const { doc, pane, execed, focused } = build();
-		const btn = pane.findByTipLabel("Keyboard");
+		const btn = pane.findByTipLabel("Keyboard mode (pen input off)");
 		if (!btn) throw new Error("no Keyboard button was built");
 
 		// Off: the user asked to type, and the focus has to happen HERE - a
@@ -1841,18 +2526,108 @@ describe("MobileTools: the Keyboard button hands the note to the keyboard", () =
 		expect(btn.classes.has("is-active")).toBe(false);
 	});
 
-	it("puts the keyboard on the collapsed pill, over the nib that is still nominally held", () => {
+	/**
+	 * THE RULING, 2026-09-06, in the owner's words: "unlit while the keyboard
+	 * mode is on", under his standing rule for this strip - "button should
+	 * become the truth".
+	 *
+	 * A pen device with a pen in hand, which is the only device that has this
+	 * button at all. `nibIsLit` asked whether another TOOL held the tip and
+	 * whether a pen existed, and never whether the pen could ink, so the Pen
+	 * button stayed lit through keyboard mode while the pen placed carets -
+	 * "lit and not drawing", the exact symptom the whole rule was written for,
+	 * reached through the one door nothing had shut.
+	 *
+	 * DRIVEN THROUGH THE BUTTON, not through the flag: `build()`'s exec is the
+	 * strip's real road to the switch (main.ts's retired-command action ->
+	 * `togglePenInput`), so what this pins is what a user's finger does.
+	 */
+	it("puts the nib light out while the keyboard has the note, and gives it back on the same nib", () => {
+		const { doc, pane } = build();
+		const pen = pane.findByTipLabel("Pen");
+		const kbd = pane.findByTipLabel("Keyboard mode (pen input off)");
+		if (!pen || !kbd) throw new Error("the strip is missing Pen or Keyboard");
+
+		// Precondition, asserted rather than assumed: a pen has been seen and
+		// the pen is the nominal tool, so the button starts LIT. Without this
+		// the last assertion could pass on a button that was never lit at all.
+		doc.flushFrames();
+		expect(pen.classes.has("is-active")).toBe(true);
+
+		// Keyboard mode on. THE DEFECT: this was `true` before 2026-09-06.
+		kbd.fire("click", { pointerType: "pen" });
+		doc.flushFrames();
+		expect(penInkEnabled()).toBe(false);
+		expect(pen.classes.has("is-active"), "the pen button stayed lit in keyboard mode").toBe(
+			false
+		);
+
+		// And back, on the same nib. NOT A PUT-DOWN: `setPenInk(false)`
+		// unpicks the tool for the pen-less device's derived grant, but the
+		// nominal tool - `h.activeTool()` - is untouched, and on a pen device
+		// the light does not read the pick at all. The strip comes back
+		// exactly as it was left.
+		kbd.fire("click", { pointerType: "pen" });
+		doc.flushFrames();
+		expect(penInkEnabled()).toBe(true);
+		expect(pen.classes.has("is-active"), "the pen button did not come back").toBe(true);
+		expect(kbd.classes.has("is-active")).toBe(false);
+	});
+
+	/**
+	 * THE SAME ROUND TRIP HOLDING THE OTHER NIB, and the one a fix that
+	 * reached for the pen would break: a highlighter user coming back from
+	 * typing is not asking to have the highlighter taken out of their hand
+	 * (the reason `togglePenInput` is deliberately not `penOnOff` - see
+	 * PenCommand.ts). Both nibs are asserted at every step, so a fix that
+	 * relit the wrong one is red here rather than merely unmentioned.
+	 */
+	it("gives the HIGHLIGHTER back to a highlighter user, not the pen", () => {
+		const { doc, pane } = build({ activeTool: () => "highlighter" });
+		const pen = pane.findByTipLabel("Pen");
+		const hi = pane.findByTipLabel("Highlighter");
+		const kbd = pane.findByTipLabel("Keyboard mode (pen input off)");
+		if (!pen || !hi || !kbd) throw new Error("the strip is missing a nib or Keyboard");
+
+		doc.flushFrames();
+		expect(hi.classes.has("is-active")).toBe(true);
+		expect(pen.classes.has("is-active")).toBe(false);
+
+		kbd.fire("click", { pointerType: "pen" });
+		doc.flushFrames();
+		expect(hi.classes.has("is-active"), "the highlighter stayed lit in keyboard mode").toBe(
+			false
+		);
+		expect(pen.classes.has("is-active")).toBe(false);
+
+		kbd.fire("click", { pointerType: "pen" });
+		doc.flushFrames();
+		expect(hi.classes.has("is-active"), "the highlighter did not come back").toBe(true);
+		expect(pen.classes.has("is-active"), "the pen was lit for a highlighter user").toBe(false);
+	});
+
+	it("puts the keyboard on the collapsed pill, and the nib goes dark under it", () => {
 		// The pill is what is on screen while the strip is folded, which is
-		// exactly when someone wonders why their pen stopped drawing. The pen
-		// nib stays LIT underneath - `penHardwareSeen` is deliberately not
-		// cleared, so the strip can be found again - so a pill that simply
-		// took the first lit button would wear a pen icon over a pen that
-		// does nothing, which is the most misleading thing it could say.
+		// exactly when someone wonders why their pen stopped drawing.
+		//
+		// THIS TEST'S COMMENT USED TO SAY "the pen nib stays LIT underneath -
+		// `penHardwareSeen` is deliberately not cleared", and that was the
+		// defect, written down as though it were the design. The pill's own
+		// pen-off branch was the only thing keeping a pen icon off the folded
+		// strip; the button behind it was lying. Since 2026-09-06 the nib goes
+		// dark too, so the two agree instead of one covering for the other -
+		// and the assertions on `pen` below are what say so, in the same test
+		// as the pill, because "the pill matches the nib" is one fact.
+		//
+		// The branch still wins outright, and still has to: agreeing on DARK
+		// is not the same as saying WHY, and only the pill can name the state.
 		markPenHardwareSeen();
 		const { doc, pane, strip } = build();
 		const pill = pane.querySelector(".handwriting-pen-pill");
-		if (!pill) throw new Error("no pen pill was built");
+		const pen = pane.findByTipLabel("Pen");
+		if (!pill || !pen) throw new Error("no pen pill or Pen button was built");
 		expect(pill.dataset.icon).toBe("pen");
+		expect(pen.classes.has("is-active")).toBe(true);
 
 		setPenInk(false);
 		strip.refreshNow();
@@ -1860,26 +2635,109 @@ describe("MobileTools: the Keyboard button hands the note to the keyboard", () =
 		expect(pill.dataset.icon).toBe("keyboard");
 		expect(pill.dataset.tipLabel).toBe("Pen off");
 		expect(pill.querySelector(".handwriting-sr-only")?.textContent).toBe("Pen off");
+		expect(pen.classes.has("is-active"), "the pill said Pen off over a lit nib").toBe(false);
 
 		setPenInk(true);
 		strip.refreshNow();
 		doc.flushFrames();
 		expect(pill.dataset.icon).toBe("pen");
 		expect(pill.dataset.tipLabel).toBe("Pen tools");
+		expect(pen.classes.has("is-active")).toBe(true);
 	});
 });
 
 /**
- * Delete selection, Copy selected ink and Paste ink HIDE when they cannot
- * act, rather than greying (owner's ruling, 2026-09-05: "too many icons" -
- * thirteen buttons at rest). Undo and Redo, the strip's other two
- * `isEnabled` buttons, keep the old greying instead - covered above in "a
- * dimmed button's refused click corrects the stale class" - because a
- * disabled Undo is telling you something (there is nothing to undo yet)
- * where a disabled Paste with nothing on the ink clipboard is only another
- * icon to scan past on a strip already thirteen wide.
+ * THE REGRESSION THIS FIX COULD HAVE CAUSED, pinned rather than reasoned
+ * about: a device that has NEVER seen a pen must draw with the mouse exactly
+ * as it did before 2026-09-06.
+ *
+ * On that device the mouse's grant is DERIVED from the lit tool
+ * (`mouseDrawsFromLitTool`, MouseInk.ts - alan's addendum to "button should
+ * become the truth": a pen-less machine has nothing else for the mouse to be),
+ * and the strip's light and the router's grant reach it through one shared
+ * function so they cannot disagree. Darkening the light is therefore one
+ * careless edit away from taking a pen-less user's ink with it, and the
+ * careless edit has a name: wrapping `h.penInksHere()` around the WHOLE of
+ * `nibIsLit` instead of around its pen disjunct. That is why the fix gates
+ * `penDrawsHere` only.
+ *
+ * FALSIFIABILITY, stated plainly because it is not the usual answer: these
+ * assertions are GREEN on the code before the fix as well as after, by
+ * design - "unchanged" is the whole claim. What they do go red on is the
+ * wrong fix above, which is the failure actually worth catching here.
+ *
+ * `mouseActsAsPen(...)` is composed exactly as `InlinePenRouter.mouseActsAsPen`
+ * composes it (InlinePenRouter.ts, its one call site), so this is the router's
+ * real answer and not a restatement of it.
  */
-describe("MobileTools: the selection group hides rather than greys", () => {
+describe("MobileTools: keyboard mode leaves a pen-less device's mouse ink alone", () => {
+	beforeEach(() => {
+		resetPenToolsForTest();
+		resetPenInkForTest();
+		// NO `markPenHardwareSeen()`: this describe is the pen-less device,
+		// so the latch stays false and `deviceHasNeverSeenAPen()` reads true.
+	});
+	afterEach(() => resetPenInkForTest());
+
+	/** The router's own expression, at its own call site's shape. */
+	const mouseDraws = (): boolean =>
+		mouseActsAsPen("mouse", toolIsLit(penInkEnabled()), deviceHasNeverSeenAPen());
+
+	it("keeps the derived grant riding the pick, exactly as it did before the light changed", () => {
+		expect(deviceHasNeverSeenAPen()).toBe(true);
+
+		// Launch: nothing picked, so nothing inks and a drag selects text.
+		expect(mouseDraws()).toBe(false);
+
+		// A tool picked from the palette IS the grant on this device.
+		markToolPicked();
+		expect(mouseDraws()).toBe(true);
+
+		// Keyboard mode takes it, through `toolIsLit` and through
+		// `setPenInk(false)`'s own unpick - both of which predate this fix and
+		// neither of which the fix touches.
+		setPenInk(false);
+		expect(mouseDraws()).toBe(false);
+		expect(toolPickedHere()).toBe(false);
+
+		// And the way back is a PICK, not the switch: this is the behaviour
+		// PenInk.ts chose on purpose ("coming up dark (right)"), and the fix
+		// must not have quietly turned it into a restore.
+		setPenInk(true);
+		expect(mouseDraws()).toBe(false);
+		markToolPicked();
+		expect(mouseDraws()).toBe(true);
+	});
+
+	it("leaves the light lit for a pen-less user whose mouse ink is armed BY NAME, keyboard mode or not", () => {
+		// The case the wrong fix breaks, and the inverse lie the ruling
+		// forbids just as loudly: `mouseActsAsPen`'s explicit `enabled` half
+		// is not gated on pen input anywhere - every `penOff()` site in
+		// InlinePenRouter.ts is `pointerType === "pen" && penOff()` - so this
+		// mouse really does still draw in keyboard mode, and a dark button
+		// beside a drawing mouse is "dark and drawing", the exact inverse of
+		// the symptom being fixed.
+		const host = fakeHost({ activeTool: () => "pen", mouseInkOn: () => true });
+		expect(nibIsLit(host, "pen")).toBe(true);
+		setPenInk(false);
+		expect(nibIsLit(host, "pen"), "keyboard mode darkened an armed mouse's nib").toBe(true);
+	});
+});
+
+/**
+ * Delete selection, Lasso: copy selection and Lasso: paste DIM when they cannot
+ * act, exactly like Undo and Redo - covered above in "a dimmed button's
+ * refused click corrects the stale class" - present, hoverable, `is-disabled`
+ * and `aria-disabled="true"`, never hidden.
+ *
+ * They briefly HID instead (owner's ruling, 2026-09-05: "too many icons" -
+ * thirteen buttons at rest), but after trying that on vault test 2 the
+ * owner ruled it back, verbatim: "on trying it out, i dont think they
+ * should disappear." This pins that reversal: the three selection buttons
+ * and the divider that opens their group stay in the dom and stay visible
+ * no matter what `isEnabled` says.
+ */
+describe("MobileTools: the selection group dims rather than hides", () => {
 	beforeEach(() => resetPenToolsForTest());
 
 	const build = (over: Partial<MobileToolsHost>): { pane: FakeEl; strip: MobileTools } => {
@@ -1890,8 +2748,9 @@ describe("MobileTools: the selection group hides rather than greys", () => {
 	};
 
 	/** The divider drawn immediately before the named button, in the strip's
-	 * own child order - `startsGroup` (MobileTools.ts) draws it right there,
-	 * so this is the one that must hide alongside an emptied group. */
+	 * own child order - `startsGroup` (MobileTools.ts) draws it right there.
+	 * Used below to confirm it stays visible even when every button after it
+	 * is dimmed. */
 	const dividerBefore = (pane: FakeEl, label: string): FakeEl => {
 		const el = pane.querySelector(".handwriting-mobile-tools");
 		if (!el) throw new Error("no strip was built");
@@ -1904,49 +2763,1657 @@ describe("MobileTools: the selection group hides rather than greys", () => {
 		return divider;
 	};
 
-	it("hides Delete, Copy, Paste and their divider with no selection and nothing to paste - Undo stays visible and only greys", () => {
+	it("dims Delete, Copy and Paste with no selection and nothing to paste - present, not hidden, same as Undo", () => {
 		const { pane } = build({ hasInkSelection: () => false, canPasteInk: () => false });
 		const del = pane.findByTipLabel("Delete selection");
-		const copy = pane.findByTipLabel("Copy selected ink");
-		const paste = pane.findByTipLabel("Paste ink");
+		const copy = pane.findByTipLabel("Lasso: copy selection");
+		const paste = pane.findByTipLabel("Lasso: paste");
 		const undo = pane.findByTipLabel("Undo");
 		if (!del || !copy || !paste || !undo) {
 			throw new Error("the selection group or Undo was not built");
 		}
-		expect(del.hidden).toBe(true);
-		expect(copy.hidden).toBe(true);
-		expect(paste.hidden).toBe(true);
-		expect(dividerBefore(pane, "Delete selection").hidden).toBe(true);
+		for (const btn of [del, copy, paste]) {
+			expect(btn.hidden).toBe(false);
+			expect(btn.classes.has("is-disabled")).toBe(true);
+			expect(btn.getAttribute("aria-disabled")).toBe("true");
+		}
+		expect(dividerBefore(pane, "Delete selection").hidden).toBe(false);
 
-		// Undo/Redo's own ruling, untouched: greyed, never hidden. `canUndo`
-		// defaults false in `fakeHost`, so this strip's Undo is disabled too -
-		// the case the two behaviours must tell apart.
+		// Undo's own long-standing behaviour, unchanged by any of this:
+		// dimmed, never hidden. `canUndo` defaults false in `fakeHost`, so
+		// this strip's Undo is disabled too - the case the two now share.
 		expect(undo.hidden).toBe(false);
 		expect(undo.classes.has("is-disabled")).toBe(true);
 		expect(undo.getAttribute("aria-disabled")).toBe("true");
 	});
 
-	it("shows Delete, Copy and their divider once ink is selected - Paste stays hidden", () => {
+	it("undims Delete and Copy once ink is selected - Paste stays dimmed, nothing hides", () => {
 		const { pane } = build({ hasInkSelection: () => true, canPasteInk: () => false });
 		const del = pane.findByTipLabel("Delete selection");
-		const copy = pane.findByTipLabel("Copy selected ink");
-		const paste = pane.findByTipLabel("Paste ink");
+		const copy = pane.findByTipLabel("Lasso: copy selection");
+		const paste = pane.findByTipLabel("Lasso: paste");
 		if (!del || !copy || !paste) throw new Error("the selection group was not built");
 		expect(del.hidden).toBe(false);
 		expect(copy.hidden).toBe(false);
-		expect(paste.hidden).toBe(true);
+		expect(paste.hidden).toBe(false);
+		expect(del.classes.has("is-disabled")).toBe(false);
+		expect(copy.classes.has("is-disabled")).toBe(false);
+		expect(paste.classes.has("is-disabled")).toBe(true);
 		expect(dividerBefore(pane, "Delete selection").hidden).toBe(false);
 	});
 
-	it("shows Paste and the divider with a full ink clipboard alone - Delete and Copy stay hidden", () => {
+	it("undims Paste with a full ink clipboard alone - Delete and Copy stay dimmed, nothing hides", () => {
 		const { pane } = build({ hasInkSelection: () => false, canPasteInk: () => true });
 		const del = pane.findByTipLabel("Delete selection");
-		const copy = pane.findByTipLabel("Copy selected ink");
-		const paste = pane.findByTipLabel("Paste ink");
+		const copy = pane.findByTipLabel("Lasso: copy selection");
+		const paste = pane.findByTipLabel("Lasso: paste");
 		if (!del || !copy || !paste) throw new Error("the selection group was not built");
-		expect(del.hidden).toBe(true);
-		expect(copy.hidden).toBe(true);
+		expect(del.hidden).toBe(false);
+		expect(copy.hidden).toBe(false);
 		expect(paste.hidden).toBe(false);
+		expect(del.classes.has("is-disabled")).toBe(true);
+		expect(copy.classes.has("is-disabled")).toBe(true);
+		expect(paste.classes.has("is-disabled")).toBe(false);
 		expect(dividerBefore(pane, "Delete selection").hidden).toBe(false);
+	});
+});
+
+/**
+ * Nothing sets `el.hidden` on these buttons today - Delete selection, Lasso:
+ * copy selection and Lasso: paste dim instead of hiding (the owner tried
+ * hiding them, then ruled it back after trying it on vault test 2, verbatim:
+ * "i dont think they should disappear", 2026-09-05). The override below is
+ * kept in styles.css anyway, for whichever button next needs `el.hidden`:
+ * `.handwriting-mobile-tool` carries an author `display: flex`, and an
+ * author rule beats the user-agent default `[hidden] { display: none }`
+ * outright regardless of selector specificity or source order - so without
+ * this override a hidden button would stay laid out and painted (dimmed,
+ * hoverable, not-allowed cursor on hover) despite `hidden` being true. That
+ * silent defeat is exactly what vault test 2 saw on 1.4.12-dev before this
+ * override existed - a unit test over `FakeEl` cannot see a CSS cascade
+ * defeat at all, in either direction.
+ *
+ * So this is matched against the CASCADE, not the file's text - the pattern
+ * `GuardStyle.test.ts` established for the same reason: a stylesheet read
+ * as text is a document, and a comment can quote a rule's selector and
+ * declaration while explaining it, which reads identically to a live rule
+ * under a plain substring match. `codeOnly` (`src/CodeOnly.ts`) blanks
+ * comments before either regex below ever sees the text.
+ */
+/** The declaration body of `.handwriting-mobile-tool[hidden] { ... }` in the
+ * cascade, or null if that selector is not a live rule there (commented out,
+ * or only named inside a comment that explains it). */
+function hiddenToolOverrideBody(sheet: string): string | null {
+	const rule = /\.handwriting-mobile-tool\[hidden\]\s*\{([^}]*)\}/;
+	return codeOnly(sheet).match(rule)?.[1] ?? null;
+}
+
+describe("styles.css - the [hidden] override, kept for any future el.hidden use", () => {
+	it("`.handwriting-mobile-tool[hidden]` forces display:none, outranking the button's own display:flex", () => {
+		const body = hiddenToolOverrideBody(css);
+		expect(body, "[hidden] override present in the cascade, not merely in the file").not.toBeNull();
+		expect(body!).toMatch(/display:\s*none\s*!important/);
+	});
+});
+
+/**
+ * Fixtures for the extractor above, same shape as `GuardStyle.test.ts`'s:
+ * attacked directly with sheet text instead of `styles.css`, so a green run
+ * on the real sheet above is evidence rather than an artifact of a reader
+ * that finds everything.
+ */
+describe("the hidden-override reader matches the cascade, not the document", () => {
+	const RULE = ".handwriting-mobile-tool[hidden] {\n\tdisplay: none !important;\n}\n";
+
+	it("finds the rule when it is really there", () => {
+		// Anti-vacuity: a reader that matched nothing would also pass both
+		// negative fixtures below while proving the opposite of what they claim.
+		expect(hiddenToolOverrideBody(RULE)).toMatch(/display:\s*none\s*!important/);
+	});
+
+	it("does NOT accept a commented-out copy of the rule", () => {
+		// The actual regression this guards: deleting the rule from the
+		// cascade while a comment nearby still spells it out (or simply
+		// forgetting to re-add it after wrapping the block in `/* */` during
+		// a debugging pass) must not read as the fix still being in place.
+		expect(hiddenToolOverrideBody(`/*\n${RULE}*/\n`)).toBeNull();
+	});
+
+	it("does NOT accept the rule spelled out inside prose that explains it", () => {
+		const prose =
+			"/*\n * The override reads\n * .handwriting-mobile-tool[hidden] { display: none !important; }\n" +
+			" * so an author display rule never outranks a hidden button again.\n */\n";
+		expect(hiddenToolOverrideBody(prose)).toBeNull();
+	});
+});
+
+
+/**
+ * ITEM 1: the colour moved INTO the nib pops, and the nibs wear it.
+ *
+ * The strip had an "Ink color" button that cycled the palette and opened a
+ * pop of swatches of its own. Alan, 2026-09-05: "13 buttons is too much,
+ * especially on phone", and, on where the colour should go instead, "color
+ * into the pen pop fine but then pen should be colored to indicate color
+ * without having to touch anything".
+ *
+ * So there are two separable claims here and both are pinned below: the
+ * button is GONE and its swatches are a row inside each nib's own size pop
+ * (its own palette, not the active tool's), and the two nib icons are
+ * PAINTED with their own ink at all times - including the nib that is not
+ * currently active, which is the case an `activeColor()` read could not have
+ * answered and which is why the host read is parameterised by tool now.
+ */
+describe("MobileTools: colour lives in the nib pops and on the nib icons", () => {
+	beforeEach(() => resetPenToolsForTest());
+
+	const PENS = [
+		{ name: "black", hex: "#101010" },
+		{ name: "red", hex: "#dd2222" },
+	];
+	const HIGHLIGHTS = [
+		{ name: "yellow", hex: "#ffee55" },
+		{ name: "green", hex: "#66dd66" },
+	];
+
+	/** A strip whose two nibs hold different colours from different palettes. */
+	const build = (
+		over: Partial<MobileToolsHost> = {}
+	): { doc: FakeDoc; pane: FakeEl; strip: MobileTools; picked: string[] } => {
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		const picked: string[] = [];
+		const host = fakeHost({
+			toolColor: (tool: string) => (tool === "highlighter" ? "#ffee55" : "#dd2222"),
+			paletteFor: (tool: string) => (tool === "highlighter" ? HIGHLIGHTS : PENS),
+			pickColor: (name: string, hex: string) => void picked.push(`${name} ${hex}`),
+			...over,
+		});
+		const strip = new MobileTools(pane as unknown as HTMLElement, host);
+		return { doc, pane, strip, picked };
+	};
+
+	/** Every control on the strip that carries a name, in build order. */
+	const labels = (pane: FakeEl): string[] => {
+		const el = pane.querySelector(".handwriting-mobile-tools");
+		if (!el) throw new Error("no strip was built");
+		const out: string[] = [];
+		const walk = (node: FakeEl): void => {
+			for (const kid of node.children) {
+				if (kid.dataset.tipLabel !== undefined) out.push(kid.dataset.tipLabel);
+				walk(kid);
+			}
+		};
+		walk(el);
+		return out;
+	};
+
+	it("builds no Ink color button at all - not dimmed, absent", () => {
+		const { pane } = build();
+		// By the label it wore, and by the tint that used to identify it:
+		// the tooltip is rewritten from the live colour on every refresh, so
+		// a surviving palette button could be wearing a colour name instead.
+		expect(labels(pane)).not.toContain("Ink color");
+		expect(labels(pane).some((l) => l.startsWith("Ink color"))).toBe(false);
+		// The two nibs are still there - this removed a button, not a nib.
+		expect(pane.findByTipLabel("Pen: red")).not.toBeNull();
+		expect(pane.findByTipLabel("Highlighter: yellow")).not.toBeNull();
+	});
+
+	// The heart of "without having to touch anything": BOTH nibs are painted,
+	// on every refresh, whichever one the tip is actually holding. The old
+	// single `activeColor()` read could answer for one of them at a time.
+	it("paints each nib with its OWN ink, including the one that is not active", () => {
+		const { pane } = build({ activeTool: () => "pen" });
+		const pen = pane.findByTipLabel("Pen: red");
+		const hl = pane.findByTipLabel("Highlighter: yellow");
+		if (!pen || !hl) throw new Error("a nib button was not built");
+		expect(pen.style.color).toBe("#dd2222");
+		// Not the pen's colour, and not the active tool's: its own.
+		expect(hl.style.color).toBe("#ffee55");
+	});
+
+	it("names the colour beside the tool in the tooltip, so a hover can say it", () => {
+		const { pane } = build();
+		const pen = pane.findByTipLabel("Pen: red");
+		if (!pen) throw new Error("no Pen button was built");
+		expect(pen.querySelector(".handwriting-sr-only")?.textContent).toBe("Pen: red");
+		// A colour outside the palette has no name to give, so the button
+		// keeps its plain one rather than inventing one or going blank.
+		const other = build({ toolColor: () => "#123456" });
+		expect(other.pane.findByTipLabel("Pen")).not.toBeNull();
+	});
+
+	/** The swatch row inside the named nib's pop, and the pop holding it. */
+	const openPopColors = (
+		nib: "pen" | "highlighter"
+	): { row: FakeEl; pop: FakeEl; picked: string[] } => {
+		const { doc, pane, picked } = build({ activeTool: () => nib });
+		const label = nib === "pen" ? "Pen: red" : "Highlighter: yellow";
+		const btn = pane.findByTipLabel(label);
+		if (!btn) throw new Error(`no ${nib} button was built`);
+		// Touch, not hover: hover also arms the tooltip, which reaches for a
+		// real `window` this suite does not have (see the held-slider rig).
+		btn.fire("click", { pointerType: "touch" });
+		doc.flushFrames();
+		const strip = pane.querySelector(".handwriting-mobile-tools");
+		if (!strip) throw new Error("no strip was built");
+		const rows: FakeEl[] = [];
+		const walk = (node: FakeEl): void => {
+			for (const kid of node.children) {
+				if (kid.classes.has("handwriting-pop-colors")) rows.push(kid);
+				walk(kid);
+			}
+		};
+		walk(strip);
+		// One row per NIB pop, and none for the eraser's - two rows exist,
+		// and the showing one is the only one that was filled.
+		expect(rows.length).toBe(2);
+		const filled = rows.filter((r) => r.children.length > 0);
+		expect(filled.length, "exactly one nib's swatches are built at a time").toBe(1);
+		const row = filled[0]!;
+		// FakeEl carries no parentElement, so the pop is re-found as the one
+		// `.handwriting-slider-pop` that contains this row.
+		const pop = strip.children.find(
+			(k) => k.classes.has("handwriting-slider-pop") && k.contains(row)
+		);
+		if (!pop) throw new Error("the swatch row was not built inside a pop");
+		return { row, pop, picked };
+	};
+
+	it("gives the pen's pop the PEN's palette, current colour ringed", () => {
+		const { row } = openPopColors("pen");
+		expect(row.children.map((s) => s.getAttribute("aria-label"))).toEqual(["black", "red"]);
+		expect(row.children.map((s) => s.style.backgroundColor)).toEqual(["#101010", "#dd2222"]);
+		// `toolColor("pen")` is #dd2222, which is `red` - the second swatch.
+		expect(row.children.map((s) => s.classes.has("is-current"))).toEqual([false, true]);
+	});
+
+	it("gives the highlighter's pop its OWN palette, not the pen's", () => {
+		const { row } = openPopColors("highlighter");
+		expect(row.children.map((s) => s.getAttribute("aria-label"))).toEqual(["yellow", "green"]);
+		expect(row.children.map((s) => s.classes.has("is-current"))).toEqual([true, false]);
+	});
+
+	// The old colour pop closed itself on a pick, because picking was the
+	// whole of what that pop was for. This row shares a pop with the size
+	// slider, so closing on a pick would take the size control away from
+	// under the finger that was about to use it.
+	it("applies a tapped swatch and leaves the pop open with the size slider in it", () => {
+		const { row, pop, picked } = openPopColors("pen");
+		const black = row.children[0]!;
+		black.fire("click", { pointerType: "touch" });
+		expect(picked).toEqual(["black #101010"]);
+		expect(pop.classes.has("is-showing")).toBe(true);
+		// Still a size pop: the slider it shares the pop with is untouched.
+		expect(pop.querySelector("input")).not.toBeNull();
+	});
+});
+
+/**
+ * The strip lost the button; the COMMAND is untouched, and the brief says so
+ * in as many words ("`handwriting:ink-color-cycle` keeps working - it is in
+ * the palette's always set"). Verified against main.ts's own source rather
+ * than taken on trust: an unconditional `callback`, never a
+ * `checkCallback`/`isChecking` gate, is what "always in the palette" means
+ * mechanically, and it is the half a strip change could plausibly have
+ * broken by tidying the command away with the button that used to exec it.
+ */
+describe("ink-color-cycle survives the strip button that used to exec it", () => {
+	it("is still registered, and still unconditionally", () => {
+		const src = codeOnly(mainSrc);
+		const at = src.indexOf(`id: "ink-color-cycle"`);
+		expect(at, "ink-color-cycle is no longer registered in main.ts").toBeGreaterThan(-1);
+		const next = src.indexOf("this.addCommand({", at);
+		const block = next === -1 ? src.slice(at) : src.slice(at, next);
+		expect(block).toContain("callback:");
+		expect(block).not.toContain("checkCallback");
+	});
+
+	it("is no longer a button on the strip", () => {
+		// The other end of the same change, read off MobileTools.ts's own
+		// source: the command id may appear in prose explaining where the
+		// cycle went, and `codeOnly` blanks that before this counts it.
+		expect(codeOnly(stripSrc)).not.toContain("handwriting:ink-color-cycle");
+	});
+});
+
+/**
+ * ITEM 2: Pan is for devices that have no other way to drag the page.
+ *
+ * `shownOn` is BACK on ButtonSpec after `6ad3730` removed it (that commit
+ * removed `penCanTurnOff` with it, and rightly - its one predicate said the
+ * pdf gets no keyboard button, which the owner reversed). What returns is a
+ * different question: not "can this surface honour the button" but "does
+ * this DEVICE have any use for it". Panning with the tip is a workaround for
+ * having no finger, so a touchscreen makes the button redundant rather than
+ * broken.
+ */
+describe("MobileTools: Pan is built on every device, touchscreen or not", () => {
+	beforeEach(() => resetPenToolsForTest());
+
+	const stripFor = (hasTouch: boolean): FakeEl => {
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		new MobileTools(pane as unknown as HTMLElement, fakeHost({ hasTouch: () => hasTouch }));
+		return pane;
+	};
+
+	it("builds it on a mouse-only device", () => {
+		expect(stripFor(false).findByTipLabel("Pan")).not.toBeNull();
+	});
+
+	// THE RULING THIS TEST EXISTS FOR (alan, 2026-09-05): "pan in the fold
+	// list fine". Pan was absent on touch devices for a day, to buy a phone's
+	// row some width; the width problem went to the fold list instead, so the
+	// button is back everywhere and a narrow pane sends it under the chevron.
+	// This assertion is the inverse of the one it replaces, deliberately.
+	it("builds it on a touch device too - the fold, not the device, decides", () => {
+		const pane = stripFor(true);
+		expect(pane.findByTipLabel("Pan")).not.toBeNull();
+		// The tools around it are untouched, and no divider was orphaned:
+		// Pan sits inside the tip group rather than opening one.
+		expect(pane.findByTipLabel("Insert space")).not.toBeNull();
+		expect(pane.findByTipLabel("Eraser")).not.toBeNull();
+	});
+
+	// The host's touch answer is now read by nothing, and a strip must not
+	// start caring about it again by accident: a host that flips it mid-life
+	// changes no button on the strip.
+	it("ignores the host's touch answer entirely, before and after a refresh", () => {
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		const touch = { now: false };
+		const strip = new MobileTools(
+			pane as unknown as HTMLElement,
+			fakeHost({ hasTouch: () => touch.now })
+		);
+		expect(pane.findByTipLabel("Pan")).not.toBeNull();
+		touch.now = true;
+		strip.refreshNow();
+		doc.flushFrames();
+		expect(pane.findByTipLabel("Pan")).not.toBeNull();
+	});
+});
+
+/**
+ * The device read itself, pinned apart from the strip that consumes it.
+ *
+ * `navigator.maxTouchPoints` and not `Platform.isMobile`: the two disagree on
+ * exactly the machines this rule is about (a Surface running the desktop app
+ * has glass; a desktop build in mobile emulation does not), so the choice is
+ * asserted against the source rather than left to whoever reads it next.
+ */
+describe("deviceHasTouch reads the device, not the app", () => {
+	afterEach(() => setHasTouchForTest(null));
+
+	it("answers the seam when one is set, in both directions", () => {
+		setHasTouchForTest(true);
+		expect(deviceHasTouch()).toBe(true);
+		setHasTouchForTest(false);
+		expect(deviceHasTouch()).toBe(false);
+	});
+
+	it("falls back to asking the device when the seam is cleared", () => {
+		setHasTouchForTest(true);
+		setHasTouchForTest(null);
+		// Node has no `navigator.maxTouchPoints` and no `ontouchstart`, so
+		// the honest answer here is false - and, more to the point, it is an
+		// ANSWER: a bare `navigator.maxTouchPoints` read would have thrown
+		// inside a strip constructor on this very platform.
+		expect(deviceHasTouch()).toBe(false);
+	});
+
+	it("is written against maxTouchPoints, never Platform.isMobile", () => {
+		const src = codeOnly(deviceSrc);
+		expect(src).toContain("maxTouchPoints");
+		// The mistake this rules out by name: `Platform.isMobile` answers
+		// "is this the mobile app", which is a different question.
+		expect(src).not.toContain("Platform");
+		expect(src).not.toContain("isMobile");
+	});
+});
+
+/**
+ * ITEM 3: the Keyboard button belongs to devices that have held a pen.
+ *
+ * Alan, 2026-09-05, ruling on it directly: "yeah mouse only users should
+ * never see it, i think". The brief asked for this off `penSeen`, and that
+ * flag cannot deliver it - every tool command sets it, so a mouse-only user
+ * turns it true with their first press of the strip and the button appears
+ * for exactly the people the ruling excludes. `penHardwareSeen()` is honest
+ * but goes back to false on every mouse-ink-off, which would make the button
+ * come and go. The latch is the flag that answers the question asked.
+ */
+describe("MobileTools: the Keyboard button waits for a pen to have been here", () => {
+	beforeEach(() => {
+		resetPenToolsForTest();
+		resetPenInkForTest();
+	});
+	afterEach(() => resetPenInkForTest());
+
+	// The tip string 1.4.12 reworded ("Keyboard" was unclear about what the
+	// button does, 6440f87). Named once here so this block cannot be the place
+	// the next rewording is missed - the four `toBeNull` assertions below pass
+	// against ANY wrong string, so a stale literal would go unnoticed in half
+	// of them.
+	const KEYBOARD_TIP = "Keyboard mode (pen input off)";
+
+	const stripOn = (pane: FakeEl, doc: FakeDoc): MobileTools =>
+		new MobileTools(pane as unknown as HTMLElement, fakeHost());
+
+	it("is absent on a machine that has never seen a pen", () => {
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		stripOn(pane, doc);
+		expect(pane.findByTipLabel(KEYBOARD_TIP)).toBeNull();
+		// Absent, not dimmed: there is no disabled Keyboard button hiding in
+		// the strip either.
+		const strip = pane.querySelector(".handwriting-mobile-tools");
+		expect(strip?.findByTipLabel(KEYBOARD_TIP) ?? null).toBeNull();
+	});
+
+	// The flag the brief named. A mouse-only user reaches it by pressing ANY
+	// tool button, because every tool command calls markPenSeen to raise the
+	// strip - so a `penSeen` predicate would have shown them the button.
+	it("stays absent after markPenSeen alone - the flag the brief asked for", () => {
+		markPenSeen();
+		expect(penSeenThisSession()).toBe(true);
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		stripOn(pane, doc);
+		expect(pane.findByTipLabel(KEYBOARD_TIP)).toBeNull();
+	});
+
+	it("is built once real pen hardware has been seen", () => {
+		markPenHardwareSeen();
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		stripOn(pane, doc);
+		expect(pane.findByTipLabel(KEYBOARD_TIP)).not.toBeNull();
+	});
+
+	/**
+	 * 1.4.12, and the half of Alan's ruling the session-scoped latch could not
+	 * deliver: "a pen device shows the Keyboard button FROM LAUNCH".
+	 *
+	 * This is a restart, told the way the code experiences one - the module
+	 * reset, then `restorePenHardwareEverSeen()` from a settings file that
+	 * says a pen has been here, then the FIRST strip of the session built with
+	 * no pen anywhere near the glass. `stale()` and the rebuild it drives are
+	 * the mechanism for the OTHER case (a pen arriving mid-session); on this
+	 * path there is nothing stale to notice, because the very first build
+	 * already had the right answer.
+	 */
+	it("is built on the first strip after a restore, with no pen contact at all", () => {
+		restorePenHardwareEverSeen();
+		expect(penHardwareEverSeen(), "the restore set the latch").toBe(true);
+		// And set NOTHING else. A restored latch is a fact about the past; the
+		// present-tense flags must still say no pen is in the room, or the nib
+		// lights at launch and the desktop strip appears unasked.
+		expect(penHardwareSeen(), "a restore is not a pen in the room").toBe(false);
+		expect(penSeenThisSession(), "a restore does not raise the strip by itself").toBe(false);
+
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		const strip = stripOn(pane, doc);
+		expect(pane.findByTipLabel(KEYBOARD_TIP)).not.toBeNull();
+		// Nothing to rebuild: the button was right the first time. A strip
+		// that reported itself stale here would destroy and rebuild itself at
+		// every launch on every pen device.
+		expect(strip.stale(), "the first strip of the session is already correct").toBe(false);
+	});
+
+	// THE non-monotonicity that rules `penHardwareSeen()` out. Mouse ink
+	// going off clears the present-tense flag deliberately (the nib light
+	// must go dark "at any point"), and a button keyed off that would vanish
+	// from the next strip built - the toolbar-disappearing complaint at one
+	// button's scale.
+	it("survives a mouse-ink-off that clears the present-tense flag", () => {
+		markPenHardwareSeen();
+		clearPenHardwareSeen();
+		expect(penHardwareSeen(), "the present-tense flag really did go false").toBe(false);
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		stripOn(pane, doc);
+		expect(pane.findByTipLabel(KEYBOARD_TIP)).not.toBeNull();
+	});
+
+	/**
+	 * THE EDGE, and the reason `stale()` exists.
+	 *
+	 * `shownOn` runs once per strip. On a phone the strip is built at mount,
+	 * before any pen has touched the glass, so the latch flips while the
+	 * strip is already on screen - and a refresh cannot conjure a button that
+	 * was never built. Without a rebuild the button would appear only when
+	 * something else happened to recreate the strip, which on a phone is
+	 * "when you reopen the note".
+	 */
+	it("reports itself stale on the first pen contact, so a surface can rebuild it", () => {
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		const strip = stripOn(pane, doc);
+		expect(strip.stale(), "a fresh strip matches the device it was built for").toBe(false);
+		markPenHardwareSeen();
+		expect(strip.stale(), "the latch moved under a strip that cannot repaint it away").toBe(
+			true
+		);
+		// A repaint is NOT the answer, which is the whole point: the button
+		// still is not there until the surface rebuilds.
+		strip.refreshNow();
+		doc.flushFrames();
+		expect(pane.findByTipLabel(KEYBOARD_TIP)).toBeNull();
+		// What the surfaces do on a true answer - destroy, then build again.
+		strip.destroy();
+		const rebuilt = new FakeEl("div", doc);
+		stripOn(rebuilt, doc);
+		expect(rebuilt.findByTipLabel(KEYBOARD_TIP)).not.toBeNull();
+	});
+
+	it("stays put once the latch is set - a second contact rebuilds nothing", () => {
+		markPenHardwareSeen();
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		const strip = stripOn(pane, doc);
+		expect(strip.stale()).toBe(false);
+		markPenHardwareSeen();
+		clearPenHardwareSeen();
+		markPenHardwareSeen();
+		// At most one rebuild per session per strip: the latch cannot go back
+		// down, so nothing after the first contact asks for another.
+		expect(strip.stale()).toBe(false);
+	});
+
+	// A touch device that HAS held a pen keeps its keyboard button. Pan was
+	// the contrast here until 2026-09-05 - present on a mouse-only device,
+	// absent on glass - and it lost that predicate when the owner put it back
+	// on every device and gave the width problem to the fold list. So the
+	// point stands with the assertion inverted: the pen latch is now the ONLY
+	// thing that decides whether a button on this strip exists at all. This is
+	// the Boox/Surface case - glass and a stylus.
+	it("is independent of the touchscreen rule", () => {
+		markPenHardwareSeen();
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		new MobileTools(pane as unknown as HTMLElement, fakeHost({ hasTouch: () => true }));
+		expect(pane.findByTipLabel(KEYBOARD_TIP)).not.toBeNull();
+		expect(pane.findByTipLabel("Pan")).not.toBeNull();
+	});
+});
+
+/**
+ * The latch itself, apart from the strip that reads it. Three flags whose
+ * names are one word apart live in PenToolsMode.ts, and the cost of
+ * confusing two of them has been three releases once already.
+ */
+describe("penHardwareEverSeen: the third flag, and how it differs", () => {
+	beforeEach(() => resetPenToolsForTest());
+
+	it("starts false and is not set by markPenSeen", () => {
+		expect(penHardwareEverSeen()).toBe(false);
+		markPenSeen();
+		expect(penSeenThisSession()).toBe(true);
+		expect(penHardwareEverSeen()).toBe(false);
+	});
+
+	it("is set by real pen hardware, alongside the present-tense flag", () => {
+		markPenHardwareSeen();
+		expect(penHardwareSeen()).toBe(true);
+		expect(penHardwareEverSeen()).toBe(true);
+	});
+
+	// The one behaviour that distinguishes it from its neighbour, and the
+	// reason it exists at all.
+	it("is NOT cleared by clearPenHardwareSeen, which its neighbour is", () => {
+		markPenHardwareSeen();
+		clearPenHardwareSeen();
+		expect(penHardwareSeen()).toBe(false);
+		expect(penHardwareEverSeen()).toBe(true);
+	});
+
+	it("is NOT cleared by a quiet mouse-ink release either", () => {
+		markPenHardwareSeen();
+		releaseMouseInkQuietly();
+		expect(penHardwareSeen()).toBe(false);
+		expect(penHardwareEverSeen()).toBe(true);
+	});
+
+	// NOT a restart any more. Since 1.4.12 the latch is written to settings
+	// and restored at load, so a real restart of a device that has held a pen
+	// answers TRUE - that behaviour is pinned in PenToolsMode.test.ts, where
+	// the restore seam lives. What survives here is the seam's other job: it
+	// is the only thing in the codebase that puts this flag back down, and a
+	// suite whose first pen contact leaked into every later test would assert
+	// nothing at all.
+	it("is cleared by the test reset, which is the only thing that clears it", () => {
+		markPenHardwareSeen();
+		resetPenToolsForTest();
+		expect(penHardwareEverSeen()).toBe(false);
+	});
+});
+
+/**
+ * ITEM 4, the strip's half: the chevron exists, toggles, and gets out of the
+ * way. The DECISION about which buttons fold is `StripOverflow.test.ts`; this
+ * is only about the control.
+ *
+ * Nothing here can make the row actually overflow - `FakeEl` answers 0 to
+ * every dimension, so `layoutOverflow` bails on an unmeasurable width and
+ * leaves the strip exactly as built. That bail is itself the reason every
+ * other test in this file still describes a single unfolded row, so it is
+ * asserted rather than assumed.
+ */
+describe("MobileTools: the More chevron", () => {
+	beforeEach(() => resetPenToolsForTest());
+
+	const build = (): { doc: FakeDoc; pane: FakeEl; strip: FakeEl } => {
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		new MobileTools(pane as unknown as HTMLElement, fakeHost());
+		const strip = pane.querySelector(".handwriting-mobile-tools");
+		if (!strip) throw new Error("no strip was built");
+		return { doc, pane, strip };
+	};
+
+	it("builds the chevron and the second row, both idle, on every strip", () => {
+		const { pane, strip } = build();
+		expect(pane.findByTipLabel("More tools")).not.toBeNull();
+		expect(strip.querySelector(".handwriting-mobile-tools-more")).not.toBeNull();
+		// Neither class is on: an unmeasurable width means "no fold", and
+		// stylesheet-side that is a hidden chevron and a hidden row.
+		expect(strip.classes.has("is-more-needed")).toBe(false);
+		expect(strip.classes.has("is-more-open")).toBe(false);
+	});
+
+	it("sits AFTER every tool button, so nothing shifts under it", () => {
+		const { strip } = build();
+		const named = strip.children.filter((k) => k.dataset.tipLabel !== undefined);
+		expect(named[named.length - 1]?.dataset.tipLabel).toBe("More tools");
+	});
+
+	it("opens and closes on a press, flipping the chevron with it", () => {
+		const { pane, strip } = build();
+		const more = pane.findByTipLabel("More tools");
+		if (!more) throw new Error("no More button was built");
+		more.fire("click", { pointerType: "touch" });
+		expect(strip.classes.has("is-more-open")).toBe(true);
+		more.fire("click", { pointerType: "touch" });
+		expect(strip.classes.has("is-more-open")).toBe(false);
+	});
+
+	it("closes when a tool is picked - the row is a menu, not a drawer", () => {
+		const { doc, pane, strip } = build();
+		const more = pane.findByTipLabel("More tools");
+		const eraser = pane.findByTipLabel("Eraser");
+		if (!more || !eraser) throw new Error("the strip was not built");
+		more.fire("click", { pointerType: "touch" });
+		expect(strip.classes.has("is-more-open")).toBe(true);
+		eraser.fire("click", { pointerType: "touch" });
+		doc.flushFrames();
+		expect(strip.classes.has("is-more-open")).toBe(false);
+	});
+
+	it("closes on a tap outside the strip", () => {
+		const { doc, pane, strip } = build();
+		const more = pane.findByTipLabel("More tools");
+		if (!more) throw new Error("no More button was built");
+		more.fire("click", { pointerType: "touch" });
+		expect(strip.classes.has("is-more-open")).toBe(true);
+		// A document-level pointerdown whose target is not in this strip.
+		doc.fire("pointerdown", { target: new FakeEl("div", doc) });
+		expect(strip.classes.has("is-more-open")).toBe(false);
+	});
+
+	it("closes when the strip collapses to its pill", () => {
+		const { doc, pane, strip } = build();
+		const more = pane.findByTipLabel("More tools");
+		const collapse = pane.findByTipLabel("Collapse pen tools");
+		if (!more || !collapse) throw new Error("the strip was not built");
+		more.fire("click", { pointerType: "touch" });
+		collapse.fire("click", { pointerType: "touch" });
+		doc.flushFrames();
+		expect(strip.classes.has("is-more-open")).toBe(false);
+		// Put the session preference back for the tests after this one:
+		// `collapsedSession` is module state and a collapsed strip would be
+		// inherited by every strip built afterwards.
+		const pill = pane.querySelector(".handwriting-pen-pill");
+		pill?.fire("click", { pointerType: "touch" });
+	});
+});
+
+/**
+ * The stylesheet's half of item 4, matched against the CASCADE rather than
+ * the file's text - the pattern `GuardStyle.test.ts` established, and the one
+ * the `[hidden]` override below already uses: a comment can quote a selector
+ * while explaining it, which reads identically to a live rule under a plain
+ * substring match. `codeOnly` blanks comments before either regex sees them.
+ */
+describe("styles.css - the folded row is invisible until it is needed", () => {
+	/**
+	 * The declaration body of ONE live rule, found by its exact selector
+	 * text. Substring-and-scan rather than a built regex: the selectors here
+	 * are full of `.` and `-`, and a helper that escapes them for a regex is
+	 * one more thing between the assertion and the sheet. `codeOnly` has
+	 * already blanked every comment, so a selector quoted in prose - and
+	 * these are, at length, right above the rules - cannot be found here.
+	 */
+	const body = (selector: string): string | null => {
+		const sheet = codeOnly(css);
+		let from = 0;
+		for (;;) {
+			const at = sheet.indexOf(selector, from);
+			if (at === -1) return null;
+			const rest = sheet.slice(at + selector.length);
+			// The selector must be the WHOLE of what precedes the brace, or
+			// `.handwriting-mobile-tools` would match inside
+			// `.handwriting-mobile-tools-more` and read the wrong rule.
+			const open = rest.match(/^\s*\{/);
+			if (open) {
+				const close = rest.indexOf("}");
+				return close === -1 ? null : rest.slice(open[0].length, close);
+			}
+			from = at + 1;
+		}
+	};
+
+	it("hides the chevron until a real measurement says the row overflowed", () => {
+		expect(body(".handwriting-tools-more")).toMatch(/display:\s*none/);
+		expect(
+			body(".handwriting-mobile-tools.is-more-needed .handwriting-tools-more")
+		).toMatch(/display:\s*flex/);
+	});
+
+	it("hides the second row until the chevron opens it, and makes it a ROW", () => {
+		const shut = body(".handwriting-mobile-tools-more");
+		expect(shut, "the second row's own rule is in the cascade").not.toBeNull();
+		expect(shut!).toMatch(/display:\s*none/);
+		// width:100% is what forces the wrap that MAKES it a second line -
+		// without it the "row" would sit on the end of the first one.
+		expect(shut!).toMatch(/width:\s*100%/);
+		expect(
+			body(".handwriting-mobile-tools.is-more-open .handwriting-mobile-tools-more")
+		).toMatch(/display:\s*flex/);
+	});
+
+	// The failsafe underneath the whole fold. If a measurement is ever wrong,
+	// a too-wide row must still wrap rather than clip its last buttons off
+	// the glass - which is what the strip did before this slice and must go
+	// on doing when the plan cannot help.
+	it("keeps flex-wrap on the strip as the failsafe under the fold", () => {
+		expect(body(".handwriting-mobile-tools")).toMatch(/flex-wrap:\s*wrap/);
+	});
+
+	// Anti-vacuity: a reader that found nothing would pass nothing above,
+	// but a reader that found EVERYTHING would pass all of it wrongly.
+	it("finds no rule for a selector that is not in the sheet", () => {
+		expect(body(".handwriting-tools-more-that-does-not-exist")).toBeNull();
+	});
+});
+
+/**
+ * Quick pens (1.4.12 §4, §10): the chip row at the top of a nib's pop.
+ *
+ * The DOM half only. WHICH chips exist, which one is ringed and how big each
+ * dot is are decided by `presetChips` and pinned in InkPresets.test.ts; what
+ * is asserted here is that the row is built where the design put it, that it
+ * is the ACTIVE nib's row, and that a chip's gestures reach the host rather
+ * than being handled inside the strip.
+ */
+describe("MobileTools: the quick-pen row inside a nib's pop", () => {
+	beforeEach(() => resetPenToolsForTest());
+
+	const PENS = [
+		{ name: "black", hex: "#101010" },
+		{ name: "red", hex: "#dd2222" },
+	];
+	const HIGHLIGHTS = [{ name: "yellow", hex: "#ffee55" }];
+	const penPreset = (hex: string, size: number): InkPreset => ({
+		tool: "pen",
+		hex,
+		name: "starred",
+		size,
+	});
+
+	/** Opens the named nib's pop and hands back its preset row. */
+	const openPop = (
+		nib: "pen" | "highlighter",
+		over: Partial<MobileToolsHost> = {}
+	): {
+		doc: FakeDoc;
+		row: FakeEl;
+		pop: FakeEl;
+		applied: number[];
+		forgotten: number[];
+		starred: string[];
+	} => {
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		const applied: number[] = [];
+		const forgotten: number[] = [];
+		const starred: string[] = [];
+		const host = fakeHost({
+			activeTool: () => nib,
+			toolColor: (tool: string) => (tool === "highlighter" ? "#ffee55" : "#dd2222"),
+			paletteFor: (tool: string) => (tool === "highlighter" ? HIGHLIGHTS : PENS),
+			applyPreset: (_tool: string, index: number) => void applied.push(index),
+			forgetPreset: (_tool: string, index: number) => void forgotten.push(index),
+			starPreset: (tool: string) => void starred.push(tool),
+			...over,
+		});
+		const strip = new MobileTools(pane as unknown as HTMLElement, host);
+		const label = nib === "pen" ? "Pen: red" : "Highlighter: yellow";
+		const btn = pane.findByTipLabel(label);
+		if (!btn) throw new Error(`no ${nib} button was built`);
+		// Touch, not hover: hover arms the tooltip, which reaches for a real
+		// `window` this suite does not have.
+		btn.fire("click", { pointerType: "touch" });
+		doc.flushFrames();
+		const stripEl = pane.querySelector(".handwriting-mobile-tools");
+		if (!stripEl) throw new Error("no strip was built");
+		const pop = stripEl.children.find(
+			(k) =>
+				k.classes.has("handwriting-slider-pop") &&
+				k.classes.has("is-showing") &&
+				k.querySelector(".handwriting-pop-presets") !== null
+		);
+		if (!pop) throw new Error("no nib pop was showing");
+		const row = pop.querySelector(".handwriting-pop-presets");
+		if (!row) throw new Error("the pop has no preset row");
+		return { doc, row, pop, applied, forgotten, starred };
+	};
+
+	const chips = (row: FakeEl): FakeEl[] =>
+		row.children.filter((c) => c.classes.has("handwriting-preset-chip"));
+
+	it("puts the row ABOVE the swatches inside the same pop", () => {
+		// Design §10's one placement relation. §10 also calls the row the top
+		// of the pop; the pop reads slider, saved pens, palette, so "above the
+		// swatches" is what the code can honour and this is it.
+		const { pop } = openPop("pen");
+		const at = (cls: string): number => pop.children.findIndex((k) => k.classes.has(cls));
+		expect(at("handwriting-pop-presets")).toBeGreaterThanOrEqual(0);
+		expect(at("handwriting-pop-colors")).toBeGreaterThan(at("handwriting-pop-presets"));
+		// And still under the slider, which nobody asked to move. The slider
+		// is a direct child of the pop now rather than sitting in a rotated
+		// slot, so it is found by TAG: `findIndex` on a class that no longer
+		// exists returns -1, and every row in the pop is "greater than -1",
+		// which is how this line went on passing after the slot was deleted.
+		const slider = pop.children.findIndex((k) => k.tag === "input");
+		expect(slider).toBeGreaterThanOrEqual(0);
+		expect(at("handwriting-pop-presets")).toBeGreaterThan(slider);
+	});
+
+	it("shows a star and no chips for a tool nobody has starred", () => {
+		const { row } = openPop("pen");
+		expect(chips(row)).toHaveLength(0);
+		expect(row.children.filter((c) => c.classes.has("handwriting-preset-star"))).toHaveLength(1);
+	});
+
+	it("draws one chip per preset, in the preset's colour, at its own width", () => {
+		const { row } = openPop("pen", {
+			presetsFor: () => [penPreset("#dd2222", 1.8), penPreset("#101010", 0.6)],
+		});
+		const dots = chips(row).map((c) => c.children[0]!);
+		expect(dots.map((d) => d.style.backgroundColor)).toEqual(["#dd2222", "#101010"]);
+		// Bold draws a bigger dot than fine - the numbers themselves are
+		// `presetDotPx`'s to pin.
+		expect(parseFloat(dots[0]!.style.width!)).toBeGreaterThan(parseFloat(dots[1]!.style.width!));
+		// The pen in hand is red at 1x, so neither the bold nor the fine red
+		// is the current one.
+		expect(chips(row).map((c) => c.classes.has("is-current"))).toEqual([false, false]);
+	});
+
+	it("rings the chip the nib is actually wearing", () => {
+		const { row } = openPop("pen", {
+			inkSizeMult: () => 1.8,
+			presetsFor: () => [penPreset("#dd2222", 1.8), penPreset("#101010", 1.8)],
+		});
+		expect(chips(row).map((c) => c.classes.has("is-current"))).toEqual([true, false]);
+	});
+
+	it("gives the highlighter's pop its OWN row, asked for by tool", () => {
+		const asked: string[] = [];
+		const { row } = openPop("highlighter", {
+			presetsFor: (tool: string) => {
+				asked.push(tool);
+				return tool === "highlighter" ? [] : [penPreset("#dd2222", 1)];
+			},
+		});
+		expect(asked).toContain("highlighter");
+		expect(chips(row)).toHaveLength(0);
+	});
+
+	it("tapping a chip applies that slot and closes the pop", () => {
+		const { doc, row, pop, applied } = openPop("pen", {
+			presetsFor: () => [penPreset("#dd2222", 1.8), penPreset("#101010", 0.6)],
+		});
+		chips(row)[1]!.fire("click");
+		// The strip's refresh is rAF-deferred, the same as every other close.
+		doc.flushFrames();
+		expect(applied).toEqual([1]);
+		// Design §4: the pop closes behind a preset, where a swatch leaves it
+		// open. The whole pen was chosen; there is nothing left to adjust.
+		expect(pop.classes.has("is-showing")).toBe(false);
+	});
+
+	it("right-clicking a chip forgets that slot and never applies it", () => {
+		const { row, forgotten, applied } = openPop("pen", {
+			presetsFor: () => [penPreset("#dd2222", 1.8)],
+		});
+		chips(row)[0]!.fire("contextmenu");
+		expect(forgotten).toEqual([0]);
+		expect(applied).toEqual([]);
+	});
+
+	it("the star saves the pair in hand and leaves the pop open to show it", () => {
+		const { doc, row, pop, starred } = openPop("pen");
+		const star = row.children.find((c) => c.classes.has("handwriting-preset-star"));
+		if (!star) throw new Error("no star chip was built");
+		star.fire("click");
+		doc.flushFrames();
+		expect(starred).toEqual(["pen"]);
+		expect(pop.classes.has("is-showing")).toBe(true);
+	});
+
+	it("says the star will replace when all four slots are full", () => {
+		const full = Array.from({ length: 4 }, () => penPreset("#dd2222", 1));
+		const { row } = openPop("pen", { presetsFor: () => full });
+		const star = row.children.find((c) => c.classes.has("handwriting-preset-star"));
+		expect(star?.dataset.tipLabel ?? star?.getAttribute("aria-label")).toContain("replacing");
+	});
+});
+
+/**
+ * The fold order is a SETTING now, which means the array this code works with
+ * came off disk and can say anything. `normalizeFoldOrder` is the whole of
+ * the defence, and each case below is a defect it prevents rather than a
+ * tidiness: a lost button, a fold that stops early, or a button folding that
+ * the row is meant to keep.
+ */
+describe("normalizeFoldOrder: a saved order made safe", () => {
+	it("keeps a good order exactly as given", () => {
+		const mine = [...DEFAULT_FOLD_ORDER].reverse();
+		expect(normalizeFoldOrder(mine)).toEqual(mine);
+	});
+
+	it("drops an id this build does not know", () => {
+		const got = normalizeFoldOrder(["handwriting:from-the-future", "editor:redo"]);
+		expect(got).not.toContain("handwriting:from-the-future");
+		expect(got[0]).toBe("editor:redo");
+	});
+
+	// A repeat would demote nothing the second time and silently shorten the
+	// list by one, so a row one button too wide would stop folding early.
+	it("drops a duplicate, keeping the first", () => {
+		const got = normalizeFoldOrder(["editor:redo", "editor:redo"]);
+		expect(got.filter((id) => id === "editor:redo")).toHaveLength(1);
+		expect(got[0]).toBe("editor:redo");
+	});
+
+	// Without this a file written by a build with fewer foldable buttons
+	// would leave the new ones unfoldable and the row would simply overflow.
+	it("appends every missing id, in default order", () => {
+		const got = normalizeFoldOrder(["handwriting:inline-tool-space"]);
+		expect(got[0]).toBe("handwriting:inline-tool-space");
+		expect([...got].sort()).toEqual([...DEFAULT_FOLD_ORDER].sort());
+		const rest = got.slice(1);
+		const expectedRest = DEFAULT_FOLD_ORDER.filter(
+			(id) => id !== "handwriting:inline-tool-space"
+		);
+		expect(rest).toEqual(expectedRest);
+	});
+
+	// THE ONE THAT MATTERS MOST: a saved order naming a button that must
+	// never fold would fold it. Pen is not in the demotable set and never
+	// becomes so by being written into the file.
+	it("drops an id that is not allowed to fold at all", () => {
+		const got = normalizeFoldOrder(["handwriting:inline-tool-pen", "editor:redo"]);
+		expect(got).not.toContain("handwriting:inline-tool-pen");
+		expect(got).toEqual(["editor:redo", ...DEFAULT_FOLD_ORDER.filter((id) => id !== "editor:redo")]);
+	});
+
+	it("answers the default for anything that is not a usable array", () => {
+		for (const junk of [null, undefined, 42, "editor:redo", {}, [1, 2, 3], [null]]) {
+			expect(normalizeFoldOrder(junk)).toEqual([...DEFAULT_FOLD_ORDER]);
+		}
+	});
+});
+
+/**
+ * WHERE main.ts WIRES THE FOLD ORDER, read off its own source.
+ *
+ * Not observable from this module: it lives in the sequence of statements in
+ * `loadSettings`, and the suite cannot construct a plugin to run them. Bounded
+ * at both ends, both ends asserted present and unique, CRLF normalised first,
+ * and read through `codeOnly` so a prose mention cannot satisfy it.
+ */
+describe("main.ts reads the fold order off disk and applies it", () => {
+	const src = codeOnly(mainSrc).replace(/\r\n/g, "\n");
+
+	const onlyIndexOf = (needle: string, what: string): number => {
+		const at = src.indexOf(needle);
+		expect(at, `${what} is not in main.ts any more: ${needle}`).toBeGreaterThan(-1);
+		expect(src.indexOf(needle, at + 1), `${what} is no longer unique in main.ts`).toBe(-1);
+		return at;
+	};
+
+	it("normalises the saved field rather than trusting it", () => {
+		onlyIndexOf("stripFoldOrder: normalizeFoldOrder(raw?.stripFoldOrder),", "the fold-order normalise");
+	});
+
+	// WITHIN loadSettings, and only within it. Both anchors below live in
+	// that one method, so their source positions really do describe the order
+	// the two statements run in. The wider guarantee - that loadSettings is
+	// awaited before any surface exists - is a fact about `onload`, which is
+	// a DIFFERENT method and sits EARLIER in the file than loadSettings does;
+	// comparing an index from one against an index from the other compares
+	// nothing at all. It is pinned separately, and by its own anchors.
+	// THE DROP AND THE DROPDOWN SHARE ONE ROAD, and nothing else pinned it.
+	// `setControlValue`'s toolbarCorner case no longer writes the field or
+	// saves - both halves now come from this hook, so deleting the
+	// registration would stop the SETTINGS DROPDOWN persisting as well as the
+	// drag, and every test in this file would stay green while a user's chosen
+	// placement quietly failed to survive a restart.
+	it("registers the placement writer inside loadSettings, and it saves", () => {
+		const hook = onlyIndexOf("setPersistToolbarCorner((corner) => {", "the placement write hook");
+		const normalise = onlyIndexOf(
+			"stripFoldOrder: normalizeFoldOrder(raw?.stripFoldOrder),",
+			"the fold-order normalise"
+		);
+		expect(normalise, "the hook must be registered inside loadSettings").toBeLessThan(hook);
+
+		const end = src.indexOf("});", hook);
+		expect(end, "the hook body has no end in main.ts any more").toBeGreaterThan(hook);
+		const body = src.slice(hook, end);
+		expect(body).toContain("this.settings.toolbarCorner = corner;");
+		expect(body, "a placement that is not saved does not survive a restart").toContain(
+			"runDetached(this.persistSettings()"
+		);
+	});
+
+	it("applies it inside loadSettings, after the normalise", () => {
+		const normalise = onlyIndexOf(
+			"stripFoldOrder: normalizeFoldOrder(raw?.stripFoldOrder),",
+			"the fold-order normalise"
+		);
+		const apply = onlyIndexOf("setStripFoldOrder(this.settings.stripFoldOrder);", "the fold-order setter call");
+
+		expect(normalise, "the setter must read a normalised order").toBeLessThan(apply);
+
+		const slice = src.slice(normalise, apply);
+		expect(slice.length, "the bounded slice collapsed to nothing").toBeGreaterThan(100);
+		expect(slice).toContain("setToolbarCorner(this.settings.toolbarCorner);");
+	});
+
+	// And the guarantee that makes the above worth anything: settings are read
+	// before the extension that builds strips is registered, so the fold order
+	// is in place before the session's first strip.
+	it("awaits loadSettings before registering the surface that builds strips", () => {
+		const load = onlyIndexOf("await this.loadSettings();", "the settings load");
+		const host = onlyIndexOf(
+			"this.registerEditorExtension(inkOverlayExtension());",
+			"the note surface's strip host"
+		);
+		expect(load, "settings must be read before any surface exists").toBeLessThan(host);
+	});
+
+	// The writer the settings control will call. It exists before the control
+	// does so that slice adds a row and nothing else.
+	it("has a write path that normalises, applies and saves", () => {
+		const at = onlyIndexOf("applyStripFoldOrder(order: readonly string[]): void {", "the fold-order writer");
+		const body = src.slice(at, at + 400);
+		expect(body).toContain("normalizeFoldOrder(order)");
+		expect(body).toContain("setStripFoldOrder(next)");
+		expect(body).toContain("this.settings.stripFoldOrder = next;");
+	});
+});
+
+/**
+ * THE TIMERS, and what a strip destroyed inside one of their windows does.
+ *
+ * A strip is destroyed and rebuilt on a pen edge (`stale()`), so 600ms is a
+ * window a real gesture lands in: press and hold a chip, the first pen contact
+ * of the session rebuilds the strip underneath, and the timer fires against a
+ * strip that no longer exists. The chip one had teeth - `paintPresets` empties
+ * and rebuilds the row, so a hold armed on a chip that has since been redrawn
+ * called `forgetPreset` with an index that now named a different pen: a
+ * starred pen deleted after the finger lifted (review, 2026-09-05).
+ *
+ * One test per timer, each asserting the EFFECT does not happen rather than
+ * that a field is null - a cleared field with an uncancelled timer would pass
+ * the second and fail the user.
+ */
+describe("MobileTools: a strip destroyed inside a timer's window fires nothing", () => {
+	beforeEach(() => {
+		resetPenToolsForTest();
+		vi.useFakeTimers();
+		// The suite runs on node with no DOM, and the strip reaches its timers
+		// through `window`. Pointing that at globalThis is what lets the fake
+		// timers see them - a captured reference taken before the fakes are
+		// installed would be the real setTimeout and nothing would advance.
+		vi.stubGlobal("window", globalThis);
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.unstubAllGlobals();
+	});
+
+	const build = (
+		over: Partial<MobileToolsHost> = {}
+	): { doc: FakeDoc; pane: FakeEl; strip: MobileTools } => {
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		const strip = new MobileTools(
+			pane as unknown as HTMLElement,
+			fakeHost({ activeTool: () => "pen", ...over })
+		);
+		doc.flushFrames();
+		return { doc, pane, strip };
+	};
+
+	// THE FAR END OF THE ROW, not beside the grip (alan, 2026-09-06: "it
+	// already has a pulse, probably move it to trailing or far edge"). It is
+	// still BUILT early - the shared tooltip has to exist before the buttons
+	// are wired - so what this pins is where it ENDS UP, which is the only
+	// thing anyone can see. Asserted against the grip rather than by index:
+	// an index would break every time a button is added.
+	it("the recording dot sits at the row's far end, past every button", () => {
+		const { pane } = build({ recordingOn: () => true });
+		const row = pane.querySelector(".handwriting-mobile-tools");
+		expect(row, "the strip was not built").not.toBeNull();
+
+		const kids = row!.children;
+		const at = (cls: string): number => kids.findIndex((k) => k.classes.has(cls));
+		const dot = at("handwriting-recording-dot");
+		const grip = at("handwriting-tools-grip");
+		expect(dot, "the recording dot is not on the strip").toBeGreaterThan(-1);
+		expect(grip, "the grip is not on the strip").toBeGreaterThan(-1);
+
+		expect(dot, "the dot is back beside the grip").toBeGreaterThan(grip + 1);
+		// The LAST place a tool can hold: everything after it is the More
+		// chevron, which a separate test pins as the final labelled control.
+		const after = kids.slice(dot + 1).filter((k) => k.dataset.tipLabel !== undefined);
+		expect(
+			after.map((k) => k.dataset.tipLabel),
+			"a labelled control other than More sits after the dot"
+		).toEqual(["More tools"]);
+	});
+
+	it("the recording dot's hold does not toggle diagnostics", () => {
+		const exec = vi.fn();
+		const { pane, strip } = build({ exec });
+		const dot = pane.querySelector(".handwriting-recording-dot");
+		expect(dot, "the recording dot is on the strip").not.toBeNull();
+
+		dot!.fire("pointerdown", { preventDefault: () => {} });
+		strip.destroy();
+		vi.advanceTimersByTime(2000);
+
+		expect(exec).not.toHaveBeenCalledWith("handwriting:toggle-diagnostics");
+	});
+
+	// THE ONE THAT COST A STARRED PEN.
+	it("a quick-pen chip's hold does not forget the preset", () => {
+		// A TOOL IS PICKED, because the chip is only reachable through the
+		// nib's hover pop and that pop only opens for a nib that can ink
+		// (`nibIsLit`). This test is about the hold timer, not about the
+		// grant; before `mouse-lit-truth` the launch state was wrongly lit
+		// and the setup got its pop for free.
+		markToolPicked();
+		const forgetPreset = vi.fn();
+		const { doc, pane, strip } = build({
+			presetsFor: () => [{ tool: "pen", hex: "#1a1a1a", name: "black", size: 1 }],
+			forgetPreset,
+		});
+		const penBtn = pane.findByTipLabel("Pen");
+		expect(penBtn, "the pen button is on the strip").not.toBeNull();
+		penBtn!.fire("pointerenter", { pointerType: "mouse" });
+		doc.flushFrames();
+		const chip = pane.querySelector(".handwriting-preset-chip");
+		expect(chip, "the open pop carries a quick-pen chip").not.toBeNull();
+
+		chip!.fire("pointerdown", { preventDefault: () => {} });
+		strip.destroy();
+		vi.advanceTimersByTime(2000);
+
+		expect(forgetPreset).not.toHaveBeenCalled();
+	});
+
+	// And the same hold, cancelled by the ROW being rebuilt rather than by a
+	// destroy: this is the path that renamed a pen rather than removing one.
+	it("a chip's hold does not survive the row being repainted under it", () => {
+		// Same setup correction as the test above, same reason.
+		markToolPicked();
+		const forgetPreset = vi.fn();
+		const { doc, pane, strip } = build({
+			presetsFor: () => [{ tool: "pen", hex: "#1a1a1a", name: "black", size: 1 }],
+			forgetPreset,
+		});
+		const penBtn = pane.findByTipLabel("Pen");
+		penBtn!.fire("pointerenter", { pointerType: "mouse" });
+		doc.flushFrames();
+		const chip = pane.querySelector(".handwriting-preset-chip");
+		expect(chip).not.toBeNull();
+
+		chip!.fire("pointerdown", { preventDefault: () => {} });
+		// A repaint of the same pop: the chips are emptied and rebuilt, and
+		// the armed hold belongs to a button that no longer exists.
+		strip.refreshNow();
+		doc.flushFrames();
+		vi.advanceTimersByTime(2000);
+
+		expect(forgetPreset).not.toHaveBeenCalled();
+	});
+
+	// DOUBLE FORGET (auditor, 2026-09-05): Windows pen and touch fire BOTH the
+	// 600ms hold timer AND the contextmenu event that follows the release, and
+	// both used to call forgetPreset unconditionally - one long press could
+	// delete two presets. The guard is `held`, already set true by the timer;
+	// the contextmenu that follows must see it and stand down.
+	it("a hold that already forgot ignores the contextmenu the release fires after it", () => {
+		// A TOOL IS PICKED, for the same reason its two neighbours say so: the
+		// chip is only reachable through the nib's hover pop, and that pop only
+		// opens for a nib that can ink. This test is about the double-forget
+		// guard, not about the grant; it was written on a lane where the launch
+		// state was still wrongly lit, so its setup got the pop for free.
+		markToolPicked();
+		const forgetPreset = vi.fn();
+		const { doc, pane } = build({
+			presetsFor: () => [{ tool: "pen", hex: "#1a1a1a", name: "black", size: 1 }],
+			forgetPreset,
+		});
+		const penBtn = pane.findByTipLabel("Pen");
+		penBtn!.fire("pointerenter", { pointerType: "mouse" });
+		doc.flushFrames();
+		const chip = pane.querySelector(".handwriting-preset-chip");
+		expect(chip, "the open pop carries a quick-pen chip").not.toBeNull();
+
+		chip!.fire("pointerdown", { preventDefault: () => {} });
+		vi.advanceTimersByTime(600);
+		expect(forgetPreset).toHaveBeenCalledTimes(1);
+
+		// The same press's release, on Windows pen/touch: the contextmenu
+		// event that follows the hold that already fired.
+		chip!.fire("contextmenu");
+		expect(forgetPreset).toHaveBeenCalledTimes(1);
+	});
+
+	it("the hover tooltip does not appear", () => {
+		const { pane, strip } = build();
+		const tip = pane.querySelector(".handwriting-strip-tip");
+		expect(tip, "the strip carries its tooltip element").not.toBeNull();
+		const undo = pane.findByTipLabel("Undo");
+		expect(undo, "the undo button is on the strip").not.toBeNull();
+
+		undo!.fire("pointerenter", { pointerType: "mouse" });
+		strip.destroy();
+		vi.advanceTimersByTime(2000);
+
+		expect(tip!.classes.has("is-showing")).toBe(false);
+	});
+});
+
+/**
+ * DRAG TO ANCHOR (1.4.12). Alan: "drag to anchor we can get out in 1.4.12?
+ * do it".
+ *
+ * The arithmetic - has this contact become a drag, and which of the six did
+ * it land on - is `ToolbarDrag.ts` and is pinned in its own file, against a
+ * real pane with real boxes, which this suite cannot supply by accident.
+ * What is pinned HERE is everything the class does around those two answers:
+ * which elements are draggable at all, that a tap is still a tap, that a drop
+ * reaches the one setter both surfaces share, that Escape gets the strip
+ * back, and - the one with teeth - that the actions-row dodge and a live drag
+ * compose instead of erasing each other.
+ */
+describe("MobileTools: dragging the toolbar to an anchor", () => {
+	// FAKE TIMERS FOR THE WHOLE GROUP, because a drop that really lands flies
+	// the last few px on a `window.setTimeout` - and this suite runs on node,
+	// where there is no `window` at all until one is stubbed in. Every test
+	// below that drops a strip whose anchor actually moves goes through that
+	// path; the ones that drop it where it already was return before reaching
+	// it, and are unaffected either way.
+	beforeEach(() => {
+		resetPenToolsForTest();
+		vi.useFakeTimers();
+		vi.stubGlobal("window", globalThis);
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.unstubAllGlobals();
+	});
+
+	interface DragRig {
+		doc: FakeDoc;
+		pane: FakeEl;
+		strip: MobileTools;
+		el: FakeEl;
+		pill: FakeEl;
+		grip: FakeEl;
+		/** Every placement the host was asked for, in order. */
+		placed: string[];
+	}
+
+	const buildDrag = (over: Partial<MobileToolsHost> = {}): DragRig => {
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		const placed: string[] = [];
+		const strip = new MobileTools(
+			pane as unknown as HTMLElement,
+			fakeHost({ setPlacement: (corner) => void placed.push(corner), ...over })
+		);
+		// EXPANDED, said rather than assumed. `collapsedSession` is module
+		// state shared by every strip in this file's run - it is a session
+		// preference, deliberately - so a test that collapsed one leaves the
+		// next one's strip born folded, with the pill (a zero box here) as
+		// the thing that gets measured. Every drag test below that reads a
+		// box wants the strip.
+		strip.setCollapsed(false);
+		const el = pane.querySelector(".handwriting-mobile-tools");
+		const pill = pane.querySelector(".handwriting-pen-pill");
+		const grip = pane.querySelector(".handwriting-tools-grip");
+		if (!el || !pill || !grip) throw new Error("the strip, its pill or its grip was not built");
+		return { doc, pane, strip, el, pill, grip, placed };
+	};
+
+	/**
+	 * A fake element that answers where it ACTUALLY is: its resting box,
+	 * shifted by whatever `paintTransform` last wrote on it.
+	 *
+	 * A plain `rect` cannot express this slice. Two of the strip's own reads
+	 * are taken at DIFFERENT moments of the same gesture and are meant to
+	 * differ: `applyHeaderClearance` clears the transform and measures the
+	 * strip at rest, and the drag measures it mid-flight with the dodge - and
+	 * later with the drag's own offset - still on it. A fake that answers one
+	 * number to both cannot tell a dodged box from an un-dodged one, which is
+	 * exactly the confusion the drop had. `resting` is a live object rather
+	 * than a value so a test can move the strip's anchor under it, the way
+	 * `setPlacement` does on a real surface.
+	 */
+	interface Resting {
+		left: number;
+		top: number;
+		width: number;
+		height: number;
+	}
+	const liveRect = (el: FakeEl, resting: Resting): void => {
+		el.getBoundingClientRect = (): {
+			left: number;
+			top: number;
+			right: number;
+			bottom: number;
+			width: number;
+			height: number;
+		} => {
+			const seen = /translate\((-?[\d.]+)px, (-?[\d.]+)px\)/.exec(el.style.transform ?? "");
+			const dx = seen ? Number(seen[1]) : 0;
+			const dy = seen ? Number(seen[2]) : 0;
+			return {
+				left: resting.left + dx,
+				top: resting.top + dy,
+				right: resting.left + resting.width + dx,
+				bottom: resting.top + resting.height + dy,
+				width: resting.width,
+				height: resting.height,
+			};
+		};
+	};
+
+	/** One whole gesture: press here, travel there, let go. */
+	const gesture = (rig: DragRig, on: FakeEl, dx: number, dy: number): void => {
+		on.fire("pointerdown", { pointerId: 7, clientX: 100, clientY: 100 });
+		on.fire("pointermove", { pointerId: 7, clientX: 100 + dx, clientY: 100 + dy });
+		rig.doc.fire("pointerup", { pointerId: 7 });
+	};
+
+	it("only the handles drag: the same gesture on a BUTTON moves nothing", () => {
+		const rig = buildDrag();
+		const undo = rig.pane.findByTipLabel("Undo");
+		if (!undo) throw new Error("the undo button is on the strip");
+
+		gesture(rig, undo, 300, 400);
+
+		expect(rig.el.style.transform ?? "", "a button press translated the strip").toBe("");
+		expect(rig.el.classes.has("is-dragging")).toBe(false);
+		expect(rig.placed, "a button press moved the toolbar's placement").toEqual([]);
+
+		// The same gesture on the GRIP does move it, which is what makes the
+		// assertions above about the ELEMENT rather than about the gesture
+		// having been built wrong.
+		gesture(rig, rig.grip, 300, 400);
+		expect(rig.placed.length, "the grip is draggable").toBe(1);
+	});
+
+	it("the grip is the strip's leading element and takes pointer capture", () => {
+		const rig = buildDrag();
+		expect(rig.el.children[0], "the grip is not the row's first element").toBe(rig.grip);
+		expect(rig.grip.querySelector(".handwriting-tools-grip-dots")).not.toBeNull();
+
+		rig.grip.fire("pointerdown", { pointerId: 3, clientX: 0, clientY: 0 });
+		expect(rig.grip.captured, "the handle did not capture the pointer").toBe(3);
+		rig.doc.fire("pointerup", { pointerId: 3 });
+		expect(rig.grip.captured).toBeNull();
+	});
+
+	it("a tap on the pill still opens the strip; a drag on it does not", () => {
+		const rig = buildDrag();
+		rig.strip.setCollapsed(true);
+		expect(rig.el.classes.has("is-collapsed")).toBe(true);
+
+		// A TAP, with the pixel or two of pen jitter every tap on glass has.
+		gesture(rig, rig.pill, 3, 4);
+		rig.pill.fire("click");
+		expect(rig.el.classes.has("is-collapsed"), "a tap on the pill no longer opens the strip").toBe(
+			false
+		);
+		expect(rig.placed, "a tap moved the placement").toEqual([]);
+
+		// A DRAG, whose release synthesizes the same click on the same pill.
+		rig.strip.setCollapsed(true);
+		gesture(rig, rig.pill, 0, 120);
+		rig.pill.fire("click");
+		expect(rig.el.classes.has("is-collapsed"), "a drag on the pill opened the strip").toBe(true);
+		expect(rig.placed.length, "a drag on the pill did not place it").toBe(1);
+	});
+
+	it("a drop hands the chosen anchor to the setter both surfaces share", () => {
+		const rig = buildDrag();
+		// A 1000x800 pane with a 400x40 strip parked in its top-right corner,
+		// 8px off both edges - the strip's own resting box.
+		rig.pane.rect = { left: 0, top: 0, right: 1000, bottom: 800, width: 1000, height: 800 };
+		rig.el.rect = { left: 592, top: 8, right: 992, bottom: 48, width: 400, height: 40 };
+
+		// Down and across, to a centre of (232, 728) - nearest the bottom-left
+		// anchor's resting centre of (208, 772).
+		gesture(rig, rig.grip, -560, 700);
+
+		expect(rig.placed).toEqual(["bottom-left"]);
+		// And the drag's own translate is gone: the placement is what holds
+		// the strip now, not an offset left behind on the element.
+		expect(rig.el.style.transform).toBe("");
+		expect(rig.el.classes.has("is-dragging")).toBe(false);
+	});
+
+	it("Escape mid-drag puts the strip back and writes no placement", () => {
+		const rig = buildDrag();
+		rig.pane.rect = { left: 0, top: 0, right: 1000, bottom: 800, width: 1000, height: 800 };
+		rig.el.rect = { left: 592, top: 8, right: 992, bottom: 48, width: 400, height: 40 };
+
+		rig.grip.fire("pointerdown", { pointerId: 4, clientX: 100, clientY: 100 });
+		rig.grip.fire("pointermove", { pointerId: 4, clientX: -460, clientY: 800 });
+		expect(rig.el.style.transform, "the drag is not live").toContain("translate(-560px, 700px)");
+		expect(rig.el.classes.has("is-dragging")).toBe(true);
+
+		rig.doc.fire("keydown", { key: "Escape", defaultPrevented: false, stopPropagation: () => {} });
+
+		expect(rig.el.style.transform, "Escape left the strip where the drag had it").toBe("");
+		expect(rig.el.classes.has("is-dragging")).toBe(false);
+		expect(rig.placed, "a cancelled drag still wrote a placement").toEqual([]);
+
+		// The lift that follows a cancel must not resurrect the drop either.
+		rig.doc.fire("pointerup", { pointerId: 4 });
+		expect(rig.placed).toEqual([]);
+	});
+
+	/**
+	 * THE COLLISION, and the one thing in this slice that had to be designed
+	 * rather than added.
+	 *
+	 * `applyHeaderClearance` writes an inline `transform` to dodge the pane's
+	 * actions row and replaces the whole property doing it - which is why the
+	 * middles are centred with auto margins and not with a transform
+	 * (CornerSafeArea.test.ts). A drag wants the same property. The two are
+	 * reachable together: `setCorner` calls the clearance, and the pdf
+	 * surface's `refreshStrip` (PdfInkController.ts) calls `setCorner` on
+	 * EVERY strip refresh - so a hotkey that changes tool while a finger is
+	 * on the grip runs the clearance mid-drag. On the note surface the resize
+	 * observer does the same on a rotation, on a split being dragged, or on
+	 * the sidebar opening.
+	 *
+	 * Neither writes `transform` now. Both keep a number and `paintTransform`
+	 * composes the pair, so a dodge landing mid-drag moves the strip by the
+	 * amount the actions row moved and by nothing else.
+	 */
+	it("a dodge recomputed mid-drag keeps the drag's offset", () => {
+		const rig = buildDrag();
+		rig.pane.rect = { left: 0, top: 0, right: 1000, bottom: 800, width: 1000, height: 800 };
+		rig.el.rect = { left: 800, top: 8, right: 992, bottom: 48, width: 192, height: 40 };
+		const actions = rig.pane.createDiv({ cls: "view-actions" });
+		actions.rect = { left: 900, top: 0, right: 990, bottom: 40, width: 90, height: 40 };
+
+		// The dodge alone, with no drag: 100px left, clear of the dots.
+		rig.strip.setCorner("top-right");
+		expect(rig.pane.querySelector(".view-actions"), "the pane's actions row").toBe(actions);
+		expect(rig.el.style.transform, "the actions row is not being dodged at all").toBe(
+			"translate(-100px, 0px)"
+		);
+
+		rig.grip.fire("pointerdown", { pointerId: 9, clientX: 100, clientY: 100 });
+		rig.grip.fire("pointermove", { pointerId: 9, clientX: 130, clientY: 140 });
+		expect(rig.el.style.transform).toBe("translate(-70px, 40px) scale(1.04)");
+
+		// THE CLEARANCE, mid-drag, by the road the pdf surface takes on every
+		// strip refresh.
+		rig.strip.setCorner("top-right");
+
+		expect(
+			rig.el.style.transform,
+			"the clearance erased the drag's offset instead of composing with it"
+		).toBe("translate(-70px, 40px) scale(1.04)");
+		// And the pill moved with it, as it does for the dodge alone.
+		expect(rig.pill.style.transform).toBe("translate(-70px, 40px) scale(1.04)");
+	});
+
+	/**
+	 * THE SAME COLLISION AT THE OTHER END: the drop, which has to UN-dodge
+	 * before it can compare.
+	 *
+	 * The box the drop reasons from is read off the live element and carries
+	 * the actions-row dodge. `anchorRestingCentre` has no dodge term - it
+	 * answers where the stylesheet puts a strip - so the drop was comparing a
+	 * dodged centre against six un-dodged predictions of it. On a pdf, where
+	 * the dodge is the whole width of the three-dots row, that is a hundred px
+	 * or two of error in the one direction the top anchors are told apart by:
+	 * the strip is dropped where the user is not looking, off a gesture that
+	 * asked for nothing.
+	 */
+	it("a dodged strip is dropped in the anchors' frame, not the dodge's", () => {
+		const rig = buildDrag();
+		rig.pane.rect = { left: 0, top: 0, right: 1000, bottom: 800, width: 1000, height: 800 };
+		// A 400x40 strip resting in the pane's top-right corner, and an
+		// actions row far enough in that clearing it costs 200px.
+		liveRect(rig.el, { left: 592, top: 8, width: 400, height: 40 });
+		const actions = rig.pane.createDiv({ cls: "view-actions" });
+		actions.rect = { left: 800, top: 0, right: 990, bottom: 40, width: 190, height: 40 };
+
+		rig.strip.setCorner("top-right");
+		expect(rig.el.style.transform, "the strip is not dodging the actions row at all").toBe(
+			"translate(-200px, 0px)"
+		);
+
+		// A NUDGE: ten px right and nothing else. Un-dodged, the strip's
+		// centre is at 802 and the top-right anchor rests at 792 - ten px, the
+		// distance the finger moved. Dodged, it reads 602, which is nearer the
+		// top MIDDLE's 500 than the top right's 792.
+		gesture(rig, rig.grip, 10, 0);
+
+		expect(
+			rig.placed,
+			"a 10px nudge on a dodged strip was dropped a dodge-width from where it was aimed"
+		).toEqual(["top-right"]);
+	});
+
+	it("the folded row is shut BEFORE the box is measured, not after", () => {
+		const rig = buildDrag();
+		rig.pane.rect = { left: 0, top: 0, right: 400, bottom: 800, width: 400, height: 800 };
+		// A phone-width strip with a SECOND ROW open: that row is in flow
+		// inside the strip (`.handwriting-mobile-tools-more`), so the strip
+		// stands 88px tall open and 40px shut, and the fake says so by reading
+		// the very class `setMoreOpen` toggles.
+		const resting = { left: 8, top: 372, width: 300, height: 40 };
+		liveRect(rig.el, resting);
+		const boxed = rig.el.getBoundingClientRect.bind(rig.el);
+		rig.el.getBoundingClientRect = () => {
+			resting.height = rig.el.classes.has("is-more-open") ? 88 : 40;
+			return boxed();
+		};
+		const more = rig.pane.querySelector(".handwriting-tools-more");
+		if (!more) throw new Error("the strip built no More chevron");
+		more.fire("click", {});
+		expect(rig.el.classes.has("is-more-open"), "the chevron did not open the row").toBe(true);
+
+		// The nudge is HORIZONTAL, so the vertical answer is the thing
+		// under test. The strip rests just above the pane's midline at
+		// 800/2 = 400: shut, its centre is 392 and the drop is a top anchor.
+		// Measured while the second row is still in the box, the same strip
+		// reads 416 - below the line - and lands on a bottom one, for a
+		// gesture that never left the top half.
+		gesture(rig, rig.grip, 8, 0);
+
+		expect(
+			rig.placed,
+			"an open second row measured into the box pushed the drop past the midline"
+		).toEqual(["top-left"]);
+	});
+
+	it("a pointercancel arms no click swallow: the pill still opens by keyboard", () => {
+		const rig = buildDrag();
+		rig.pane.rect = { left: 0, top: 0, right: 1000, bottom: 800, width: 1000, height: 800 };
+		liveRect(rig.el, { left: 8, top: 8, width: 300, height: 40 });
+		rig.strip.setCollapsed(true);
+
+		// A drag on the PILL that the system takes away mid-flight. No lift
+		// follows a pointercancel, so there is no synthesized click to eat.
+		rig.pill.fire("pointerdown", { pointerId: 7, clientX: 100, clientY: 100 });
+		rig.pill.fire("pointermove", { pointerId: 7, clientX: 140, clientY: 100 });
+		rig.doc.fire("pointercancel", { pointerId: 7 });
+
+		// The keyboard reaches a real button through `click` alone, with no
+		// pointerdown ahead of it to clear a stale flag - so a swallow armed
+		// here would eat the user's Enter and the strip would stay shut.
+		rig.pill.fire("click", {});
+
+		expect(
+			rig.el.classes.has("is-collapsed"),
+			"a cancelled drag swallowed the next press on the pill"
+		).toBe(false);
+	});
+
+	it("only the primary left button drags the grip", () => {
+		const rig = buildDrag();
+		rig.pane.rect = { left: 0, top: 0, right: 1000, bottom: 800, width: 1000, height: 800 };
+		liveRect(rig.el, { left: 8, top: 8, width: 300, height: 40 });
+
+		rig.grip.fire("pointerdown", { pointerId: 7, clientX: 100, clientY: 100, button: 2 });
+		rig.grip.fire("pointermove", { pointerId: 7, clientX: 400, clientY: 700 });
+		rig.doc.fire("pointerup", { pointerId: 7 });
+		expect(rig.placed, "a right-button drag moved the toolbar").toEqual([]);
+
+		rig.grip.fire("pointerdown", { pointerId: 8, clientX: 100, clientY: 100, isPrimary: false });
+		rig.grip.fire("pointermove", { pointerId: 8, clientX: 400, clientY: 700 });
+		rig.doc.fire("pointerup", { pointerId: 8 });
+		expect(rig.placed, "a secondary contact dragged the toolbar").toEqual([]);
 	});
 });

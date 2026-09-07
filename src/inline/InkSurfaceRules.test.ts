@@ -25,9 +25,9 @@
  *   - do note and pdf still each wire every `InlinePenRouter` callback BOTH
  *     surfaces owe an answer to, which is the duplication surface every one of
  *     the divergences happened on. That set is not the same as the type's
- *     required members: the interface declares ten, three of them optional,
- *     and two of those three are note-only while the third
- *     (`onStrokeAbandoned?`) is owed by both - see INLINE_PEN_CALLBACKS
+ *     required members: the interface declares eleven, four of them optional,
+ *     and two of those four are note-only while the other two (`penOff?` and
+ *     `onStrokeAbandoned?`) are owed by both - see INLINE_PEN_CALLBACKS
  *     (InkSurfaces.ts)
  *
  * WHAT THIS CANNOT ANSWER
@@ -230,13 +230,50 @@ const RULES: readonly SurfaceRule[] = [
 		},
 	},
 	{
-		// See the lasso row above for why this dropped `.add(PAN_CURSOR_CLASS)`
-		// in 1.4.9: the note now carries `this.showPanCursor(` as a real call
-		// site (the pan branch in penDown, penRaw's pan branch, and penUp's
-		// pan branch), and the class marker was true from hover alone -
-		// proving nothing about whether the gesture itself called through.
+		// THE OR IS GONE, AND ITS REMOVAL IS THE NEWS. 1.4.9 gave both
+		// surfaces `this.showPanCursor(` as a real call site, replacing
+		// `.add(PAN_CURSOR_CLASS)`, which was true from hover alone and proved
+		// nothing about the gesture. 1.4.12 took that call site off the note,
+		// and this row carried both spellings for as long as the two surfaces
+		// disagreed - which was exactly as long as reviewer finding F4 was
+		// open ("the pan-drag reticle fix is note-only, the pdf pan still
+		// paints the ring per sample via `showPanCursor` and never wears the
+		// grabbing hand"; 1.4.12-design §11). Both surfaces now carry
+		// `this.beginPanDragCursor(`, so one marker is the honest count, and
+		// leaving the OR in place would have quietly let either surface drop
+		// back to the other spelling.
+		//
+		// WHY NO RETICLE MID-DRAG, on the note: Alan, 2026-09-05, on hardware,
+		// "pan reticle allows you to like fling it away from the point of pan
+		// and it flickers". Not a painting bug - a COORDINATE one, and only
+		// the note has it. `InlinePenRouter` maps client points through a rect
+		// frozen at pen-down, and the note's overlay is a child of the
+		// scroller its own `panMove` scrolls, so every sample of the drag was
+		// mapped further wrong than the last.
+		//
+		// WHY NO RETICLE MID-DRAG ON THE PDF, whose samples are
+		// viewport-relative and explicitly scroll-independent
+		// (`PdfInkController.penRaw`'s own comment) and whose ring therefore
+		// never flew: because a ring is the wrong marker for a tip that is
+		// holding a page rather than marking it, and because painting it cost
+		// a DOM write and a re-armed watchdog on every sample of every drag.
+		// Two surfaces, two different reasons, one ruling - which is the shape
+		// this whole file exists to keep.
+		//
+		// So the rule is: the pan tip shows it is panning with the SOLID RING
+		// on hover, before contact and again once the drag is over, and with
+		// the GRABBING HAND for the length of the drag itself - swapped in for
+		// the `cursor: none` the hover class puts down (`PAN_DRAG_CLASS` on
+		// the note, `handwriting-pdf-pan-drag` on the pdf). What neither does
+		// any more is paint a reticle mid-drag. The marker is a real call site
+		// in each surface's `penDown` pan branch, never the declaration, which
+		// carries no `this.` because a method never calls itself through
+		// `this.` in its own signature. Deleting it while leaving the method
+		// declared fails this row. The rule and its reasoning are one pure
+		// function, `penReticleShown` (PenCursor.ts), tested both ways and now
+		// called by both surfaces.
 		rule: "a pan surface shows that the tip is panning, not marking",
-		markers: ["this.showPanCursor("],
+		markers: ["this.beginPanDragCursor("],
 		on: ["note", "pdf"],
 		exempt: {
 			canvas:
@@ -678,8 +715,10 @@ describe("ink surfaces - the shared callbacks are still wired twice", () => {
 	// The list is INLINE_PEN_CALLBACKS, and it is not simply "the required
 	// members": `claimBandContact?` and `describeChrome?` are optional AND
 	// note-only, so demanding them of the pdf would report a legitimately
-	// surface-specific member as a divergence, while `onStrokeAbandoned?` is
-	// optional and owed by both. That file carries the reason for each.
+	// surface-specific member as a divergence, while `penOff?` and
+	// `onStrokeAbandoned?` are optional and owed by both. That file carries
+	// the reason for each - `penOff?` is the newest, and it is here because
+	// it spent two days being the other kind.
 	const inline = INK_SURFACES.filter((s) => s.router === "InlinePenRouter");
 
 	it("there are exactly two InlinePenRouter surfaces", () => {
@@ -909,14 +948,29 @@ describe("ink surfaces - the registry is derived from the tree, not maintained b
 	});
 
 	it("mountsStrip is derived, not asserted", () => {
-		const mounts = Object.keys(ALL_TS)
+		const buildsOne = Object.keys(ALL_TS)
 			.filter((f) => !f.endsWith(".test.ts") && !f.endsWith(".d.ts"))
 			.filter((f) => codeOnly(ALL_TS[f]!).includes("new MobileTools("))
 			.sort();
+		// A PREVIEW strip is not a surface. The settings tab builds a real
+		// `MobileTools` to show what the fold order does to the toolbar
+		// (FoldOrderControl.ts), and passes `preview: true` to say which kind
+		// it is: it draws no ink, routes no pointer, and mounts over no
+		// document. Excluded on that FLAG rather than by filename, so a file
+		// that built a strip for some other reason would still have to become
+		// a named surface.
+		const mounts = buildsOne.filter((f) => !codeOnly(ALL_TS[f]!).includes("preview: true"));
 		const claimed = INK_SURFACES.filter((s) => s.mountsStrip)
 			.map((s) => s.file)
 			.sort();
 		expect(mounts).toEqual(claimed);
+		// BOTH ENDS, because an exclusion that excluded nothing would make the
+		// assertion above pass by doing nothing at all, and a broader one would
+		// let a real surface hide behind the same flag. Exactly one file is
+		// dropped, and it is the one this comment is about.
+		expect(buildsOne.filter((f) => !mounts.includes(f))).toEqual([
+			"/src/inline/FoldOrderControl.ts",
+		]);
 	});
 });
 

@@ -91,10 +91,54 @@ export const RELEASE_NOTES: Record<string, string[]> = {
 		"dotted paper",
 		"bug fixes",
 	],
+	// Opened ahead of the cut, which is safe: `notesSince` only ever looks at
+	// versions at or below the one being LANDED on, so this says nothing to
+	// anyone until manifest.json reaches it.
+	// One line per thing a reader would notice, in one voice, each true on its
+	// own: the toolbar lines used to say the same thing twice and the palette
+	// lines split one change across two entries. "pressure moved to settings"
+	// was half true and is now specific - the switch was always a setting; what
+	// moved is the Recalibrate button, and three commands left the palette.
+	//
+	// IN FLIGHT, sentences that belong here when their slices merge:
+	//  - mouse-toast-ink: turning mouse drawing on says "Handwriting: ink".
+	//  - pen-hardware-local-store: the Keyboard latch is per device and does
+	//    not travel with a synced vault.
+	//  - pen-button-is-the-truth: the mouse acts as the lit tool on a pen-less
+	//    device, and the first pen contact lights the pen.
+	//  - ipad-ink-purge-repaint: ink repaints when the app comes back.
+	//  - ink-theme-adapt: the black and the white swatch stay told apart on the
+	//    dark theme while ink adapts to it. NOT WRITTEN HERE YET, and the
+	//    reason is that the defect cannot happen on this branch: it needs the
+	//    `inkAdaptsToTheme` setting and the `previewColor` hook that paints a
+	//    swatch with the DISPLAYED colour rather than the stored one, and
+	//    neither exists here - `paintSwatches` in MobileTools.ts fills every
+	//    swatch straight from `paletteFor`, so black (#1c1f26) and white
+	//    (#f4f4f2) are two colours on every theme. The sentence, and the fix
+	//    it describes, belong on the branch that carries the adaptation.
+	"1.4.12": [
+		"bug fixes galore",
+		"keyboard button on the toolbar",
+		"check for broken ink command added",
+		"toolbar fixes",
+		"toolbar ui change (draggable!)",
+		"bug report flow fixes",
+		"bug fixes",
+		"data safety fixes",
+	],
 };
 
 /** One release's own notes, kept apart so the toast can label them honestly. */
-export type NotesGroup = { version: string; notes: string[] };
+export type NotesGroup = {
+	version: string;
+	notes: string[];
+	/**
+	 * Set only on the synthetic marker `collapseOlderGroups` stands in for
+	 * every group older than the two most recent - never on a real release's
+	 * group. Its `notes` holds the one summary line to show; `version` is "".
+	 */
+	collapsedCount?: number;
+};
 
 /** Show the notes, or don't - and either way, the version to remember. */
 export type NotesDecision =
@@ -132,9 +176,16 @@ export function decideWhatsNew(
 	// this version's notes late.
 	if (fresh) return { show: false, record: current };
 	if (seen === current) return { show: false, record: current };
-	const groups = notesSince(current, seen, notes);
+	const rawGroups = notesSince(current, seen, notes);
+	if (rawGroups.every((g) => g.notes.length === 0)) return { show: false, record: current };
+	// The two most recent groups render in full; anything older collapses to
+	// a count, so a vault back after a long absence is told how much it
+	// missed instead of being shown all of it ("they shouldn't get spammed,
+	// ever"). `lines` is read off the COLLAPSED groups, not the raw ones, so
+	// whatsNewDurationMs - fed from this same array's length by the caller -
+	// scales to what actually renders, not to everything that would have.
+	const groups = collapseOlderGroups(rawGroups);
 	const lines = groups.flatMap((g) => g.notes);
-	if (lines.length === 0) return { show: false, record: current };
 	return { show: true, record: current, version: current, notes: lines, groups };
 }
 
@@ -198,6 +249,29 @@ function notesSince(
 	return groups;
 }
 
+/** The one true wording for how many older groups got folded away. */
+function collapsedNoticeText(count: number): string {
+	return `and ${count} earlier update${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * Keep the two most recent groups exactly as `notesSince` returned them;
+ * fold every older one into a single synthetic marker naming a count, never
+ * the version numbers themselves (the point is fewer lines, not a shorter
+ * list of version numbers). Two groups or fewer already fits on screen, so
+ * nothing changes for them - no marker, no empty element left behind.
+ */
+function collapseOlderGroups(groups: NotesGroup[]): NotesGroup[] {
+	if (groups.length <= 2) return groups;
+	const collapsedCount = groups.length - 2;
+	const notice: NotesGroup = {
+		version: "",
+		notes: [collapsedNoticeText(collapsedCount)],
+		collapsedCount,
+	};
+	return [notice, ...groups.slice(-2)];
+}
+
 /**
  * The notice's contents: a heading and the lines the release went out with.
  *
@@ -213,6 +287,10 @@ function notesSince(
  * above already names the current version. With zero or one group (or no
  * `groups` argument at all, for older callers) the output is exactly what
  * this function always produced: one title, one list.
+ *
+ * A group with `collapsedCount` set (see `collapseOlderGroups`) stands for
+ * every release older than the two most recent: it renders as its one
+ * summary line, with no version label and no list of its own.
  */
 export function whatsNewFragment(
 	version: string,
@@ -223,6 +301,13 @@ export function whatsNewFragment(
 	frag.createDiv({ cls: "handwriting-whats-new-title", text: `Handwriting ${version}` });
 	if (groups && groups.length > 1) {
 		groups.forEach((group, i) => {
+			if (group.collapsedCount !== undefined) {
+				frag.createDiv({
+					cls: "handwriting-whats-new-collapsed",
+					text: group.notes[0] ?? "",
+				});
+				return;
+			}
 			if (i > 0) {
 				frag.createDiv({
 					cls: "handwriting-whats-new-version",

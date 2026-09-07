@@ -202,6 +202,13 @@ function makeRig(): Rig {
 	o.builder = null;
 	o.mode = "ink";
 	o.erased = [];
+	// `resetGestureState` (which `unmount` calls) now also clears these three -
+	// the erase-gesture fields sitting beside `erased` in InkOverlay.ts - so
+	// this Object.create rig needs them seeded like every other field on the
+	// path, or the real `unmount()` under test throws on the unset `Set`.
+	o.erasePieces = new Set<string>();
+	o.eraseFrom = [];
+	o.eraseWhole = false;
 	o.lassoPts = [];
 	o.lassoActive = false;
 	o.dragFrom = null;

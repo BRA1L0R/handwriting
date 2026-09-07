@@ -192,7 +192,7 @@ export const INK_SURFACES: readonly InkSurface[] = [
  * pdf each supply all of them, independently, and a rule implemented inside
  * two of these is a rule that can diverge. Kept in the declaration's own order.
  *
- * `InlinePenCallbacks` declares TEN members: seven required, and three
+ * `InlinePenCallbacks` declares ELEVEN members: seven required, and four
  * optional. Membership here is not "is it required by the type" - it is "must
  * both surfaces answer it", and the two questions have come apart:
  *
@@ -204,6 +204,16 @@ export const INK_SURFACES: readonly InkSurface[] = [
  *   - `describeChrome?` is optional and note-only for the same kind of reason:
  *     it is trace-only, and it answers for a strip the router holds no
  *     reference to. The pdf leaves it undefined.
+ *   - `penOff?` is optional in the TYPE and required of both here, and it is
+ *     the newest entry precisely because it spent two days being the other
+ *     kind. It shipped note-only - the pdf passed nothing, so its router never
+ *     gated on the pen-off state - and the owner reversed that ("why would you
+ *     take keyboard mode away from pdf"): the state is whether this router
+ *     claims the pen at all, which is a question every ink surface has the
+ *     same answer to. It is here so the next surface that quietly stops
+ *     wiring the gate fails this scan instead of shipping a switch that does
+ *     nothing on one of two panes. Optional in the type because a router built
+ *     by a harness has no opinion and undefined reads as "never off".
  *   - `onStrokeAbandoned?` is optional in the TYPE and required of both here.
  *     Optional because a router may be built by something with no chrome to
  *     stand down (the harnesses do); required of both because the thing it
@@ -261,6 +271,7 @@ export const INLINE_PEN_CALLBACKS = [
 	"onPenRaw",
 	"onPenMove",
 	"onPenUp",
+	"penOff",
 	"onStrokeAbandoned",
 ] as const;
 

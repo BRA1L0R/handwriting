@@ -55,19 +55,82 @@ export function normalizeInkFolder(raw: unknown): string {
  * file is lost, a vault is copied, or the plugin is reinstalled - starts on
  * `.handwriting` while every sidecar sits in `handwriting/` beside it. It
  * reads nothing, and then writes a SECOND sidecar for every page id it is
- * asked to save. `PageStore.readPath` keeps the existing ink visible; this
- * is what stops the fork, by pointing writes at the folder the vault is
- * plainly already using.
+ * asked to save. `PageStore.findSidecar` keeps the existing ink visible (there
+ * is no `readPath`, and has not been for some time); this is what stops the
+ * fork, by pointing writes at the folder the vault is plainly already using.
  *
- * `.handwriting` wins when both exist. Two populated folders is a state
- * somebody has to look at, and picking the default keeps that decision
- * where the settings tab can make it - the read fallback means neither
- * folder's ink is hidden meanwhile.
+ * The question asked is "which folder HOLDS INK", not "which folder
+ * exists". Existence is the wrong test because anything at all can create
+ * `.handwriting` - the OCR line downloads its local model into it - and an
+ * empty folder appearing beside a populated `handwriting/` used to hand the
+ * vault straight back to the default and re-arm the fork this function
+ * exists to stop. A folder counts when it holds at least one LIVE PAGE FILE;
+ * a model blob, a stray `.md`, or nothing at all does not count.
+ *
+ * Nor does the wreckage of an earlier fork. `*.json` was too loose: a
+ * `.handwriting/X.conflict-<mtime>.json` or `.damaged-<mtime>.json` is
+ * exactly what the shipped 1.4.9-1.4.11 fork and the external-revision guard
+ * leave behind, so a dot-folder holding nothing but one of those was read as
+ * "this vault keeps its ink here" and the device adopted `.handwriting`
+ * although every real page sat in `handwriting/`. Every NEW page id on that
+ * device then went to the unsynced folder and forked on the next device -
+ * the very sequence adoption exists to end. `isLiveSidecarName` is the
+ * filter `PageStore.listIds` uses to enumerate pages, shared so the two can
+ * never drift apart.
+ *
+ * `.handwriting` still wins when BOTH hold pages - deliberately unchanged.
+ * Two populated folders is a state somebody has to look at, and picking the
+ * default keeps that decision where the settings tab can make it; the read
+ * fallback means neither folder's ink is hidden meanwhile.
+ *
+ * An adapter that cannot list, or a folder that will not enumerate, falls
+ * back to plain existence, which is exactly the answer this function gave
+ * before. Not being able to look inside is no reason to change the choice.
  */
-export async function adoptInkFolder(adapter: Pick<MigrationAdapter, "exists">): Promise<string> {
+export async function adoptInkFolder(
+	adapter: Pick<MigrationAdapter, "exists" | "list">
+): Promise<string> {
+	if (await holdsSidecars(adapter, DEFAULT_INK_FOLDER)) return DEFAULT_INK_FOLDER;
+	if (await holdsSidecars(adapter, SYNCED_INK_FOLDER)) return SYNCED_INK_FOLDER;
+	// Neither holds a page. The folders themselves are still the best hint
+	// available about which one this vault means to use.
 	if (await adapter.exists(DEFAULT_INK_FOLDER)) return DEFAULT_INK_FOLDER;
 	if (await adapter.exists(SYNCED_INK_FOLDER)) return SYNCED_INK_FOLDER;
 	return DEFAULT_INK_FOLDER;
+}
+
+/**
+ * The name of a LIVE page file: what `PageStore.listIds` counts as a sidecar,
+ * and what `adoptInkFolder` counts as evidence that a folder holds ink.
+ *
+ * The recovery copies are deliberately NOT live pages. `<id>.conflict-<mtime>`
+ * and `<id>.damaged-<mtime>` (PageStore.ts freeConflictPath, freeDamagedPath)
+ * are the residue of an accident, one of them being the residue of the very
+ * fork this release closes; a folder holding only residue holds no pages.
+ * `.json.tmp` fails the suffix test and is excluded with them.
+ *
+ * Separate from `isSidecarFile`, which answers a different question - "is this
+ * file ours to MOVE when the folder changes" - where the answer for the
+ * recovery copies is yes, because they are what someone reaches for after an
+ * accident and orphaning them is how they get lost.
+ */
+export function isLiveSidecarName(name: string): boolean {
+	return name.endsWith(".json") && !name.includes(".conflict-") && !name.includes(".damaged-");
+}
+
+/** Is there ink in this folder - a live page file, not merely a directory? */
+async function holdsSidecars(
+	adapter: Pick<MigrationAdapter, "exists" | "list">,
+	folder: string
+): Promise<boolean> {
+	if (!(await adapter.exists(folder))) return false;
+	if (!adapter.list) return true;
+	try {
+		const listing = await adapter.list(folder);
+		return listing.files.some((f) => isLiveSidecarName(baseName(f)));
+	} catch {
+		return true;
+	}
 }
 
 /**
@@ -217,6 +280,15 @@ export async function migrateInkFolder(
 export interface FolderChangeSteps {
 	/** Resolves false when writes are still in flight. */
 	settle(): Promise<boolean>;
+	/**
+	 * Hold writes for the duration of the move: they requeue instead of
+	 * landing in the folder being emptied. Settling is not enough on its own -
+	 * it drains the queue ONCE, and the move that follows spans a list plus a
+	 * rename per file with a pen still able to land in between.
+	 */
+	holdWrites?(): void;
+	/** Release the hold. Called from a `finally`, so it always runs. */
+	releaseWrites?(): void;
 	migrate(from: string, to: string): Promise<MigrationResult>;
 	/** Send reads and writes to the new folder. */
 	repoint(to: string): void;
@@ -238,13 +310,33 @@ export type FolderChangeOutcome =
  *
  * 1. Settle first. A write still in flight can land in the folder about to be
  *    emptied, stranding the newest strokes.
- * 2. Move before repointing. Repointing first sends reads to a folder the
+ * 2. HOLD writes across the move and the repoint. Settling drains the queue
+ *    once; the move that follows spans a list plus a rename per file, and a
+ *    pen landing in that window recreated the sidecar in the folder being
+ *    emptied - after which the repoint cleared the pins, the next resolve
+ *    served the older migrated copy, and the newest ink was orphaned.
+ * 3. Move before repointing. Repointing first sends reads to a folder the
  *    files have not reached yet.
- * 3. Persist last, so a failed save cannot claim a move that did not happen.
+ * 4. Persist last, so a failed save cannot claim a move that did not happen.
  *
- * None of it is load-bearing for the user's data - `PageStore.readPath` falls
- * back to the default folder, so an interruption anywhere leaves pages
- * readable - but the sequence should still be right, and now it is testable.
+ * WHAT AN INTERRUPTION ACTUALLY COSTS. This used to claim "an interruption
+ * anywhere leaves pages readable", on the strength of the read fallback. That
+ * is true for a move between the two WELL-KNOWN folders and false for a custom
+ * one: `PageStore.findSidecar` searches the configured folder plus
+ * `.handwriting` and `handwriting`, and nothing else. So a move to
+ * `assets/ink` that dies between the migration and the settings save leaves
+ * the store pointed at the old folder while the files sit in the new one, and
+ * those pages read as ABSENT - which the plugin shows as blank notes.
+ *
+ * Nothing is lost: every file is exactly where the migration put it. The
+ * recovery is one step, and it is the user's: set the ink folder to the
+ * destination in Settings. The pages come back on the next open; nothing has
+ * to be moved by hand.
+ *
+ * Widening the read search to arbitrary remembered folders is deliberately NOT
+ * the fix - it would put a speculative probe on every miss, for a window that
+ * only opens if a settings save fails. The ordering above is the guarantee,
+ * and unlike the old claim it is testable.
  */
 export async function changeFolder(
 	steps: FolderChangeSteps,
@@ -253,9 +345,17 @@ export async function changeFolder(
 ): Promise<FolderChangeOutcome> {
 	if (from === to) return { kind: "unchanged" };
 	if (!(await steps.settle())) return { kind: "busy" };
-	const result = await steps.migrate(from, to);
-	if (result.unsupported) return { kind: "unsupported" };
-	steps.repoint(to);
+	// Held across BOTH the move and the repoint, and released in a finally so
+	// a migration that throws cannot leave the store unable to save.
+	steps.holdWrites?.();
+	let result: MigrationResult;
+	try {
+		result = await steps.migrate(from, to);
+		if (result.unsupported) return { kind: "unsupported" };
+		steps.repoint(to);
+	} finally {
+		steps.releaseWrites?.();
+	}
 	await steps.persist(to);
 	return { kind: "moved", result };
 }

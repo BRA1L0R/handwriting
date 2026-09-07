@@ -9,6 +9,7 @@ import {
 	ensureFolder,
 	baseName,
 	inkFolderSyncs,
+	isLiveSidecarName,
 	isSidecarFile,
 	migrateInkFolder,
 	normalizeInkFolder,
@@ -85,6 +86,34 @@ describe("isSidecarFile / baseName", () => {
 	it("takes the last segment of a path", () => {
 		expect(baseName(".handwriting/abc.json")).toBe("abc.json");
 		expect(baseName("abc.json")).toBe("abc.json");
+	});
+});
+
+describe("isLiveSidecarName - a page, not the residue of an accident", () => {
+	// Deliberately NARROWER than isSidecarFile, and the difference is the
+	// point: a folder change MOVES the recovery copies (they are what someone
+	// reaches for after an accident), but a folder holding only recovery copies
+	// holds no pages, and must not be adopted as this vault's ink folder.
+	it("claims page files", () => {
+		expect(isLiveSidecarName("abc.json")).toBe(true);
+		expect(isLiveSidecarName("pdf-9f86d081-2.json")).toBe(true);
+	});
+
+	it("refuses the recovery copies and the interrupted write", () => {
+		expect(isLiveSidecarName("abc.conflict-1700000000.json")).toBe(false);
+		expect(isLiveSidecarName("abc.conflict-1700000000-2.json")).toBe(false);
+		expect(isLiveSidecarName("abc.damaged-1700000000.json")).toBe(false);
+		expect(isLiveSidecarName("abc.json.tmp")).toBe(false);
+	});
+
+	it("and every one of those still travels when the folder changes", () => {
+		for (const n of [
+			"abc.conflict-1700000000.json",
+			"abc.damaged-1700000000.json",
+			"abc.json.tmp",
+		]) {
+			expect(isSidecarFile(n)).toBe(true);
+		}
 	});
 });
 
@@ -236,6 +265,47 @@ describe("changeFolder (the ordering IS the safety story)", () => {
 		expect(order).toEqual(["settle", "migrate", "repoint", "persist"]);
 	});
 
+	it("holds writes across the move AND the repoint, and releases after", async () => {
+		// Settling drains the queue once; the move that follows spans a list
+		// plus a rename per file, so a pen landing there could still recreate
+		// the sidecar in the folder being emptied.
+		const { steps, order } = recordingSteps({
+			holdWrites: () => order.push("hold"),
+			releaseWrites: () => order.push("release"),
+		});
+		await changeFolder(steps, ".handwriting", "handwriting");
+		expect(order).toEqual(["settle", "hold", "migrate", "repoint", "release", "persist"]);
+	});
+
+	it("releases the hold when the migration throws", async () => {
+		// Otherwise a failed folder change leaves the plugin unable to save.
+		const { steps, order } = recordingSteps({
+			holdWrites: () => order.push("hold"),
+			releaseWrites: () => order.push("release"),
+			migrate: () => {
+				order.push("migrate");
+				return Promise.reject(new Error("disk full"));
+			},
+		});
+		await expect(changeFolder(steps, ".handwriting", "handwriting")).rejects.toThrow("disk full");
+		expect(order).toEqual(["settle", "hold", "migrate", "release"]);
+	});
+
+	it("releases the hold when the vault cannot enumerate", async () => {
+		const { steps, order } = recordingSteps({
+			holdWrites: () => order.push("hold"),
+			releaseWrites: () => order.push("release"),
+			migrate: () => {
+				order.push("migrate");
+				return Promise.resolve({ moved: 0, skipped: 0, unsupported: true });
+			},
+		});
+		expect(await changeFolder(steps, ".handwriting", "handwriting")).toEqual({
+			kind: "unsupported",
+		});
+		expect(order).toEqual(["settle", "hold", "migrate", "release"]);
+	});
+
 	it("does nothing at all when the folder has not changed", async () => {
 		const { steps, order } = recordingSteps();
 		expect(await changeFolder(steps, "ink", "ink")).toEqual({ kind: "unchanged" });
@@ -345,6 +415,97 @@ describe("adoptInkFolder (no data.json to ask)", () => {
 		// fallback means neither folder's ink is hidden while they do.
 		expect(await adoptInkFolder(fs(DEFAULT_INK_FOLDER, SYNCED_INK_FOLDER))).toBe(
 			DEFAULT_INK_FOLDER
+		);
+	});
+
+	/** A vault where the folders can be looked inside, not just counted. */
+	const withFiles = (contents: Record<string, string[]>) => ({
+		exists: async (p: string) => p in contents,
+		list: async (p: string) => {
+			const files = contents[p];
+			if (files === undefined) throw new Error(`ENOENT ${p}`);
+			return { files: files.map((f) => `${p}/${f}`), folders: [] };
+		},
+	});
+
+	it("ignores an EMPTY .handwriting beside a populated handwriting/", async () => {
+		// Anything can create the dot-folder - the local OCR model downloads
+		// into it - and an empty one used to win on existence alone, sending
+		// this device's writes away from the ink and re-arming the fork.
+		expect(
+			await adoptInkFolder(
+				withFiles({ [DEFAULT_INK_FOLDER]: [], [SYNCED_INK_FOLDER]: ["page-1.json"] })
+			)
+		).toBe(SYNCED_INK_FOLDER);
+	});
+
+	it("ignores a .handwriting holding only non-sidecar files", async () => {
+		expect(
+			await adoptInkFolder(
+				withFiles({
+					[DEFAULT_INK_FOLDER]: ["ocr-model.bin", "notes.md"],
+					[SYNCED_INK_FOLDER]: ["page-1.json"],
+				})
+			)
+		).toBe(SYNCED_INK_FOLDER);
+	});
+
+	it("ignores a .handwriting holding only the wreckage of an earlier fork", async () => {
+		// A `.conflict-<mtime>.json` is EXACTLY what the shipped 1.4.9-1.4.11
+		// fork and the external-revision guard leave in the dot-folder. Counted
+		// as a page, it re-armed the fork on the population this release is
+		// for: the device adopted `.handwriting`, and every NEW page id then
+		// went to the folder Obsidian Sync cannot see.
+		expect(
+			await adoptInkFolder(
+				withFiles({
+					[DEFAULT_INK_FOLDER]: ["page-1.conflict-1700000000.json"],
+					[SYNCED_INK_FOLDER]: ["page-1.json", "page-2.json"],
+				})
+			)
+		).toBe(SYNCED_INK_FOLDER);
+	});
+
+	it("ignores damaged copies and interrupted writes the same way", async () => {
+		expect(
+			await adoptInkFolder(
+				withFiles({
+					[DEFAULT_INK_FOLDER]: ["page-1.damaged-1700000000.json", "page-3.json.tmp"],
+					[SYNCED_INK_FOLDER]: ["page-1.json"],
+				})
+			)
+		).toBe(SYNCED_INK_FOLDER);
+	});
+
+	it("a real page beside the wreckage still counts", async () => {
+		// The filter must not go the other way: residue does not hide a page.
+		expect(
+			await adoptInkFolder(
+				withFiles({
+					[DEFAULT_INK_FOLDER]: ["page-1.conflict-1700000000.json", "page-9.json"],
+					[SYNCED_INK_FOLDER]: ["page-1.json"],
+				})
+			)
+		).toBe(DEFAULT_INK_FOLDER);
+	});
+
+	it("still prefers .handwriting when BOTH hold pages - unchanged on purpose", async () => {
+		expect(
+			await adoptInkFolder(
+				withFiles({
+					[DEFAULT_INK_FOLDER]: ["page-1.json"],
+					[SYNCED_INK_FOLDER]: ["page-2.json"],
+				})
+			)
+		).toBe(DEFAULT_INK_FOLDER);
+	});
+
+	it("falls back to existence when neither folder holds a page", async () => {
+		expect(await adoptInkFolder(withFiles({ [DEFAULT_INK_FOLDER]: [] }))).toBe(
+			DEFAULT_INK_FOLDER
+		);
+		expect(await adoptInkFolder(withFiles({ [SYNCED_INK_FOLDER]: [] }))).toBe(
+			SYNCED_INK_FOLDER
 		);
 	});
 });

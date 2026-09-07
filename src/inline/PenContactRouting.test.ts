@@ -172,6 +172,12 @@ function noteSurface(): Surface {
 	view.schedulePresentProbe = () => undefined;
 	view.drawPredictedTail = () => undefined;
 	view.showEraserCursor = () => undefined;
+	// Same reason as the eraser's cursor above: the reticle is not this file's
+	// subject. Since 1.4.12 a pan drag hides the ring and swaps the scroller's
+	// cursor classes instead of painting one (`penReticleShown`, PenCursor.ts),
+	// which wants a real `view.dom` for the hover watchdog and a real
+	// `scrollDOM` for the classes; contact ARBITRATION wants neither.
+	view.beginPanDragCursor = () => undefined;
 	view.filePath = () => "";
 	view.lassoDown = () => {
 		gesture = "lasso";

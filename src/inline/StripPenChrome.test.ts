@@ -275,6 +275,10 @@ const FOCUS_ALLOWED: Readonly<Record<string, Exemption>> = {
 		max: 1,
 		why: "the text box editor taking the caret when a box opens for editing - the user asked to type, which is the ordinary reason to call focus and the opposite of the pen-gesture case",
 	},
+	"/src/inline/FoldOrderControl.ts": {
+		max: 2,
+		why: "a settings list keeping focus on the drag handle the user is holding. One after ArrowUp/ArrowDown moved that row and took its grip with it, without which the second arrow press goes nowhere; one on pointerdown, because the drag preventDefaults the gesture (a finger would scroll the pane, a mouse would select the row's text) and that is what stops the grip taking focus by itself, leaving drag-then-arrow dead. A settings tab, not an ink surface: no pen gesture, no PointerRouter, nothing stripped a native focus these could be restoring",
+	},
 };
 
 /**
@@ -288,7 +292,11 @@ const FOCUS_ALLOWED: Readonly<Record<string, Exemption>> = {
  * ink surface" will not do: a `new MobileTools(` IS the ink chrome.
  */
 type StripMount = { readonly why: string };
-const PEN_TOOLS_RULE_ALLOWED: Readonly<Record<string, StripMount>> = {};
+const PEN_TOOLS_RULE_ALLOWED: Readonly<Record<string, StripMount>> = {
+	"/src/inline/FoldOrderControl.ts": {
+		why: "the settings tab's fold-order PREVIEW, built with `preview: true` (MobileToolsOptions). It is the one strip in the tree that is not chrome over a document: it lives inside a settings row, it is inert - `previewStripHost` runs no command and the stylesheet refuses it pointer events - and it can never become the toolbar. `penToolsVisible` answers whether the TOOLBAR exists over a note, and asking it here would empty the preview exactly when the setting is Hide, which is precisely when somebody is looking at this control to decide whether to turn the toolbar on. The rule is not being dodged; it is being asked of the wrong thing",
+	},
+};
 
 /** Files that construct a strip, in scan order. Prose about one does not count. */
 function stripMounters(): string[] {

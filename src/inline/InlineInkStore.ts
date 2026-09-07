@@ -62,6 +62,13 @@ function inkFingerprint(strokes: readonly InkStroke[]): string {
 
 type LoadState = "no" | "loading" | "yes";
 
+/**
+ * What the store knows about a note's ink. See `InlineInkStore.inkPresence`
+ * for why "unknown" is a state a caller has to handle rather than a boolean
+ * it can round off.
+ */
+export type InkPresence = "ink" | "none" | "unknown";
+
 interface NoteRecord {
 	strokes: InkStroke[];
 	pageId: string | null;
@@ -89,7 +96,7 @@ interface NoteRecord {
 	duplicateLocked: boolean;
 	claimInFlight: Promise<void> | null;
 	/** The sidecar read in progress; a mutation racing it waits for the merge. */
-	loadInFlight: Promise<void> | null;
+	loadInFlight: Promise<boolean> | null;
 	/** The post-claim first write is armed once per claim, not once per stroke. */
 	claimFollowUpArmed: boolean;
 	noticed: boolean;
@@ -129,6 +136,56 @@ export class InlineInkStore {
 
 	hasInk(path: string): boolean {
 		return (this.byPath.get(path)?.strokes.length ?? 0) > 0;
+	}
+
+	/**
+	 * Does this note have ink - and do we actually KNOW yet?
+	 *
+	 * `hasInk` is two questions collapsed into one boolean, and its `false`
+	 * answers the wrong one. The store is a cache of the sidecar, filled by
+	 * `ensureLoaded` on a real file read; until that read lands, a note whose
+	 * sidecar is full of ink holds zero strokes here and `hasInk` says "no
+	 * ink" about it. Every caller that turns that `false` into a sentence for
+	 * a human ("no ink on this note", "no ink on the page to erase") then
+	 * states as fact something the store has not looked up.
+	 *
+	 * Alan, hardware, on 1.4.12: "touching eraser end to screen spams toast
+	 * notification - there is no ink on the note to erase, even though there
+	 * is". "Even though there is" is the whole bug: the answer was not wrong
+	 * about the strokes in memory, it was wrong to be given at all.
+	 *
+	 * So the three states are named instead:
+	 *
+	 * - "ink"     strokes are in the session right now. Certain.
+	 * - "none"    the record is LOADED and empty, or the note carries no
+	 *             `handwriting-page-id` at all - and no id means no sidecar
+	 *             can exist, because sidecars are keyed by id. Certain, and
+	 *             the second case costs one metadata lookup, no file I/O.
+	 * - "unknown" not loaded, mid-load, or the sidecar is damaged and locked.
+	 *             The honest answer is "ask me after a read".
+	 *
+	 * `hasInk` is deliberately left exactly as it was rather than made to
+	 * guess in the other direction: a caller that wants "certainly empty"
+	 * must say so, and one that only wants the session's strokes still gets
+	 * them without a lie in either direction.
+	 *
+	 * NO HOST is the headless session-memory mode (`attachHost` never called,
+	 * which is most of this repo's tests and the calibration harness). There
+	 * is no sidecar behind the session there, so the session IS the whole
+	 * truth and "none" is certain.
+	 */
+	inkPresence(path: string): InkPresence {
+		const rec = this.byPath.get(path);
+		if ((rec?.strokes.length ?? 0) > 0) return "ink";
+		if (!this.host) return "none";
+		if (rec !== undefined && rec.load === "yes" && !rec.damagedLocked) return "none";
+		// Not read yet. One cheap metadata lookup settles the common case:
+		// a note with no id has no sidecar, so it is certainly empty, and an
+		// untouched note must not cost a caller a file read to be told so.
+		if (rec === undefined || rec.load === "no") {
+			return this.host.readPageId(path) === null ? "none" : "unknown";
+		}
+		return "unknown";
 	}
 
 	private record(path: string): NoteRecord {
@@ -171,20 +228,37 @@ export class InlineInkStore {
 	async ensureLoaded(path: string): Promise<boolean> {
 		const rec = this.record(path);
 		if (!this.host) return false;
+		// Every viewer waiting on this read needs its completion result. Returning
+		// false while loading leaves a joining editor blank until another repaint.
+		if (rec.load === "loading") return rec.loadInFlight ?? false;
 		if (rec.load === "yes" && rec.damagedLocked) return this.retryDamaged(rec);
 		if (rec.load !== "no") return false;
-		rec.load = "loading";
-		const id = this.host.readPageId(path);
-		if (!id) {
-			rec.load = "yes";
-			return false;
-		}
-		rec.pageId = id;
-		return this.trackLoad(rec, async () => {
-			const changed = await this.adoptSidecar(rec, id);
+		return this.loadRecord(path, rec);
+	}
+
+	/** Complete adoption or fallback restoration before releasing waiting viewers. */
+	private loadRecord(
+		path: string,
+		rec: NoteRecord,
+		fallback?: Pick<NoteRecord, "strokes" | "basePage">
+	): Promise<boolean> {
+		const finish = (changed: boolean): boolean => {
+			if (fallback && rec.basePage === null) {
+				// A failed reread keeps the prior page and any ink added while
+				// waiting. The same completion releases viewers and pending saves.
+				if (rec.strokes.length === 0) rec.strokes = fallback.strokes;
+				else this.insert(rec, fallback.strokes, fallback.strokes.map((_, i) => i));
+				rec.basePage = fallback.basePage;
+				changed = rec.strokes.length > 0;
+			}
 			rec.load = "yes";
 			return changed;
-		});
+		};
+		rec.load = "loading";
+		const id = this.host?.readPageId(path);
+		if (!id) return Promise.resolve(finish(false));
+		rec.pageId = id;
+		return this.trackLoad(rec, async () => finish(await this.adoptSidecar(rec, id)));
 	}
 
 	/**
@@ -198,8 +272,8 @@ export class InlineInkStore {
 		const run = work();
 		rec.loadInFlight = run
 			.then(
-				() => undefined,
-				() => undefined
+				(changed) => changed,
+				() => false
 			)
 			.finally(() => {
 				rec.loadInFlight = null;
@@ -486,18 +560,11 @@ export class InlineInkStore {
 		// back with `basePage` still null falls to `emptyPage(pageId)` there
 		// and the next save writes `textBoxes: []` over the disk copy.
 		const keptBase = rec.basePage;
-		rec.load = "no";
 		rec.strokes = [];
 		rec.basePage = null;
-		await this.ensureLoaded(path);
-		if (rec.basePage === null) {
-			// Nothing was read: damaged, locked, or the file is gone. Put the
-			// session back. A lock leaves the file untouched; if it vanished,
-			// the next save rewrites it from what is still on screen.
-			rec.strokes = kept;
-			rec.basePage = keptBase;
-			return false;
-		}
+		await this.loadRecord(path, rec, { strokes: kept, basePage: keptBase });
+		// Joining viewers need the restored picture even when existing panes
+		// still show identical ink. Only actual changes notify the poller.
 		return inkFingerprint(this.strokes(path)) !== before;
 	}
 

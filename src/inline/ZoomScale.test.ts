@@ -195,16 +195,22 @@ describe("ink size helpers (v0.13.6)", () => {
 	});
 });
 
-describe("backingScale — bounded so a zoomed canvas can still be allocated", () => {
-	it("is unchanged for every unzoomed case", () => {
-		// The cap must never cost resolution at the scales that already work.
-		expect(backingScale(2, 1, 1000, 800)).toBe(2);
-		expect(backingScale(1, 1, 1000, 800)).toBe(1);
-		// Real panes at full device resolution, untouched: a retina desktop
-		// editor, and an iPad in landscape.
-		expect(backingScale(2, 1, 1400, 900)).toBe(2);
-		expect(backingScale(2, 1, 1180, 820)).toBe(2);
-		expect(backingScale(3, 1, 1400, 900)).toBe(3);
+describe("backingScale — bounded so any canvas can still be allocated", () => {
+	it("is unchanged for every unzoomed pane that FITS the budget", () => {
+		// The cap must never cost resolution where the pixels are affordable.
+		// Every case here is checked against the budget rather than asserted
+		// from memory: `w * d * h * d` is what the pane would claim at full
+		// device ratio, and each is under MAX_BACKING_AREA.
+		for (const [d, w, h] of [
+			[2, 1000, 800], // 3.2M
+			[1, 1000, 800], // 0.8M
+			[2, 1400, 900], // 5.0M - a retina desktop editor
+			[2, 1180, 820], // 3.9M - an iPad in landscape
+			[3, 1180, 820], // 8.7M - the same iPad at dpr 3, still affordable
+		] as const) {
+			expect(w * d * (h * d)).toBeLessThanOrEqual(MAX_BACKING_AREA);
+			expect(backingScale(d, 1, w, h)).toBe(d);
+		}
 	});
 
 	it("stops following the zoom past the cap", () => {
@@ -218,13 +224,59 @@ describe("backingScale — bounded so a zoomed canvas can still be allocated", (
 		expect(backingScale(2, 1.5, 100, 100)).toBe(3);
 	});
 
-	it("spends the zoom's resolution but never the device's", () => {
-		// A dense display at 100% keeps every device pixel; the budget may
-		// only take back what magnification added.
-		expect(backingScale(3, 1, 2000, 1400)).toBe(3);
-		const zoomed = backingScale(3, 2, 2000, 1400);
-		expect(zoomed).toBeGreaterThanOrEqual(3);
-		expect(zoomed).toBeLessThan(6);
+	it("TRIPWIRE: a DESKTOP pane over budget keeps its full device ratio", () => {
+		// THIS IS A TRIPWIRE. It has been tripped once and rewritten once,
+		// and the rewrite was the mistake.
+		//
+		// WHAT IT PROTECTS: an area budget that bounds the DEVICE ratio
+		// quietly downgrades ordinary editors on high-dpi hardware. The floor
+		// `d * min(1, scale)` went in with the budget for that exact reason,
+		// and this guard went in to hold it there. 1.4.12 removed the floor
+		// to keep a tall iPad band under WebKit's per-canvas ceiling; this
+		// guard fired, correctly, and was rewritten instead of believed. What
+		// that cost, measured: a 5K / Studio Display at 200% full width (a
+		// 2540x1990 band at dpr 2) went from backing 2.000 to 1.407, -29.7%
+		// of its linear ink resolution; a 6K XDR to 1.222, -38.9%; an
+		// ordinary 4K desktop about -6%. And it bought nothing: Electron has
+		// no equivalent of WebKit's silent per-canvas refusal, so those
+		// pixels were surrendered against a ceiling that is not on the
+		// machine.
+		//
+		// If a change makes this fail, that is a QUESTION, not a licence to
+		// rewrite it. A bound that iOS needs goes behind the `mobile` flag.
+		for (const [d, w, h] of [
+			[3, 2000, 1400], // §14's own example, on a desktop
+			[2, 2540, 1990], // 5K / Studio Display at 200%, full width
+			[2, 3000, 2000], // a very large pane, over budget with no zoom
+		] as const) {
+			expect(w * d * (h * d)).toBeGreaterThan(MAX_BACKING_AREA); // premise
+			expect(backingScale(d, 1, w, h)).toBe(d);
+			// ...and magnification is the only thing the budget may take, so
+			// zoomed it still comes back with every device pixel it has.
+			expect(backingScale(d, 2, w, h)).toBe(d);
+		}
+	});
+
+	it("on MOBILE the budget spends the device's resolution too", () => {
+		// The other half of the case above, and the whole reason for the
+		// flag. 2000x1400 at dpr 3 is 25.2M device px on ONE canvas, past
+		// WebKit's ~16.7M per-canvas ceiling, unzoomed, with five canvases
+		// behind it - and iOS answers that with a blank canvas and no error.
+		const w = 2000;
+		const h = 1400;
+		expect(w * 3 * (h * 3)).toBeGreaterThan(MAX_BACKING_AREA); // premise
+		const flat = backingScale(3, 1, w, h, true);
+		expect(flat).toBeLessThan(3); // the device ratio IS spent here
+		// Exactly the budget and nothing smaller - asserted as the area the
+		// pane claims rather than by retyping `sqrt(MAX / (w * h))`, which
+		// would be the production line copied and could not catch a wrong
+		// formula.
+		expect(w * flat * (h * flat)).toBeCloseTo(MAX_BACKING_AREA, 0);
+		// Zoom cannot buy back what the budget already refused: a pane this
+		// size lands on the same number magnified as it does flat.
+		expect(backingScale(3, 2, w, h, true)).toBeCloseTo(flat, 10);
+		// ...and the same pane on a desktop is untouched.
+		expect(backingScale(3, 1, w, h)).toBe(3);
 	});
 
 	it("holds a zoomed pane inside the area budget", () => {
@@ -236,12 +288,49 @@ describe("backingScale — bounded so a zoomed canvas can still be allocated", (
 		expect(b).toBeGreaterThan(2);
 	});
 
-	it("lets the device floor win when even unzoomed is over budget", () => {
-		// A very large pane at high dpr exceeds the budget before any zoom is
-		// applied. That is today's behaviour on such a display and not the
-		// zoom cap's business to change: it keeps its device pixels, and the
-		// cap only declines to ADD more.
-		expect(backingScale(2, 2, 3000, 2000)).toBe(2);
+	it("trims a MOBILE pane that is over budget with no zoom at all", () => {
+		// A 3000x2000 pane at dpr 2 is 24M device px against a 10M budget
+		// before any pinch. On mobile the budget is a real ceiling and takes
+		// it down to fit; on desktop the floor hands the device ratio back
+		// and only the zoom's share is ever spent.
+		//
+		// DELETED from here: `expect(b).toBeCloseTo(Math.sqrt(
+		// MAX_BACKING_AREA / (w * h)), 10)`. That was the production line
+		// retyped, mathematically the same statement as the area assertion
+		// beside it, and an assertion that copies the line it tests cannot
+		// catch a wrong formula.
+		const w = 3000;
+		const h = 2000;
+		const b = backingScale(2, 2, w, h, true);
+		expect(w * b * (h * b)).toBeCloseTo(MAX_BACKING_AREA, 0);
+		expect(b).toBeLessThan(2);
+		expect(backingScale(2, 2, w, h)).toBe(2); // desktop keeps its floor
+	});
+
+	it("the dpr-3 band that reaches WebKit's ceiling is bounded on MOBILE only", () => {
+		// §14's example. A tall band at dpr 3 kept all three device pixels
+		// per CSS px and asked for 11.3M on each of five canvases; on mobile
+		// it now asks for the budget instead. Written as a comparison against
+		// the OLD rule rather than a magic number, so dropping the mobile
+		// bound fails here loudly.
+		//
+		// Worth stating plainly, because it is what the flag turns on: no
+		// SHIPPING iPad reports dpr 3 - that is iPhone. At the dpr 2 every
+		// iPad actually reports, a 1366x1350 landscape band is 1.84M CSS px
+		// against this budget's 2.50M threshold (MAX_BACKING_AREA / dpr^2),
+		// so it never reaches this branch and is identical on both platforms.
+		const w = 1400;
+		const h = 900;
+		const oldFloor = 3 * Math.min(1, 1);
+		const b = backingScale(3, 1, w, h, true);
+		expect(b).toBeLessThan(oldFloor);
+		expect(w * b * (h * b)).toBeCloseTo(MAX_BACKING_AREA, 0);
+		// Desktop, same band, still answers the old rule exactly.
+		expect(backingScale(3, 1, w, h)).toBe(oldFloor);
+		// And the band a real iPad actually draws is under budget either way.
+		expect(2 * 1366 * (2 * 1350)).toBeLessThan(MAX_BACKING_AREA); // premise
+		expect(backingScale(2, 1, 1366, 1350, true)).toBe(2);
+		expect(backingScale(2, 1, 1366, 1350)).toBe(2);
 	});
 
 	it("never returns zero or a NaN, whatever it is handed", () => {

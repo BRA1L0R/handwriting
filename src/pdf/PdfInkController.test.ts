@@ -21,6 +21,7 @@ import { DEFAULT_PEN } from "../ink/PenStyle";
 import { setInkShaping } from "../ink/InkShape";
 import {
 	addStripSurface,
+	endLiveStrokesEverywhere,
 	getEraserRadiusPx,
 	getInkSizeMult,
 	releaseMouseInkQuietlyEverywhere,
@@ -28,6 +29,11 @@ import {
 	setInlineTool,
 	setPenReticle,
 } from "../inline/InkOverlay";
+import { resetPenInkForTest, setPenInk } from "../inline/PenInk";
+// Source text, not the module: nothing here can construct the plugin class,
+// and importing main.ts for real would pull obsidian's runtime in. `?raw`
+// (raw-imports.d.ts) is the house pattern for asking what a file says.
+import mainSrc from "../main.ts?raw";
 import { strokesHitByCircle } from "../ink/Eraser";
 import { calibrationStrokes } from "./PdfCalibration";
 import { clearInkClipboard, clipboardSize } from "../inline/InkClipboard";
@@ -1488,11 +1494,19 @@ describe("PdfInkController pen reticle - mode-specific looks", () => {
  * and again on the next raw batch, without a fresh hover sample in between,
  * and the reticle is put away at pen-up rather than left for the watchdog.
  *
- * `cursorEl` is primed by one hover first, matching the limit `showLasso/
- * Pan/SpaceCursor` all state in their own comments: none of them BUILD the
- * reticle, they only refresh one that hover already built.
+ * `cursorEl` is primed by one hover first, matching the limit
+ * `showLasso/SpaceCursor` both state in their own comments: neither BUILDS
+ * the reticle, they only refresh one that hover already built.
+ *
+ * THE PAN IS THE EXCEPTION NOW, and its case in here is the inverse of the
+ * other two. 1.4.12 ruled that a pan drag paints no reticle at all
+ * (`penReticleShown`, PenCursor.ts) and wears the grabbing hand instead; the
+ * pdf surface was left behind by that fix and reviewer finding F4 said so
+ * (1.4.12-design §11). So where lasso and space assert that the ring SURVIVES
+ * the drag, the pan asserts that it goes away once, stays away for every
+ * batch, and that something is under the hand in its place the whole time.
  */
-describe("PdfInkController pen reticle - stays alive through pan, lasso and space", () => {
+describe("PdfInkController pen reticle - stays alive through lasso and space, and stands down for a pan", () => {
 	let controller: PdfInkController;
 	let pen: {
 		showCursor(s: PenSample, pointerType?: string): void;
@@ -1504,16 +1518,22 @@ describe("PdfInkController pen reticle - stays alive through pan, lasso and spac
 	let cursorStyle: Record<string, unknown>;
 	let setTimeoutSpy: ReturnType<typeof vi.fn>;
 	let clearTimeoutSpy: ReturnType<typeof vi.fn>;
+	/** Real membership, not a no-op: the pan case asks WHICH class survived. */
+	let scrollerClasses: Set<string>;
 
 	beforeEach(() => {
 		resetTipModeForTest();
 		setPenReticle(true);
 		strokes = [];
 		cursorStyle = { display: "none" };
+		scrollerClasses = new Set<string>();
 		const scroller = {
 			scrollLeft: 0,
 			scrollTop: 0,
-			classList: { add: () => {}, remove: () => {} },
+			classList: {
+				add: (c: string) => scrollerClasses.add(c),
+				remove: (c: string) => scrollerClasses.delete(c),
+			},
 			querySelector: () => null,
 			setCssStyles: () => {},
 			createDiv: () => ({
@@ -1559,18 +1579,87 @@ describe("PdfInkController pen reticle - stays alive through pan, lasso and spac
 		setPenReticle(true);
 	});
 
-	it("pan: pen-down and the next raw batch each re-arm the watchdog", () => {
-		pen.showCursor(sample(10, 10), "pen"); // the pen approached and hovered first
+	it("pan: pen-down puts the reticle away for the grabbing hand, and every batch leaves it away", () => {
+		// Hover first, as the hardware would: ring up, `cursor: none` on.
+		pen.showCursor(sample(10, 10), "pen");
+		expect(cursorStyle.display).toBe("block");
+		expect(scrollerClasses.has("handwriting-pdf-hover")).toBe(true);
 		setTimeoutSpy.mockClear();
 		setTipMode("pan");
+
 		pen.penDown(sample(200, 200));
-		expect(setTimeoutSpy, "pen-down did not refresh the reticle").toHaveBeenCalledTimes(1);
-		expect(cursorStyle.display).toBe("block");
+		expect(cursorStyle.display, "the pan kept a ring for a tip that is not marking").toBe(
+			"none"
+		);
+		expect(
+			scrollerClasses.has("handwriting-pdf-pan-drag"),
+			"the drag hid the reticle and put no cursor in its place"
+		).toBe(true);
+		expect(
+			scrollerClasses.has("handwriting-pdf-hover"),
+			"`cursor: none` was left on the viewer under the grabbing hand"
+		).toBe(false);
+		expect(
+			setTimeoutSpy,
+			"a watchdog was armed for a reticle that is not on screen"
+		).not.toHaveBeenCalled();
+
+		// TWO batches, because "once per drag" is a claim about the second one
+		// as much as the first: the branch used to repaint and re-arm on each.
 		pen.penRaw([sample(210, 190)]);
-		expect(setTimeoutSpy, "the raw batch did not refresh the reticle").toHaveBeenCalledTimes(2);
-		expect(cursorStyle.display).toBe("block");
+		pen.penRaw([sample(230, 170)]);
+		expect(cursorStyle.display, "a raw batch brought the ring back").toBe("none");
+		expect(scrollerClasses.has("handwriting-pdf-pan-drag")).toBe(true);
+		expect(setTimeoutSpy, "a raw batch re-armed the reticle watchdog").not.toHaveBeenCalled();
+
 		pen.penUp();
-		expect(cursorStyle.display, "pen-up left the reticle up instead of hiding it").toBe("none");
+		expect(
+			scrollerClasses.has("handwriting-pdf-pan-drag"),
+			"the grabbing hand outlived the drag"
+		).toBe(false);
+		expect(cursorStyle.display).toBe("none");
+	});
+
+	it("pan: nothing can paint the ring mid-drag, not even a direct showCursor", () => {
+		// The call sites that used to paint it are gone, so this reaches the
+		// gate that keeps them gone - `penReticleShown` read inside
+		// `showCursor` itself. A new mode, or a new caller (`refreshStrip`
+		// reaches this method), must not be able to put a ring back.
+		pen.showCursor(sample(10, 10), "pen");
+		setTipMode("pan");
+		pen.penDown(sample(200, 200));
+		expect(cursorStyle.display).toBe("none");
+
+		pen.showCursor(sample(300, 300), "pen");
+
+		expect(cursorStyle.display, "a direct call painted a ring mid-pan").toBe("none");
+		// And it REFUSED rather than hid: hiding here would take the grabbing
+		// hand off and leave the viewer with no pointer at all mid-drag.
+		expect(
+			scrollerClasses.has("handwriting-pdf-pan-drag"),
+			"the gate took the grabbing hand away mid-drag"
+		).toBe(true);
+		expect(
+			scrollerClasses.has("handwriting-pdf-hover"),
+			"the gate put `cursor: none` back over a hidden reticle"
+		).toBe(false);
+	});
+
+	it("pan: the ring comes back on the next hover once the drag is over", () => {
+		// The other end of the gate. `panLast` is cleared before the reticle
+		// is touched at pen-up, so the mode is pan and the ring is allowed
+		// again the moment there is no drag under it.
+		pen.showCursor(sample(10, 10), "pen");
+		setTipMode("pan");
+		pen.penDown(sample(200, 200));
+		pen.penRaw([sample(210, 190)]);
+		pen.penUp();
+
+		pen.showCursor(sample(40, 40), "pen");
+
+		expect(cursorStyle.display, "the pan tip lost its hover ring for good").toBe("block");
+		expect(scrollerClasses.has("handwriting-pdf-pan-drag")).toBe(false);
+		expect(scrollerClasses.has("handwriting-pdf-hover")).toBe(true);
 	});
 
 	it("lasso: a fresh loop's pen-down and its raw batch each re-arm the watchdog", () => {
@@ -2666,14 +2755,20 @@ describe("PdfInkController pdf trace (pdf-pendown / pdf-raw / pdf-penup)", () =>
  * the pane or it has sent pointerleave. `showCursor` has said so since it
  * was written, and exempts `pointerType === "mouse"` from arming the timer.
  *
- * The exemption only ever reached the HOVER call. The four in-stroke
- * wrappers - `showEraserCursor`, `showLassoCursor`, `showPanCursor`,
- * `showSpaceCursor` - call `showCursor(sample)` with NO pointerType at all
- * (deliberately: the hardware and pen-seen marks belong to the hover and the
- * pen-down that already happened, not to every sample of a stroke in
- * flight). So a mouse erasing, lassoing or panning a PDF inherited the pen's
- * 1000ms timer, and any stall over a second in raw delivery while the button
- * was held took the ring away in the middle of the gesture.
+ * The exemption only ever reached the HOVER call. The in-stroke wrappers -
+ * `showEraserCursor`, `showLassoCursor`, `showSpaceCursor` - call
+ * `showCursor(sample)` with NO pointerType at all (deliberately: the
+ * hardware and pen-seen marks belong to the hover and the pen-down that
+ * already happened, not to every sample of a stroke in flight). So a mouse
+ * erasing, lassoing or panning a PDF inherited the pen's 1000ms timer, and
+ * any stall over a second in raw delivery while the button was held took the
+ * ring away in the middle of the gesture.
+ *
+ * There were FOUR wrappers when this was written, and `showPanCursor` was the
+ * fourth. 1.4.12 removed it: a pan drag paints no reticle at all, so it has
+ * no watchdog to be exempt from either (`penReticleShown`, PenCursor.ts, and
+ * the pan cases in the reticle suite above). The pan is still named in the
+ * sentence above because the defect really did reach it.
  *
  * These drive the real gesture through `penDown`/`penRaw` and let the clock
  * actually run: `win.setTimeout` here is the (fake-timed) global one rather
@@ -3371,6 +3466,227 @@ describe("PdfInkController: a stroke torn down with no pointerup stands the surf
 
 		expect(tools.inking).toEqual([]);
 		expect(tools.refreshes).toBe(0);
+	});
+});
+
+/**
+ * PEN OFF ON A PDF (PenInk.ts, design §5), driven through the real router.
+ *
+ * The state shipped note-only: `PdfInkController` passed no `penOff`
+ * predicate, so this router gated on nothing and the pen kept inking on a pdf
+ * however the switch read. Two follow-ups then made the strip agree with that
+ * - the keyboard button first went dark on a pdf strip, then vanished from it
+ * - and the owner reversed the whole line: "i think the dude was having
+ * trouble with his keyboard coming up on pdf when he didnt want it to? so why
+ * would you take keyboard mode away from pdf".
+ *
+ * So the assertion is about the CLAIM, not about the strip. A pdf with the pen
+ * off must hand a pen contact back to the viewer untouched - that is what lets
+ * the pen select text, follow a link and put the caret in a form field, and it
+ * is the same refusal the note makes. Driven over the same element fake and
+ * the same real router as the teardown suite above, because the thing that
+ * broke was the wiring between the two surfaces and only a real router can
+ * say whether this one is wired.
+ *
+ * `InkSurfaceRules.test.ts` scans both surfaces' source for `penOff:` now that
+ * it is in `INLINE_PEN_CALLBACKS`; that catches the member going missing. What
+ * it cannot catch is a body that answers wrongly, which is this file's half.
+ */
+describe("PdfInkController: the pen off on a pdf claims nothing", () => {
+	let uninstallWindow: () => void = () => {};
+	beforeAll(() => {
+		uninstallWindow = installFakeWindow();
+	});
+	afterAll(() => {
+		uninstallWindow();
+	});
+
+	let controller: PdfInkController;
+	let priv: { tools: unknown; builder: unknown; pair: unknown; wetHostPage: number };
+	let ops: InkOp[];
+	let scroller: ReturnType<typeof fakeEl>;
+	/** What a claimed contact would have spent on the event, and did not. */
+	let prevented: number;
+
+	/** The strip stand-in, counting only what a claim would move. */
+	function toolsStub(): { inking: boolean[]; setInking(on: boolean): void; refresh(): void; closeInkSliders(): void } {
+		const stub = {
+			inking: [] as boolean[],
+			setInking: (on: boolean) => void stub.inking.push(on),
+			refresh: () => {},
+			closeInkSliders: () => {},
+		};
+		return stub;
+	}
+
+	beforeEach(() => {
+		resetTipModeForTest();
+		resetPenInkForTest();
+		setPenReticle(true);
+		setMouseInk(false);
+		prevented = 0;
+		const el = fakeEl() as ReturnType<typeof fakeEl> & Record<string, unknown>;
+		el.querySelector = () => null;
+		el.createDiv = () => ({
+			setAttribute: () => {},
+			remove: () => {},
+			classList: { add: () => {}, remove: () => {}, toggle: () => {} },
+			setCssStyles: () => {},
+			parentElement: el,
+		});
+		scroller = el;
+		probe.current = {
+			scroller: el,
+			scaleFactor: SCALE,
+			scaleSource: "test",
+			pages: [
+				{ pageNumber: 1, leftPx: 0, topPx: 0, widthPx: 600, heightPx: 800, hasCanvas: true },
+			],
+		};
+		const win = {
+			devicePixelRatio: 1,
+			navigator: { userAgent: "", platform: "", maxTouchPoints: 0 },
+			setTimeout: (fn: () => void, ms?: number) => setTimeout(fn, ms),
+			clearTimeout: (id: unknown) => clearTimeout(id as ReturnType<typeof setTimeout>),
+			requestAnimationFrame: () => 0,
+			getComputedStyle: () => ({ position: "relative" }),
+		};
+		ops = [];
+		controller = new PdfInkController(
+			{} as HTMLElement,
+			win as unknown as Window,
+			() => [],
+			() => "doc-1",
+			() => [],
+			(op) => void ops.push(op)
+		);
+		priv = controller as unknown as typeof priv;
+		(controller as unknown as { bindTo(el: unknown): void }).bindTo(el);
+		priv.tools = toolsStub();
+	});
+
+	afterEach(() => {
+		(controller as unknown as { router: { dispose(): void } | null }).router?.dispose();
+		resetPenInkForTest();
+		resetTipModeForTest();
+		setPenReticle(true);
+	});
+
+	/** A real nib contact on the viewer, through the router's own handler. */
+	function penDown(): void {
+		setTipMode("nib");
+		const h = scroller.handlers.get("pointerdown");
+		if (!h) throw new Error("the router registered no pointerdown handler");
+		const ev = penEvent("pointerdown", 100) as unknown as Record<string, unknown>;
+		ev.preventDefault = () => void prevented++;
+		h(ev as unknown as Event);
+	}
+
+	it("hands a pen contact back to the viewer while the pen is off", () => {
+		setPenInk(false);
+
+		penDown();
+
+		// Nothing was claimed, so nothing on this surface changed: no builder,
+		// no strip stand-down, and - the half a user feels - no
+		// preventDefault, which is what lets the viewer place its own caret
+		// and raise the keyboard from a field the pen taps.
+		expect(priv.builder, "the pdf built a stroke with the pen off").toBe(null);
+		expect(controller.idle, "the pdf claimed a gesture with the pen off").toBe(true);
+		expect(prevented, "the contact was eaten instead of handed to the viewer").toBe(0);
+		expect(ops).toEqual([]);
+	});
+
+	it("and inks again the moment the pen comes back on", () => {
+		// The other half, so the test above cannot pass because this harness
+		// simply never inks.
+		setPenInk(false);
+		penDown();
+		expect(controller.idle).toBe(true);
+
+		setPenInk(true);
+		penDown();
+
+		expect(priv.builder, "the pdf refused the pen after it was turned back on").not.toBe(null);
+		expect(controller.idle).toBe(false);
+		expect(prevented, "a claimed contact was left to the viewer").toBeGreaterThan(0);
+	});
+
+	/**
+	 * The toggle can be hit with the nib on the glass - a hotkey, the palette,
+	 * or the other hand on the strip - and the router's gate refuses only NEW
+	 * claims (`InlinePenCallbacks.penOff`). The note answers that by committing
+	 * the live stroke, on the owner's alt-tab ruling ("sure make it
+	 * consistent"), and a pdf that answered differently would eat the word
+	 * being written on one surface and keep it on the other.
+	 *
+	 * Driven through the REAL fan-out, `endLiveStrokesEverywhere`, with this
+	 * controller registered the way main.ts registers every open pane's -
+	 * `addStripSurface`'s fifth callback. Asserting the REGISTERED callback ran
+	 * is what fails if that wiring is dropped, where calling `endLiveStroke()`
+	 * directly would stay green with the fan-out deleted; the idiom is the
+	 * mouse-ink one two suites above.
+	 */
+	it("commits a live pdf stroke when the pen goes off under it", () => {
+		setTipMode("nib");
+		penDown();
+		const wetCleared: number[][] = [];
+		priv.pair = {
+			wetCanvas: { setCssProps: () => {} },
+			headCanvas: { setCssProps: () => {} },
+			wet: {
+				clear: (w: number, h: number) => void wetCleared.push([w, h]),
+				clearStroke: (w: number, h: number) => void wetCleared.push([w, h]),
+			},
+			tail: { clear: () => {}, clearAll: () => {} },
+		};
+		priv.wetHostPage = 1;
+		const tools = toolsStub();
+		priv.tools = tools;
+		expect(controller.idle, "the ink contact never took").toBe(false);
+
+		const undo = addStripSurface(
+			() => {},
+			undefined,
+			undefined,
+			undefined,
+			() => controller.endLiveStroke()
+		);
+		try {
+			setPenInk(false);
+			endLiveStrokesEverywhere();
+		} finally {
+			undo();
+		}
+
+		// COMMITTED, not dropped: one `add` op on the page the contact started
+		// on, exactly as a lift would have made.
+		expect(ops.length, "the live pdf stroke vanished when the pen went off").toBe(1);
+		const op = ops[0] as Extract<InkOp, { type: "add" }>;
+		expect(op.type).toBe("add");
+		expect(op.path).toBe("doc-1");
+		expect(op.strokes[0]?.page).toBe(1);
+		// And the gesture is over, so the pane can be reloaded and the strip
+		// is not left wearing `is-inking`.
+		expect(controller.idle).toBe(true);
+		expect(tools.inking).toEqual([false]);
+	});
+
+	it("and main.ts really registers that fan-out for every open pdf pane", () => {
+		// The half the test above cannot reach: it registers the callback
+		// itself, so it stays green if main.ts stops registering one. Nothing
+		// in this repo can construct the plugin class, so this is a source
+		// read - `?raw` (raw-imports.d.ts), the house pattern - and it is
+		// bounded at BOTH ends by anchors asserted to exist, so it cannot pass
+		// on a stray `endLiveStroke` somewhere else in the file.
+		const from = mainSrc.indexOf("addStripSurface(");
+		expect(from, "main.ts no longer registers a strip surface at all").toBeGreaterThan(-1);
+		const to = mainSrc.indexOf('this.app.workspace.on("file-open"', from);
+		expect(to, "the anchor after the registration moved").toBeGreaterThan(from);
+		expect(
+			mainSrc.slice(from, to),
+			"main.ts registers no end-live-stroke callback, so a pdf stroke survives the pen going off"
+		).toContain("c.endLiveStroke()");
 	});
 });
 

@@ -14,25 +14,9 @@ one line is written to the invisible frontmatter of a note when you first write 
 
 a note you never inked on is never modified.
 
-## why i built this
-
-back in uni i remember taking biochem notes on my new surface pro 4 with stars in my eyes. drawing structures and typing labels on the same OneNote page felt like literal magic. i can still remember how good it felt, how proud i was showing my notes to friends and professors
-
-ten years later, now for work, I'm still using onenote - and i consider it a prison. things change.
-
-Obsidian has almost reached feature-parity but there's one last integration that keeps me coming back into the hands of Microsoft.
-
-**Handwriting is OneNote's last bastion.**
-
-not to wax poetic but i am beyond ready to break out.
-
-Handwriting is designed for students, educators, engineers, artists, or anyone who needs to handwrite and type in Obsidian.
-
-i designed this app with a decade of OneNote experience driving my tastes, so a few of the quirks and nuances of operation should feel remarkably similar or remarkably bad. sometimes it's a matter of taste
+## what it does
 
 Here's a demonstration of some of the features: https://youtu.be/TUeniA9BZcc
-
-## what it does
 
 ### right now you can
 
@@ -108,19 +92,19 @@ Obsidian 1.12.3 or newer. please send reports.
 
 ### the toolbar
 
-tap any tool in the toolbar to use it: pen, highlighter, eraser, lasso, insert space, pan. hover to see the slider. the keyboard button turns the pen off so a tap places the caret and the on-screen keyboard comes up - `Pen: on / off` does the same from the palette, notes only, and pdfs keep inking.
+tap any tool in the toolbar to use it: pen, highlighter, eraser, lasso, insert space - and pan, which is only built where there is no touchscreen at all (anything you can pan with a finger already can). hover to see the slider. the keyboard button turns the pen off so a tap places the caret and the on-screen keyboard comes up - `Pen on / off` does the same from the palette. it works on pdfs too: the pen stops inking there and taps go straight to the viewer.
 
-(mouse users only) run `Handwriting: Mouse` to activate the toolbar, or go into settings and set Pen toolbar's dropdown menu to Show. once it's up, click any tool and the mouse picks it up; click the tool you're using again and the mouse goes back to your cursor.
+(mouse users only) run `Handwriting: Mouse on / off` to activate the toolbar, or go into settings and set Pen toolbar's dropdown menu to Show. once it's up, click any tool and the mouse picks it up; click the tool you're using again and the mouse goes back to your cursor.
 
 ### eraser modes
 
-the eraser can erase whole strokes or just at the eraser reticle. switch between the two by tapping the eraser button and choosing either stroke or reticle. default erases whole strokes. `Eraser: toggle` toggles the eraser on and off, `Eraser size: next` cycles the reticle size.
+the eraser can erase whole strokes or just at the eraser reticle. switch between the two by tapping the eraser button and choosing either stroke or reticle. default erases whole strokes. the eraser button on the toolbar is the way in and out; `Toggle eraser on / off` and `Eraser size: next` do the same from the palette once **Extra commands for hotkeys** is on in settings.
 
 ### color palette
 
-click the palette button and a 4-wide grid palette drops down. pick from 8 pen colors or 5 highlighter colors. tap one to pick it or run `Ink color: next` to cycle them from the keyboard.
+there is no palette button any more. tap the pen button on the strip and its pop opens with the size slider, the quick-pen chips, and a row of the 8 pen colors; the highlighter button opens the same pop with its own 5. tap a swatch to pick it. it colors the nib you are already holding, and drops any eraser, lasso, insert space or pan mode so the tip goes back to inking - each nib's pop only ever shows its own colors, so a swatch never swaps pen for highlighter.
 
-`Pen color: next` and `Highlighter color: next` cycle through their respective colors. as a workaround for not having favorites, you can try binding a hotkey to a color or size.
+the cycles - `Ink color: next`, `Pen color: next`, `Highlighter color: next`, `Ink size: next` - one command per color and per size, the four tool toggles (`Toggle eraser / lasso / insert space / pan on / off`), and the sixteen quick-pen commands (`Pen preset 1` to `4`, `Highlighter preset 1` to `4`, and a `Save current pen as preset N` for each slot) all live behind **Extra commands for hotkeys** in settings. turn it on and they show up in the palette straight away, each ready to take its own hotkey - a starred quick pen can sit on a single key. turning it back off takes them out again and leaves your hotkeys waiting for them. they're off by default because they crowded out the export and flatten commands in the palette.
 
 ### palm rejection
 
@@ -136,6 +120,8 @@ pinch to zoom works on notes and pdfs. the point you start the pinch on stays un
 
 hold the pen still for about a third of a second at the end of a stroke and it redraws as a line, triangle, rectangle, circle or ellipse.
 
+with a mouse, pause at the end of a stroke and a Snap button appears; click it to snap.
+
 ### update notice
 
 the first time you open Obsidian after an update a small notice in the corner shows the changelog. it goes away on its own or click it to dismiss it sooner.
@@ -144,6 +130,7 @@ the first time you open Obsidian after an update a small notice in the corner sh
 
 * turn off Scribble or ios will draw its own black ink over your strokes and scratch-out deletes ink
 * iPad Settings > Apple Pencil > Scribble > Toggle off
+* ink that vanishes after switching apps or under memory pressure repaints when you come back to Obsidian. ios can take a canvas's pixels back without telling the page, and on a long note beside photos or a pdf that is most likely while the app is in the background
 
 ### obsidian sync notes
 
@@ -208,7 +195,7 @@ if you have any more questions i'd be glad to answer in the comments
 
 ## reporting problems
 
-open an issue. report what happened. remember to include which device and pen please.
+[open an issue](https://github.com/ellimist-afk/handwriting/issues/new/choose). report what happened. remember to include which device and pen please.
 
 EZMODE reporting:
 
@@ -250,3 +237,18 @@ CC BY-NC-ND 4.0
 
 disclaimer: ai assistance was used in this project.
 
+## why i built this
+
+back in uni i remember taking biochem notes on my new surface pro 4 with stars in my eyes. drawing structures and typing labels on the same OneNote page felt like literal magic. i can still remember how good it felt, how proud i was showing my notes to friends and professors
+
+ten years later, now for work, I'm still using onenote - and i consider it a prison. things change.
+
+Obsidian has almost reached feature-parity but there's one last integration that keeps me coming back into the hands of Microsoft.
+
+**Handwriting is OneNote's last bastion.**
+
+not to wax poetic but i am beyond ready to break out.
+
+Handwriting is designed for students, educators, engineers, artists, or anyone who needs to handwrite and type in Obsidian.
+
+i designed this app with a decade of OneNote experience driving my tastes, so a few of the quirks and nuances of operation should feel remarkably similar or remarkably bad. sometimes it's a matter of taste

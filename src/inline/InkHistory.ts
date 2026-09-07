@@ -98,15 +98,38 @@ export function snapHistoryOps(
 ): InkOp[] {
 	return [
 		{ type: "add", path, strokes: [freehand], indices: [at] },
-		{
-			type: "replace",
-			path,
-			removed: [freehand],
-			removedAt: [at],
-			inserted: snapped,
-			insertedAt: [at],
-		},
+		snapReplaceOp(path, freehand, snapped, at),
 	];
+}
+
+/**
+ * The swap itself: the freehand out, the fitted figure in, at the same depth.
+ *
+ * Named once and reached two ways, because a MOUSE takes the same snap by a
+ * different route (SnapChip.ts). The pen's dwell replaces the stroke before
+ * it is ever committed, so its history has to invent the landing as well as
+ * the swap - that is what `snapHistoryOps` above is. A mouse stroke is
+ * committed as drawn first and its `add` has already gone into the history by
+ * the time the Snap chip is pressed, so the chip publishes THIS op alone and
+ * the two undo steps Alan gets are the same two: back to the freehand, then
+ * gone. What must never happen is a second, separately-written replace
+ * drifting from this one - the un-snap is the half that has already been got
+ * wrong once (alan, 2026-08-27).
+ */
+export function snapReplaceOp(
+	path: string,
+	freehand: InkStroke,
+	snapped: InkStroke[],
+	at: number
+): InkOp {
+	return {
+		type: "replace",
+		path,
+		removed: [freehand],
+		removedAt: [at],
+		inserted: snapped,
+		insertedAt: [at],
+	};
 }
 
 export const inkEffect = StateEffect.define<InkOp>();

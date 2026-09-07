@@ -83,19 +83,27 @@ describe("decideWhatsNew", () => {
 		]);
 	});
 
-	it("groups the shipped notes from 1.3.10: five versions, the repeat kept only in the oldest", () => {
-		// Measured against the shipped RELEASE_NOTES in 1.4.6-design.md §5c:
-		// 1.3.10 -> 1.4.5 is five versions (1.3.11, 1.4.1, 1.4.2, 1.4.4, 1.4.5)
-		// and 23 lines once repeats collapse to their first appearance. "bug
-		// fixes" is in every one of those five lists in RELEASE_NOTES; only
-		// the oldest should still carry it.
+	it("1.3.10 -> 1.4.5 is five versions, but only the newest two show in full - this test used to pin all five (23 lines) at once, which is exactly the spam this feature exists to stop", () => {
+		// Measured against the shipped RELEASE_NOTES: 1.3.10 -> 1.4.5 is five
+		// versions (1.3.11, 1.4.1, 1.4.2, 1.4.4, 1.4.5). This test formerly
+		// asserted all five rendered as separate groups totalling 23 lines;
+		// that was the un-collapsed behaviour Alan flagged ("100 lines is
+		// crazy wtf"). Now the three oldest fold into one summary line and
+		// only 1.4.4 and 1.4.5 - the two most recent - render in full.
 		const d = decideWhatsNew("1.4.5", "1.3.10", false);
 		expect(d.show).toBe(true);
 		if (!d.show) throw new Error("unreachable, asserted above");
-		expect(d.groups.map((g) => g.version)).toEqual(["1.3.11", "1.4.1", "1.4.2", "1.4.4", "1.4.5"]);
-		expect(d.notes).toHaveLength(23);
-		expect(d.groups[0]?.notes).toContain("bug fixes");
-		for (const group of d.groups.slice(1)) expect(group.notes).not.toContain("bug fixes");
+		expect(d.groups.map((g) => g.version)).toEqual(["", "1.4.4", "1.4.5"]);
+		expect(d.groups[0]?.collapsedCount).toBe(3);
+		expect(d.groups[0]?.notes).toEqual(["and 3 earlier updates"]);
+		// "bug fixes" was first seen in the now-collapsed 1.3.11, so it no
+		// longer appears anywhere in what's kept.
+		expect(d.groups[1]?.notes).not.toContain("bug fixes");
+		expect(d.groups[2]?.notes).not.toContain("bug fixes");
+		// 1 collapsed line + 1.4.4's kept lines + 1.4.5's kept lines, once
+		// dedup against the whole 1.3.11..1.4.5 span (not just what's kept
+		// visible) has already run.
+		expect(d.notes).toHaveLength(9);
 	});
 });
 
@@ -209,9 +217,8 @@ describe("whatsNewFragment", () => {
 
 describe("whatsNewDurationMs", () => {
 	// The duration table §5c specifies: 15000 for <= 4 lines, +1500/line past
-	// that, capped at 45000. Measured case: the shipped 1.3.10 -> 1.4.5
-	// history is 23 lines (see the grouping test above), landing at 43500 -
-	// short of the cap, so the earliest release's lines stay on screen.
+	// that, capped at 45000. 23 and 40 are arbitrary sample line counts
+	// exercising the middle and the cap, not tied to any one release's notes.
 	it.each([
 		[0, 15000],
 		[4, 15000],
@@ -220,5 +227,132 @@ describe("whatsNewDurationMs", () => {
 		[40, 45000],
 	])("%i lines -> %i ms", (lineCount, expectedMs) => {
 		expect(whatsNewDurationMs(lineCount)).toBe(expectedMs);
+	});
+});
+
+describe("collapsing groups older than the two most recent", () => {
+	// Same DOM stand-in as the whatsNewFragment suite above: whatsNewFragment
+	// runs unmodified against a fake with the same call shape, since this
+	// suite has no real `document` (vitest.config.ts sets no `environment`).
+	class FakeEl {
+		children: FakeEl[] = [];
+		constructor(
+			public tag: string,
+			public cls?: string,
+			public text?: string
+		) {}
+		createDiv(opts: { cls?: string; text?: string } = {}): FakeEl {
+			const el = new FakeEl("div", opts.cls, opts.text);
+			this.children.push(el);
+			return el;
+		}
+		createEl(tag: string, opts: { cls?: string; text?: string } = {}): FakeEl {
+			const el = new FakeEl(tag, opts.cls, opts.text);
+			this.children.push(el);
+			return el;
+		}
+	}
+
+	beforeEach(() => {
+		(globalThis as unknown as { createFragment: () => FakeEl }).createFragment = () =>
+			new FakeEl("fragment");
+	});
+
+	/** Every rendered <li>, wherever it sits in the tree. */
+	function listItems(el: FakeEl): FakeEl[] {
+		return el.children.flatMap((c) => (c.tag === "li" ? [c] : listItems(c)));
+	}
+
+	/** Every rendered collapsed-notice div, wherever it sits in the tree. */
+	function collapsedDivs(el: FakeEl): FakeEl[] {
+		return el.children.flatMap((c) =>
+			c.tag === "div" && c.cls === "handwriting-whats-new-collapsed" ? [c] : collapsedDivs(c)
+		);
+	}
+
+	it("from 1.3.11 to 1.4.12: two groups render in full, the collapsed line appears exactly once, and the rendered total is far below the 57 lines this same scenario shows with collapsing turned off", () => {
+		const d = decideWhatsNew("1.4.12", "1.3.11", false);
+		expect(d.show).toBe(true);
+		if (!d.show) throw new Error("unreachable, asserted above");
+		expect(d.groups.map((g) => g.version)).toEqual(["", "1.4.11", "1.4.12"]);
+		const frag = whatsNewFragment(d.version, d.notes, d.groups) as unknown as FakeEl;
+		const collapsed = collapsedDivs(frag);
+		expect(collapsed).toHaveLength(1);
+		const renderedLineCount = listItems(frag).length + collapsed.length;
+		// DERIVED FROM THE NOTES, NOT TYPED IN. This asserted a hardcoded 21 -
+		// one collapsed line plus the two kept groups as they read that day -
+		// and it went red the moment the owner rewrote the 1.4.12 entry in his
+		// own words. That is not a defect and must never be answered by padding
+		// his text back to length. The subject of this file is the COLLAPSE, so
+		// what it asserts is the collapse: the two newest groups render in full
+		// (their own lines, however many he writes) and EVERYTHING OLDER is one
+		// line between them. A changelog edit moves this number; a broken
+		// collapse moves it by a group.
+		// From the GROUPS, not from RELEASE_NOTES: `notesSince` deduplicates
+		// across the whole set, so a line the owner repeats from an older
+		// version keeps its oldest occurrence and drops out of the newer group.
+		// Summing the arrays instead would count those twice and go red for a
+		// changelog that is perfectly correct.
+		const kept = d.groups.filter((g) => g.version !== "").reduce((n, g) => n + g.notes.length, 0);
+		expect(renderedLineCount).toBe(kept + 1);
+	});
+
+	it("from 1.4.11 to 1.4.12 (one group): no collapsed line anywhere in the output", () => {
+		const d = decideWhatsNew("1.4.12", "1.4.11", false);
+		expect(d.show).toBe(true);
+		if (!d.show) throw new Error("unreachable, asserted above");
+		expect(d.groups).toHaveLength(1);
+		const frag = whatsNewFragment(d.version, d.notes, d.groups) as unknown as FakeEl;
+		expect(collapsedDivs(frag)).toHaveLength(0);
+	});
+
+	it("from 1.4.10 to 1.4.12 (two groups): no collapsed line, both groups render in full", () => {
+		const d = decideWhatsNew("1.4.12", "1.4.10", false);
+		expect(d.show).toBe(true);
+		if (!d.show) throw new Error("unreachable, asserted above");
+		expect(d.groups.map((g) => g.version)).toEqual(["1.4.11", "1.4.12"]);
+		const frag = whatsNewFragment(d.version, d.notes, d.groups) as unknown as FakeEl;
+		expect(collapsedDivs(frag)).toHaveLength(0);
+		expect(listItems(frag)).toHaveLength(d.notes.length);
+	});
+
+	it("the collapsed line names the exact number of older groups, no more and no less", () => {
+		// Five made-up versions, one note each, none of them repeating - a
+		// fixture immune to Alan's in-flight rewrite of 1.4.12's real notes.
+		const notes = {
+			"2.0.0": ["a"],
+			"2.0.1": ["b"],
+			"2.0.2": ["c"],
+			"2.0.3": ["d"],
+			"2.0.4": ["e"],
+		};
+		const d = decideWhatsNew("2.0.4", "1.9.9", false, notes);
+		expect(d.show).toBe(true);
+		if (!d.show) throw new Error("unreachable, asserted above");
+		// Five groups -> newest two (2.0.3, 2.0.4) in full, three collapsed.
+		expect(d.groups.map((g) => g.version)).toEqual(["", "2.0.3", "2.0.4"]);
+		const frag = whatsNewFragment(d.version, d.notes, d.groups) as unknown as FakeEl;
+		const collapsed = collapsedDivs(frag);
+		expect(collapsed).toHaveLength(1);
+		expect(collapsed[0]?.text).toBe("and 3 earlier updates");
+	});
+
+	it("whatsNewDurationMs is fed the reduced, post-collapse count - not the 78 lines every version between 1.3.11 and 1.4.12 would total uncollapsed", () => {
+		const d = decideWhatsNew("1.4.12", "1.3.11", false);
+		expect(d.show).toBe(true);
+		if (!d.show) throw new Error("unreachable, asserted above");
+		const reducedDuration = whatsNewDurationMs(d.notes.length);
+		// The PROPERTY, not a frozen millisecond count: the duration is fed the
+		// post-collapse total, so it is what that count asks for and less than
+		// the uncollapsed set would ask for. The literal 40500 here was the
+		// answer for one particular changelog and went red the moment the owner
+		// rewrote his own entry - which is not a defect, and must not be
+		// answered by editing his text.
+		// `d.notes` is the POST-COLLAPSE set, so the only real claim here is
+		// that it is shorter than the uncollapsed one and buys a shorter read.
+		// (Comparing the duration with itself would assert nothing at all.)
+		const rawTotal = Object.values(RELEASE_NOTES).reduce((n, v) => n + v.length, 0);
+		expect(d.notes.length, "the collapse kept every line").toBeLessThan(rawTotal);
+		expect(reducedDuration).toBeLessThan(whatsNewDurationMs(rawTotal));
 	});
 });

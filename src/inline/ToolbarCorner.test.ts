@@ -32,6 +32,9 @@ import {
 	DEFAULT_TOOLBAR_CORNER,
 	TOOLBAR_CORNERS,
 	TOOLBAR_CORNER_LABELS,
+	collapseChevronGlyph,
+	collapseChevronIcon,
+	isMiddleAnchor,
 	allToolbarCornerClasses,
 	normalizeToolbarCorner,
 	toolbarCornerClass,
@@ -39,9 +42,38 @@ import {
 import css from "../../styles.css?raw";
 
 describe("ToolbarCorner", () => {
-	it("offers all four corners and defaults to the one that shipped", () => {
-		expect(TOOLBAR_CORNERS).toHaveLength(4);
+	it("offers six placements and defaults to the one that shipped", () => {
+		expect(TOOLBAR_CORNERS).toHaveLength(6);
 		expect(DEFAULT_TOOLBAR_CORNER).toBe("top-right");
+	});
+
+	// THE FOUR ORIGINAL VALUES ARE LOAD-BEARING: they are in every existing
+	// data.json. Adding the middles must not rename one of them, or every
+	// user's toolbar moves on upgrade and the normalise hands them the
+	// default instead of what they chose.
+	it("keeps the four original values exactly as they were persisted", () => {
+		for (const corner of ["top-right", "top-left", "bottom-right", "bottom-left"] as const) {
+			expect(TOOLBAR_CORNERS).toContain(corner);
+			expect(normalizeToolbarCorner(corner)).toBe(corner);
+		}
+	});
+
+	it("accepts the two middles, and labels them as middles", () => {
+		expect(normalizeToolbarCorner("top-center")).toBe("top-center");
+		expect(normalizeToolbarCorner("bottom-center")).toBe("bottom-center");
+		const labels = new Map(TOOLBAR_CORNER_LABELS.map((r) => [r.value, r.label]));
+		expect(labels.get("top-center")).toBe("Top middle");
+		expect(labels.get("bottom-center")).toBe("Bottom middle");
+		expect(isMiddleAnchor("top-center")).toBe(true);
+		expect(isMiddleAnchor("bottom-center")).toBe(true);
+		expect(isMiddleAnchor("top-right")).toBe(false);
+	});
+
+	// The dropdown is built from the labels, so a placement with no label is
+	// a placement the user cannot reach, and a label with no placement is a
+	// row that sets nothing.
+	it("offers exactly one label per placement, in the same order", () => {
+		expect(TOOLBAR_CORNER_LABELS.map((r) => r.value)).toEqual([...TOOLBAR_CORNERS]);
 	});
 
 	it("turns anything off disk into a real corner", () => {
@@ -61,7 +93,7 @@ describe("ToolbarCorner", () => {
 
 	it("gives each corner its own class, and can list them all to clear", () => {
 		const classes = allToolbarCornerClasses();
-		expect(new Set(classes).size).toBe(4);
+		expect(new Set(classes).size).toBe(TOOLBAR_CORNERS.length);
 		for (const c of TOOLBAR_CORNERS) expect(classes).toContain(toolbarCornerClass(c));
 	});
 
@@ -101,5 +133,43 @@ describe("the stylesheet check reads rules, not sentences", () => {
 	it("does NOT accept a rule that has been commented out", () => {
 		const retired = `/*\n.handwriting-mobile-tools.${CLASS} { top: 0; }\n*/\n`;
 		expect(codeOnly(retired)).not.toContain(`.${CLASS}`);
+	});
+});
+
+/**
+ * WHICH WAY THE COLLAPSE CHEVRON POINTS.
+ *
+ * It names the edge the strip collapses INTO. A corner has two edges and the
+ * horizontal one is the one that reads; a middle has only one, and it is
+ * vertical. Pointing a top-middle strip's chevron sideways would name an edge
+ * the strip is nowhere near - and before this rule existed it did exactly
+ * that, because the mapping was a two-way `endsWith("left")` test and a
+ * middle is neither.
+ */
+describe("collapseChevronIcon: the arrow names the edge the strip goes to", () => {
+	it("points sideways for the four corners, as it always has", () => {
+		expect(collapseChevronIcon("top-right")).toBe("chevron-right");
+		expect(collapseChevronIcon("bottom-right")).toBe("chevron-right");
+		expect(collapseChevronIcon("top-left")).toBe("chevron-left");
+		expect(collapseChevronIcon("bottom-left")).toBe("chevron-left");
+	});
+
+	it("points at the edge for the two middles", () => {
+		expect(collapseChevronIcon("top-center")).toBe("chevron-up");
+		expect(collapseChevronIcon("bottom-center")).toBe("chevron-down");
+	});
+
+	it("has a glyph fallback for every placement, matching the icon", () => {
+		const want: Record<string, string> = {
+			"top-right": ">",
+			"top-left": "<",
+			"top-center": "^",
+			"bottom-right": ">",
+			"bottom-left": "<",
+			"bottom-center": "v",
+		};
+		for (const corner of TOOLBAR_CORNERS) {
+			expect(collapseChevronGlyph(corner), corner).toBe(want[corner]);
+		}
 	});
 });

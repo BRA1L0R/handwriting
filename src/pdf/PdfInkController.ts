@@ -34,6 +34,7 @@ import {
 	penToolsVisible,
 	pointerRaisesPenTools,
 } from "../inline/PenToolsMode";
+import { deviceHasTouch } from "../inline/DeviceInput";
 import {
 	padBBox,
 	pointInBBox,
@@ -71,6 +72,7 @@ import { InkOp } from "../inline/InkHistory";
 import { newStrokeId } from "../ink/Stroke";
 import { splitStrokeByCircle, strokesHitByCircle } from "../ink/Eraser";
 import {
+	applyToolbarPlacement,
 	commitEraserRadius,
 	getEraserRadiusPx,
 	getEraserWholeStrokes,
@@ -84,6 +86,7 @@ import {
 	setInkSizeMult,
 } from "../inline/InkOverlay";
 import { mouseInkEnabled } from "../inline/MouseInk";
+import { penInkEnabled } from "../inline/PenInk";
 import { MobileTools } from "../inline/MobileTools";
 import {
 	armStripPenFocus,
@@ -93,8 +96,17 @@ import {
 } from "../inline/StripPenChrome";
 import { clipboardSize } from "../inline/InkClipboard";
 import { colorsFor } from "../ink/InkColor";
+import {
+	applyInkPreset,
+	forgetInkPreset,
+	inkPresetsFor,
+	starInkPreset,
+} from "../ink/InkPresets";
+import { penReticleShown } from "../inline/PenCursor";
 import { PenContactIntent, penContactIntent, releaseTipMode, tipMode, tipModeHeld } from "../inline/TipMode";
 import { PdfInkHistory } from "./PdfInkHistory";
+import { PAN_EDGE_CLEAR, panBatchDelta, panEdgeContact, panScrollLimit, panScrollNext, type PanEdgeLatch } from "./PanScroll";
+import { coalescedCount, recordPdfPanMove, recordPdfScrollEvent } from "./PdfPanTrace";
 import { PageBox, livePages, pageAt, snipViewport, toPagePoint } from "./PageMap";
 import {
 	Band,
@@ -145,7 +157,7 @@ const OWN_CLASSES = [OVERLAY_CLASS, INK_OVER_CLASS, "handwriting-pdf-cursor"];
  * the return value when it was `void`, and still does; this is read back
  * only by the trace sites below.
  */
-type ReticleOutcome = "wrote" | "off" | "no-probe" | "no-scale" | "no-cursor-el";
+type ReticleOutcome = "wrote" | "off" | "no-probe" | "no-scale" | "no-cursor-el" | "pan-drag";
 
 /**
  * A `penRaw` batch is traced once for the first 5 of a gesture, then every
@@ -457,12 +469,62 @@ export class PdfInkController {
 	/** The scroll listener, kept so add and remove pass the same function. */
 	private readonly onScroll = (): void => {
 		const scroller = this.boundScroller;
+		if (!scroller) return;
+		// The finger-scroll instrument (PdfPanTrace.ts), and the ONE boolean
+		// read it adds to this listener. The pan branch could reuse `penRaw`'s
+		// single `diagnosticsEnabled()`; this handler had none to reuse, so it
+		// takes its own - which is exactly what THE CALL-SITE RULE
+		// (DiagSwitch.ts) asks for and all it asks for. With the switch off
+		// that is a boolean read and a `diagOn ? ... : 0` on a local: no clock
+		// read, no entry object, no animation frame requested.
+		//
+		// Named `scrollDiagOn` and not `diagOn`: `PdfPanTrace.test.ts` counts
+		// `const diagOn = diagnosticsEnabled();` across this file and holds it
+		// at exactly one, which is how it proves the PAN branch added no
+		// boolean read of its own. A second identical line here would have
+		// broken that assertion by satisfying it somewhere else.
+		const scrollDiagOn = diagnosticsEnabled();
+		const scrollT0 = scrollDiagOn ? performance.now() : 0;
+		// A LIVE PAN RECONCILES ITS CARRIED POSITION HERE, and this is the only
+		// place the drag reads the scroller after pen-down (`panLast`).
+		//
+		// HOW OUR OWN WRITES ARE TOLD FROM THE VIEWER'S: they are not, and they
+		// do not need to be. Reading the element answers for BOTH - after a
+		// write of ours the offsets already equal the carried value and this
+		// stores back what it just read, and after a wheel, a keyboard page or
+		// a scrollbar drag it is the correction. A flag set around the write
+		// and cleared here would be cheaper by one read and WRONG in one case:
+		// scroll events are coalesced to at most one per frame, so a foreign
+		// scroll landing in the same frame as one of our writes would be
+		// swallowed as ours and the drag would stay offset by it for good.
+		//
+		// AND IT COSTS NO LAYOUT THAT WAS NOT ALREADY BEING PAID. A pan is not
+		// a wet gesture (`wetGestureLive`), so `syncBand` below does not take
+		// its early return during one - it reads these same two offsets on
+		// every scroll event of every pan already. This read sits immediately
+		// before it on the same layout, so the pair is one update between them,
+		// and it happens at most once per frame rather than once per move.
+		const pan = this.panLast;
+		if (pan !== null) {
+			pan.scrollX = scroller.scrollLeft;
+			pan.scrollY = scroller.scrollTop;
+		}
 		// The whole hot path. `syncBand` is a `bandNeedsMove` call and nothing
 		// else when the viewport is still inside the margin, which is the
 		// overwhelming majority of scroll events; only a scroll that has eaten
 		// into the margin reaches `schedule`, and only then does anything
 		// proportional to the ink on screen run.
-		if (scroller && this.syncBand(scroller)) this.schedule();
+		const repaint = this.syncBand(scroller);
+		if (repaint) this.schedule();
+		// Timed to HERE, past the schedule: `repaint` is the column that tells
+		// a cheap scroll event from an expensive one, so the work it stands
+		// for belongs inside the number it is printed beside.
+		if (scrollDiagOn) {
+			recordPdfScrollEvent(
+				{ t: scrollT0, handlerMs: performance.now() - scrollT0, repaint },
+				this.win
+			);
+		}
 	};
 	/**
 	 * The one wet/head pair, built on first use and kept for the life of the
@@ -494,11 +556,34 @@ export class PdfInkController {
 	/** Whether the stroke on the wet layer right now is a highlighter. */
 	private wetHighlighter = false;
 	/**
-	 * A live pan gesture: where the last sample was, in scroller-viewport
-	 * coordinates. Deltas of those ARE scroll deltas, which is what makes
-	 * this whole mode three lines of arithmetic.
+	 * A live pan gesture: where the last sample left the HAND, in
+	 * scroller-viewport coordinates, and where the last write left the
+	 * SCROLLER. Deltas of the samples ARE scroll deltas, which is what makes
+	 * this whole mode arithmetic.
+	 *
+	 * THE SCROLL HALF IS CARRIED RATHER THAN READ, and that is the point of
+	 * it. `scroller.scrollLeft -= d` is a read AND a write, and in Blink the
+	 * read goes through the same layout update `clientWidth` does (see
+	 * `syncBand`'s own comment, and `ScrollerSize` in PageBand.ts). pdf.js
+	 * does not virtualise its page divs, so on a heavy document that read is a
+	 * forced layout over the whole viewer - two of them per sample, at pointer
+	 * rate. Reading once at pen-down and carrying the total from there leaves
+	 * the move path with two writes and no read at all. The arithmetic is
+	 * `PanScroll.ts`, which is pure and tested; this field is its state.
+	 *
+	 * THE ONE THING THAT CAN MAKE IT STALE is the viewer scrolling under the
+	 * drag by some other means - a wheel, a keyboard page, a programmatic
+	 * jump. `onScroll` reconciles it; see the comment there for why that needs
+	 * no flag and costs no layout that was not already being paid.
 	 */
-	private panLast: { x: number; y: number } | null = null;
+	private panLast: { x: number; y: number; scrollX: number; scrollY: number } | null = null;
+	/**
+	 * Which axes this drag is currently sitting at the far end of, and so has
+	 * already re-measured `scrollerSize` at. Per axis rather than shared, and
+	 * cleared at pen-down; `panEdgeContact` (PanScroll.ts) is the rule and the
+	 * reasons. Meaningless while `panLast` is null.
+	 */
+	private panEdge: PanEdgeLatch = PAN_EDGE_CLEAR;
 	/**
 	 * A live insert-space gesture: the divider's y in page units, the ids
 	 * frozen at pen-down, and the drag so far. Same shape as the note
@@ -820,6 +905,16 @@ export class PdfInkController {
 		const want =
 			this.mounted &&
 			penToolsVisible(getPenToolsMode(), Platform.isMobileApp, penSeenThisSession());
+		// Same rebuild the note surface makes, for the same reason and in the
+		// same place: `ButtonSpec.shownOn` is read once per strip, and the pen
+		// latch behind the Keyboard button has a false-to-true edge that the
+		// create-or-destroy test below cannot see. Written here as well as
+		// there because the two surfaces owning one rule between them is what
+		// this project's nine one-surface divergences were all made of.
+		if (want && this.tools?.stale()) {
+			this.tools.destroy();
+			this.tools = null;
+		}
 		if (want === (this.tools !== null)) return;
 		if (!want) {
 			this.tools?.destroy();
@@ -840,13 +935,19 @@ export class PdfInkController {
 			toast: (message) => this.notify(message),
 			exec: (id) => this.stripExec(id),
 			activeTool: () => getInlineTool(),
+			// Drag to anchor: the SAME call the note surface makes, which is
+			// the same call the settings dropdown makes. A placement dragged
+			// on a pdf is the placement a note opens with, and it survives a
+			// restart, because there is one road (`applyToolbarPlacement`,
+			// InkOverlay.ts) and not a copy of it here.
+			setPlacement: (corner) => applyToolbarPlacement(corner),
 			eraserOn: () => getInlineEraserMode(),
 			eraserWholeStroke: () => getEraserWholeStrokes(),
 			setEraserWholeStroke: (on) => setEraserWholeStrokes(on),
 			lassoOn: () => getInlineLassoMode(),
 			spaceOn: () => getInlineSpaceMode(),
 			panOn: () => getInlinePanMode(),
-			activeColor: () => getInkColorHex(getInlineTool()),
+			toolColor: (tool) => getInkColorHex(tool as InkTool),
 			eraserRadiusPx: () => getEraserRadiusPx(),
 			setEraserRadiusPx: (px, commit) => {
 				setEraserRadiusPx(px);
@@ -872,36 +973,41 @@ export class PdfInkController {
 			// enablement gate, and "lasso some ink first" over a visible
 			// lasso. One question, one answer.
 			hasInkSelection: () => this.hasSelection,
-			palette: () => colorsFor(getInlineTool()),
+			paletteFor: (tool) => colorsFor(tool as InkTool),
 			pickColor: (name, hex) => pickStripColor(name, hex),
+			// The same four as the note strip: one feature, two surfaces.
+			presetsFor: (tool) => inkPresetsFor(tool as InkTool),
+			applyPreset: (tool, index) => applyInkPreset(tool as InkTool, index),
+			starPreset: (tool) => starInkPreset(tool as InkTool),
+			forgetPreset: (tool, index) => forgetInkPreset(tool as InkTool, index),
 			inkSizeMult: (tool) => getInkSizeMult(tool as InkTool),
 			setInkSizeMult: (tool, mult, commit) => {
 				setInkSizeMult(tool as InkTool, mult);
 				void commit;
 			},
-			// A NO-OP, and the honest one. The pen-off state is note-only
-			// (PenInk.ts): this surface keeps inking while it is off, so
-			// there is nothing here for the keyboard to take - and there is
-			// no editor either. `armStripPenFocus` gives this root a
-			// `tabindex="-1"` so the pen's own gestures can claim the keys,
-			// but that is not a contenteditable and focusing it would raise
-			// no software keyboard even if one were wanted. The button on
-			// this strip still toggles the state for the notes, which is
-			// where it means something.
+			// A NO-OP, and still the honest one now that this surface honours
+			// pen off. There is no editor here to hand the keys to:
+			// `armStripPenFocus` gives this root a `tabindex="-1"` so the
+			// pen's own gestures can claim the keys, but that is not a
+			// contenteditable and focusing it would raise no software
+			// keyboard. Nothing is lost by that. Turning the pen off here is
+			// a request to stop CLAIMING it (`penOff` on this controller's
+			// router), and what the freed pen then taps - a form field, the
+			// viewer's own search box - raises the keyboard itself, which is
+			// what the note's forced focus is standing in for.
 			setEditorFocus: () => {},
-			// ALWAYS TRUE: the pen-off flag (PenInk.ts) is note-only and this
-			// router never gates on it, so the pdf pen keeps inking no matter
-			// what the note's toggle says. Answering true here keeps the
-			// keyboard button and pill from wearing "Pen off" on a surface
-			// where the pen never actually turned off.
-			penInksHere: () => true,
-			// ALWAYS FALSE: there is no keyboard use case on a pdf - nothing
-			// to type into - and no amount of a truer light fixes a button
-			// that promises an off switch this router will never read. The
-			// owner pressed it on a pdf, got "pen off", and his pen kept
-			// inking; answering false here keeps the button from being BUILT
-			// on this strip at all (MobileTools.ts's `penCanTurnOff`).
-			penCanTurnOff: () => false,
+			// The same read the note host makes, because this router now
+			// gates on the same flag (`penOff`, below). It answered an
+			// unconditional `true` for two days, on the note-only rule the
+			// owner then reversed - "why would you take keyboard mode away
+			// from pdf" - and that left this strip's keyboard button dark
+			// while the pen it describes was off (MobileTools.ts's
+			// `penInksHere`).
+			penInksHere: () => penInkEnabled(),
+			// The same one implementation the note surface reads, for the same
+			// reason it reads it there: a device fact must not have two
+			// answers depending on which surface asked (DeviceInput.ts).
+			hasTouch: () => deviceHasTouch(),
 		});
 		this.tools.setCorner(getToolbarCorner());
 	}
@@ -1313,6 +1419,18 @@ export class PdfInkController {
 				// expensive defect shape rebuilt at small scale.
 				onPenMove: (_ev, count) => this.metrics.recordEvent("move", count, 0, false),
 				onPenUp: (ev) => this.penUp(ev),
+				// PEN OFF (PenInk.ts, design §5): byte-for-byte the note
+				// overlay's line, because it is byte-for-byte the same rule.
+				// This surface passed NOTHING for two days - the state was
+				// declared note-only on the grounds that a pdf has nothing to
+				// type into - and the owner reversed it: "i think the dude was
+				// having trouble with his keyboard coming up on pdf when he
+				// didnt want it to? so why would you take keyboard mode away
+				// from pdf". Off means this router claims nothing, so the pen
+				// is a native pointer on the viewer: it selects text, follows
+				// a link, reaches a form field, and a tap in one raises the
+				// keyboard the way any other app's would.
+				penOff: () => !penInkEnabled(),
 				// See `strokeAbandoned`. A named method rather than the body
 				// inline: the surface registry's check for this wiring is a
 				// scan of raw source text, which a comment satisfies, so the
@@ -1413,14 +1531,18 @@ export class PdfInkController {
 		//
 		// WHAT THIS SWITCH NOW SHARES, AND WHAT IT DELIBERATELY DOES NOT.
 		// `abandonActiveStroke` is the note surface's teardown, whole, so an
-		// in-place document switch here now also wipes the router's touch
-		// BOOKKEEPING - `touchPos`, `liveTouchIds`, `guardTouches` - along
-		// with the stroke, the ownership tail and the fling. That is the
-		// point: those three maps name contacts of the OLD document, and a
-		// pane that keeps them across a switch answers questions about a
-		// gesture that no longer exists. Gated on the predicate either way,
-		// so a switch with nothing live still touches none of them (2e880b4:
-		// abandon is a true no-op with nothing live, `guardApplied` included).
+		// in-place document switch here also stands down the stroke, the
+		// ownership tail and the fling. Its touch BOOKKEEPING - `touchPos`,
+		// `liveTouchIds`, `guardTouches` - is narrower than that (`e0ff9c3`):
+		// a switch wipes them only when a claimed pen stroke was torn down,
+		// `hadStroke`, because only then did those contacts belong to the
+		// gesture being dropped. A mid-pinch switch leaves them alone - the
+		// fingers are still on the glass, and wiping the maps while the
+		// assist/pinch quartet survived left the two halves of the touch
+		// model disagreeing about what was still down (1.4.10-design.md §17
+		// deferral (2)). A switch with nothing live still touches none of it
+		// (2e880b4: abandon is a true no-op with nothing live, `guardApplied`
+		// included).
 		// The ASSIST-PAN stand-down was left out of this round on purpose. It
 		// is the other thing a switch could plausibly reset, and resetting it
 		// would un-protect a contact that is still on the glass: the assist
@@ -1440,6 +1562,27 @@ export class PdfInkController {
 		this.resetGestureState();
 		// A new document is a new wait, so it may say so once more.
 		this.warnedNoId = false;
+	}
+
+	/**
+	 * End a stroke that is live right now, committing it. The pdf half of
+	 * `endLiveStrokesEverywhere` (InkOverlay.ts), whose header carries the
+	 * whole reasoning, and byte-for-byte the note's `endLiveStroke`.
+	 *
+	 * The pen can be turned off with the nib on the glass - a hotkey, the
+	 * palette, or the other hand on this strip - and the router's gate refuses
+	 * only NEW claims. COMMITS rather than drops: `finishActiveStroke()` ends
+	 * the stroke exactly as a lift does, reaching `penUp()` through `onPenUp`,
+	 * which is where the ink is stored and the strip chrome comes back down.
+	 * Deliberately NOT `abandonActiveStroke()` - that is the teardown for a
+	 * stroke whose page is going away (`forgetHistory` above), and turning the
+	 * pen off is not a request to throw away the word being written.
+	 *
+	 * A no-op with nothing live, and no chrome call of its own, for the same
+	 * reasons the note's twin gives.
+	 */
+	endLiveStroke(): void {
+		this.router?.finishActiveStroke();
 	}
 
 	/**
@@ -1817,17 +1960,38 @@ export class PdfInkController {
 		// still costs a timer per move defeats the e-ink point as much as a
 		// visible one would.
 		if (!penReticleEnabled()) return "off";
+		// A PAN DRAG PAINTS NO RETICLE (reviewer F4, 1.4.12-design §11). The
+		// rule and its reasoning are the note surface's own pure function,
+		// `penReticleShown` (PenCursor.ts), called rather than copied: this
+		// surface's whole recurring defect is a ruling that reached one ink
+		// surface and not the other, and a second implementation of a
+		// predicate is the shape that keeps causing it.
+		//
+		// A GATE AND NOT JUST A DELETED CALL SITE. The two calls that painted
+		// the ring - one at pen-down, one per raw batch - are gone from
+		// `penDown` and `penRaw`, but `refreshStrip`, the hover path and any
+		// future caller all reach this method, and a pan holds the pointer for
+		// as long as the button is down. This refuses them.
+		//
+		// It REFUSES rather than hides, and that distinction is the whole of
+		// what `beginPanDragCursor` set up: hiding here would run `hideCursor`
+		// and take the grabbing hand off with the ring, leaving the surface
+		// with no pointer at all mid-drag - the exact defect the note's
+		// PAN_DRAG_CLASS exists to prevent.
+		if (!penReticleShown(tipMode(), this.panLast !== null)) return "pan-drag";
 		// IS THE POINTER IN HAND A MOUSE? Two of the decisions below turn on
 		// that and not on which caller asked, and the callers do not all say.
 		//
-		// The four in-stroke wrappers - showEraserCursor, showLassoCursor,
-		// showPanCursor, showSpaceCursor - pass NO pointerType, deliberately
-		// and permanently: the marks above are claims about a pen approaching
+		// The in-stroke wrappers - showEraserCursor, showLassoCursor,
+		// showSpaceCursor - pass NO pointerType, deliberately and
+		// permanently: the marks above are claims about a pen approaching
 		// or landing, not about every sample of a gesture already in flight.
 		// So a MOUSE erasing, lassoing or panning arrived here looking
 		// exactly like a pen, inherited the watchdog it is meant to be exempt
 		// from, and had its ring taken away by any stall over a second while
 		// the button was held (alan, hardware, 2026-09-04, mouse ink armed).
+		// There were FOUR of them; the pan's is gone, and its gesture now
+		// reaches the reticle exactly twice, at each end of the drag.
 		// `mouseStroke` is what penDown already wrote down about the pointer
 		// that is drawing, so it answers for the callers that cannot.
 		//
@@ -1877,6 +2041,7 @@ export class PdfInkController {
 					this.cursorEl?.remove();
 					this.cursorEl = null;
 					this.boundScroller?.classList.remove("handwriting-pdf-hover");
+					this.boundScroller?.classList.remove("handwriting-pdf-pan-drag");
 				});
 			}
 		}
@@ -2034,6 +2199,19 @@ export class PdfInkController {
 		// element does not carry is a no-op, so the common case where the two
 		// agree costs one call and changes nothing.
 		this.boundScroller?.classList.remove("handwriting-pdf-hover");
+		// The pan drag's grabbing hand comes off wherever the reticle does,
+		// and that is not tidiness: this is the ONE place every abandon path
+		// already passes through. `resetGestureState` (a file switch, a
+		// viewer rebuild), `onPenLeave`, the disposer and
+		// `hidePenCursorsEverywhere` all reach it, and a pan torn down by any
+		// of them would otherwise leave the viewer wearing `cursor: grabbing`
+		// with no gesture behind it for the rest of the session. Both
+		// elements again, for the reason the two lines above give: the probe
+		// and the bound scroller are not the same element after pdf.js
+		// rebuilds its viewer, and the class was added to whichever one
+		// pen-down held.
+		probed?.scroller.classList.remove("handwriting-pdf-pan-drag");
+		this.boundScroller?.classList.remove("handwriting-pdf-pan-drag");
 		// One boolean write, always: arms the next showCursor's `pdf-hover`
 		// "resumed" transition line. See `cursorTraceHidden`.
 		this.cursorTraceHidden = true;
@@ -2104,14 +2282,70 @@ export class PdfInkController {
 		this.hideCursor();
 	}
 
-	/** The pan reticle, during a pan gesture. See showLassoCursor. */
-	private showPanCursor(sample: PenSample): void {
-		if (!this.cursorEl) return;
-		this.showCursor(sample);
+	/**
+	 * Enter the pan drag's cursor state: no reticle, and the grabbing hand
+	 * over the viewer until the drag ends.
+	 *
+	 * THERE IS NO `showPanCursor` BESIDE `showLassoCursor` AND
+	 * `showSpaceCursor` ANY MORE, and its absence is the point (reviewer F4,
+	 * 1.4.12-design §11; the note surface made the same swap first, and this
+	 * method is deliberately its twin down to the name). Those two exist
+	 * because a lasso and a space gesture want the ring KEPT ALIVE through a
+	 * drag that produces no hover samples. A pan wants the opposite: the ring
+	 * says "marking" for the one tip that is not marking, and what a hand
+	 * holding a page should look like is a hand.
+	 *
+	 * WHAT IT COST, stated exactly, because the finding that opened this
+	 * reads "per sample" and the code said something slightly different. F4
+	 * (1.4.12-design §11): "the pdf pan still paints the ring per sample via
+	 * `showPanCursor`". `penRaw`'s pan branch called it once per BATCH, on
+	 * the batch's last sample - so per sample for a mouse, which delivers
+	 * one, and once per four for a Surface pen delivering coalesced batches.
+	 * Per MOVE either way, which is the rate that matters, and each of those
+	 * moves paid a `toContent` (two scroll reads), a `setCssStyles`, six
+	 * `classList` calls, and a `clearTimeout` - plus, under a pen, the
+	 * `setTimeout` that re-armed the watchdog. A mouse is exempt from the
+	 * timer (a7eba85) and was panning anyway, so for the hardware that
+	 * reported this it was the two reads and the style write.
+	 *
+	 * ONCE PER DRAG, both ways. Nothing in `penRaw`'s pan branch touches the
+	 * cursor now, so a move costs the two scroll writes and nothing else.
+	 *
+	 * `hideCursor` FIRST, then the class - the same ordering the note's
+	 * `beginPanDragCursor` needs and for the same reason. It clears the hover
+	 * watchdog that would otherwise fire mid-drag, takes
+	 * `handwriting-pdf-hover`'s `cursor: none` off, AND removes the pan-drag
+	 * class, so the add below cannot be undone by the line above it and the
+	 * viewer is left wearing exactly one cursor rule.
+	 *
+	 * Takes the scroller rather than probing for one: `penDown` has the
+	 * probed element in hand, and probing again to reach the same element is
+	 * the kind of layout read this slice exists to remove.
+	 */
+	private beginPanDragCursor(scroller: HTMLElement): void {
+		this.hideCursor();
+		scroller.classList.add("handwriting-pdf-pan-drag");
 	}
 
-	/** Put the pan reticle away. */
-	private hidePanCursor(): void {
+	/**
+	 * Leave it: the hand comes off and the reticle stays down until the next
+	 * hover paints it.
+	 *
+	 * Thin, because `hideCursor` is where the class removal lives - see its
+	 * comment for why that is the one place every abandon path already passes
+	 * through. The name is here so the pan branch says what it is doing and
+	 * so the surface registry has a call site to look for.
+	 *
+	 * NO RESTORE UNDER THE LIFT, unlike the note's `restoreReticleAfterPan`,
+	 * and that is a difference in the surfaces rather than an omission. The
+	 * note has to re-measure a rect its pan scrolled out from under, and
+	 * having paid for that it may as well repaint; this surface's samples are
+	 * viewport-relative and scroll-independent (`penRaw`'s own comment), so
+	 * there is nothing stale to fix and the next hover is enough - which is
+	 * exactly what the eraser, the lasso and the space gesture already do
+	 * here at pen-up.
+	 */
+	private endPanDragCursor(): void {
 		this.hideCursor();
 	}
 
@@ -2346,12 +2580,26 @@ export class PdfInkController {
 		// missing (alan, 2026-08-30). Pan drags the viewer's own scroller;
 		// space is refused with the reason, because a pdf page cannot grow.
 		if (intent === "pan") {
-			this.panLast = { x: sample.x, y: sample.y };
-			// Drive the reticle through the pan, the same reasoning as the
-			// erase branch below: nothing calls `showCursor` again once the
-			// pen is down (hover has gone quiet), so without this the 1000ms
-			// watchdog takes the ring away mid-drag.
-			this.showPanCursor(sample);
+			// THE ONE SCROLL READ OF THE WHOLE DRAG, taken here where it is off
+			// the move path and where `probe()` above has already forced layout
+			// clean. Everything after this is arithmetic on the carried value;
+			// see `panLast` and `PanScroll.ts`.
+			this.panLast = {
+				x: sample.x,
+				y: sample.y,
+				scrollX: scroller.scrollLeft,
+				scrollY: scroller.scrollTop,
+			};
+			// No edge held from whatever the last drag ended against.
+			this.panEdge = PAN_EDGE_CLEAR;
+			// The ring goes away and the grabbing hand goes on, ONCE, here -
+			// not per sample, and not the other way round from the erase
+			// branch below by accident. A pan is the one gesture on this
+			// surface that is not marking anything, so it is the one gesture
+			// with nothing to put under the tip; see `beginPanDragCursor`.
+			// AFTER `panLast` is set, because the gate that keeps the ring
+			// down for the rest of the drag reads it.
+			this.beginPanDragCursor(scroller);
 			return;
 		}
 		if (intent === "space") {
@@ -2564,20 +2812,78 @@ export class PdfInkController {
 			// scroll offsets move against the sample deltas. 1:1 and direct -
 			// no glide, no curve - because the pen is literally holding the
 			// page. Viewport-relative samples are already scroll-independent.
-			const last = { ...this.panLast };
-			for (const smp of samples) {
-				scroller.scrollLeft -= smp.x - last.x;
-				scroller.scrollTop -= smp.y - last.y;
-				last.x = smp.x;
-				last.y = smp.y;
+			//
+			// `from` is where this batch found the hand AND the page. Nothing
+			// below writes to it - `this.panLast` is rebound past it - so the
+			// trace can still say what the batch actually applied. It is a
+			// reference to an object that already exists, so it costs nothing
+			// when the trace is off.
+			const from = this.panLast;
+			// The pan latency instrument (PdfPanTrace.ts). The only thing
+			// between it and the pan path is `diagOn` - the ONE
+			// `diagnosticsEnabled()` read this call already made at the top
+			// for its eight trace branches. With diagnostics off that is a
+			// test of a local and nothing else: no clock read, no coalesced
+			// list, no entry object, no animation frame requested.
+			const panT0 = diagOn ? performance.now() : 0;
+			// ONE WRITE PER AXIS PER MOVE, AND NO READ. What stood here was a
+			// loop of `scroller.scrollLeft -= smp.x - last.x` - a read and a
+			// write for every sample in the batch - and the read is the half
+			// that can force layout across every page div pdf.js has left in
+			// the DOM. The batch collapses to one delta (`panBatchDelta`, and
+			// its header on why that is equal and not merely close), the delta
+			// lands on a total this drag has carried since pen-down, and the
+			// total is clamped to what the scroller can actually do because
+			// the browser's own clamp is no longer in the loop to do it.
+			const batch = panBatchDelta(from, samples);
+			const start = { x: from.scrollX, y: from.scrollY };
+			let limit = panScrollLimit(this.scrollerSize);
+			let to = panScrollNext(start, batch, limit);
+			// THE ONE PLACE THE SIZE CACHE IS ALLOWED TO BE WRONG. It is
+			// measured in `sync`, a scroll does not reach `sync`, and pdf.js can
+			// grow `scrollHeight` between two of them. One measure per edge
+			// ARRIVAL and never per move; `panEdgeContact` is the whole rule.
+			let edge = panEdgeContact(to, limit, this.panEdge);
+			if (edge.remeasure) {
+				this.scrollerSize = scrollerSizeOf(scroller);
+				limit = panScrollLimit(this.scrollerSize);
+				to = panScrollNext(start, batch, limit);
+				edge = panEdgeContact(to, limit, edge.latch);
 			}
-			this.panLast = last;
-			// Last sample only, matching the erase branch below: one DOM write
-			// per batch, and every call re-arms the watchdog for the length of
-			// the drag.
-			const lastPan = samples[samples.length - 1];
-			if (lastPan) this.showPanCursor(lastPan);
-			if (diagOn) this.traceRawBatch("pan", samples.length, ev, "reticle=n/a");
+			this.panEdge = edge.latch;
+			scroller.scrollLeft = to.x;
+			scroller.scrollTop = to.y;
+			this.panLast = { x: batch.last.x, y: batch.last.y, scrollX: to.x, scrollY: to.y };
+			// NO CURSOR WORK HERE ANY MORE; see beginPanDragCursor, and the
+			// gate in showCursor that keeps it out. This branch used to call
+			// `showPanCursor(lastPan)` on every batch, which repainted the
+			// ring and re-armed a 1000ms watchdog for a marker the drag has no
+			// business showing at all.
+			if (diagOn) {
+				// The handler number is now the two scroll writes and the
+				// arithmetic that decided them - the whole of what a pan move
+				// costs, because there is nothing else left in the branch.
+				recordPdfPanMove(
+					{
+						t: panT0,
+						handlerMs: performance.now() - panT0,
+						// THE DELTA ACTUALLY WRITTEN, which is not always the
+						// one the batch asked for: a drag already at the top
+						// of the document asks for more and gets clamped to
+						// nothing. Measured across the carried position rather
+						// than the samples, so the column stays true whatever
+						// the clamp did - and negated already, since the
+						// scroller moves against the hand.
+						dx: to.x - from.scrollX,
+						dy: to.y - from.scrollY,
+						samples: samples.length,
+						coalesced: coalescedCount(ev),
+						ptr: ev?.pointerType ?? "",
+					},
+					this.win
+				);
+				this.traceRawBatch("pan", samples.length, ev, "reticle=n/a");
+			}
 			return;
 		}
 		const box = frame.boxes.find((b) => b.pageNumber === this.strokePageNumber);
@@ -3421,10 +3727,12 @@ export class PdfInkController {
 		this.frame = null;
 		if (this.panLast !== null) {
 			this.panLast = null;
-			// Put the pan reticle away with the gesture, exactly as the erase
-			// branch does below - not left to the watchdog, so a released pan
-			// does not strand its ring on screen for up to a second.
-			this.hidePanCursor();
+			// Take the grabbing hand off with the gesture rather than leaving
+			// it to a watchdog that guards the reticle and not the cursor.
+			// AFTER `panLast` is cleared: `hideCursor` is a reticle path and
+			// the gate in `showCursor` reads that field, so clearing first is
+			// what lets the next hover paint a ring again.
+			this.endPanDragCursor();
 			return;
 		}
 		if (this.spaceLineY !== null) {

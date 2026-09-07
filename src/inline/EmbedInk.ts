@@ -33,9 +33,24 @@
  * carries a containerEl - undocumented, but present in both the old and new
  * renderers - naming the renderer's own element (the sizer, or the
  * `.markdown-preview-view` div) whether or not the section has landed yet,
- * so the walk tries the section first and falls back to that container. If
- * a future build drops containerEl too, the caller in main.ts retries across
- * a few animation frames once the section is actually connected.
+ * so the walk tries the section first and falls back to that container.
+ *
+ * A build that hands us NEITHER - no container and a section that has not
+ * landed - is the third route, and it is the one we cannot reproduce on this
+ * machine: an eight-case matrix against Obsidian 1.13.7 desktop passes on
+ * routes one and two without ever reaching it. It is also where a report of
+ * "I embed a note and see no ink" most plausibly lands, so
+ * `attachEmbedInkOnceReady` covers it twice over - a MutationObserver on the
+ * document body, and a poll bounded by ten seconds of WALL CLOCK rather than
+ * by frames, since a backgrounded or slow renderer is exactly the case where
+ * a frame count buys almost no time at all. Both are cancelled by the render
+ * child's unload AND by `teardownEmbedInk`.
+ *
+ * A found root is not yet a visible one: a box measuring 0x0 when we paint
+ * (a collapsed embed, a folded callout, a pane the theme lays out a tick
+ * later) holds a perfectly correct canvas that nobody can see. Such a root is
+ * watched with a ResizeObserver and repainted the moment it has a size - see
+ * `watchIfCollapsed`.
  *
  * Staleness (1.0.5): ink saves touch the sidecar and never the .md, so a
  * rendered embed used to keep its picture until Obsidian happened to
@@ -112,6 +127,38 @@ const layers = new Map<HTMLElement, string>();
 /** Bumped per path on every persisted change; part of the marker. */
 const revisions = new Map<string, number>();
 let strokesFor: ((path: string) => readonly InkStroke[]) | null = null;
+/**
+ * Where the one diagnostic line goes, when the setting is on.
+ *
+ * The pieces, not the string: the caller owns the `devDiagnostics` check and
+ * so the line is only ever FORMATTED when someone is going to read it, which
+ * matters when a scrolling reading view resolves a root per section.
+ */
+let diagnose: ((via: EmbedInkVia, path: string, waitedMs: number) => void) | null = null;
+/**
+ * Cancellers for waits that have not resolved yet, and for the resize
+ * observers watching a collapsed root.
+ *
+ * Both live in someone else's document and outlast the render child that
+ * started them: a plugin reload replaces this module while a pending timer or
+ * a live observer goes on calling into the old one. `teardownEmbedInk` empties
+ * both, which is why unload is the single place either can be leaked from.
+ */
+const pendingWaits = new Set<() => void>();
+/**
+ * One route-3 MutationObserver per DOCUMENT, shared by every wait on it.
+ *
+ * That observer is `body` + `subtree`, so it fires for every mutation
+ * Obsidian makes anywhere. One per unresolved section meant a reading-view
+ * note with N embeds installed N of them, each running
+ * `embedInkResolveRoot` (up to two `closest` walks) on every one of those
+ * mutations for up to ten seconds. The waits share one observer instead,
+ * armed with the first wait on a body and disconnected when its last wait
+ * goes. Keyed by body, not module-wide: a popout is its own document and
+ * watching it through the main window's observer would see nothing.
+ */
+const bodyWatches = new Map<HTMLElement, { observer: MutationObserver; probes: Set<() => void> }>();
+const sizeWatches = new Map<HTMLElement, () => void>();
 
 /**
  * The rendered document's root for a section element, if recognizable.
@@ -156,7 +203,100 @@ export function embedInkRootFor(
 	sectionEl: HTMLElement,
 	containerEl: HTMLElement | null | undefined
 ): HTMLElement | null {
-	return embedInkRoot(sectionEl) ?? (containerEl ? embedInkRoot(containerEl) : null);
+	return embedInkResolveRoot(sectionEl, containerEl).root;
+}
+
+/**
+ * Which of the routes to a root actually worked.
+ *
+ * `section` and `container` are the two synchronous ones above. `observer`
+ * and `timer` are the deferred route - no root at post-processing time, so
+ * the wait below watched for the section to land and one of its two triggers
+ * got there first. `none` means the wait ran out its budget and this section
+ * never gained ink; it is the line worth having from a user we cannot see.
+ */
+export type EmbedInkVia = "section" | "container" | "observer" | "timer" | "none";
+
+/**
+ * The root AND the route that found it.
+ *
+ * Same order as `embedInkRoot`'s selectors and for the same reason - the
+ * section pins the coordinate origin best - but it reports which route won,
+ * because on a machine we cannot see that is the difference between "the
+ * renderer handed us a container" and "we waited for the DOM". `embedInkRootFor`
+ * is this with the route dropped, so every existing caller is unchanged.
+ */
+export function embedInkResolveRoot(
+	sectionEl: HTMLElement,
+	containerEl: HTMLElement | null | undefined
+): { root: HTMLElement | null; via: "section" | "container" | "none" } {
+	const fromSection = embedInkRoot(sectionEl);
+	if (fromSection) return { root: fromSection, via: "section" };
+	const fromContainer = containerEl ? embedInkRoot(containerEl) : null;
+	if (fromContainer) return { root: fromContainer, via: "container" };
+	return { root: null, via: "none" };
+}
+
+/**
+ * How long the deferred route may wait for a section to land in the tree.
+ *
+ * This replaced a 30-FRAME budget, which is the wrong unit for the thing it
+ * was bounding. Frames are not time: a background window throttles them to
+ * nothing, a busy renderer stretches them, and a device slow enough to be the
+ * reason the section is late is exactly the device whose 30 frames are worth
+ * far less than half a second. Ten seconds of wall clock is the same promise
+ * on every machine - and it is a ceiling, not a cost, because the observer
+ * below almost always gets there first.
+ */
+export const EMBED_INK_WAIT_MS = 10_000;
+
+/** Pure: is the wait still inside its budget? Time, never frames. */
+export function embedInkKeepWaiting(elapsedMs: number): boolean {
+	return elapsedMs < EMBED_INK_WAIT_MS;
+}
+
+/**
+ * Pure: how long to sleep before the next check.
+ *
+ * Tight at first, because the ordinary case is a section that lands on the
+ * very next tick and an export that is about to serialize the page; loose
+ * later, because a section still missing after a second is waiting on
+ * something slower than polling can help with, and the MutationObserver is
+ * the one that will actually catch it. Bounded above so the whole schedule
+ * costs about fifty wake-ups across ten seconds rather than six hundred.
+ */
+export function embedInkRetryDelay(elapsedMs: number): number {
+	if (elapsedMs < 250) return 16;
+	if (elapsedMs < 1_000) return 50;
+	return 250;
+}
+
+/**
+ * Pure: the one diagnostic line, behind the developer diagnostics setting.
+ *
+ * One line per section that resolved (or failed to resolve) a root, naming
+ * the route. It exists for a machine we cannot get at: it is the difference
+ * between "your renderer hands us no container and the section never
+ * connected" and "we attached fine, the ink is elsewhere", which is otherwise
+ * an afternoon of guessing per report.
+ */
+export function embedInkDiagLine(via: EmbedInkVia, path: string, waitedMs: number): string {
+	return `[handwriting] embed ink root via ${via} after ${waitedMs}ms: ${path}`;
+}
+
+/**
+ * Pure: has a painted root been given no size on screen?
+ *
+ * A root can be found, marked and painted while its box measures 0x0 - a
+ * `.markdown-embed-content` inside a collapsed callout, a pane whose theme
+ * lays it out a tick later, an embed rendered inside something still
+ * `display: none`. The canvas is sized from the INK's extent, so it is not
+ * itself zero, but nothing of it is on screen and painting once and never
+ * looking again leaves it that way until the section happens to re-render.
+ */
+export function embedInkIsCollapsed(rect: { width: number; height: number } | null): boolean {
+	if (!rect) return false;
+	return rect.width <= 0 || rect.height <= 0;
 }
 
 /**
@@ -234,6 +374,24 @@ export function initEmbedInkRefresh(provider: (path: string) => readonly InkStro
 }
 
 /**
+ * Where the diagnostic line goes. Wired once at plugin load; null silences it.
+ */
+export function initEmbedInkDiagnostics(
+	sink: ((via: EmbedInkVia, path: string, waitedMs: number) => void) | null
+): void {
+	diagnose = sink;
+}
+
+/** Diagnostics: waits still pending, and roots still watched for a size. */
+export function embedInkPendingWaitCount(): number {
+	return pendingWaits.size;
+}
+
+export function embedInkSizeWatchCount(): number {
+	return sizeWatches.size;
+}
+
+/**
  * A note's ink was persisted: bump its revision and repaint every connected
  * root showing it. Every notification also sweeps roots the DOM dropped.
  */
@@ -256,6 +414,27 @@ function sweepDisconnected(): void {
 	for (const root of [...layers.keys()]) {
 		if (!root.isConnected) layers.delete(root);
 	}
+	sweepSizeWatches();
+}
+
+/**
+ * Drop the size watches whose root the DOM let go of: a root that left the
+ * tree will never gain a size, so its watch is a live ResizeObserver holding
+ * a detached tree alive by a strong Map key for nothing.
+ *
+ * Split out of `sweepDisconnected` because `paint` runs THIS half on its own
+ * and the layers half above is the expensive one: `embedInkChanged` paints
+ * every root showing the note, so a full sweep per paint would cost
+ * O(roots) per root - quadratic in the embeds on screen, on the path every
+ * save takes. This half is bounded by the number of COLLAPSED roots, which
+ * is zero in the ordinary case and does not grow with the embeds that did
+ * lay out; the size test keeps even the array copy off that path.
+ */
+function sweepSizeWatches(): void {
+	if (sizeWatches.size === 0) return;
+	for (const root of [...sizeWatches.keys()]) {
+		if (!root.isConnected) stopSizeWatch(root);
+	}
 }
 
 /**
@@ -274,6 +453,245 @@ export function attachEmbedInk(
 	layers.set(root, path);
 	armPrintSwap(root.ownerDocument.defaultView ?? window);
 	paint(root, path, strokes);
+}
+
+/**
+ * Attach ink to a rendered section as soon as a root for it can be found,
+ * however this build of Obsidian gets round to producing one.
+ *
+ * There are three routes and the code has to hold all three at once, because
+ * which one applies is a property of the reader's app, not of ours:
+ *
+ * 1. The section is already in the tree, so `closest` walks straight up to the
+ *    root. Every renderer before 1.12, and reading view once it has settled.
+ * 2. The section is NOT in the tree yet - the virtualised preview renderer
+ *    loads a section's render child before inserting the element - but the
+ *    post-processor context carries the renderer's own `containerEl`, which
+ *    is, and climbing from that lands on the same root.
+ * 3. Neither: a build that hands us no container and a section that has not
+ *    landed. Older desktop builds, and mobile is assumed to be here until
+ *    somebody measures it. This is the route we cannot test on this machine
+ *    and the one a report of "no ink in embeds" most likely lands on, so it
+ *    gets belt AND braces: a MutationObserver on the document body (ONE
+ *    per document, shared with every other wait on it - see `bodyWatches`),
+ *    which fires the moment the renderer inserts the section whether or not
+ *    frames are running, and a time-bounded poll behind it, in case a renderer
+ *    reparents into a subtree the observer was not given or the section is
+ *    moved by something that does not mutate `body` (an iframe-hosted
+ *    document, a shadow root). Ten seconds of WALL CLOCK, not thirty frames:
+ *    a backgrounded window can run no frames at all and a slow device's
+ *    thirty are worth less than half a second.
+ *
+ * Route 1 stays SYNCHRONOUS and that is not an optimisation. An export
+ * renders the note and serializes it immediately; a picture taken before a
+ * promise resolves has already lost its ink.
+ *
+ * Returns a canceller for `child.onunload`, and registers the same canceller
+ * for `teardownEmbedInk` - a render child's unload is not the plugin's, and a
+ * pending wait that survives a reload is a timer calling into a dead module.
+ */
+export function attachEmbedInkOnceReady(
+	el: HTMLElement,
+	container: HTMLElement | null,
+	path: string,
+	strokes: () => readonly InkStroke[]
+): () => void {
+	const immediate = embedInkResolveRoot(el, container);
+	if (immediate.root) {
+		attachEmbedInk(immediate.root, path, strokes());
+		diagnose?.(immediate.via, path, 0);
+		return () => {};
+	}
+	const view = el.ownerDocument?.defaultView ?? null;
+	const started = Date.now();
+	let timer: number | null = null;
+	let unwatchBody: (() => void) | null = null;
+	let done = false;
+
+	const cancel = (): void => {
+		if (done) return;
+		done = true;
+		if (timer !== null) {
+			clearTimer(view, timer);
+			timer = null;
+		}
+		unwatchBody?.();
+		unwatchBody = null;
+		pendingWaits.delete(cancel);
+	};
+
+	/** One attempt. True once a root was found and the wait is over. */
+	const settle = (via: "observer" | "timer"): boolean => {
+		if (done) return false;
+		const late = embedInkResolveRoot(el, container);
+		if (!late.root) return false;
+		const waited = Date.now() - started;
+		cancel();
+		attachEmbedInk(late.root, path, strokes());
+		diagnose?.(via, path, waited);
+		return true;
+	};
+
+	const tick = (): void => {
+		timer = null;
+		if (done) return;
+		if (settle("timer")) return;
+		const elapsed = Date.now() - started;
+		if (!embedInkKeepWaiting(elapsed)) {
+			// Out of budget. The line naming `none` is the whole point of the
+			// diagnostic: it says the section never connected, which is a
+			// different bug from one that attached and drew nothing.
+			cancel();
+			diagnose?.("none", path, elapsed);
+			return;
+		}
+		timer = setTimer(view, tick, embedInkRetryDelay(elapsed));
+	};
+
+	// Registered before either trigger is armed, so there is no window in
+	// which something is running that teardown cannot reach.
+	pendingWaits.add(cancel);
+	// The observer first, so a section inserted between here and the first
+	// poll is caught by the cheaper of the two. Watching `body` with a
+	// subtree is broad, but it lives only until the section lands or the
+	// budget runs out, and only on the route where nothing else worked.
+	const body = el.ownerDocument?.body ?? el.ownerDocument?.documentElement ?? null;
+	unwatchBody = watchBodyForSections(view, body, () => void settle("observer"));
+	if (!done) timer = setTimer(view, tick, embedInkRetryDelay(0));
+	return cancel;
+}
+
+/**
+ * Subscribe a probe to this document's shared route-3 observer, arming it if
+ * this is the first wait on that body. Returns the unsubscriber (null when
+ * there is no observer to be had - a host without `MutationObserver`, or a
+ * detached document with no body - which is exactly the case the poll behind
+ * it exists for), and disconnects the observer as the last probe leaves.
+ */
+function watchBodyForSections(
+	view: (Window & typeof globalThis) | null,
+	body: HTMLElement | null,
+	probe: () => void
+): (() => void) | null {
+	const MO = view?.MutationObserver ?? null;
+	if (!MO || !body) return null;
+	let entry = bodyWatches.get(body);
+	if (!entry) {
+		const probes = new Set<() => void>();
+		// Over a COPY: a probe that resolves cancels its own wait, which
+		// unsubscribes it from this very set mid-iteration.
+		const observer = new MO(() => {
+			for (const p of [...probes]) p();
+		});
+		observer.observe(body, { childList: true, subtree: true });
+		entry = { observer, probes };
+		bodyWatches.set(body, entry);
+	}
+	entry.probes.add(probe);
+	return () => {
+		const live = bodyWatches.get(body);
+		if (!live) return;
+		live.probes.delete(probe);
+		if (live.probes.size > 0) return;
+		live.observer.disconnect();
+		bodyWatches.delete(body);
+	};
+}
+
+/**
+ * Timers scheduled on the section's OWN window where there is one.
+ *
+ * A popout has its own window object, and a timer scheduled on the main one
+ * for an element in a popout goes on firing after that popout has closed.
+ * Falling back to the globals keeps this working under a fake view in tests
+ * and anywhere `defaultView` is null (a detached document).
+ */
+function setTimer(view: Window | null, fn: () => void, ms: number): number {
+	const set = view?.setTimeout;
+	if (typeof set === "function") return set.call(view, fn, ms) as unknown as number;
+	return setTimeout(fn, ms) as unknown as number;
+}
+
+function clearTimer(view: Window | null, handle: number): void {
+	const clear = view?.clearTimeout;
+	if (typeof clear === "function") {
+		clear.call(view, handle);
+		return;
+	}
+	clearTimeout(handle);
+}
+
+/** Cancel every pending wait. Called by teardown; safe to call twice. */
+function cancelPendingWaits(): void {
+	for (const cancel of [...pendingWaits]) cancel();
+	pendingWaits.clear();
+	// Cancelling every wait empties the shared observers by itself; this is
+	// the belt on that, so unload stays the single place either collection
+	// can be leaked from even if a canceller was lost.
+	for (const { observer } of bodyWatches.values()) observer.disconnect();
+	bodyWatches.clear();
+}
+
+/** Stop watching a root's size, if we were. */
+function stopSizeWatch(root: HTMLElement): void {
+	const stop = sizeWatches.get(root);
+	if (!stop) return;
+	stop();
+	sizeWatches.delete(root);
+}
+
+/** Stop every size watch. Called by teardown. */
+function stopAllSizeWatches(): void {
+	for (const stop of [...sizeWatches.values()]) stop();
+	sizeWatches.clear();
+}
+
+/**
+ * A painted root with no size on screen gets watched until it has one.
+ *
+ * The 1.4.11 §6 clip - an embed's content box sized to its TEXT, 24px against
+ * 368px of ink - is fixed by growing `min-height`, but that fix assumes the
+ * box is being LAID OUT when we paint. Under a theme that renders the embed
+ * collapsed, or inside a folded callout, or on a pane the renderer has not
+ * given a size to yet, the box measures 0x0 and the min-height lands on
+ * something with no layout to apply it to. Drawing once and walking away
+ * leaves the ink invisible until that section next re-renders, which for an
+ * embed can be never.
+ *
+ * So the box is re-measured on the observer's tick instead: as soon as the
+ * layout gives it a size, the marker is dropped and it is painted again
+ * against the box it actually has. The watch stops on the first non-zero
+ * measurement, on teardown, and when the root leaves the DOM.
+ */
+function watchIfCollapsed(root: HTMLElement, path: string): void {
+	if (typeof root.getBoundingClientRect !== "function") return;
+	// A root the DOM has let go of measures 0x0, which `embedInkIsCollapsed`
+	// cannot tell from a collapsed root still on screen - and it will never
+	// gain a size, so arming a watch here would be a ResizeObserver on a
+	// detached tree with nothing left to fire it.
+	if (root.isConnected === false) {
+		stopSizeWatch(root);
+		return;
+	}
+	const view = root.ownerDocument?.defaultView ?? null;
+	const RO = view?.ResizeObserver ?? null;
+	if (!RO) return;
+	if (!embedInkIsCollapsed(root.getBoundingClientRect())) {
+		stopSizeWatch(root);
+		return;
+	}
+	if (sizeWatches.has(root)) return;
+	const ro = new RO(() => {
+		if (!sizeWatches.has(root)) return;
+		if (embedInkIsCollapsed(root.getBoundingClientRect())) return;
+		stopSizeWatch(root);
+		// Re-measure: the marker is what makes `paint` stand down, so drop it
+		// and paint again now the box has a size.
+		root.removeAttribute(MARKER_ATTR);
+		paint(root, path, strokesFor ? strokesFor(path) : []);
+	});
+	ro.observe(root);
+	sizeWatches.set(root, () => ro.disconnect());
 }
 
 /**
@@ -337,6 +755,12 @@ export function disarmPrintSwaps(): void {
  * Obsidian's and removing it would move somebody else's layout.
  */
 export function teardownEmbedInk(): void {
+	// Before the roots themselves: a wait or a resize observer that survives
+	// this goes on calling into a module the reload has already replaced,
+	// which is a repaint from a plugin that is no longer running at best and
+	// a throw inside someone else's observer callback at worst.
+	cancelPendingWaits();
+	stopAllSizeWatches();
 	for (const root of [...layers.keys()]) {
 		if (!root.isConnected) continue;
 		root.querySelector(":scope > canvas.handwriting-embed-ink")?.remove();
@@ -348,6 +772,7 @@ export function teardownEmbedInk(): void {
 	layers.clear();
 	revisions.clear();
 	strokesFor = null;
+	diagnose = null;
 }
 
 function usePrintVector(on: boolean): void {
@@ -422,6 +847,13 @@ function clearEmbedMinHeight(root: HTMLElement): void {
 }
 
 function paint(root: HTMLElement, path: string, strokes: readonly InkStroke[]): void {
+	// Until now the size watches were swept only from `attachEmbedInk` and
+	// `embedInkChanged`, so a collapsed root that left the DOM kept its
+	// ResizeObserver until the next embed render or the next persisted
+	// gesture ANYWHERE - which in a session that only reads is never. Paint
+	// is the cheapest boundary that a watch cannot outlive: see the
+	// function's own comment for why this is the size half only.
+	sweepSizeWatches();
 	const marker = embedInkMarker(path, revisions.get(path) ?? 0);
 	let canvas = root.querySelector<HTMLCanvasElement>(
 		":scope > canvas.handwriting-embed-ink"
@@ -435,6 +867,8 @@ function paint(root: HTMLElement, path: string, strokes: readonly InkStroke[]): 
 		// room we grew the embed by to hold it.
 		canvas?.remove();
 		if (embedInkRootIsEmbed(root)) clearEmbedMinHeight(root);
+		// Nothing left to become visible, so nothing left to watch for.
+		stopSizeWatch(root);
 		return;
 	}
 	if (view.getComputedStyle(root).position === "static") {
@@ -474,4 +908,8 @@ function paint(root: HTMLElement, path: string, strokes: readonly InkStroke[]): 
 	for (const s of strokes) if (s.tool === "highlighter") drawStroke(ctx, CAM, s, undefined, true);
 	ctx.globalAlpha = 1;
 	for (const s of strokes) if (s.tool !== "highlighter") drawStroke(ctx, CAM, s, undefined, true);
+	// Drawn - but drawn into a box that may have no size on screen yet. If it
+	// has none, re-measure when the layout gives it one instead of leaving a
+	// correct canvas inside a collapsed root.
+	watchIfCollapsed(root, path);
 }
