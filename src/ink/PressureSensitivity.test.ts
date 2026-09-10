@@ -12,22 +12,22 @@ import { PEN_SHAPE } from "./InkShape";
 afterEach(() => setPressureSensitivity(true));
 
 describe("pressure sensitivity", () => {
-	it("pins Alan's accepted exp7 ON curve before and after an OFF round trip", () => {
+	it("pins the 1.4.12 ON curve before and after an OFF round trip", () => {
 		const golden: Array<[pressure: number, width: number]> = [
-			[0, 0.396],
-			[0.06, 0.657399],
-			[0.1, 0.866359],
-			[0.25, 1.745151],
-			[0.5, 3.389954],
-			[0.75, 5.168545],
-			[0.959, 6.72771],
-			[1, 7.04],
+			[0, 0.77],
+			[0.06, 0.9433602303012543],
+			[0.1, 1.0242939556355661],
+			[0.25, 1.2755813485483816],
+			[0.5, 1.6202830872269456],
+			[0.75, 1.922476251880749],
+			[0.959, 2.155798199828466],
+			[1, 2.2],
 		];
 		const assertGolden = () => {
 			for (const [pressure, width] of golden) {
 				expect(widthForPressure(DEFAULT_PEN, pressure), `pressure ${pressure}`).toBeCloseTo(
 					width,
-					6
+					12
 				);
 			}
 		};
@@ -38,31 +38,28 @@ describe("pressure sensitivity", () => {
 		assertGolden();
 	});
 
-	it("off paints the width Alan SELECTED, at every pressure and base width", () => {
+	it("off preserves the 1.4.12 width at every pressure and base width", () => {
 		setPressureSensitivity(false);
-		// The selected factor, not the old shipped one (0.7364923123758843).
-		// He picked the displayed 0.32 -> 2.19 row - "same as the hardest
-		// press" - and this pins that choice rather than a point on a curve.
-		const selected = 0.9945718882219903;
+		// The historical law evaluated at NO_PRESSURE (0.5).
+		const historical = 0.7364923123758843;
 		for (const style of [DEFAULT_PEN, { ...DEFAULT_PEN, baseWidth: 4.75 }]) {
 			for (const pressure of [0, 0.06, NO_PRESSURE, 0.959, 1]) {
-				expect(widthForPressure(style, pressure)).toBeCloseTo(style.baseWidth * selected, 14);
+				expect(widthForPressure(style, pressure)).toBeCloseTo(style.baseWidth * historical, 14);
 			}
 		}
 	});
 
-	it("off at the 2.2 base is the 2.19 row he was looking at", () => {
+	it("off at the 2.2 base matches the saved ink's historical width", () => {
 		setPressureSensitivity(false);
 		// The literal width on screen, so a factor change that keeps the
 		// arithmetic self-consistent but moves the ink still fails here.
 		expect(DEFAULT_PEN.baseWidth).toBe(2.2);
-		expect(widthForPressure(DEFAULT_PEN, NO_PRESSURE)).toBeCloseTo(2.188058154088379, 12);
+		expect(widthForPressure(DEFAULT_PEN, NO_PRESSURE)).toBeCloseTo(1.6202830872269456, 12);
 	});
 
-	it("the selected factor is FROZEN, not re-derived from the live ON law", () => {
+	it("the explicit OFF factor remains independent of ON fields", () => {
 		setPressureSensitivity(false);
-		// Move every ON-curve field. The OFF width must not follow, because it
-		// is a choice he made once, not a sample of whatever the curve is now.
+		// Keep the explicit style API used by uniform-width callers.
 		const moved: PenStyle = {
 			...DEFAULT_PEN,
 			minWidthFactor: 0.5,

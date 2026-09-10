@@ -147,9 +147,8 @@ describe("WetInkRenderer takes the tool's flatness from the stroke", () => {
 
 	it("shapes the width only for a non-flat tool on a shaping device", () => {
 		// liveWidthPx reports the shaper's half-width doubled when shaping is
-		// on for the stroke, and the raw pressure width when it is not. The ON
-		// stroke now starts at its pressure-aware width, so drive one sample to
-		// let velocity thinning distinguish the shaped route from the flat one.
+		// on for the stroke, and the raw pressure width when it is not. Drive
+		// one sample to exercise velocity thinning as well as the start taper.
 		const raw = widthForPressure(style, 0.5);
 		const at = (shape: boolean, flat: boolean) => {
 			const { canvas } = fakeCanvas();
@@ -250,11 +249,11 @@ describe("WetInkRenderer.contactHalfWidth", () => {
 		return wet;
 	};
 
-	it("holds the tap at the nib when the pressure-aware live line is wider", () => {
+	it("holds the tap at the nib when the shaped width is at the tip floor", () => {
 		const wet = atPenDown({ shape: true, flat: false, pressure: 0.5 });
-		// The two answers are deliberately separate: a held-pressure line uses
-		// accepted exp7 width, while a tap remains exactly one nominal nib.
-		expect(wet.liveHalfWidth(style, 0.5)).toBeGreaterThan(style.baseWidth / 2);
+		// A line begins at the historical tip floor; a tap stays visible at
+		// one nominal nib.
+		expect(wet.liveHalfWidth(style, 0.5)).toBeLessThan(style.baseWidth / 2 / 4);
 		expect(wet.contactHalfWidth(style, 0.5)).toBeCloseTo(style.baseWidth / 2, 10);
 	});
 
@@ -283,8 +282,8 @@ describe("WetInkRenderer.contactHalfWidth", () => {
 	});
 
 	it("never falls below the nib whatever the pressure sample says", () => {
-		// The exp7 ON curve can exceed baseWidth, but the accepted contact dot
-		// remains one nib. A future wet-start parity correction must preserve it.
+		// The pressure curve tops out at baseWidth. Contact dots stay at one
+		// nominal nib even when a line starts at the geometric tip floor.
 		for (const pressure of [0, 0.25, 0.5, 0.75, 1]) {
 			const wet = atPenDown({ shape: true, flat: false, pressure });
 			expect(wet.contactHalfWidth(style, pressure)).toBeCloseTo(style.baseWidth / 2, 10);

@@ -306,6 +306,14 @@ describe("collapsing groups older than the two most recent", () => {
 		expect(collapsedDivs(frag)).toHaveLength(0);
 	});
 
+	it("renders the 1.4.14 hotfix note verbatim", () => {
+		const d = decideWhatsNew("1.4.14", "1.4.13", false);
+		expect(d.show).toBe(true);
+		if (!d.show) throw new Error("unreachable, asserted above");
+		const frag = whatsNewFragment(d.version, d.notes, d.groups) as unknown as FakeEl;
+		expect(listItems(frag).map((item) => item.text)).toEqual(["ink thickness hotfix"]);
+	});
+
 	it("renders the thirteen 1.4.13 release-note lines verbatim and in order", () => {
 		const d = decideWhatsNew("1.4.13", "1.4.12", false);
 		expect(d.show).toBe(true);

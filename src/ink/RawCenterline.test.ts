@@ -64,15 +64,15 @@ const SMOOTH_FIXTURE: number[][] = [
 	[10, 10, 1.104738],
 ];
 
-/** The same centerline through the accepted pressure-aware endpoint taper. */
+/** The same stroke through the shaped path, frozen from 1.4.12. */
 const SHAPED_FIXTURE: number[][] = [
-	[0, 0, 1.007385],
+	[0, 0, 0.121848],
 	[5, 0, 1.023476],
 	[7.1875, 0.3125, 1.021835],
 	[8.75, 1.25, 1.020193],
 	[9.6875, 2.8125, 1.018551],
 	[10, 5, 1.016909],
-	[10, 10, 0.981491],
+	[10, 10, 0.120272],
 ];
 
 function fakeCtx(): CanvasRenderingContext2D {

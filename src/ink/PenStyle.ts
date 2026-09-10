@@ -19,22 +19,11 @@ export interface PenStyle {
 export const DEFAULT_PEN: PenStyle = {
 	color: "#2f6de0",
 	baseWidth: 2.2,
-	minWidthFactor: 0.18,
-	gamma: 1.15,
-	maxWidthFactor: 3.2,
-	// The width Alan SELECTED, not a point on the ON curve.
-	//
-	// He picked the displayed 0.32 -> 2.19 row and called it "same as the
-	// hardest press", so pressure-off ink is the width he chose rather than
-	// whatever the current ON law happens to yield at some sample pressure.
-	// The number is .18 + (3.2 - .18) * .32^1.15, the ON law evaluated once at
-	// his selection and then FROZEN here: it is a fixed selected factor, so a
-	// later change to the ON curve's min, gamma or ceiling must not move it.
-	// At the 2.2 base that is 2.188058154088379 on screen.
-	//
-	// It replaces 0.7364923123758843, the shipped OFF pen at NO_PRESSURE under
-	// the pre-exp7 curve, which was a point on a law rather than a choice.
-	pressureOffWidthFactor: 0.9945718882219903,
+	minWidthFactor: 0.35,
+	gamma: 0.75,
+	maxWidthFactor: 1,
+	// Preserve the 1.4.12 width law at NO_PRESSURE for saved and new pen ink.
+	pressureOffWidthFactor: 0.7364923123758843,
 };
 
 /**
@@ -87,11 +76,9 @@ export const NO_PRESSURE = 0.5;
 /**
  * Pressure sensitivity, off for anyone who wants an even line.
  *
- * Each style carries its historical OFF width. That keeps existing ink at the
- * width users already saw while the ON curve can change independently. Speed
- * thinning stays active; InkShape preserves the historical geometric endpoint
- * taper while OFF. Every stroke is styled at render time, so flipping this
- * restyles ink that was written years ago.
+ * Each style carries its OFF width. Speed thinning and geometric endpoint
+ * taper stay active in both states. Every stroke is styled at render time,
+ * so flipping this restyles ink that was written years ago.
  */
 let pressureSensitive = true;
 

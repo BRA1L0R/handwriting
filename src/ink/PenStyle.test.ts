@@ -27,11 +27,11 @@ describe("shapeFor", () => {
 		});
 	});
 
-	it("pins DEFAULT_PEN's current values", () => {
-		expect(DEFAULT_PEN.minWidthFactor).toBe(0.18);
-		expect(DEFAULT_PEN.gamma).toBe(1.15);
-		expect(DEFAULT_PEN.maxWidthFactor).toBe(3.2);
-		expect(DEFAULT_PEN.pressureOffWidthFactor).toBeCloseTo(0.9945718882219903, 15);
+	it("pins DEFAULT_PEN's 1.4.12 pressure profile", () => {
+		expect(DEFAULT_PEN.minWidthFactor).toBe(0.35);
+		expect(DEFAULT_PEN.gamma).toBe(0.75);
+		expect(DEFAULT_PEN.maxWidthFactor).toBe(1);
+		expect(DEFAULT_PEN.pressureOffWidthFactor).toBeCloseTo(0.7364923123758843, 15);
 	});
 
 	it("pins HIGHLIGHTER_PEN's current values", () => {

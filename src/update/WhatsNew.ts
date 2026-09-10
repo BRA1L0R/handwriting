@@ -156,6 +156,7 @@ export const RELEASE_NOTES: Record<string, string[]> = {
 		"boox/ipad hints",
 		"bug fixes",
 	],
+	"1.4.14": ["ink thickness hotfix"],
 };
 
 /** One release's own notes, kept apart so the toast can label them honestly. */
