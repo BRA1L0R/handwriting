@@ -133,7 +133,7 @@ there is no separate palette button.
 
 tap the pen button to open its size slider, quick pens and 8 pen colors. tap the highlighter button to open the same controls with its 5 highlighter colors.
 
-selecting a color applies it to the corresponding nib and returns to inking from eraser, lasso, insert space or pan. pen colors do not switch to the highlighter, and highlighter colors do not switch to the pen.
+selecting a color applies it to the corresponding nib and returns to inking from eraser, lasso, insert space or pan.
 
 ### extra commands for hotkeys
 
