@@ -44,12 +44,12 @@ jobs:
       # rather than quietly rewriting the lock.
       - run: npm ci
 
-      # Chromium for the rendered-geometry suite. `--with-deps` installs the
-      # system libraries (libgbm, libnss3, etc.) that headless Chromium needs
-      # on a stock Ubuntu runner. Placed here so the binary is ready when the
+      # Chromium and WebKit for the browser suites. `--with-deps` installs the
+      # system libraries (libgbm, libnss3, etc.) that the headless browsers need
+      # on a stock Ubuntu runner. Placed here so the binaries are ready when the
       # `rendered geometry` step runs after `tests`.
-      - name: install chromium
-        run: npx playwright install chromium --with-deps
+      - name: install chromium and webkit
+        run: npx playwright install chromium webkit --with-deps
 
       # The version lives in three files and they must agree. The
       # packager checks this too, but only at packaging time - after the
