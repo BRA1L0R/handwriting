@@ -251,6 +251,10 @@ const CLOSE_INK_SLIDERS_ALLOWED: Readonly<Record<string, Exemption>> = {
 };
 
 const FOCUS_ALLOWED: Readonly<Record<string, Exemption>> = {
+	"/src/inline/NotePaper.ts": {
+		max: 3,
+		why: "the paper Modal moves keyboard focus between pattern buttons, focuses the current pattern on open, and restores its invoking element on close. These are dialog navigation, not an ink surface reclaiming focus after a pen gesture. PaperPicker.test.ts exercises arrow navigation, selection, cancellation, and focus return",
+	},
 	"/src/inline/StripPenChrome.ts": {
 		max: ANY,
 		why: "stripPenFocus, the shared keyboard claim for a non-editor ink surface - the pdf half of the pair the note gets from InlineFocus",

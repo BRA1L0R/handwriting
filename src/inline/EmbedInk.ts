@@ -172,21 +172,36 @@ const pendingWaits = new Set<() => void>();
  */
 const bodyWatches = new Map<HTMLElement, { observer: MutationObserver; probes: Set<() => void> }>();
 const sizeWatches = new Map<HTMLElement, () => void>();
+/** Reading-view roots whose layer offset has to keep up with the pane. */
+const anchorWatches = new Map<HTMLElement, { stop(): void; sizer: HTMLElement | null }>();
+
+export function embedInkAnchorWatchCount(): number {
+	return anchorWatches.size;
+}
 
 /**
  * The rendered document's root for a section element, if recognizable.
  *
- * Tried in order of how well each one pins the note's coordinate origin. The
- * last two are a fallback for render contexts that have no sizer at all -
- * an export or a print renders the markdown into a container of its own, and
- * "no sizer" there meant no root, which meant no ink on the page. A sizer,
- * where one exists, still wins: `closest` reaches it first walking up.
+ * Order is a preference, not a distance: each `closest` walks the whole chain.
+ *
+ * The sizer used to be the reading view's root and cannot be one. The
+ * virtualised renderer owns its direct children and removes an appended
+ * canvas in the same millisecond (Obsidian 1.13.7); the marker attribute
+ * survives, so the root looks painted while showing nothing, and nothing
+ * repaints it in a session that only reads. Embeds were unaffected because
+ * `.markdown-embed-content` is not reconciled.
+ *
+ * `.markdown-preview-view` one level up survives a re-render and is already
+ * `position: relative`, so it holds the layer instead; `embedInkAnchor` undoes
+ * the inset between the two. The sizer stays below it for a render context
+ * with no view, and the last entry for one with no sizer either - an export
+ * or a print renders into a container of its own.
  */
 export function embedInkRoot(sectionEl: HTMLElement): HTMLElement | null {
 	return (
 		sectionEl.closest<HTMLElement>(".markdown-embed-content") ??
-		sectionEl.closest<HTMLElement>(".markdown-preview-sizer") ??
 		sectionEl.closest<HTMLElement>(".markdown-preview-view") ??
+		sectionEl.closest<HTMLElement>(".markdown-preview-sizer") ??
 		sectionEl.closest<HTMLElement>(".markdown-rendered")
 	);
 }
@@ -324,6 +339,39 @@ export function embedInkRootIsEmbed(root: { classList: { contains(cls: string): 
 	return root.classList.contains("markdown-embed-content");
 }
 
+/**
+ * The offset a reading view's layer needs, or null to leave it where the
+ * stylesheet puts it.
+ *
+ * Ink is anchored to the sizer's top-left. The root is now the view outside
+ * it, so the inset between them has to be added back, and it is not a
+ * constant: the sizer is centred, so it moves with the pane's width.
+ *
+ * Null for every other root, whose `0, 0` is already right, and for a sizer
+ * with no offset parent - that is a `display: none` subtree, where every
+ * offset reads 0, which is a real coordinate rather than a missing one.
+ */
+export function embedInkAnchor(root: HTMLElement): { left: number; top: number } | null {
+	const sizer = anchorSizer(root);
+	if (!sizer || sizer.offsetParent !== root) return null;
+	return { left: sizer.offsetLeft, top: sizer.offsetTop };
+}
+
+/** The sizer a reading view's layer is anchored to, if this root is one. */
+function anchorSizer(root: HTMLElement): HTMLElement | null {
+	if (!root.classList?.contains("markdown-preview-view")) return null;
+	return root.querySelector<HTMLElement>(":scope > .markdown-preview-sizer");
+}
+
+function anchorLayer(root: HTMLElement, el: { style: CSSStyleDeclaration }): void {
+	const at = embedInkAnchor(root);
+	if (!at) return;
+	// Through `style`, not `setCssStyles`: the print swap anchors an <svg>,
+	// and Obsidian's helper is an augmentation of HTMLElement.
+	el.style.left = `${at.left}px`;
+	el.style.top = `${at.top}px`;
+}
+
 /** Pure: the css extent that covers every stroke. Never clipped. */
 export function embedInkExtent(strokes: readonly InkStroke[]): { w: number; h: number } {
 	let maxX = 0;
@@ -444,6 +492,9 @@ function sweepDisconnected(): void {
  * lay out; the size test keeps even the array copy off that path.
  */
 function sweepSizeWatches(): void {
+	if (anchorWatches.size > 0) {
+		for (const root of [...anchorWatches.keys()]) if (!root.isConnected) stopAnchorWatch(root);
+	}
 	if (sizeWatches.size === 0) return;
 	for (const root of [...sizeWatches.keys()]) {
 		if (!root.isConnected) stopSizeWatch(root);
@@ -657,6 +708,63 @@ function stopAllSizeWatches(): void {
 	sizeWatches.clear();
 }
 
+function stopAnchorWatch(root: HTMLElement): void {
+	const watch = anchorWatches.get(root);
+	if (!watch) return;
+	watch.stop();
+	anchorWatches.delete(root);
+}
+
+/** Stop every anchor watch. Called by teardown. */
+function stopAllAnchorWatches(): void {
+	for (const watch of [...anchorWatches.values()]) watch.stop();
+	anchorWatches.clear();
+}
+
+/**
+ * Re-anchor a reading view's layer as the pane changes width.
+ *
+ * Only `paint` writes the offset and a resize does not repaint, so without
+ * this the ink stays where the text used to be until the next gesture.
+ *
+ * Both boxes are observed: toggling "readable line length" resizes the sizer
+ * inside a view whose own box never changes, so watching the view alone sees
+ * nothing while the ink drifts by the whole centring margin.
+ */
+function watchAnchor(root: HTMLElement): void {
+	if (!root.classList?.contains("markdown-preview-view") || anchorWatches.has(root)) return;
+	const RO = root.ownerDocument?.defaultView?.ResizeObserver ?? null;
+	if (!RO) return;
+	const sync = (): void => {
+		if (anchorWatches.get(root) !== watch) return;
+		if (!root.isConnected) {
+			stopAnchorWatch(root);
+			return;
+		}
+		const sizer = anchorSizer(root);
+		if (watch.sizer !== sizer) {
+			if (watch.sizer) ro.unobserve(watch.sizer);
+			watch.sizer = sizer;
+			if (sizer) ro.observe(sizer);
+		}
+		const canvas = root.querySelector<HTMLCanvasElement>(":scope > canvas.handwriting-embed-ink");
+		if (canvas) anchorLayer(root, canvas);
+		const svg = root.querySelector<SVGSVGElement>(":scope > svg.handwriting-embed-ink");
+		if (svg) anchorLayer(root, svg);
+	};
+	const ro = new RO(sync);
+	// A replacement need not repaint or resize the view. Observe only the
+	// surviving root's direct children, then move the resize watch to its
+	// current sizer; edits inside rendered sections need no observer work.
+	const MO = root.ownerDocument?.defaultView?.MutationObserver ?? null;
+	const mo = MO ? new MO(sync) : null;
+	const watch = { sizer: null as HTMLElement | null, stop: () => { ro.disconnect(); mo?.disconnect(); } };
+	anchorWatches.set(root, watch);
+	ro.observe(root);
+	mo?.observe(root, { childList: true });
+	sync();
+}
+
 /**
  * A painted root with no size on screen gets watched until it has one.
  *
@@ -772,6 +880,7 @@ export function teardownEmbedInk(): void {
 	// a throw inside someone else's observer callback at worst.
 	cancelPendingWaits();
 	stopAllSizeWatches();
+	stopAllAnchorWatches();
 	for (const root of [...layers.keys()]) {
 		if (!root.isConnected) continue;
 		root.querySelector(":scope > canvas.handwriting-embed-ink")?.remove();
@@ -826,6 +935,7 @@ function usePrintVector(on: boolean): void {
 		}
 		for (const run of layers.pen) svg.appendChild(inkPathEl(root, run));
 		if (!existing) root.appendChild(svg);
+		anchorLayer(root, svg);
 		canvas?.setCssStyles({ display: "none" });
 	}
 }
@@ -869,7 +979,13 @@ function paint(root: HTMLElement, path: string, strokes: readonly InkStroke[]): 
 	let canvas = root.querySelector<HTMLCanvasElement>(
 		":scope > canvas.handwriting-embed-ink"
 	);
-	if (!embedInkNeedsPaint(root.getAttribute(MARKER_ATTR), marker, canvas !== null)) return;
+	if (!embedInkNeedsPaint(root.getAttribute(MARKER_ATTR), marker, canvas !== null)) {
+		// A detached view may return with its unchanged bitmap. Its old
+		// observers were stopped, so restore layout tracking without repainting.
+		if (canvas) anchorLayer(root, canvas);
+		watchAnchor(root);
+		return;
+	}
 	root.setAttribute(MARKER_ATTR, marker);
 	const view = root.ownerDocument.defaultView ?? window;
 	const { w, h } = embedInkExtent(strokes);
@@ -880,6 +996,7 @@ function paint(root: HTMLElement, path: string, strokes: readonly InkStroke[]): 
 		if (embedInkRootIsEmbed(root)) clearEmbedMinHeight(root);
 		// Nothing left to become visible, so nothing left to watch for.
 		stopSizeWatch(root);
+		stopAnchorWatch(root);
 		return;
 	}
 	if (view.getComputedStyle(root).position === "static") {
@@ -900,6 +1017,10 @@ function paint(root: HTMLElement, path: string, strokes: readonly InkStroke[]): 
 	if (!canvas) {
 		canvas = root.createEl("canvas", { cls: "handwriting-embed-ink" });
 	}
+	// Every paint, not only the ones that resize the backing store: a repaint
+	// can follow a resize that moved the sizer without changing the ink.
+	anchorLayer(root, canvas);
+	watchAnchor(root);
 	// The canvas is sized in DEVICE pixels and laid out in css pixels, so the
 	// strokes below can go on drawing in note units and come out sharp.
 	const scale = embedInkScale(w, h, view.devicePixelRatio || 1);

@@ -67,6 +67,31 @@ export function clampScale(scale: number): number {
 	return Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale));
 }
 
+/** An owned transform is not an external-CSS sanity limit. */
+export function validCameraScale(scale: number, width = 1, height = 1): boolean {
+	return Number.isFinite(scale) && scale > 0 && Number.isFinite(1 / scale) &&
+		Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0 &&
+		Number.isFinite(width / scale) && Number.isFinite(height / scale) &&
+		width / scale <= Number.MAX_SAFE_INTEGER && height / scale <= Number.MAX_SAFE_INTEGER &&
+		Number.isFinite(width * scale) && Number.isFinite(height * scale) &&
+		width * scale <= Number.MAX_SAFE_INTEGER && height * scale <= Number.MAX_SAFE_INTEGER;
+}
+
+/** Null means defer this geometry; never substitute a different inverse. */
+export function ownedEffectiveScale(inputs: ScaleInputs, owned: number): number | null {
+	if (!validCameraScale(owned) || !Number.isFinite(inputs.visualWidth) ||
+		!Number.isFinite(inputs.layoutWidth) || inputs.visualWidth <= 0 || inputs.layoutWidth <= 0) return null;
+	const combined = inputs.visualWidth / inputs.layoutWidth;
+	const external = combined / owned;
+	if (!validCameraScale(combined) || external < MIN_SCALE || external > MAX_SCALE) return null;
+	return combined;
+}
+
+/** Callers validate provenance when adopting geometry, not on each conversion. */
+function coherentScale(scale: number): number {
+	return Number.isFinite(scale) && scale > 0 && Number.isFinite(1 / scale) ? scale : 1;
+}
+
 /**
  * Convert an on-screen distance to note space.
  *
@@ -77,12 +102,12 @@ export function clampScale(scale: number): number {
  * space as the editor grows.
  */
 export function visualToNote(distance: number, scale: number): number {
-	return distance / clampScale(scale);
+	return distance / coherentScale(scale);
 }
 
 /** The inverse: a note-space distance as it appears on screen. */
 export function noteToVisual(distance: number, scale: number): number {
-	return distance * clampScale(scale);
+	return distance * coherentScale(scale);
 }
 
 /**
@@ -182,7 +207,7 @@ export function backingScale(
 	mobile = false
 ): number {
 	const d = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
-	let b = d * Math.min(clampScale(scale), MAX_ZOOM_BACKING);
+	let b = d * Math.min(coherentScale(scale), MAX_ZOOM_BACKING);
 	if (layoutW > 0 && layoutH > 0 && Number.isFinite(layoutW) && Number.isFinite(layoutH)) {
 		const area = layoutW * b * layoutH * b;
 		if (area > MAX_BACKING_AREA) {
@@ -213,7 +238,7 @@ export function backingScale(
 			// hardware; ZoomScale.test.ts keeps a TRIPWIRE on exactly that,
 			// and a change that makes it fail is a question, not a licence to
 			// rewrite it.
-			b = mobile ? trimmed : Math.max(d * Math.min(1, clampScale(scale)), trimmed);
+			b = mobile ? trimmed : Math.max(d * Math.min(1, coherentScale(scale)), trimmed);
 		}
 	}
 	return b > 0 && Number.isFinite(b) ? b : 1;

@@ -57,6 +57,8 @@ export class FrontierCache {
  * flip is invisible to this comparison and the skip holds a stale extent.
  */
 export interface ExtentInputs {
+	readonly scrollRevision?: number;
+	readonly granted?: Extent;
 	readonly path: string;
 	readonly frontier: Extent;
 	readonly writtenOn: boolean;
@@ -74,6 +76,8 @@ export interface ExtentInputs {
 export function sameExtentInputs(a: ExtentInputs | null, b: ExtentInputs): boolean {
 	return (
 		a !== null &&
+		a.scrollRevision === b.scrollRevision &&
+		a.granted === b.granted &&
 		a.path === b.path &&
 		// Identity: FrontierCache hands back the same object until invalidated.
 		a.frontier === b.frontier &&

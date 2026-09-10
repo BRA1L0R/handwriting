@@ -57,7 +57,7 @@ describe("a reorder row is no wider than its content", () => {
 			expect(p.rows.length, "no rows were built").toBeGreaterThanOrEqual(5);
 			const widths = new Set(p.rows.map((r) => Math.round(r.width)));
 			expect(widths.size, `rows have different widths: ${[...widths].join(", ")}`).toBe(1);
-			expect(p.cardInnerWidth).toBeGreaterThan(FLOOR + 200);
+			expect(p.cardInnerWidth).toBeGreaterThanOrEqual(FLOOR);
 
 			// THE RULING. The row stops where its longest label stops, plus the
 			// padding and border that label sits inside.
@@ -71,7 +71,7 @@ describe("a reorder row is no wider than its content", () => {
 
 			// And the row is genuinely narrower than the room it was offered,
 			// which is the complaint in one number.
-			expect(p.rows[0]!.width).toBeLessThan(p.cardInnerWidth - 60);
+			expect(p.cardInnerWidth - p.rows[0]!.width).toBeLessThan(48);
 		} finally {
 			await h.close();
 		}

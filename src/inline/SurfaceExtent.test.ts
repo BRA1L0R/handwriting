@@ -23,6 +23,7 @@ import { describe, expect, it } from "vitest";
 import { codeOnly } from "../CodeOnly";
 import {
 	EXTENT_CHUNK,
+	ScrollExpansionDemand,
 	EXTENT_HEADROOM,
 	EXTENT_MARGIN,
 	HSCROLL_AXIS_CLASS,
@@ -367,4 +368,16 @@ describe("writeFrontier (room to write at the top - 1.4.6 §5n)", () => {
 		// Contrast: when written on, the frontier DOES move the grant.
 		expect(Math.max(ink.y, zoom.y, writeFrontier(base).y)).toBeGreaterThan(todaysGrant);
 	});
+});
+
+
+it("rebases camera offsets and resized viewports without blank-space demand",()=>{
+ const demand=new ScrollExpansionDemand();
+ const room={left:0,top:0,width:640,height:480,edgeX:1280,edgeY:960,origin:{left:0,top:0},fontZoom:1,pinchScale:1};
+ demand.sample("note",true,0,0);demand.reserve(room);
+ demand.rebase(500,400);demand.sample("note",true,500,400);
+ expect(demand.reserve({...room,left:500,top:400,width:32000,height:24000,pinchScale:.02})).toEqual({x:0,y:0});
+ demand.sample("note",true,501,401);
+ const grown=demand.reserve({...room,left:501,top:401});
+ expect(grown.x).toBeGreaterThan(0);expect(grown.y).toBeGreaterThan(0);
 });

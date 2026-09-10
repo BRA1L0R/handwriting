@@ -158,6 +158,14 @@ export const RELEASE_NOTES: Record<string, string[]> = {
 	],
 	"1.4.14": ["ink thickness hotfix"],
 	"1.4.15": ["properly done ink pressure sens patch", "bug fixes"],
+	"1.4.16": [
+		"per note lined/dotted/grid paper (hint: the ... button in the top right corner of the note -alan)",
+		"ghost shape snapping",
+		"toolbar settings changes",
+		"reading mode ink bug fix",
+		"notification bug fix",
+		"zoom and fit to ink",
+	],
 };
 
 /** One release's own notes, kept apart so the toast can label them honestly. */

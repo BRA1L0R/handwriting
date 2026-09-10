@@ -39,6 +39,75 @@ export interface Extent {
 
 export const ZERO_EXTENT: Extent = Object.freeze({ x: 0, y: 0 });
 
+interface ScrollRoom {
+	left: number; top: number; width: number; height: number;
+	/** Native scroll range subtracts the untransformed client size. */
+	nativeWidth?: number; nativeHeight?: number;
+	edgeX: number; edgeY: number; origin: { left: number; top: number };
+	fontZoom: number; pinchScale: number;
+}
+
+/** Cheap offset sampling; layout is read only when a reserve is due. */
+export class ScrollExpansionDemand {
+	revision = 0;
+	private path = "";
+	private enabled = false;
+	private left = 0;
+	private top = 0;
+	private pendingX = false;
+	private pendingY = false;
+	private room: ScrollRoom | null = null;
+	private rebased = false;
+
+	sample(path: string, enabled: boolean, left: number, top: number): number {
+		if (path !== this.path || enabled !== this.enabled) {
+			this.path = path; this.enabled = enabled; this.room = null;
+			this.pendingX = this.pendingY = enabled;
+			this.revision++;
+		} else if (enabled && this.room) {
+			const r = this.room;
+			const x = left > this.left && r.edgeX - left - (r.nativeWidth ?? r.width) < r.width / 4;
+			const y = top > this.top && r.edgeY - top - (r.nativeHeight ?? r.height) < r.height / 4;
+			if ((x && !this.pendingX) || (y && !this.pendingY)) this.revision++;
+			this.pendingX ||= x; this.pendingY ||= y;
+		}
+		this.left = left; this.top = top;
+		return this.revision;
+	}
+
+ /** Programmatic navigation/resize rebases offsets without generating demand. */
+ rebase(left:number,top:number):void {
+  this.left=left; this.top=top;
+  this.rebased=true;
+  if(this.room) { this.pendingX=false; this.pendingY=false; }
+ }
+
+	reserve(next: ScrollRoom): Extent {
+		if (!this.enabled || next.width <= 0 || next.height <= 0 || next.fontZoom <= 0) return ZERO_EXTENT;
+		const old = this.room;
+		const resized = !old || old.fontZoom !== next.fontZoom || old.pinchScale !== next.pinchScale;
+		const x = this.pendingX || !old || (!this.rebased && (resized || old.width !== next.width));
+		const y = this.pendingY || !old || (!this.rebased && (resized || old.height !== next.height));
+		this.rebased = false;
+		this.room = next;
+		this.pendingX = this.pendingY = false;
+		const nativeWidth = next.nativeWidth ?? next.width;
+		const nativeHeight = next.nativeHeight ?? next.height;
+		return {
+			x: x && next.edgeX - next.left - nativeWidth < next.width
+				? Math.max(0, (next.left + nativeWidth + next.width - next.origin.left) / next.fontZoom) : 0,
+			y: y && next.edgeY - next.top - nativeHeight < next.height
+				? Math.max(0, (next.top + nativeHeight + next.height - next.origin.top) / next.fontZoom) : 0,
+		};
+	}
+
+	applied(edgeX: number, edgeY: number): void {
+		if (!this.room) return;
+		this.room.edgeX = Math.max(this.room.edgeX, edgeX);
+		this.room.edgeY = Math.max(this.room.edgeY, edgeY);
+	}
+}
+
 /** One axis of the chunked, never-shrinking grow rule. */
 export function grownAxis(current: number, needed: number): number {
 	if (!Number.isFinite(needed) || needed <= 0 || needed <= current - EXTENT_MARGIN) {

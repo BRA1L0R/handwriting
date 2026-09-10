@@ -280,6 +280,7 @@ function observerRig(lines: Line[]): ObserverRig {
 	};
 
 	const o = Object.create(InkOverlayPlugin.prototype) as Fields;
+ o.pinchScaleNow = 1;
 	o.container = container;
 	o.view = {
 		contentDOM: {

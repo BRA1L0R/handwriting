@@ -6,7 +6,14 @@ import { visualToNote } from "./ZoomScale";
 import { hideProbeMarkers, markRawPointer } from "./PenProbe";
 import { describeEl, hitProbeDown, hitProbeHover, isHitProbeEnabled } from "./PenHitProbe";
 import { scrollProbeTouch } from "./ScrollProbe";
-import { DIAG_OFF_NOTE, diagnosticsEnabled } from "../diag/DiagSwitch";
+import { DIAG_OFF_NOTE, diagnosticsEnabled, diagnosticsEpoch } from "../diag/DiagSwitch";
+import {
+	analyzePointerDeliveryTrace,
+	PointerDeliveryAnalysis,
+	PointerTraceRole,
+	PointerTraceMeta,
+} from "./PointerDeliveryTrace";
+import { captureUndoTrace, clearUndoTrace } from "../diag/UndoHistoryTrace";
 import { VelocitySample, flingStep, releaseVelocity } from "../input/Fling";
 import { armGuardStyle, disarmGuardStyle } from "./GuardStyle";
 import { HOVER_GHOST_MS, isPenCompatMouseMove } from "./PenCursor";
@@ -45,7 +52,8 @@ import { FINGER_INK_PRESSURE } from "./FingerInk";
  *                   gate owns it, or the note host explicitly grants the first
  *                   iPhone finger to the selected nib. A second finger drops
  *                   that provisional ink and rejoins the existing pinch path.
- *   Mouse        -> never touched.
+ *   Mouse        -> native unless its explicit mode (or pen-less tool grant)
+ *                   claims a fresh left contact while Keyboard mode is off.
  *
  * The pen hot path is byte-for-byte the frozen pipeline's shape: sync work
  * inside `pointerrawupdate`, coalesced samples, no allocation on move events
@@ -287,10 +295,26 @@ export interface TraceEntry {
 	 * without it collapses an iPad's 4-per-move stream into single points.
 	 */
 	cs?: TraceSample[];
+	eventId?: string;
+	epoch?: number;
+	role?: PointerTraceRole;
+	sourceT?: number;
+	observationT?: number;
+	partial?: boolean;
+	termination?: "silent-lift";
 }
 
 const TRACE_MAX = 3000;
+const TRACE_STORAGE_MAX = 20000;
 const trace: TraceEntry[] = [];
+let traceStorageEntries = 0;
+let traceEvictedRows = 0;
+let traceEvictedSamples = 0;
+let traceTruncated = false;
+let tracePartialBatch = false;
+let traceEventSeq = 0;
+let traceEventIds = new WeakMap<object, string>();
+let traceCopyPartial = false;
 /**
  * Native events the ownership guard's window-capture listener has eaten
  * since the last trace clear. Module-level (like `trace` itself, not
@@ -300,10 +324,59 @@ const trace: TraceEntry[] = [];
  */
 let suppressedNative = 0;
 
-function tr(type: string, e: PointerEvent | null, note = "", cs?: TraceSample[]): void {
+function traceRole(type: string, cs: TraceSample[] | undefined): PointerTraceRole {
+	if (/^(pointerdown|pointerup|pointercancel|window-pointerdown)$/.test(type)) return "lifecycle";
+	if (type === "pointermove" || type === "pointerrawupdate") return cs && cs.length > 0 ? "sample" : "sample";
+	return "annotation";
+}
+
+function eventIdentity(e: PointerEvent | null): string {
+	if (e && typeof e === "object") {
+		const existing = traceEventIds.get(e);
+		if (existing) return existing;
+		const created = `${diagnosticsEpoch()}:${++traceEventSeq}`;
+		traceEventIds.set(e, created);
+		return created;
+	}
+	return `${diagnosticsEpoch()}:${++traceEventSeq}`;
+}
+
+export function traceSampleBudget(): number {
+	return Math.max(0, TRACE_STORAGE_MAX - traceStorageEntries - 1);
+}
+
+function tr(
+	type: string,
+	e: PointerEvent | null,
+	note = "",
+	cs?: TraceSample[],
+	role?: PointerTraceRole,
+	termination?: "silent-lift"
+): void {
 	if (!diagnosticsEnabled()) return;
-	trace.push({
-		t: performance.now(),
+	const observationT = performance.now();
+	const budget = traceStorageEntries >= TRACE_STORAGE_MAX ? 0 : traceSampleBudget();
+	let retained = cs;
+	let partial = traceCopyPartial;
+	if (retained && retained.length > budget) {
+		retained = retained.slice(0, budget);
+		partial = true;
+	}
+	traceCopyPartial = false;
+	const cost = 1 + (retained?.length ?? 0);
+	while (traceStorageEntries + cost > TRACE_STORAGE_MAX && trace.length > 0) {
+		const removed = trace.shift()!;
+		traceStorageEntries -= 1 + (removed.cs?.length ?? 0);
+		traceEvictedRows++;
+		traceEvictedSamples += removed.cs?.length ?? 0;
+		traceTruncated = true;
+	}
+	if (traceStorageEntries + cost > TRACE_STORAGE_MAX) {
+		traceTruncated = true;
+		return;
+	}
+	const entry: TraceEntry = {
+		t: observationT,
 		type,
 		id: e?.pointerId ?? -1,
 		ptr: e?.pointerType ?? "",
@@ -318,14 +391,32 @@ function tr(type: string, e: PointerEvent | null, note = "", cs?: TraceSample[])
 		tx: e?.tiltX ?? 0,
 		ty: e?.tiltY ?? 0,
 		note,
-		...(cs && cs.length > 0 ? { cs } : {}),
-	});
-	if (trace.length > TRACE_MAX) trace.splice(0, trace.length - TRACE_MAX);
+		eventId: eventIdentity(e),
+		epoch: diagnosticsEpoch(),
+		role: role ?? traceRole(type, retained),
+		sourceT: e?.timeStamp ?? -1,
+		observationT,
+		...(partial ? { partial: true } : {}),
+		...(termination ? { termination } : {}),
+		...(retained && retained.length > 0 ? { cs: retained } : {}),
+	};
+	trace.push(entry);
+	traceStorageEntries += cost;
+	if (partial) tracePartialBatch = true;
+	while (traceStorageEntries > TRACE_STORAGE_MAX || trace.length > TRACE_MAX) {
+		const removed = trace.shift();
+		if (!removed) break;
+		traceStorageEntries -= 1 + (removed.cs?.length ?? 0);
+		traceEvictedRows++;
+		traceEvictedSamples += removed.cs?.length ?? 0;
+	}
 }
 
 /** The consumed coalesced list, as trace samples. */
 function csOf(events: ReadonlyArray<PointerEvent>): TraceSample[] {
-	return events.map((ce) => ({ t: ce.timeStamp, x: ce.clientX, y: ce.clientY, p: ce.pressure }));
+	const limit = Math.min(events.length, traceSampleBudget());
+	if (limit < events.length) traceCopyPartial = true;
+	return events.slice(0, limit).map((ce) => ({ t: ce.timeStamp, x: ce.clientX, y: ce.clientY, p: ce.pressure }));
 }
 
 /** Pure, unit-tested: the acquisition-health counts the summary prints. */
@@ -402,6 +493,8 @@ export interface TraceCapture {
 	v: 1;
 	env: TraceEnv;
 	events: TraceEntry[];
+	traceMeta?: PointerTraceMeta;
+	analysis?: PointerDeliveryAnalysis;
 }
 
 /**
@@ -412,15 +505,34 @@ export interface TraceCapture {
  * recorder passes that world in env.
  */
 export function captureInlinePenTrace(env: TraceEnv): TraceCapture {
+	const traceMeta: PointerTraceMeta = {
+		evictedRows: traceEvictedRows,
+		evictedSamples: traceEvictedSamples,
+		retainedRows: trace.length,
+		retainedSamples: trace.reduce((sum, event) => sum + (event.cs?.length ?? 0), 0),
+		truncated: traceTruncated,
+		partialBatch: tracePartialBatch,
+	};
+	const events = trace.map((r) => ({ ...r, ...(r.cs ? { cs: r.cs.map((c) => ({ ...c })) } : {}) }));
 	return {
 		v: 1,
-		env: { ...env },
-		events: trace.map((r) => ({ ...r, ...(r.cs ? { cs: r.cs.map((c) => ({ ...c })) } : {}) })),
+		env: { ...env, undoHistory: captureUndoTrace() },
+		events,
+		traceMeta,
+		analysis: analyzePointerDeliveryTrace(events, traceMeta),
 	};
 }
 
 export function clearInlinePenTrace(): void {
 	trace.length = 0;
+	traceStorageEntries = 0;
+	traceEvictedRows = 0;
+	traceEvictedSamples = 0;
+	traceTruncated = false;
+	tracePartialBatch = false;
+	traceEventSeq = 0;
+	traceEventIds = new WeakMap<object, string>();
+	traceCopyPartial = false;
 	suppressedNative = 0;
 	// And every live router's per-type de-dupe set (see `liveSuppressedTypes`
 	// below). The buffer and the counter were scoped to one recording and this
@@ -430,6 +542,7 @@ export function clearInlinePenTrace(): void {
 	// nothing until the next pen claim happened to call `armOwnership()`. A
 	// recording that starts is a recording that has seen no event yet.
 	for (const seen of liveSuppressedTypes) seen.clear();
+	clearUndoTrace();
 }
 
 // ---- window delivery mirror -------------------------------------------------
@@ -777,6 +890,21 @@ export function backstopMayEnd(opts: {
 	return !opts.scrollerInPath;
 }
 
+/** Whether an unclaimed mouse may enter the ink/hover path. */
+export function mouseMayStartOrHover(mouseGranted: boolean, keyboardPaused: boolean): boolean {
+	return mouseGranted && !keyboardPaused;
+}
+
+/** Whether this event belongs to the exact mouse pointer that already owns a stroke. */
+export function ownedMouseStroke(
+	pointerType: string | undefined,
+	pointerId: number,
+	activePointerId: number | null,
+	activeIsMouse: boolean
+): boolean {
+	return pointerType === "mouse" && activeIsMouse && activePointerId !== null && pointerId === activePointerId;
+}
+
 export class InlinePenRouter {
 	/** The element listeners attach to: the editor's scroller. */
 	private scrollEl: HTMLElement;
@@ -985,7 +1113,8 @@ export class InlinePenRouter {
 		on("lostpointercapture", (e) => {
 			const ownedFinger =
 				e.pointerType === "touch" && this.activeIsFinger && e.pointerId === this.activePenId;
-			if (!ownedFinger && e.pointerType !== "pen" && !this.mouseActsAsPen(e)) return;
+			const ownedMouse = this.ownedMouseStroke(e);
+			if (!ownedFinger && e.pointerType !== "pen" && !ownedMouse) return;
 			tr("lostpointercapture", e, this.activePenId !== null ? "DURING STROKE" : "");
 			this.endPenStroke(e, false);
 		});
@@ -1072,7 +1201,7 @@ export class InlinePenRouter {
 		// the pane. The mouse takes the ONE action it needs and no bookkeeping.
 		on("pointerleave", (e) => {
 			const isPen = e.pointerType === "pen";
-			if (!isPen && !this.mouseActsAsPen(e)) return;
+			if (!isPen && !this.mouseMayStartOrHover(e)) return;
 			if (isPen) tr("pointerleave", e, this.activePenId !== null ? "DURING STROKE" : "");
 			const next = e.relatedTarget as Node | null;
 			const stillInside =
@@ -1514,9 +1643,10 @@ export class InlinePenRouter {
 	 * stroke was actually finished, so the blur handler can tell this case
 	 * from "nothing live" and from "ownership bookkeeping only".
 	 */
-	finishActiveStroke(): boolean {
+	finishActiveStroke(opts: { preserveMouse?: boolean } = {}): boolean {
 		if (this.activePenId === null) return false;
 		const wasFinger = this.activeIsFinger;
+		if (opts.preserveMouse && !wasFinger && !this.activeIsPen) return false;
 		// Null FIRST, then release. `releasePointerCapture` is what raises
 		// `lostpointercapture`, whose handler calls `endPenStroke(e, false)` -
 		// a second full commit, `cb.onPenUp` included - and the only thing
@@ -1760,6 +1890,7 @@ export class InlinePenRouter {
 	}
 
 	dispose(): void {
+		this.scrollEl.classList.remove("handwriting-no-momentum");
 		this.cancelFling();
 		this.touchPos.clear();
 		this.pinchLive = false;
@@ -1956,6 +2087,21 @@ export class InlinePenRouter {
 		this.applyGuard(this.manip.penSignal(), "finger-ink-selected-after-touch");
 	}
 
+	private canvasMomentumDisabled = false;
+
+	/** Inline-note policy: own touch pan from contact start, without a release glide. */
+	setCanvasMomentumDisabled(on: boolean): void {
+		if (on === this.canvasMomentumDisabled) return;
+		this.canvasMomentumDisabled = on;
+		this.scrollEl.classList.toggle("handwriting-no-momentum", on);
+		if (on) {
+			this.cancelFling();
+			// Request an immediate stop of any native scroll animation already running.
+			// New touch gestures cannot acquire native pan under touch-action:none.
+			this.scrollEl.scrollTo({ left: this.scrollEl.scrollLeft, top: this.scrollEl.scrollTop, behavior: "instant" });
+		}
+	}
+
 	private beginAssist(e: PointerEvent): void {
 		this.cancelFling(); // a new finger takes over the glide
 		this.assistSamples = [];
@@ -1964,6 +2110,15 @@ export class InlinePenRouter {
 		this.assistLastY = e.clientY;
 		this.assistMoved = 0;
 		this.assistEngaged = false;
+	}
+
+	/** A new camera frame ends old screen-space momentum and touch run-up. */
+	cameraTransformChanged(): void {
+		this.cancelFling();
+		this.assistPointerId = null;
+		this.assistEngaged = false;
+		this.assistSamples = [];
+		this.paroleId = null;
 	}
 
 	private assistMove(e: PointerEvent): boolean {
@@ -1986,8 +2141,8 @@ export class InlinePenRouter {
 			tr("guard", e, "assist pan engaged (transition gesture)");
 		}
 		if (this.assistEngaged) {
-			this.scrollEl.scrollLeft -= dx;
-			this.scrollEl.scrollTop -= dy;
+			this.scrollEl.scrollLeft -= visualToNote(dx, this.scaleProvider());
+			this.scrollEl.scrollTop -= visualToNote(dy, this.scaleProvider());
 			const now = performance.now();
 			this.assistSamples.push({ t: now, x: e.clientX, y: e.clientY });
 			if (this.assistSamples.length > 12) this.assistSamples.shift();
@@ -2015,6 +2170,7 @@ export class InlinePenRouter {
 	 * Cancelled by ANY new pointer contact. The pen always wins instantly.
 	 */
 	private startFling(vx: number, vy: number): void {
+		if (this.canvasMomentumDisabled) return;
 		// The one number a "scrolling feels too fast" report needs: what the
 		// release actually measured. Everything downstream is deterministic
 		// physics, so a bad glide is either a bad velocity here or a surface
@@ -2037,8 +2193,8 @@ export class InlinePenRouter {
 			this.flingVy = s.vy;
 			const beforeL = this.scrollEl.scrollLeft;
 			const beforeT = this.scrollEl.scrollTop;
-			this.scrollEl.scrollLeft = beforeL - s.dx;
-			this.scrollEl.scrollTop = beforeT - s.dy;
+			this.scrollEl.scrollLeft = beforeL - visualToNote(s.dx, this.scaleProvider());
+			this.scrollEl.scrollTop = beforeT - visualToNote(s.dy, this.scaleProvider());
 			const moved =
 				this.scrollEl.scrollLeft !== beforeL || this.scrollEl.scrollTop !== beforeT;
 			// Done when the physics say so, or the scroller is clamped at an
@@ -2190,6 +2346,14 @@ export class InlinePenRouter {
 		// `nibIsLit` (MobileTools.ts) calls it too, so the light and the
 		// grant still cannot disagree.
 		return mouseActsAsPen(e.pointerType, toolIsLit(!this.penOff()), deviceHasNeverSeenAPen());
+	}
+
+	private mouseMayStartOrHover(e: PointerEvent): boolean {
+		return mouseMayStartOrHover(this.mouseActsAsPen(e), this.penOff());
+	}
+
+	private ownedMouseStroke(e: PointerEvent): boolean {
+		return ownedMouseStroke(e.pointerType, e.pointerId, this.activePenId, !this.activeIsPen && !this.activeIsFinger);
 	}
 
 	/**
@@ -2347,7 +2511,7 @@ export class InlinePenRouter {
 				e.stopPropagation();
 				return;
 			}
-			if (d.assistThisGesture && guardEnabled) {
+			if (this.canvasMomentumDisabled || (d.assistThisGesture && guardEnabled)) {
 				this.beginAssist(e);
 				tr("pointerdown", e, "touch (guard held; assist will carry this gesture)");
 			} else {
@@ -2453,7 +2617,7 @@ export class InlinePenRouter {
 		// Mouse: never touched, unless mouse-ink mode is on - then the left
 		// button is a pen tip and other buttons stay native.
 		if (e.pointerType !== "pen") {
-			if (!this.mouseActsAsPen(e) || (e.buttons & 1) === 0) return;
+			if (!this.mouseMayStartOrHover(e) || (e.buttons & 1) === 0) return;
 		}
 		if (this.activePenId !== null) {
 			// one pen at a time
@@ -2652,7 +2816,7 @@ export class InlinePenRouter {
 		// after pen hover is still the pen and must not flash the I-beam.
 		if (
 			e.pointerType === "mouse" &&
-			!mouseInkEnabled() &&
+			!this.mouseMayStartOrHover(e) &&
 			!isPenCompatMouseMove({
 				now: performance.now(),
 				lastPenHoverAt: this.lastPenHoverAt,
@@ -2698,8 +2862,8 @@ export class InlinePenRouter {
 					// 1:1 pan from touchdown, so parole feels like touch slop,
 					// not a dead zone. Seed the velocity window with the down
 					// point so a fast conversion still flings correctly.
-					this.scrollEl.scrollLeft -= e.clientX - this.paroleDownX;
-					this.scrollEl.scrollTop -= e.clientY - this.paroleDownY;
+					this.scrollEl.scrollLeft -= visualToNote(e.clientX - this.paroleDownX, this.scaleProvider());
+					this.scrollEl.scrollTop -= visualToNote(e.clientY - this.paroleDownY, this.scaleProvider());
 					this.assistSamples.push({
 						t: this.paroleDownAt,
 						x: this.paroleDownX,
@@ -2747,7 +2911,7 @@ export class InlinePenRouter {
 			}
 			return;
 		}
-		if (!ownedFinger && e.pointerType !== "pen" && !this.mouseActsAsPen(e)) return;
+		if (!ownedFinger && e.pointerType !== "pen" && !this.ownedMouseStroke(e) && !this.mouseMayStartOrHover(e)) return;
 		if (this.activePenId === null) {
 			// PEN OFF: a hovering pen is not our pen. Everything below this
 			// line is preparation for a claim that is never coming - the palm
@@ -2792,7 +2956,7 @@ export class InlinePenRouter {
 		if (silentLift(e)) {
 			this.silentLiftEnds++;
 			telemetry.bump("inline.penUp.silentLift");
-			tr(e.type, e, "SILENT LIFT, TERMINATES STROKE");
+			tr(e.type, e, "SILENT LIFT, TERMINATES STROKE", undefined, "lifecycle", "silent-lift");
 			this.endPenStroke(e, false);
 			return;
 		}
@@ -2828,7 +2992,7 @@ export class InlinePenRouter {
 			// every stroke. This is the WebKit ink hot path; it is the one
 			// call site that never got the RC4 rule.
 			if (diagnosticsEnabled()) {
-				tr("pointermove", e, `move-fed coalesced=${events.length}`, csOf(events));
+				tr("pointermove", e, `move-fed coalesced=${events.length}`, csOf(events), "sample");
 			}
 			const fed = this.inkFeed.feed(events.map((ce) => ce.timeStamp));
 			const samples: PenSample[] = [];
@@ -2845,9 +3009,10 @@ export class InlinePenRouter {
 					"pointermove",
 					e,
 					`coalesced=${events.length} ` +
-						(samples.length > 0
-							? `INK-FED ${samples.length} sample(s), no rawupdate this session`
-							: "fed nothing (all samples at or below the stroke's high-water mark)")
+					(samples.length > 0
+						? `INK-FED ${samples.length} sample(s), no rawupdate this session`
+						: "fed nothing (all samples at or below the stroke's high-water mark)")
+					, undefined, "annotation"
 				);
 			}
 			if (samples.length > 0) this.cb.onPenRaw(this.smoothed(samples), e);
@@ -2863,7 +3028,7 @@ export class InlinePenRouter {
 			const coalesced =
 				typeof e.getCoalescedEvents === "function" ? e.getCoalescedEvents() : [];
 			const n = coalesced.length > 0 ? coalesced.length : 1;
-			tr("pointermove", e, `coalesced=${n}`, coalesced.length > 0 ? csOf(coalesced) : undefined);
+			tr("pointermove", e, `coalesced=${n}`, coalesced.length > 0 ? csOf(coalesced) : undefined, "sample");
 			this.cb.onPenMove(e, n);
 		} else {
 			this.cb.onPenMove(e, 1);
@@ -2873,7 +3038,7 @@ export class InlinePenRouter {
 	private pointerRawUpdate(e: PointerEvent): void {
 		const ownedFinger =
 			e.pointerType === "touch" && this.activeIsFinger && e.pointerId === this.activePenId;
-		if (!ownedFinger && e.pointerType !== "pen" && !this.mouseActsAsPen(e)) return;
+		if (!ownedFinger && e.pointerType !== "pen" && !this.ownedMouseStroke(e) && !this.mouseMayStartOrHover(e)) return;
 		// Any PEN/MOUSE raw, hover included, proves the channel exists for that
 		// pipeline and keeps its move handler out of the ink business. A direct
 		// touch does not impersonate that hardware capability: finger strokes
@@ -2904,7 +3069,7 @@ export class InlinePenRouter {
 		if (silentLift(e)) {
 			this.silentLiftEnds++;
 			telemetry.bump("inline.penUp.silentLift");
-			tr(e.type, e, "SILENT LIFT, TERMINATES STROKE");
+			tr(e.type, e, "SILENT LIFT, TERMINATES STROKE", undefined, "lifecycle", "silent-lift");
 			this.endPenStroke(e, false);
 			return;
 		}
@@ -2935,7 +3100,7 @@ export class InlinePenRouter {
 					`+${sinceDown.toFixed(1)}ms after down, ${events.length} coalesced spanning ${span.toFixed(1)}ms`
 				);
 			}
-			tr("pointerrawupdate", e, `coalesced=${events.length}`, csOf(events));
+			tr("pointerrawupdate", e, `coalesced=${events.length}`, csOf(events), "sample");
 		}
 		// Through the arbiter like every ink delivery, so a raw flushing the
 		// samples a move already fed (session-first cold strike) drops its
@@ -3004,7 +3169,7 @@ export class InlinePenRouter {
 			}
 			return;
 		}
-		if (e.pointerType !== "pen" && !this.mouseActsAsPen(e)) return;
+		if (e.pointerType !== "pen" && !this.ownedMouseStroke(e)) return;
 		const wasOurs = this.activePenId !== null && e.pointerId === this.activePenId;
 		tr(e.type, e, wasOurs ? "TERMINATES STROKE" : "");
 		if (wasOurs) {

@@ -506,32 +506,41 @@
  * paper, and never a window decal. 28px pitch, the border color at 1px so it
  * stays quiet under ink in both themes.
  */
-body.handwriting-paper-lines .markdown-source-view .cm-scroller {
+/* Palette previews retain their normal pitch independent of note zoom. */
+.handwriting-paper-swatch {
+	--handwriting-paper-pitch: 28px;
+	--handwriting-paper-rule: 1px;
+}
+.handwriting-paper-swatch[data-paper="lines"],
+body.handwriting-paper-lines .markdown-source-view .cm-scroller,
+body [data-handwriting-paper][data-handwriting-paper="lines"] .markdown-source-view .cm-scroller {
 	background-image: repeating-linear-gradient(
 		to bottom,
 		transparent,
-		transparent 27px,
-		var(--background-modifier-border) 27px,
-		var(--background-modifier-border) 28px
+		transparent calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+		var(--background-modifier-border) calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+		var(--background-modifier-border) var(--handwriting-paper-pitch, 28px)
 	);
 	background-attachment: local;
 }
 
-body.handwriting-paper-grid .markdown-source-view .cm-scroller {
+.handwriting-paper-swatch[data-paper="grid"],
+body.handwriting-paper-grid .markdown-source-view .cm-scroller,
+body [data-handwriting-paper][data-handwriting-paper="grid"] .markdown-source-view .cm-scroller {
 	background-image:
 		repeating-linear-gradient(
 			to bottom,
 			transparent,
-			transparent 27px,
-			var(--background-modifier-border) 27px,
-			var(--background-modifier-border) 28px
+			transparent calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) var(--handwriting-paper-pitch, 28px)
 		),
 		repeating-linear-gradient(
 			to right,
 			transparent,
-			transparent 27px,
-			var(--background-modifier-border) 27px,
-			var(--background-modifier-border) 28px
+			transparent calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) var(--handwriting-paper-pitch, 28px)
 		);
 	background-attachment: local, local;
 }
@@ -542,10 +551,110 @@ body.handwriting-paper-grid .markdown-source-view .cm-scroller {
    through the ink. Same 28px pitch as lines and grid so switching between the
    three doesn't shift anything on the page, same border token, same local
    attachment so the dots are paper and not a window decal. */
-body.handwriting-paper-dots .markdown-source-view .cm-scroller {
+.handwriting-paper-swatch[data-paper="dots"],
+body.handwriting-paper-dots .markdown-source-view .cm-scroller,
+body [data-handwriting-paper][data-handwriting-paper="dots"] .markdown-source-view .cm-scroller {
 	background-image: radial-gradient(circle, var(--background-modifier-border) 1px, transparent 1.5px);
 	background-size: 28px 28px;
 	background-attachment: local;
+}
+
+/* The extra attribute specificity lets a note override any global style
+   without !important. Keep gradients on the scroller so theme colors still
+   resolve there. Non-dot overrides also clear a global dot pattern's size. */
+body [data-handwriting-paper][data-handwriting-paper="none"] .markdown-source-view .cm-scroller {
+	background-image: none;
+}
+
+body [data-handwriting-paper]:not([data-handwriting-paper="dots"]) .markdown-source-view .cm-scroller {
+	background-size: auto;
+}
+
+.modal.handwriting-paper-picker {
+	display: flex;
+	flex-direction: column;
+	width: 420px;
+	max-width: calc(100vw - 24px);
+	min-height: 0;
+	max-height: calc(100vh - 24px);
+}
+.handwriting-paper-picker .modal-content {
+	margin-top: 0;
+	min-height: 0;
+	overflow-y: auto;
+}
+.handwriting-paper-picker-note {
+	margin: 0 0 16px;
+	color: var(--text-muted);
+	font-size: var(--font-ui-small, 13px);
+	overflow-wrap: anywhere;
+}
+.handwriting-paper-picker-grid {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 10px;
+}
+.handwriting-paper-picker button.handwriting-paper-tile {
+	display: flex;
+	flex-direction: column;
+	align-items: stretch;
+	height: auto;
+	min-height: 88px;
+	padding: 8px;
+	gap: 8px;
+	border: 2px solid var(--background-modifier-border);
+	border-radius: 8px;
+	background: var(--background-primary);
+	color: var(--text-normal);
+	box-shadow: none;
+	white-space: normal;
+	cursor: pointer;
+}
+.handwriting-paper-picker button.handwriting-paper-tile[data-choice="default"] {
+	grid-column: 1 / -1;
+	flex-direction: row;
+	align-items: center;
+	text-align: left;
+	min-height: 76px;
+}
+.handwriting-paper-tile[data-choice="default"] .handwriting-paper-swatch {
+	width: 80px;
+	flex: 0 0 80px;
+}
+.handwriting-paper-picker button.handwriting-paper-tile[aria-pressed="true"] {
+	border-color: var(--interactive-accent);
+}
+.handwriting-paper-picker button.handwriting-paper-tile:focus-visible {
+	outline: 2px solid var(--text-normal);
+	outline-offset: 2px;
+}
+.handwriting-paper-swatch {
+	display: block;
+	position: relative;
+	height: 56px;
+	border-radius: 4px;
+	background-color: var(--background-secondary);
+}
+.handwriting-paper-check {
+	position: absolute;
+	right: 4px;
+	top: 4px;
+	width: 22px;
+	height: 22px;
+	border-radius: 50%;
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+	text-align: center;
+	line-height: 22px;
+	font-weight: 700;
+}
+.handwriting-paper-tile-label { font-weight: 600; }
+.handwriting-paper-inherited {
+	display: block;
+	margin-top: 3px;
+	font-size: var(--font-ui-smaller, 12px);
+	font-weight: normal;
+	color: var(--text-muted);
 }
 
 /* Toolbar corner (settings): the strip and its collapsed pill are the same
@@ -2215,7 +2324,8 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
  * block), and themes stack more rules on top. Hiding the id is an
  * invariant, so it must win every cascade, same as touch-action above.
  */
-.metadata-property[data-property-key="handwriting-page-id"] {
+.metadata-property[data-property-key="handwriting-page-id"],
+.metadata-property[data-property-key="handwriting-paper"] {
 	display: none !important;
 }
 .metadata-container.handwriting-metadata-id-only {
@@ -2429,10 +2539,11 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
  * whose only cue is a hue is a drag with no cue at all on the devices this
  * plugin is most used on.
  */
-.handwriting-fold-order-row {
+.setting-item.handwriting-fold-order-row {
 	/* The control goes UNDER the name, not into the narrow control column a
 	   settings row would otherwise squeeze it into. */
 	display: block;
+	container-type: inline-size;
 }
 
 /* That column is empty on this row - there is no toggle or dropdown to put in
@@ -2444,10 +2555,17 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
 
 .handwriting-fold-order {
 	margin-top: 12px;
+	width: 100%;
+	min-width: 0;
+	display: grid;
+	grid-template-columns: minmax(0, 1fr);
+	align-items: start;
 }
 
 .handwriting-fold-card {
-	max-width: 600px;
+	box-sizing: border-box;
+	width: fit-content;
+	max-width: 100%;
 	padding: 16px;
 	border: 1px solid var(--background-modifier-border);
 	border-radius: 6px;
@@ -2542,6 +2660,9 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
 }
 
 .handwriting-fold-row {
+	touch-action: none;
+	user-select: none;
+	cursor: grab;
 	display: flex;
 	align-items: center;
 	gap: 8px;
@@ -2693,7 +2814,7 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
 }
 
 .handwriting-fold-cap {
-	margin: 0;
+	margin: 8px 0 0;
 }
 
 .handwriting-fold-foot {
@@ -2728,7 +2849,9 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
 
 /* ---- the preview ---- */
 .handwriting-fold-preview {
-	max-width: 600px;
+	box-sizing: border-box;
+	width: 100%;
+	max-width: 466px;
 	margin-top: 16px;
 	padding: 16px;
 	border: 1px solid var(--background-modifier-border);
@@ -2750,15 +2873,33 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
 	font-size: var(--font-ui-small, 13px);
 }
 
+@container (min-width: 640px) {
+	.handwriting-fold-order {
+		grid-template-columns: fit-content(400px) minmax(0, 1fr);
+		gap: 24px;
+	}
+	.handwriting-fold-preview {
+		margin-top: 0;
+		max-width: 600px;
+		position: sticky;
+		top: 12px;
+	}
+}
+
+.handwriting-fold-preview-live {
+	margin-left: 8px;
+	font-size: var(--font-ui-smaller, 12px);
+	font-weight: normal;
+	color: var(--text-muted);
+}
+
 .handwriting-fold-preview-width {
 	font-variant-numeric: tabular-nums;
 	white-space: nowrap;
 }
 
-/* The stage clips; the pane inside it is the DETECTED width whatever the
-   settings pane can spare, because that width is the measurement the strip
-   folds against. Only the painting is scaled, from the top left so the scaled
-   box still starts where the stage does. */
+/* Layout retains the detected width for folding; painting frames the actual
+   toolbar instead of shrinking the empty space around it. */
 .handwriting-fold-preview-stage {
 	overflow: hidden;
 }
@@ -2774,10 +2915,9 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
 	box-sizing: content-box;
 	height: 156px;
 	transform-origin: top left;
-	border: 1px solid var(--background-modifier-border);
-	border-radius: 10px;
-	background: var(--background-secondary);
-	overflow: hidden;
+	border: 0;
+	background: transparent;
+	overflow: visible;
 }
 
 /* Inert: only the More chevron may be pressed. The host behind this strip
@@ -2812,3 +2952,21 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
 		overflow-x: auto;
 	}
 }
+
+/* The camera changes the viewport, never the normal text wrapping column. */
+.handwriting-note-viewport-pane { overflow: hidden; }
+.cm-editor.handwriting-note-viewport { flex: none !important; max-width: none !important; max-height: none !important; }
+.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-content {
+ box-sizing: border-box !important;
+ width: var(--handwriting-note-column-width) !important;
+ min-width: var(--handwriting-note-column-width) !important;
+ max-width: var(--handwriting-note-column-width) !important;
+ flex: 0 0 var(--handwriting-note-column-width) !important;
+ margin-left: var(--handwriting-note-column-margin-left) !important;
+ margin-right: var(--handwriting-note-column-margin-right) !important;
+}
+.handwriting-note-viewport-controls { position:absolute; top:52px; right:8px; z-index:30; display:flex; gap:2px; padding:3px; border:1px solid var(--background-modifier-border); border-radius:8px; background:var(--background-primary); box-shadow:0 2px 8px #0002; }
+.handwriting-note-viewport-controls button { min-width:30px; height:30px; padding:0 6px; font-size:12px; }
+
+/* Only Infinite Canvas note routers opt in; wheel input remains native. */
+.handwriting-no-momentum { touch-action: none !important; }

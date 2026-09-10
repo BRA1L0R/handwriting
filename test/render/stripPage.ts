@@ -30,6 +30,7 @@ import { PEN_COLORS, HIGHLIGHTER_COLORS } from "../../src/ink/InkColor";
 import type { InkPreset } from "../../src/ink/InkPresets";
 import type { ToolbarCorner } from "../../src/inline/ToolbarCorner";
 import { installObsidianDom } from "./obsidianDom";
+import { setPenToolsMode, type PenToolsMode } from "../../src/inline/PenToolsMode";
 
 const fakeHost = (): MobileToolsHost => ({
 	exec: () => {},
@@ -891,6 +892,13 @@ function buildLeaf(opts: {
  */
 let built: MobileTools | null = null;
 
+function setWritingVisibility(mode: PenToolsMode, inking: boolean, collapsed: boolean): void {
+	if (!built) throw new Error("no leaf has been built");
+	setPenToolsMode(mode);
+	built.setCollapsed(collapsed);
+	built.setInking(inking);
+}
+
 /**
  * Run the clearance a second time, through the same public entry point a
  * settings change would use.
@@ -944,6 +952,7 @@ function clearanceProbe(pane: HTMLElement, collapsed: boolean): ClearanceProbe {
 declare global {
 	interface Window {
 		__hw: {
+			setWritingVisibility: typeof setWritingVisibility;
 			buildStrip: typeof buildStrip;
 			buildLeaf: typeof buildLeaf;
 			buildMobileChrome: typeof buildMobileChrome;
@@ -961,6 +970,7 @@ declare global {
 }
 
 window.__hw = {
+	setWritingVisibility,
 	buildStrip,
 	buildLeaf,
 	buildMobileChrome,

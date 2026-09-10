@@ -41,7 +41,7 @@ describe("the obsolete live-adaptation control is gone without migration", () =>
 	});
 
 	it("leaves both export controls present", () => {
-		expect(main).toContain('name: "Keep exported ink readable"');
+		expect(main).toContain('name: "Ink color when exporting"');
 		expect(main).toContain('name: "Ink color when flattening PDFs"');
 	});
 });

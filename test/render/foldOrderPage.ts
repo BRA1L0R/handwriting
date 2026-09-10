@@ -40,8 +40,11 @@ import {
 } from "../../src/inline/MobileTools";
 import { FoldOrderControl, detectStripWidth } from "../../src/inline/FoldOrderControl";
 import { installObsidianDom } from "./obsidianDom";
+import HandwritingPlugin, { HandwritingSettingTab } from "../../src/main";
 
+let fingerAvailable = false;
 const fakeHost = (): MobileToolsHost => ({
+	fingerInkAvailable: () => fingerAvailable,
 	exec: () => {},
 	setPlacement: () => {},
 	activeTool: () => "pen",
@@ -79,6 +82,10 @@ const fakeHost = (): MobileToolsHost => ({
 });
 
 export interface FoldOrderOptions {
+	realSettings?: boolean;
+	initialOrder?: string[];
+	fingerAvailable?: boolean;
+	corner?: Parameters<MobileTools["setCorner"]>[0];
 	/**
 	 * Whether a REAL strip is up in the editor pane. Alan's toolbar was, so
 	 * both branches of `detectStripWidth` that can win in practice - the
@@ -165,7 +172,9 @@ let saved: string[] = [];
 function buildFoldOrder(opts: FoldOrderOptions): void {
 	installObsidianDom();
 	document.body.innerHTML = "";
-	saved = [];
+	saved = normalizeFoldOrder(opts.initialOrder ?? []);
+	fingerAvailable = opts.fingerAvailable === true;
+	setStripFoldOrder(saved);
 	// No scrollbars: a horizontal scrollbar from the fixed modal would take
 	// width off the workspace and make the two measurements argue.
 	document.documentElement.style.cssText = "overflow:hidden;";
@@ -225,13 +234,30 @@ function buildFoldOrder(opts: FoldOrderOptions): void {
 	document.body.appendChild(modal);
 	const holder = modal.createDiv({ cls: "setting-item handwriting-fold-order-row" });
 
-	control = new FoldOrderControl(holder, {
+	if (opts.realSettings) {
+		const plugin = Object.create(HandwritingPlugin.prototype);
+		plugin.manifest = { version: "1.4.16" };
+		plugin.app = {};
+		plugin.settings = { stripFoldOrder: saved, toolbarCorner: opts.corner ?? "top-right" };
+		plugin.persistSettings = async () => { saved = [...plugin.settings.stripFoldOrder]; };
+		const tab = Object.create(HandwritingSettingTab.prototype);
+		tab.plugin = plugin;
+		const groups = tab.getSettingDefinitions();
+		const find = (items: any[]): any => items.flatMap(item => item.items ? find(item.items) : [item]);
+		const definitions = find(groups);
+		const definition = definitions.find((item: any) => item.name === "Toolbar buttons");
+		holder.createDiv({ cls: "setting-item-info", text: definition.desc });
+		holder.createDiv({ cls: "setting-item-control" });
+		definition.render({ settingEl: holder });
+		control = tab.foldOrder;
+		modal.dataset.separateRecognitionToggle = String(definitions.some((item: any) => item.control?.key === "recognitionStripButtons"));
+	} else control = new FoldOrderControl(holder, {
 		order: () => saved,
 		apply: (order) => {
 			saved = normalizeFoldOrder(order);
 			setStripFoldOrder(saved);
 		},
-		corner: () => "top-right",
+		corner: () => opts.corner ?? "top-right",
 		previewHost: fakeHost(),
 	});
 	root = document.querySelector<HTMLElement>(".handwriting-fold-order");
@@ -545,11 +571,13 @@ declare global {
 			armReflowCounter: typeof armReflowCounter;
 			readReflowCounter: typeof readReflowCounter;
 			resetReflowCounter: typeof resetReflowCounter;
+			savedOrder: () => string[];
 		};
 	}
 }
 
 window.__fold = {
+	savedOrder: () => [...saved],
 	buildFoldOrder,
 	foldProbe,
 	rowWidths,

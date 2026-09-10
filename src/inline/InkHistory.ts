@@ -3,6 +3,8 @@ import { Annotation, Prec, StateEffect, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { Extension } from "@codemirror/state";
 import { InkStroke } from "../ink/Stroke";
+import { diagnosticsEnabled, diagnosticsEpoch } from "../diag/DiagSwitch";
+import { queueUndoPostObservation, recordUndoObservation, undoTraceIdentityForView } from "../diag/UndoHistoryTrace";
 
 /**
  * Ink operations as CodeMirror history citizens.
@@ -223,18 +225,79 @@ export function inkHistorySupport(): Extension {
 		return inverted;
 	}), Prec.highest(EditorView.updateListener.of((update) => {
 		const [tr] = update.transactions;
+		const diagnostic = diagnosticsEnabled();
+		if (diagnostic) {
+			for (const [index, transaction] of update.transactions.entries()) {
+				const userEvent = transaction.isUserEvent("undo") ? "undo" : transaction.isUserEvent("redo") ? "redo" : "other";
+				const inkEffectCount = transaction.effects.filter((effect) => effect.is(inkEffect)).length;
+				recordUndoObservation(undoTraceIdentityForView(update.view.dom), {
+					phase: "transaction",
+					transaction: {
+						sequence: index + 1,
+						count: update.transactions.length,
+						userEvent,
+						docChanged: transaction.docChanged,
+						inkEffectCount,
+						foreignEffectCount: transaction.effects.length - inkEffectCount,
+					},
+				});
+			}
+		}
+		if (diagnostic) {
+			let reason:
+				| "stale-view"
+				| "multiple-transactions"
+				| "no-transaction"
+				| "document-change"
+				| "non-history-transaction"
+				| "no-effects"
+				| "foreign-effects"
+				| null = null;
+			if (update.view.state !== update.state) reason = "stale-view";
+			else if (update.transactions.length !== 1) reason = "multiple-transactions";
+			else if (!tr) reason = "no-transaction";
+			else if (tr.docChanged) reason = "document-change";
+			else if (!(tr.isUserEvent("undo") || tr.isUserEvent("redo"))) reason = "non-history-transaction";
+			else if (tr.effects.length === 0) reason = "no-effects";
+			else if (!tr.effects.every((effect) => effect.is(inkEffect))) reason = "foreign-effects";
+			if (reason) {
+				recordUndoObservation(undoTraceIdentityForView(update.view.dom), { phase: "transaction", guard: { decision: "skip", stage: "observed", reason } });
+				return;
+			}
+		}
+		if (!diagnostic && (update.view.state !== update.state || update.transactions.length !== 1 || !tr ||
+			tr.docChanged || !(tr.isUserEvent("undo") || tr.isUserEvent("redo")) ||
+			tr.effects.length === 0 || !tr.effects.every((effect) => effect.is(inkEffect)))) return;
 		// History bypasses transaction filters. Its effect-only undo still
 		// asks the view to reveal the old text caret, which may be pages away
 		// from the ink. Replace that pending scroll with the current viewport
 		// before the view measures it; no timer or extra history step.
 		// A later listener's transaction takes precedence over this update.
-		if (update.view.state !== update.state || update.transactions.length !== 1 || !tr ||
-			tr.docChanged || !(tr.isUserEvent("undo") || tr.isUserEvent("redo")) ||
-			tr.effects.length === 0 || !tr.effects.every((effect) => effect.is(inkEffect))) return;
+		if (diagnostic) recordUndoObservation(undoTraceIdentityForView(update.view.dom), {
+			phase: "transaction",
+			guard: { decision: "restore", stage: "request", reason: "effect-only-history" },
+		});
 		update.view.dispatch({
 			selection: update.startState.selection,
 			effects: update.view.scrollSnapshot(),
 			annotations: Transaction.addToHistory.of(false),
 		});
+		if (diagnostic) {
+			const view = update.view;
+			const identity = undoTraceIdentityForView(view.dom);
+			const epoch = diagnosticsEpoch();
+			queueUndoPostObservation(identity, epoch, () => ({
+					phase: "post",
+					guard: { decision: "restore", stage: "observed", reason: "effect-only-history" },
+					selection: {
+						from: view.state.selection.main.from,
+						to: view.state.selection.main.to,
+						anchor: view.state.selection.main.anchor,
+						head: view.state.selection.main.head,
+						empty: view.state.selection.main.empty,
+					},
+					scroll: { x: view.scrollDOM.scrollLeft, y: view.scrollDOM.scrollTop, phase: "after", axes: "" },
+			}));
+		}
 	}))];
 }

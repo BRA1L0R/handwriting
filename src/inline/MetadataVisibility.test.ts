@@ -27,6 +27,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { chromium } from "playwright";
 import css from "../../styles.css?raw";
 import { codeOnly } from "../CodeOnly";
 import {
@@ -68,6 +69,29 @@ function root(...containers: HTMLElement[]): ParentNode {
 }
 
 describe("metadata visibility", () => {
+	it.each([["handwriting-paper"], ["handwriting-page-id", "handwriting-paper"]])("hides internal-only rows %j", (...keys) => {
+		const container = metadataContainer(keys);
+		updateMetadataVisibility(root(container.element));
+		expect(container.hasClass()).toBe(true);
+	});
+
+	it.each(["tags", "aliases", "handwriting-text", "handwriting-paper-other", "Handwriting-paper", "", null])("preserves genuine, unknown or unkeyed row %s beside paper", key => {
+		const container = metadataContainer(["handwriting-paper", key]);
+		updateMetadataVisibility(root(container.element));
+		expect(container.hasClass()).toBe(false);
+	});
+
+	it("the shipped CSS hides the exact paper row without hiding user or unknown rows", async () => {
+		const browser = await chromium.launch({ headless: true });
+		try {
+			const page = await browser.newPage();
+			await page.setContent('<div class="metadata-container"><div class="metadata-property" data-property-key="handwriting-paper" style="display:flex">paper</div><div class="metadata-property" data-property-key="tags" style="display:flex">tags</div><div class="metadata-property" data-property-key="handwriting-text" style="display:flex">text</div><div class="metadata-property" data-property-key="handwriting-paper-other" style="display:flex">other</div><div class="metadata-property" style="display:flex">editing</div></div>');
+			await page.addStyleTag({ content: css });
+			const display = await page.locator(".metadata-property").evaluateAll(rows => rows.map(row => getComputedStyle(row).display));
+			expect(display).toEqual(["none", "flex", "flex", "flex", "flex"]);
+		} finally { await browser.close(); }
+	}, 30_000);
+
 	it("uses a maintained class instead of relational selectors", () => {
 		// Both halves against the cascade, for opposite reasons - see the note
 		// at the top of this file.
@@ -119,6 +143,18 @@ describe("metadata visibility", () => {
 });
 
 describe("the empty shell a hidden id row leaves behind", () => {
+	it.each([["handwriting-paper"], ["handwriting-page-id", "handwriting-paper"]])("hides a rowless internal-only block %j", (...keys) => {
+		const empty = metadataContainer([]);
+		updateMetadataVisibility(root(empty.element), () => keys);
+		expect(empty.hasClass()).toBe(true);
+	});
+
+	it.each(["tags", "handwriting-text", "handwriting-paper-other", "Handwriting-paper", ""]) ("keeps rowless paper plus unknown/user key %s visible", key => {
+		const empty = metadataContainer([]);
+		updateMetadataVisibility(root(empty.element), () => ["handwriting-paper", key]);
+		expect(empty.hasClass()).toBe(false);
+	});
+
 	// Obsidian hides the id ROW itself (the property is registered hidden),
 	// so on vaults that show properties in the document the container renders
 	// with zero rows. Reproduced on stock 1.13.7 in a fresh vault, first

@@ -119,14 +119,14 @@ describe("narrowing the window moves the fold line", () => {
 				const narrow = await h.probe();
 				// Cannot fail open: the sweep really does cross the fold.
 				expect(wide.previewSecondRow).toHaveLength(0);
-				expect(wide.caption).toBe("Everything fits on the screen.");
+				expect(wide.caption).toBe("Drag to order. Everything fits on the screen.");
 				expect(narrow.previewSecondRow.length).toBeGreaterThan(0);
 				// THE REPORTED SYMPTOM. The line is drawn from
 				// `--handwriting-fold-keep`, so this is the number that has to
 				// move, and `lineTop` is where the engine actually put it.
 				expect(Number(narrow.keep)).toBeLessThan(Number(wide.keep));
 				expect(narrow.lineTop).toBeLessThan(wide.lineTop);
-				expect(narrow.caption).not.toBe("Everything fits on the screen.");
+				expect(narrow.caption).toBe("Drag to order. Buttons below this line will collapse when window narrows.");
 			} finally {
 				await h.close();
 			}

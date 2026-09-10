@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	DIAG_OFF_NOTE,
 	diagnosticsEnabled,
+	diagnosticsEpoch,
 	endRecordingForReport,
 	setDiagnosticsChangedListener,
 	setDiagnosticsEnabled,
@@ -99,5 +100,16 @@ describe("every way the switch flips reports itself", () => {
 		setDiagnosticsEnabled(false); // already off
 		endRecordingForReport(); // nothing recording
 		expect(flips).toBe(0);
+	});
+
+	it("starts a new recording epoch on each off-to-on transition", () => {
+		setDiagnosticsEnabled(false);
+		const before = diagnosticsEpoch();
+		setDiagnosticsEnabled(true);
+		const first = diagnosticsEpoch();
+		setDiagnosticsEnabled(false);
+		setDiagnosticsEnabled(true);
+		expect(first).toBe(before + 1);
+		expect(diagnosticsEpoch()).toBe(first + 1);
 	});
 });

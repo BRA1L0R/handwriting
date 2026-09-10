@@ -124,3 +124,27 @@ describe("inline pen release filtering", () => {
 		expect(stroke!.points.map((point) => point.x)).toEqual([0, 10, 25]);
 	});
 });
+
+describe("non-finishing release-filtered snapshots", () => {
+ it("owns deep points including retained pressure and tilt, without consuming the builder", () => {
+  const b = new StrokeBuilder("pen", "#123456", 2);
+  b.start(1000); b.add(0,0,0.4,1000,10,20); b.add(10,0,0.5,1010,30,40);
+  const before = b.pointCount;
+  const snapshot = b.snapshotReleaseFiltered();
+  b.add(10,0,0.9,1020,50,60);
+  expect(snapshot[0]!.points[1]!.pressure).toBe(0.5);
+  snapshot[0]!.points[0]!.x = 99;
+  expect(b.finishReleaseFiltered()[0]!.points[0]!.x).toBe(0);
+  expect(b.pointCount).toBe(before);
+  b.add(20,0,0.5,1030);
+  expect(b.finishReleaseFiltered()[0]!.points).toHaveLength(3);
+ });
+ it("uses the same release groups and profile as lift", () => {
+  const b = new StrokeBuilder("pen", "#123456", 2);
+  b.start(0); b.add(0,0,0.4,0); b.add(10,0,0.4,10); b.add(20,0,0.01,20); b.add(30,0,0.01,30); b.add(40,0,0.5,40);
+  const snapshot=b.snapshotReleaseFiltered(), final=b.finishReleaseFiltered();
+  expect(snapshot).toHaveLength(2);
+  expect(snapshot.map(s=>[s.points,s.width,s.pressureProfile])).toEqual(final.map(s=>[s.points,s.width,s.pressureProfile]));
+  expect(snapshot[0]!.points[0]).not.toBe(final[0]!.points[0]);
+ });
+});

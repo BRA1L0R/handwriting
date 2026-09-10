@@ -34,6 +34,7 @@ import {
 	penSeenThisSession,
 	releaseMouseInkQuietly,
 	resetPenToolsForTest,
+	setPenToolsMode,
 	restorePenHardwareEverSeen,
 } from "./PenToolsMode";
 import {
@@ -49,6 +50,8 @@ import {
 	toolPickedHere,
 } from "./MouseInk";
 import { penInkEnabled, resetPenInkForTest, setPenInk } from "./PenInk";
+import { penOnOff } from "./PenCommand";
+import { PdfInkController } from "../pdf/PdfInkController";
 
 /**
  * Obsidian's real `setIcon` APPENDS an svg to the parent; it does not clear
@@ -89,6 +92,33 @@ vi.mock("obsidian", async (importOriginal) => {
  * inside the test, where it reads as setup rather than as inheritance.
  */
 beforeEach(() => clearToolPicked());
+
+describe("toolbar visibility while writing", () => {
+	beforeEach(() => resetPenToolsForTest());
+
+	it("updates existing strip and collapsed pill between Auto and On without input commands", () => {
+		const pane = new FakeEl("div", new FakeDoc());
+		const exec = vi.fn();
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ exec }));
+		const toolbar = pane.querySelector(".handwriting-mobile-tools")!;
+		const pill = pane.querySelector(".handwriting-pen-pill")!;
+		strip.setInking(true);
+		for (const el of [toolbar, pill]) expect(el.classes.has("is-inking")).toBe(true);
+		setPenToolsMode("show");
+		for (const el of [toolbar, pill]) expect(el.classes.has("is-inking")).toBe(false);
+		strip.setInking(true);
+		for (const el of [toolbar, pill]) expect(el.classes.has("is-inking")).toBe(false);
+		setPenToolsMode("auto");
+		for (const el of [toolbar, pill]) expect(el.classes.has("is-inking")).toBe(true);
+		strip.setInking(false);
+		for (const el of [toolbar, pill]) expect(el.classes.has("is-inking")).toBe(false);
+		expect(exec).not.toHaveBeenCalled();
+		strip.destroy();
+		const afterDestroy = vi.spyOn(strip, "setInking");
+		setPenToolsMode("show");
+		expect(afterDestroy).not.toHaveBeenCalled();
+	});
+});
 
 /**
  * nibIsLit is the pure seam that fell out of splitting the light's predicate
@@ -486,7 +516,9 @@ describe("MobileTools: iPhone finger entry", () => {
 			"handwriting:pen-ink-toggle",
 			"handwriting:inline-tool-pen",
 			"handwriting:pen-ink-toggle",
+			"handwriting:pen-ink-toggle",
 			"handwriting:inline-tool-highlighter",
+			"handwriting:pen-ink-toggle",
 		]);
 		expect(focused).toEqual([true, false, true, false]);
 	});
@@ -2460,6 +2492,89 @@ describe("MobileTools: the put-down works on a pen-less device with nothing arme
  * keyboard, so the three things worth pinning are where it sits, when it
  * lights, and the focus call that only a click can make.
  */
+describe("MobileTools: a paused tool click resumes that tool", () => {
+	beforeEach(() => {
+		resetPenInkForTest();
+		resetPenToolsForTest();
+		markPenHardwareSeen();
+	});
+	afterEach(() => resetPenInkForTest());
+	const tools = [
+		["pen", "Pen"], ["highlighter", "Highlighter"], ["eraser", "Eraser"],
+		["lasso", "Lasso"], ["space", "Insert space"], ["pan", "Pan"],
+	] as const;
+	for (const [tool, label] of tools) {
+		for (const [pointerType, mousePreference] of [
+			["mouse", false], ["mouse", true], ["pen", false],
+			["pen", true], ["touch", false], ["touch", true],
+		] as const) {
+			for (const alreadySelected of [false, true]) {
+				it(`${pointerType} selects ${tool} from Keyboard, previously selected=${alreadySelected}, mouse preference=${mousePreference}`, () => {
+					const pane = new FakeEl("div", new FakeDoc());
+					let selected: string = alreadySelected ? tool : tool === "pen" ? "highlighter" : "pen";
+					const rememberedNib = selected === "highlighter" ? "highlighter" : "pen";
+					let nib = rememberedNib;
+					const focused: boolean[] = [];
+					const disarm = vi.fn();
+					let mouseOn = mousePreference;
+					const arm = vi.fn(() => { mouseOn = true; });
+					const exec = (id: string) => {
+						if (id === "handwriting:pen-ink-toggle") setPenInk(!penInkEnabled());
+						else if (id === "handwriting:inline-tool-pen") penOnOff({
+							tool: () => nib, tipMode: () => selected !== "pen" && selected !== "highlighter",
+							pickPen: () => { selected = "pen"; nib = "pen"; markToolPicked(); }, afterFlip: () => {},
+						});
+						else if (id === "handwriting:inline-tool-highlighter") { selected = "highlighter"; nib = "highlighter"; markToolPicked(); }
+						else if (id.startsWith("handwriting:inline-tool-")) {
+							const target = id.slice("handwriting:inline-tool-".length);
+							selected = selected === target ? nib : target;
+							markToolPicked();
+						}
+					};
+					// Exercise the actual PDF dispatch between the shared toolbar
+					// listener and commands, without mounting a synthetic viewer.
+					const pdf = new PdfInkController(
+						pane as unknown as HTMLElement, pane.ownerDocument.defaultView as unknown as Window,
+						() => [], () => null, () => [], () => {}, exec, () => {},
+					);
+					const dispatch = pdf as unknown as { stripExec(id: string): void };
+					const host = fakeHost({
+						exec: (id) => dispatch.stripExec(id), activeTool: () => nib,
+						eraserOn: () => selected === "eraser", lassoOn: () => selected === "lasso",
+						spaceOn: () => selected === "space", panOn: () => selected === "pan",
+						mouseInkOn: () => mouseOn, armMouseInkQuietly: arm, disarmMouseInkQuietly: disarm,
+						setEditorFocus: (on) => { focused.push(on); },
+					});
+					setPenInk(false);
+					const strip = new MobileTools(pane as unknown as HTMLElement, host);
+					pane.findByTipLabel(label)!.fire("click", { pointerType });
+					expect(penInkEnabled(), "tool click left Keyboard pause enabled").toBe(true);
+					expect(selected).toBe(tool);
+					expect(focused).toEqual([false]);
+					expect(disarm).not.toHaveBeenCalled();
+						expect(arm).toHaveBeenCalledTimes(pointerType === "mouse" && !mousePreference ? 1 : 0);
+						expect(host.mouseInkOn()).toBe(mousePreference || pointerType === "mouse");
+					if (tool !== "pen" && tool !== "highlighter") expect(nib).toBe(rememberedNib);
+					pane.findByTipLabel("Keyboard mode (pen input off)")!.fire("click", { pointerType });
+					expect(penInkEnabled()).toBe(false);
+					expect(selected).toBe(tool);
+					strip.destroy();
+				});
+			}
+		}
+	}
+	it("Undo does not leave Keyboard mode", () => {
+		const pane = new FakeEl("div", new FakeDoc());
+		const exec = vi.fn();
+		setPenInk(false);
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ canUndo: () => true, exec }));
+		pane.findByTipLabel("Undo")!.fire("click", { pointerType: "mouse" });
+		expect(penInkEnabled()).toBe(false);
+		expect(exec).toHaveBeenCalledExactlyOnceWith("editor:undo");
+		strip.destroy();
+	});
+});
+
 describe("MobileTools: the Keyboard button hands the note to the keyboard", () => {
 	beforeEach(() => {
 		resetPenToolsForTest();
@@ -2751,19 +2866,15 @@ describe("MobileTools: the Keyboard button hands the note to the keyboard", () =
 });
 
 /**
- * THE REGRESSION THIS FIX COULD HAVE CAUSED, pinned rather than reasoned
- * about: a device that has NEVER seen a pen must draw with the mouse exactly
- * as it did before 2026-09-06.
+ * Keyboard mode is an overarching pause for mouse drawing too. A device that
+ * has NEVER seen a pen must resume its derived mouse grant when the mode ends.
  *
  * On that device the mouse's grant is DERIVED from the lit tool
  * (`mouseDrawsFromLitTool`, MouseInk.ts - alan's addendum to "button should
  * become the truth": a pen-less machine has nothing else for the mouse to be),
  * and the strip's light and the router's grant reach it through one shared
- * function so they cannot disagree. Darkening the light is therefore one
- * careless edit away from taking a pen-less user's ink with it, and the
- * careless edit has a name: wrapping `h.penInksHere()` around the WHOLE of
- * `nibIsLit` instead of around its pen disjunct. That is why the fix gates
- * `penDrawsHere` only.
+ * function so they cannot disagree. The Keyboard pause gates the complete
+ * mouse draw predicate while leaving the explicit preference untouched.
  *
  * FALSIFIABILITY, stated plainly because it is not the usual answer: these
  * assertions are GREEN on the code before the fix as well as after, by
@@ -2774,7 +2885,7 @@ describe("MobileTools: the Keyboard button hands the note to the keyboard", () =
  * composes it (InlinePenRouter.ts, its one call site), so this is the router's
  * real answer and not a restatement of it.
  */
-describe("MobileTools: keyboard mode leaves a pen-less device's mouse ink alone", () => {
+describe("MobileTools: keyboard mode pauses and resumes a pen-less device's mouse ink", () => {
 	beforeEach(() => {
 		resetPenToolsForTest();
 		resetPenInkForTest();
@@ -2813,18 +2924,12 @@ describe("MobileTools: keyboard mode leaves a pen-less device's mouse ink alone"
 		expect(mouseDraws()).toBe(true);
 	});
 
-	it("leaves the light lit for a pen-less user whose mouse ink is armed BY NAME, keyboard mode or not", () => {
-		// The case the wrong fix breaks, and the inverse lie the ruling
-		// forbids just as loudly: `mouseActsAsPen`'s explicit `enabled` half
-		// is not gated on pen input anywhere - every `penOff()` site in
-		// InlinePenRouter.ts is `pointerType === "pen" && penOff()` - so this
-		// mouse really does still draw in keyboard mode, and a dark button
-		// beside a drawing mouse is "dark and drawing", the exact inverse of
-		// the symptom being fixed.
+	it("pauses the armed mouse nib in Keyboard mode while preserving its stored arm", () => {
 		const host = fakeHost({ activeTool: () => "pen", mouseInkOn: () => true });
 		expect(nibIsLit(host, "pen")).toBe(true);
 		setPenInk(false);
-		expect(nibIsLit(host, "pen"), "keyboard mode darkened an armed mouse's nib").toBe(true);
+		expect(nibIsLit(host, "pen"), "keyboard mode must pause an armed mouse's nib").toBe(false);
+		expect(host.mouseInkOn()).toBe(true);
 	});
 });
 

@@ -38,7 +38,7 @@ function makeRig() {
 	const win = { requestAnimationFrame, cancelAnimationFrame };
 
 	const hostStyles: Record<string, string> = {};
-	const host = {
+	const host = { clientWidth: 640, clientHeight: 480,
 		ownerDocument: { defaultView: win },
 		style: {
 			removeProperty(name: string): void {
@@ -56,8 +56,10 @@ function makeRig() {
 	};
 
 	const overlay = Object.create(InkOverlayPlugin.prototype) as Fields;
-	overlay.view = { dom: host, scrollDOM: scroller };
+	const requestMeasure = vi.fn();
+	overlay.view = { dom: host, scrollDOM: scroller, requestMeasure };
 	overlay.container = {};
+ overlay.frame = { locked: false }; overlay.cssScale = 1; overlay.fontZoom = 1;
 	overlay.pinchScaleNow = 1;
 	overlay.pinchRasterScale = 1;
 	overlay.pinchRefScale = null;
@@ -70,6 +72,15 @@ function makeRig() {
 	// than run because canvas allocation/repaint is outside this reproduction.
 	const handleResize = vi.fn();
 	overlay.handleResize = handleResize;
+	// This test owns coalescing/final raster settlement, not browser layout.
+	// The production transaction and loading guard are exercised mounted.
+	overlay.getNoteViewportState = () => ({ busy: false });
+	overlay.commitCameraScale = (next: number) => {
+		overlay.pinchScaleNow = next;
+		overlay.cssScale = next;
+		host.setCssStyles({ transform: `scale(${next})`, transformOrigin: "0 0" });
+		return true;
+	};
 
 	const prototype = InkOverlayPlugin.prototype as unknown as OverlayPrototype;
 	const onPinch = (phase: Phase, ratio: number, centroid: Point): void =>
@@ -92,6 +103,7 @@ function makeRig() {
 		scroll: () => ({ left: scroller.scrollLeft, top: scroller.scrollTop }),
 		hostStyles,
 		handleResize,
+		requestMeasure,
 		cancelAnimationFrame,
 	};
 }
@@ -106,6 +118,7 @@ describe("InkOverlay pinch end with a coalesced move still pending", () => {
 		rig.runNextFrame();
 		expect(rig.scale()).toBe(2);
 		expect(rig.handleResize).not.toHaveBeenCalled();
+		expect(rig.requestMeasure).not.toHaveBeenCalled();
 
 		// This move is newer than the frame that applied scale 2.  Lift before
 		// its requested frame runs: pinch end itself owes scale 3 and one settle.
@@ -119,6 +132,7 @@ describe("InkOverlay pinch end with a coalesced move still pending", () => {
 			"scale(3)"
 		);
 		expect.soft(rig.handleResize, "pinch end never settled/recomputed extent").toHaveBeenCalledTimes(1);
+		expect(rig.requestMeasure).toHaveBeenCalledTimes(1);
 		expect(rig.scroll().left, "the final frame lost the gesture-start x anchor").toBeCloseTo(
 			78.6666667,
 			7
@@ -144,6 +158,7 @@ describe("InkOverlay pinch end with a coalesced move still pending", () => {
 		expect(rig.rasterScale()).toBe(2);
 		expect(rig.hostStyles.transform).toBe("scale(2)");
 		expect(rig.handleResize).toHaveBeenCalledTimes(1);
+		expect(rig.requestMeasure).toHaveBeenCalledTimes(1);
 		expect(rig.pendingFrames()).toBe(0);
 		expect(rig.cancelAnimationFrame).not.toHaveBeenCalled();
 	});

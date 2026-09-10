@@ -90,13 +90,6 @@ const ROW_GAP = 4;
 const ROW_STEP = ROW_HEIGHT + ROW_GAP;
 
 /**
- * The preview pane's height. Tall enough for the strip, its second row when
- * the chevron is open, and enough page above them to read as a pane rather
- * than as a floating row of buttons.
- */
-const PREVIEW_HEIGHT = 156;
-
-/**
  * The list the user reads, from the order the strip folds in.
  *
  * TWO DIRECTIONS, ONE REVERSAL, and both are named because every defect this
@@ -126,13 +119,8 @@ export function foldOrderFromPriority(priority: readonly string[]): string[] {
  * terms of the button he can see.
  */
 export function moreCaption(behind: number): string {
-	if (behind === 0) return "Everything fits on the screen.";
-	// The ruled sentence is "these N are behind More", written for an N of two
-	// or more; at one it reads "these 1 are", which is not English. Of the two
-	// singulars Alan offered - "this 1 is behind More" and "1 is behind More" -
-	// this is the plainer, and it is pinned rather than left to taste.
-	if (behind === 1) return "On a small screen, 1 is behind More.";
-	return `On a small screen, these ${behind} are behind More.`;
+	if (behind === 0) return "Drag to order. Everything fits on the screen.";
+	return "Drag to order. Buttons below this line will collapse when window narrows.";
 }
 
 /** What one row's position means, for the screen reader that cannot see it. */
@@ -307,6 +295,7 @@ export class FoldOrderControl {
 	private readonly widthLabel: HTMLElement;
 	private readonly stage: HTMLElement;
 	private readonly previewPane: HTMLElement;
+	private previewScale = 1;
 	private readonly rows = new Map<string, HTMLElement>();
 
 	/** The list as it reads, top-down. Always a mirror of the saved setting. */
@@ -401,7 +390,8 @@ export class FoldOrderControl {
 		// ---- the preview -------------------------------------------------
 		const preview = this.root.createDiv({ cls: "handwriting-fold-preview" });
 		const head = preview.createDiv({ cls: "handwriting-fold-preview-head" });
-		head.createSpan({ cls: "handwriting-fold-preview-title", text: "Preview" });
+		const title = head.createSpan({ cls: "handwriting-fold-preview-title", text: "Preview" });
+		title.createSpan({ cls: "handwriting-fold-preview-live", text: "Live" });
 		this.widthLabel = head.createSpan({ cls: "handwriting-fold-preview-width" });
 		this.stage = preview.createDiv({ cls: "handwriting-fold-preview-stage" });
 		this.previewPane = this.stage.createDiv({ cls: "handwriting-fold-preview-pane" });
@@ -476,7 +466,7 @@ export class FoldOrderControl {
 			text: face.label,
 			attr: { title: face.label },
 		});
-		grip.addEventListener("pointerdown", (ev: PointerEvent) => this.startDrag(ev, row, grip));
+		row.addEventListener("pointerdown", (ev: PointerEvent) => this.startDrag(ev, row, grip));
 		grip.addEventListener("keydown", (ev: KeyboardEvent) => this.gripKey(ev, face.commandId));
 		return row;
 	}
@@ -613,8 +603,7 @@ export class FoldOrderControl {
 		if (from < 0) return;
 		// Without this a touch drag scrolls the settings pane instead, and a
 		// mouse drag selects the row's text. `touch-action: none` in the
-		// stylesheet is on the GRIP alone for the same reason: the list itself
-		// must still scroll under a finger.
+		// stylesheet covers the row; space outside the rows still scrolls.
 		ev.preventDefault();
 		// `preventDefault` above is what stops the grip taking focus, so the
 		// two reorder paths did not compose: drag a row with the mouse, press
@@ -667,7 +656,7 @@ export class FoldOrderControl {
 	private readonly onDragEnd = (ev: PointerEvent): void => {
 		const d = this.drag;
 		if (!d || ev.pointerId !== d.pointerId) return;
-		this.endDrag(d.to);
+		this.endDrag(ev.type === "pointercancel" ? d.from : d.to);
 	};
 
 	/**
@@ -765,6 +754,7 @@ export class FoldOrderControl {
 		this.foldCap.setText(moreCaption(folded.length));
 		this.syncMoreOpen(folded.length > 0);
 		this.sealPreview();
+		this.fit();
 		this.priority.forEach((id, i) => {
 			const row = this.rows.get(id);
 			if (!row) return;
@@ -832,7 +822,6 @@ export class FoldOrderControl {
 				// the second row's contents have just changed.
 				this.strip?.applyFoldOrder();
 			}
-			this.fit();
 			this.refold();
 		} finally {
 			this.measuring = false;
@@ -840,8 +829,8 @@ export class FoldOrderControl {
 	}
 
 	/**
-	 * Scale the preview down when the detected width will not fit the pane the
-	 * settings tab has.
+	 * Frame the toolbar itself, leaving empty detected-pane space out of the
+	 * scale calculation so a wide editor does not make its preview tiny.
 	 *
 	 * The pane stays EXACTLY the detected width in layout - that is what the
 	 * strip measures, and a strip measuring the settings pane's width would
@@ -851,9 +840,20 @@ export class FoldOrderControl {
 	 */
 	private fit(): void {
 		const room = this.stage.clientWidth;
-		const k = room > 0 && this.width > room ? room / this.width : 1;
-		this.previewPane.setCssStyles({ transform: k < 1 ? `scale(${k})` : "" });
-		this.stage.setCssStyles({ height: `${Math.round(PREVIEW_HEIGHT * k)}px` });
+		const strip = this.previewPane.querySelector<HTMLElement>(".handwriting-mobile-tools");
+		if (!strip || room <= 0 || strip.offsetWidth <= 0) return;
+		const padding = 8;
+		const k = Math.min(1, room / (strip.offsetWidth + 2 * padding));
+		// Include the strip's own corner transform (e.g. middle-center).
+		const paneBox = this.previewPane.getBoundingClientRect();
+		const stripBox = strip.getBoundingClientRect();
+		const left = (stripBox.left - paneBox.left) / this.previewScale;
+		const top = (stripBox.top - paneBox.top) / this.previewScale;
+		const x = (room - strip.offsetWidth * k) / 2 - left * k;
+		const y = (padding - top) * k;
+		this.previewPane.setCssStyles({ transform: `translate(${x}px, ${y}px) scale(${k})` });
+		this.previewScale = k;
+		this.stage.setCssStyles({ height: `${Math.ceil((strip.offsetHeight + 2 * padding) * k)}px` });
 	}
 
 	private readonly onWindowResize = (): void => this.measure();

@@ -25,7 +25,33 @@ import {
 	fontZoomFactor,
 	noteToVisual,
 	visualToNote,
+	ownedEffectiveScale,
+	validCameraScale,
 } from "./ZoomScale";
+
+describe("owned camera scale provenance", () => {
+	it("recombines external CSS with owned zoom without clamping the inverse", () => {
+		for (const owned of [.0001, .04, .25, 1, 4]) for (const external of [.5, 1, 1.5, 2]) {
+			const scale = ownedEffectiveScale({visualWidth: 1000 * owned * external, layoutWidth: 1000}, owned)!;
+			expect(scale).toBeCloseTo(owned * external, 12);
+			expect(visualToNote(120, scale)).toBeCloseTo(120 / (owned * external), 8);
+			expect(noteToVisual(visualToNote(120, scale), scale)).toBeCloseTo(120, 10);
+		}
+	});
+	it("defers hidden or invalid geometry even when CM reports a cached scale", () => {
+		for (const width of [0, -1, NaN, Infinity])
+			expect(ownedEffectiveScale({visualWidth: width, layoutWidth: 1000, cmScaleX: 2}, .04)).toBeNull();
+		expect(ownedEffectiveScale({visualWidth: 40, layoutWidth: 0}, .04)).toBeNull();
+		expect(ownedEffectiveScale({visualWidth: 40, layoutWidth: 1000}, 0)).toBeNull();
+		expect(ownedEffectiveScale({visualWidth: 1, layoutWidth: 1000}, 1)).toBeNull();
+		expect(ownedEffectiveScale({visualWidth: 40, layoutWidth: 1000}, .04)).toBe(.04);
+	});
+	it("rejects unrepresentable transforms rather than inventing a floor", () => {
+		for (const scale of [0, -1, NaN, Infinity, Number.MIN_VALUE, 1e300]) expect(validCameraScale(scale, 640, 480)).toBe(false);
+		expect(validCameraScale(.0001, 640, 480)).toBe(true);
+		expect(validCameraScale(1e-20, 640, 480)).toBe(false);
+	});
+});
 
 describe("effectiveScale", () => {
 	it("is 1 when layout and visual agree (no zoom, and Electron page zoom)", () => {

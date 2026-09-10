@@ -291,6 +291,7 @@ function makeRig(): Rig {
 			view.builder = builder;
 			view.mode = "ink";
 			view.mouseStroke = mouse;
+			view.strokePenGesture = !mouse;
 			const last = points[points.length - 1]!;
 			view.rawLastMoveX = last[0];
 			view.rawLastMoveY = last[1];
@@ -331,19 +332,12 @@ afterEach(() => {
 	vi.useRealTimers();
 });
 
-describe("the pen's dwell snap is untouched", () => {
-	it("still replaces a held pen stroke with the fitted figure", () => {
+describe("pen lift without a displayed preview", () => {
+	it("keeps freehand even after a long hold", () => {
 		const rig = makeRig();
 		rig.draw({ points: LINE, mouse: false, dwell: true });
-
-		// Two ops, exactly as `snapHistoryOps` has published them since the
-		// 1.2.0 fix: the stroke landed, then the snap replaced it.
-		expect(rig.ops.map((o) => o.type)).toEqual(["add", "replace"]);
-		// And what is in the note is the recognizer's synthesized line, not
-		// the 16 points that were drawn.
-		expect(stored()).toHaveLength(1);
-		expect(stored()[0]!.points.length).toBeGreaterThan(LINE.length);
-		// A pen is never offered a chip: its snap already happened.
+		expect(rig.ops.map(o => o.type)).toEqual(["add"]);
+		expect(shapeOf(stored()[0]!)).toEqual(LINE);
 		expect(rig.chip()).toBe(null);
 	});
 });

@@ -24,12 +24,13 @@ import {
 } from "../../src/inline/InkOverlay";
 import {
 	clearGatedCommandActions,
+	runGatedCommand,
 	setRetiredCommandAction,
 } from "../../src/CommandPaletteSplit";
-import { clearToolPicked, toolPickedHere } from "../../src/inline/MouseInk";
+import { clearToolPicked, mouseInkEnabled, setMouseInk, toolPickedHere } from "../../src/inline/MouseInk";
 import { PEN_INK_TOGGLE } from "../../src/inline/MobileTools";
 import { type PenCommandHost, penOnOff, togglePenInput } from "../../src/inline/PenCommand";
-import { penInkEnabled, resetPenInkForTest } from "../../src/inline/PenInk";
+import { penInkEnabled, resetPenInkForTest, setPenInk } from "../../src/inline/PenInk";
 import {
 	penHardwareSeen,
 	markPenSeen,
@@ -117,6 +118,28 @@ export interface FingerLifecycleTrace {
 		storeAfterLateUp: number;
 		freshDownPrevented: boolean;
 		storeAfterFreshTouch: number;
+		mousePreferenceBefore: boolean;
+		mousePreferenceAfterClick: boolean;
+		mouseNibBefore: string;
+		mouseNibAfterClick: string;
+		mouseStrokeBeforeKeyboard: number;
+		mouseDownPrevented: boolean;
+		mouseUpPrevented: boolean;
+		mouseLateUpPrevented: boolean;
+		mouseStoreAfterClick: number;
+		mouseFreshDownPrevented: boolean;
+		mouseFreshStore: number;
+		mouseHeldStoreAfterCommand: number;
+		mouseHeldRouterStrokingAfterCommand: boolean;
+		mouseHeldStoreAfterUp: number;
+		mouseHeldRouterStrokingAfterUp: boolean;
+		mousePostHeldDownPrevented: boolean;
+		mousePostHeldStore: number;
+		mouseHoverClassWhilePaused: boolean;
+		mousePreferenceAfterResume: boolean;
+		mouseNibAfterResume: string;
+		mouseResumeDownPrevented: boolean;
+		mouseResumeStore: number;
 	};
 	reentry: {
 		mounted: boolean;
@@ -157,7 +180,7 @@ const commandHost: PenCommandHost = {
 	},
 	afterFlip: (on) => {
 		// This is the shipped main.ts fan-out, in the shipped order.
-		endLiveStrokesEverywhere();
+		endLiveStrokesEverywhere(!on);
 		if (on || shouldRaiseStripOnPenOff(penHardwareSeen())) markPenSeen();
 		refreshPenToolsAll();
 		refreshAllStrips();
@@ -168,6 +191,7 @@ const commandHost: PenCommandHost = {
 function resetSession(): void {
 	for (const path of ALL_PATHS) inlineInk.handleDelete(path);
 	clearGatedCommandActions();
+	setMouseInk(false);
 	resetPenInkForTest();
 	resetPenToolsForTest();
 	clearToolPicked();
@@ -220,6 +244,10 @@ async function mount(path: string): Promise<MountedNote> {
 					setInlineLassoMode(false);
 					setInlineSpaceMode(false);
 					setInlinePanMode(false);
+					return true;
+				}
+				if (id === PEN_INK_TOGGLE) {
+					togglePenInput(commandHost);
 					return true;
 				}
 				return false;
@@ -275,6 +303,29 @@ function touch(
 		clientY: y,
 		buttons,
 		pressure: buttons === 0 ? 0 : 0.87,
+	});
+	target.dispatchEvent(event);
+	return event;
+}
+
+function mouse(
+	target: HTMLElement,
+	type: string,
+	pointerId: number,
+	x: number,
+	y: number,
+	buttons: number
+): PointerEvent {
+	const event = new PointerEvent(type, {
+		bubbles: true,
+		cancelable: true,
+		pointerType: "mouse",
+		pointerId,
+		isPrimary: true,
+		clientX: x,
+		clientY: y,
+		buttons,
+		pressure: buttons === 0 ? 0 : 0.5,
 	});
 	target.dispatchEvent(event);
 	return event;
@@ -445,26 +496,123 @@ async function keyboardTrace(): Promise<FingerLifecycleTrace["keyboard"]> {
 		if (keyboard) pressToolbarButton(keyboard);
 		await settle();
 		const storeAfterClick = inlineInk.strokes(PATH_KEYBOARD).length;
+		const historyAfterClick = undoDepth(note.view.state);
 		touch(note.view.contentDOM, "pointerup", 31, 130, 185, 0);
 		await settle();
 		const storeAfterLateUp = inlineInk.strokes(PATH_KEYBOARD).length;
 		const freshDown = touch(note.view.contentDOM, "pointerdown", 32, 90, 170, 1);
 		touch(note.view.contentDOM, "pointerup", 32, 90, 170, 0);
 		await settle();
+		const storeAfterFreshTouch = inlineInk.strokes(PATH_KEYBOARD).length;
+		const penInkAfterClick = penInkEnabled();
+		const toolPickedAfterClick = toolPickedHere();
+		const editorFocused = note.view.hasFocus;
+		const keyboardRunsAfterTouch = keyboardRuns;
+
+		// The same mounted editor now exercises the approved Surface Keyboard
+		// mouse pause. Keep an explicit Mouse preference and a nominal
+		// highlighter, then enter Keyboard through the real toolbar while idle.
+		// The registered command seam is exercised separately while a mouse
+		// stroke is held, because ownership correctly suppresses that click.
+		setPenInk(true);
+		setMouseInk(true);
+		const highlighterChoice = toolbarButton(note.wrapper, "Highlighter");
+		if (!highlighterChoice) throw new Error("missing mounted Highlighter control");
+		pressToolbarButton(highlighterChoice);
+		await settle();
+		const mouseKeyboard = toolbarButton(note.wrapper, "Keyboard mode (pen input off)");
+		if (!mouseKeyboard) throw new Error("missing refreshed Keyboard control");
+		const mousePreferenceBefore = mouseInkEnabled();
+		const mouseNibBefore = getInlineTool();
+		const mouseDown = mouse(note.view.contentDOM, "pointerdown", 71, 80, 155, 1);
+		mouse(note.view.contentDOM, "pointermove", 71, 120, 180, 1);
+		const mouseUp = mouse(note.view.contentDOM, "pointerup", 71, 120, 180, 0);
+		await settle();
+		const mouseStrokeBeforeKeyboard = inlineInk.strokes(PATH_KEYBOARD).length - storeAfterFreshTouch;
+		pressToolbarButton(mouseKeyboard);
+		await settle();
+		const mouseStoreAfterClick = inlineInk.strokes(PATH_KEYBOARD).length;
+		const mousePreferenceAfterClick = mouseInkEnabled();
+		const mouseNibAfterClick = getInlineTool();
+		const mouseFreshDown = mouse(note.view.contentDOM, "pointerdown", 72, 100, 175, 1);
+		mouse(note.view.contentDOM, "pointermove", 72, 120, 195, 1);
+		mouse(note.view.contentDOM, "pointerup", 72, 120, 195, 0);
+		await settle();
+		const mouseHoverClassWhilePaused = note.view.scrollDOM.classList.contains("handwriting-pen-hover");
+		const mouseStoreWhilePaused = inlineInk.strokes(PATH_KEYBOARD).length;
+		const keyboardResume = toolbarButton(note.wrapper, "Keyboard mode (pen input off)");
+		if (!keyboardResume) throw new Error("missing Keyboard resume control");
+		pressToolbarButton(keyboardResume);
+		await settle();
+		mouse(note.view.contentDOM, "pointerdown", 73, 105, 180, 1);
+		mouse(note.view.contentDOM, "pointermove", 73, 140, 205, 1);
+		if (!runGatedCommand(PEN_INK_TOGGLE) || penInkEnabled()) {
+			throw new Error("registered Keyboard command did not pause pen input");
+		}
+		const mouseHeldStoreAfterCommand = inlineInk.strokes(PATH_KEYBOARD).length;
+		const mouseHeldRouterStrokingAfterCommand =
+			((overlay as unknown as { router?: { isStroking: boolean } }).router?.isStroking ?? false);
+		await settle();
+		const mouseLateUp = mouse(note.view.contentDOM, "pointerup", 73, 140, 205, 0);
+		await settle();
+		const mouseHeldStoreAfterUp = inlineInk.strokes(PATH_KEYBOARD).length;
+		const mouseHeldRouterStrokingAfterUp =
+			((overlay as unknown as { router?: { isStroking: boolean } }).router?.isStroking ?? false);
+		const mousePostHeldDown = mouse(note.view.contentDOM, "pointerdown", 74, 110, 185, 1);
+		mouse(note.view.contentDOM, "pointerup", 74, 110, 185, 0);
+		await settle();
+		const mousePostHeldStore = inlineInk.strokes(PATH_KEYBOARD).length;
+		const mouseResume = toolbarButton(note.wrapper, "Highlighter");
+		if (!mouseResume) throw new Error("missing Highlighter resume control after held stroke");
+		pressToolbarButton(mouseResume);
+		await settle();
+		const mouseResumeDown = mouse(note.view.contentDOM, "pointerdown", 75, 105, 180, 1);
+		mouse(note.view.contentDOM, "pointermove", 75, 140, 205, 1);
+		mouse(note.view.contentDOM, "pointerup", 75, 140, 205, 0);
+		await settle();
+		const mousePreferenceAfterResume = mouseInkEnabled();
+		const mouseNibAfterResume = getInlineTool();
+		// Leave the mounted fixture in Keyboard mode for the existing re-entry
+		// trace, while keeping the explicit Mouse preference armed.
+		const finalKeyboard = toolbarButton(note.wrapper, "Keyboard mode (pen input off)");
+		if (!finalKeyboard) throw new Error("missing final Keyboard control");
+		pressToolbarButton(finalKeyboard);
 		return {
 			mounted: overlay !== null,
 			keyboardButtonPresent: keyboard !== null,
 			downPrevented: down.defaultPrevented,
 			storeBeforeClick,
-			keyboardRuns,
-			penInkAfterClick: penInkEnabled(),
-			toolPickedAfterClick: toolPickedHere(),
-			editorFocused: note.view.hasFocus,
+			keyboardRuns: keyboardRunsAfterTouch,
+			penInkAfterClick,
+			toolPickedAfterClick,
+			editorFocused,
 			storeAfterClick,
-			historyAfterClick: undoDepth(note.view.state),
+			historyAfterClick,
 			storeAfterLateUp,
 			freshDownPrevented: freshDown.defaultPrevented,
-			storeAfterFreshTouch: inlineInk.strokes(PATH_KEYBOARD).length,
+			storeAfterFreshTouch,
+			mousePreferenceBefore,
+			mousePreferenceAfterClick,
+			mouseNibBefore,
+			mouseNibAfterClick,
+			mouseStrokeBeforeKeyboard,
+			mouseDownPrevented: mouseDown.defaultPrevented,
+			mouseUpPrevented: mouseUp.defaultPrevented,
+			mouseLateUpPrevented: mouseLateUp.defaultPrevented,
+			mouseStoreAfterClick,
+			mouseFreshDownPrevented: mouseFreshDown.defaultPrevented,
+			mouseFreshStore: mouseStoreWhilePaused,
+			mouseHeldStoreAfterCommand,
+			mouseHeldRouterStrokingAfterCommand,
+			mouseHeldStoreAfterUp,
+			mouseHeldRouterStrokingAfterUp,
+			mousePostHeldDownPrevented: mousePostHeldDown.defaultPrevented,
+			mousePostHeldStore,
+			mouseHoverClassWhilePaused,
+			mousePreferenceAfterResume,
+			mouseNibAfterResume,
+			mouseResumeDownPrevented: mouseResumeDown.defaultPrevented,
+			mouseResumeStore: inlineInk.strokes(PATH_KEYBOARD).length,
 		};
 	} finally {
 		note.view.destroy();
@@ -596,6 +744,7 @@ async function run(): Promise<FingerLifecycleTrace> {
 		for (const path of ALL_PATHS) inlineInk.handleDelete(path);
 		clearGatedCommandActions();
 		resetPenInkForTest();
+		setMouseInk(false);
 		clearToolPicked();
 		resetPenToolsForTest();
 	}

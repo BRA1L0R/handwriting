@@ -99,6 +99,8 @@ describe("sameExtentInputs", () => {
 
 	it("is false when any single input moved", () => {
 		const moved: Array<Partial<ExtentInputs>> = [
+			{ scrollRevision: 1 },
+			{ granted: { x: 1024, y: 2048 } },
 			{ path: "b.md" },
 			{ writtenOn: true },
 			{ camX: 0 },

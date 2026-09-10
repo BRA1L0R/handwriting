@@ -12,6 +12,7 @@
  */
 
 export class Component {}
+export function requestUrl(): never { throw new Error("network requests are unavailable in tests"); }
 export class Plugin {}
 export class PluginSettingTab {}
 export class Modal {}
@@ -20,6 +21,8 @@ export class ItemView {}
 export class TextFileView {}
 export class MarkdownRenderChild {}
 export class MarkdownRenderer {}
+export class MarkdownView {}
+export class SuggestModal {}
 export class Notice {}
 export class App {}
 export class TFile {}

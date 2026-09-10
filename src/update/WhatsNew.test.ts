@@ -325,6 +325,21 @@ describe("collapsing groups older than the two most recent", () => {
 		]);
 	});
 
+	it("renders the six 1.4.16 release-note lines verbatim and in order", () => {
+		const d = decideWhatsNew("1.4.16", "1.4.15", false);
+		expect(d.show).toBe(true);
+		if (!d.show) throw new Error("unreachable, asserted above");
+		const frag = whatsNewFragment(d.version, d.notes, d.groups) as unknown as FakeEl;
+		expect(listItems(frag).map((item) => item.text)).toEqual([
+			"per note lined/dotted/grid paper (hint: the ... button in the top right corner of the note -alan)",
+			"ghost shape snapping",
+			"toolbar settings changes",
+			"reading mode ink bug fix",
+			"notification bug fix",
+		"zoom and fit to ink",
+		]);
+	});
+
 	it("renders the thirteen 1.4.13 release-note lines verbatim and in order", () => {
 		const d = decideWhatsNew("1.4.13", "1.4.12", false);
 		expect(d.show).toBe(true);

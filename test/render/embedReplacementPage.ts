@@ -5,6 +5,7 @@ import { InkOverlayPlugin, inlineInk } from "../../src/inline/InkOverlay";
 import { inkApplied, inkEffect, inkHistorySupport, type InkOp } from "../../src/inline/InkHistory";
 import { onInkChanged } from "../../src/inline/InkEvents";
 import { initEmbedInkRefresh, attachEmbedInk, embedInkChanged, teardownEmbedInk, disarmPrintSwaps } from "../../src/inline/EmbedInk";
+import * as embedInk from "../../src/inline/EmbedInk";
 import type { InkStroke } from "../../src/ink/Stroke";
 import { installObsidianDom } from "./obsidianDom";
 
@@ -88,3 +89,129 @@ function run(kind: Kind): Picture[] {
 	}
 }
 (window as unknown as { embedReplacement: typeof run }).embedReplacement = run;
+
+async function readingRecovery(popout: boolean) {
+	const frame = popout ? document.body.appendChild(document.createElement("iframe")) : null;
+	const doc = frame?.contentDocument ?? document;
+	const win = doc.defaultView!;
+	const realm = win as Window & typeof globalThis;
+	const NativeRO = realm.ResizeObserver, NativeMO = realm.MutationObserver;
+	const observers: Array<{ stopped: boolean; targets: Set<Node>; kind: string }> = [];
+	realm.ResizeObserver = class extends NativeRO {
+		readonly record = { stopped: false, targets: new Set<Node>(), kind: "resize" };
+		constructor(callback: ResizeObserverCallback) { super(callback); observers.push(this.record); }
+		observe(target: Element, options?: ResizeObserverOptions): void {
+			this.record.targets.add(target); super.observe(target, options);
+		}
+		unobserve(target: Element): void { this.record.targets.delete(target); super.unobserve(target); }
+		disconnect(): void { this.record.stopped = true; this.record.targets.clear(); super.disconnect(); }
+	};
+	realm.MutationObserver = class extends NativeMO {
+		readonly record = { stopped: false, targets: new Set<Node>(), kind: "mutation" };
+		constructor(callback: MutationCallback) { super(callback); observers.push(this.record); }
+		observe(target: Node, options?: MutationObserverInit): void {
+			this.record.targets.add(target); super.observe(target, options);
+		}
+		disconnect(): void { this.record.stopped = true; this.record.targets.clear(); super.disconnect(); }
+	};
+	if (frame) {
+		for (const style of document.querySelectorAll("style")) doc.head.appendChild(style.cloneNode(true));
+		const proto = (win as unknown as { HTMLElement: typeof HTMLElement }).HTMLElement.prototype;
+		proto.createEl = HTMLElement.prototype.createEl;
+		proto.setCssStyles = HTMLElement.prototype.setCssStyles;
+	}
+	const view = doc.body.appendChild(doc.createElement("div"));
+	view.className = "markdown-preview-view";
+	view.style.cssText = "position:relative;width:600px;height:200px;overflow:auto;padding:0";
+	const makeSizer = (width: number, top: number) => {
+		const el = doc.createElement("div");
+		el.className = "markdown-preview-sizer";
+		el.style.cssText = `width:${width}px;height:800px;margin:${top}px auto 0;padding:0;max-width:none`;
+		el.appendChild(doc.createElement("p")).textContent = "reading view content";
+		return el;
+	};
+	let sizer = view.appendChild(makeSizer(400, 24));
+	let reads = 0;
+	const ink = [{ ...stroke("reading"), color: "#ffffff" }];
+	const strokes = () => { reads++; return ink; };
+	initEmbedInkRefresh(strokes);
+	const settle = async () => {
+		for (let i = 0; i < 3; i++) await new Promise<void>(resolve => win.requestAnimationFrame(() => resolve()));
+	};
+	const watchCount = () => (embedInk as unknown as { embedInkAnchorWatchCount?(): number }).embedInkAnchorWatchCount?.() ?? -1;
+	const gap = (el: Element | null) => {
+		if (!el) return null;
+		const a = el.getBoundingClientRect(), b = sizer.getBoundingClientRect();
+		return [a.left - b.left, a.top - b.top];
+	};
+	try {
+		embedInk.attachEmbedInkOnceReady(sizer.firstElementChild as HTMLElement, view, "reading.md", strokes);
+		await settle();
+		const canvas = view.querySelector("canvas");
+		const initial = { parent: canvas?.parentElement?.className, gap: gap(canvas), watches: watchCount() };
+		// Obsidian owns the sizer's children. No second postprocessor call.
+		sizer.replaceChildren(doc.createElement("p"));
+		await settle();
+		const survivedEviction = canvas !== null && canvas.isConnected;
+		const replacement = makeSizer(300, 40);
+		sizer.replaceWith(replacement); sizer = replacement;
+		await settle();
+		const replacementGap = gap(canvas);
+		// Root stays 600px wide: only the new sizer emits this ResizeObserver event.
+		sizer.style.width = "200px";
+		await settle();
+		const resizeGap = gap(canvas);
+		const readsAfterResize = reads;
+		const currentSizerObserved = observers.some(o => o.kind === "resize" && o.targets.has(sizer));
+		view.scrollTop = 80;
+		await settle();
+		const scrollGap = gap(canvas);
+		view.style.display = "none";
+		await settle();
+		view.style.display = "block"; view.style.width = "700px";
+		await settle();
+		const modeGap = gap(canvas);
+		const pixels = canvas?.getContext("2d")?.getImageData(0, 0, canvas.width, canvas.height).data;
+		const painted = pixels?.some((value, i) => i % 4 === 3 && value > 0) ?? false;
+		const nested = sizer.appendChild(doc.createElement("div"));
+		nested.className = "markdown-embed-content";
+		nested.style.cssText = "position:relative;width:250px;height:100px";
+		const innerView = nested.appendChild(doc.createElement("div"));
+		innerView.className = "markdown-preview-view";
+		const innerSizer = innerView.appendChild(makeSizer(180, 0));
+		embedInk.attachEmbedInkOnceReady(innerSizer.firstElementChild as HTMLElement, innerView, "nested.md", () => ink);
+		const nestedParent = nested.querySelector("canvas")?.parentElement === nested;
+		win.dispatchEvent(new (win as unknown as { Event: typeof Event }).Event("beforeprint"));
+		await settle();
+		const svg = view.querySelector(":scope > svg.handwriting-embed-ink");
+		const printGap = gap(svg);
+		const printFill = svg?.querySelector("path")?.getAttribute("fill");
+		sizer.style.width = "260px";
+		await settle();
+		const resizedPrintGap = gap(svg);
+		win.dispatchEvent(new (win as unknown as { Event: typeof Event }).Event("afterprint"));
+		const printRestored = !view.querySelector(":scope > svg") && canvas?.style.display !== "none";
+		view.remove();
+		await settle();
+		const detachedWatches = watchCount();
+		const detachedObserversStopped = observers.every(o => o.stopped);
+		doc.body.appendChild(view);
+		embedInk.attachEmbedInkOnceReady(sizer.firstElementChild as HTMLElement, view, "reading.md", strokes);
+		sizer.style.width = "320px";
+		await settle();
+		const reenteredGap = gap(canvas);
+		const reenteredWatches = watchCount();
+		teardownEmbedInk(); disarmPrintSwaps();
+		const stoppedWatches = watchCount();
+		const allObserversStopped = observers.length > 0 && observers.every(o => o.stopped);
+		const layersRemoved = view.querySelector("canvas.handwriting-embed-ink, svg.handwriting-embed-ink") === null;
+		return { initial, survivedEviction, replacementGap, resizeGap, readsAfterResize,
+			scrollGap, modeGap, painted, nestedParent, printGap, printFill, resizedPrintGap,
+			printRestored, detachedWatches, stoppedWatches, currentSizerObserved,
+			detachedObserversStopped, reenteredGap, reenteredWatches, allObserversStopped, layersRemoved };
+	} finally {
+		teardownEmbedInk(); disarmPrintSwaps(); view.remove(); frame?.remove();
+		realm.ResizeObserver = NativeRO; realm.MutationObserver = NativeMO;
+	}
+}
+(window as unknown as { readingRecovery: typeof readingRecovery }).readingRecovery = readingRecovery;

@@ -2,6 +2,10 @@ import { EditorSelection, EditorState, StateEffect, Transaction } from "@codemir
 import { EditorView, keymap } from "@codemirror/view";
 import { history, historyKeymap, isolateHistory, redo, undo } from "@codemirror/commands";
 import { inkApplied, inkEffect, inkHistorySupport, type InkOp } from "../../src/inline/InkHistory";
+import { InkOverlayPlugin } from "../../src/inline/InkOverlay";
+import { installObsidianDom } from "./obsidianDom";
+
+installObsidianDom();
 
 // Real CM state/view/commands. Only requestAnimationFrame is controlled, so
 // deferred measurement can be delivered explicitly without timing sleeps.
@@ -23,7 +27,7 @@ const stroke = { id: "s", color: "#000", width: 2, tool: "pen" as const, points:
 function snapshot() {
  return {top:view.scrollDOM.scrollTop,left:view.scrollDOM.scrollLeft,selection:view.state.selection.toJSON(),doc:view.state.doc.toString(),applied:[...applied]};
 }
-function setup(caret: number, kind: "ink" | "text" | "mixed", operation: InkOp["type"] = "add") {
+function setup(caret: number, kind: "ink" | "text" | "mixed", operation: InkOp["type"] = "add", scale = 1) {
  view?.destroy(); frames.clear(); document.body.replaceChildren(); applied=[];
  const doc = Array.from({length:200},(_,i)=>`${i}: ` + "long text ".repeat(30)).join("\n");
  view = new EditorView({parent:document.body,state:EditorState.create({doc,selection:{anchor:caret},extensions:[
@@ -36,6 +40,12 @@ function setup(caret: number, kind: "ink" | "text" | "mixed", operation: InkOp["
  measure();
  // A real later selection must survive ink history too.
  if(kind==="ink")view.dispatch({selection:EditorSelection.range(caret+1,caret+3)});
+ const overlay = Object.assign(Object.create(InkOverlayPlugin.prototype), {
+  view, frame:{locked:false}, cssScale:1, fontZoom:1, container:null, pinchAnchor:{scrollTop:0,scrollLeft:0,offsetX:0,offsetY:0},
+  pinchRefScale:1,pinchScaleNow:1,pinchRasterScale:1,
+ });
+ overlay.applyPinchScale(scale,true);
+ measure();
  view.scrollDOM.scrollTop=1700; view.scrollDOM.scrollLeft=190;
  view.scrollDOM.dispatchEvent(new Event("scroll")); measure();
  return snapshot();

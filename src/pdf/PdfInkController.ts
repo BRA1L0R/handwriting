@@ -1717,6 +1717,8 @@ export class PdfInkController {
 	 * only NEW claims. COMMITS rather than drops: `finishActiveStroke()` ends
 	 * the stroke exactly as a lift does, reaching `penUp()` through `onPenUp`,
 	 * which is where the ink is stored and the strip chrome comes back down.
+	 * Keyboard-OFF passes `preserveMouse` so an owned mouse remains live until
+	 * its own lift; blur and teardown retain the default forced finish.
 	 * Deliberately NOT `abandonActiveStroke()` - that is the teardown for a
 	 * stroke whose page is going away (`forgetHistory` above), and turning the
 	 * pen off is not a request to throw away the word being written.
@@ -1724,8 +1726,8 @@ export class PdfInkController {
 	 * A no-op with nothing live, and no chrome call of its own, for the same
 	 * reasons the note's twin gives.
 	 */
-	endLiveStroke(): void {
-		this.router?.finishActiveStroke();
+	endLiveStroke(preserveMouse = false): void {
+		this.router?.finishActiveStroke({ preserveMouse });
 	}
 
 	/**
@@ -2058,6 +2060,14 @@ export class PdfInkController {
 	 * the eraser's reach is worse than no dot.
 	 */
 	private showCursor(sample: PenSample, pointerType?: string): ReticleOutcome {
+		// Keyboard mode pauses fresh mouse claims but does not strand a mouse
+		// stroke that was already claimed. Its wet loop calls this seam with an
+		// explicit "mouse", while in-gesture wrappers omit the type; neither
+		// may repaint the reticle after the keyboard command hid it.
+		const mousePaused =
+			!penInkEnabled() &&
+			(pointerType === "mouse" || (pointerType === undefined && this.mouseStroke));
+		if (mousePaused) return "off";
 		// Both marks sit ahead of the reticle gate below - audit doc §5k/(d):
 		// turning "Pen reticle" off, or Boox mode, which turns it off for you,
 		// must not also stop the pointer being noticed.

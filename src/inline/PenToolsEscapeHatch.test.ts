@@ -330,18 +330,18 @@ describe("a mouse-only user reaches the pen toolbar, and only through the two ru
 	});
 
 	it.each([
-		{ saved: "hide", mobile: true, afterNote: 1, afterPdf: 2 },
-		{ saved: "show", mobile: false, afterNote: 0, afterPdf: 0 },
+		{ saved: "hide", mobile: true, afterNote: 0, afterPdf: 0 },
+		{ saved: "show", mobile: false, afterNote: 1, afterPdf: 2 },
 		{ saved: "auto", mobile: true, afterNote: 1, afterPdf: 2 },
 	] as const)(
-		"upgrades saved $saved to auto before note and PDF toolbars mount",
+		"restores saved $saved before note and PDF toolbars mount",
 		async ({ saved, mobile, afterNote, afterPdf }) => {
 			platform.isMobileApp = mobile;
 			const loaded = await loadSavedPenTools(saved);
 
-			expect(loaded.settings.penTools).toBe("auto");
-			expect(loaded.saved?.penTools).toBe("auto");
-			expect(getPenToolsMode()).toBe("auto");
+			expect(loaded.settings.penTools).toBe(saved);
+			expect(loaded.saved?.penTools).toBe(saved);
+			expect(getPenToolsMode()).toBe(saved);
 			openNote();
 			expect(strips.live).toBe(afterNote);
 			openPdf();

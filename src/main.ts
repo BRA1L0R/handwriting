@@ -81,6 +81,7 @@ import { destroyProbeMarkers } from "./inline/PenProbe";
 import { lassoDeleteNotice } from "./inline/InlineSelectionDelete";
 import { armForegroundRepaint } from "./inline/ForegroundRepaint";
 import { captureInlinePenTrace, clearInlinePenTrace, formatInlinePenTrace } from "./inline/InlinePenRouter";
+import { syncUndoTraceForDiagnostics } from "./diag/UndoHistoryTrace";
 import {
 	clearHitProbe,
 	formatHitReport,
@@ -122,6 +123,27 @@ import {
 } from "./diag/DiagSwitch";
 import { routineNoticesVisible, setRoutineNoticesVisible } from "./diag/RoutineNotices";
 import { traceGuardVerdict } from "./diag/TraceGuard";
+
+declare const __HW_BUILD_SOURCE_COMMIT__: string;
+declare const __HW_BUILD_SOURCE_TREE__: string;
+declare const __HW_BUILD_DIRTY_STATUS__: string;
+declare const __HW_BUILD_VERIFIED__: boolean;
+
+function loadedBuild(version: string): {
+	version: string;
+	sourceCommit: string;
+	sourceTree: string;
+	dirtyStatus: string;
+	verified: boolean;
+} {
+	return {
+		version,
+		sourceCommit: __HW_BUILD_SOURCE_COMMIT__,
+		sourceTree: __HW_BUILD_SOURCE_TREE__,
+		dirtyStatus: __HW_BUILD_DIRTY_STATUS__,
+		verified: __HW_BUILD_VERIFIED__,
+	};
+}
 import {
 	armMouseInkQuietly,
 	consumeMousePutDown,
@@ -130,6 +152,8 @@ import {
 } from "./inline/MouseInk";
 import { setPrediction, setPredictionEink } from "./inline/StrokePrediction";
 import { PaperStyle, nextPaperStyle, normalizePaperStyle, paperClass } from "./inline/Paper";
+import { NotePaper } from "./inline/NotePaper";
+import { setScrollExpansionEnabled } from "./inline/InkOverlay";
 import { inkToSvg } from "./ink/SvgExport";
 import { InkTool } from "./ink/Stroke";
 import { appendInkToPdf, flattenedPdfPath } from "./ink/InkPdfAppend";
@@ -406,6 +430,7 @@ interface HandwritingSettings {
 	scribbleHintOffered: boolean;
 	/** Ruled paper background (v0.13.16): none, lines, grid or dots. Per device. */
 	paperStyle: PaperStyle;
+	extendCanvasWhileScrolling: boolean;
 	/** Pen tools strip (v0.13.16): auto (pen summons it), show, or hide. */
 	penTools: PenToolsMode;
 	/** What the eraser erases, globally (1.0.9): whole strokes by default. */
@@ -496,6 +521,7 @@ const DEFAULT_SETTINGS: HandwritingSettings = {
 	einkHintOffered: false,
 	scribbleHintOffered: false,
 	paperStyle: "none",
+	extendCanvasWhileScrolling: false,
 	penTools: "auto",
 	eraserMode: "stroke",
 	penReticle: true,
@@ -707,10 +733,10 @@ function hideOwnedNotices(): void {
  * unchanged and in its own order; its comments are the reason each line is
  * there and none of them has stopped being true:
  *
- *   - the live stroke first, before any chrome. The switch can be hit with
- *     the nib on the glass, and the router's gate refuses new claims without
- *     breaking the one it already made. `endLiveStrokesEverywhere` commits it
- *     rather than dropping it, and the pdf half rides the strip registry.
+	 *   - the live stroke first, before any chrome. OFF preserves an owned mouse
+	 *   - OFF preserves an owned mouse until its own lift while committing
+	 *     pen/touch; ON and other teardown callers retain the default forced
+	 *     finish, with the pdf half riding the strip registry.
  *   - the pen UI on the ON side unconditionally, the rule every tool command
  *     follows, and it matters most here because the strip is the way BACK.
  *     OFF raises it only once a real pen has been seen on this device (alan,
@@ -738,7 +764,7 @@ const penInkCommandHost: PenCommandHost = {
 		setInlinePanMode(false);
 	},
 	afterFlip: (on: boolean) => {
-		endLiveStrokesEverywhere();
+		endLiveStrokesEverywhere(!on);
 		if (on || shouldRaiseStripOnPenOff(penHardwareSeen())) markPenSeen();
 		refreshPenToolsAll();
 		refreshAllStrips();
@@ -1857,6 +1883,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	 * all three, rather than three different answers to the same question.
 	 */
 	private unloaded = false;
+	notePaper: NotePaper | null = null;
 
 	/** One ink controller per open PDF view, keyed by its root element. */
 	private pdfInk = new Map<HTMLElement, PdfInkController>();
@@ -2067,6 +2094,8 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// rendered roots showing that note. See EmbedInk.ts.
 		initEmbedInkRefresh((p) => inlineInk.strokes(p));
 		this.register(onInkChanged((p) => embedInkChanged(p)));
+		this.notePaper = new NotePaper(this.app, message => { blockNotice(message); });
+		this.notePaper.start(this);
 		this.addSettingTab(new HandwritingSettingTab(this.app, this));
 		// A popout is born without the paper class; stamp it as it opens.
 		this.registerEvent(
@@ -3072,6 +3101,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				this.syncRecordingBadge();
 				refreshAllStrips();
 				const capture = captureInlinePenTrace({
+					loadedBuild: loadedBuild(this.manifest.version),
 					// Host flags, not navigator.userAgent: the directory review
 					// reads a UA lookup as OS sniffing, and Platform answers the
 					// same question honestly. The device model goes with it.
@@ -3498,7 +3528,10 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// Every way the recording switch flips, not just the command: showing
 		// a report also ends the capture, and that path left "recording pen"
 		// in the status bar with nothing recording.
-		setDiagnosticsChangedListener(() => this.syncRecordingBadge());
+		setDiagnosticsChangedListener(() => {
+			syncUndoTraceForDiagnostics();
+			this.syncRecordingBadge();
+		});
 		this.register(() => setDiagnosticsChangedListener(null));
 		// Open PDFs carry a strip too, and the settings fan-outs only ever
 		// walked the editor overlays - so changing the toolbar corner, or the
@@ -3545,8 +3578,8 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				// See `endLiveStrokesEverywhere` (InkOverlay.ts), which is what
 				// calls this, and `PdfInkController.endLiveStroke` for why it
 				// commits the stroke rather than dropping it.
-				() => {
-					for (const c of this.pdfInk.values()) c.endLiveStroke();
+				(preserveMouse = false) => {
+					for (const c of this.pdfInk.values()) c.endLiveStroke(preserveMouse);
 				}
 			)
 		);
@@ -4501,6 +4534,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	onunload(): void {
 		// First, so that anything still waiting on onLayoutReady finds it set.
 		this.unloaded = true;
+		this.notePaper?.destroy();
 		// Pending recycles are DROPPED, never run early. A sidecar left in
 		// place is an orphan somebody can delete; ink recycled for a note
 		// that was about to come back is the failure this delay exists to
@@ -5059,6 +5093,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			docs.add(leaf.view.containerEl.ownerDocument);
 		});
 		for (const doc of docs) this.applyPaperTo(doc, style);
+		this.notePaper?.refresh();
 	}
 
 	private applyPaperTo(doc: Document, style: PaperStyle): void {
@@ -5213,7 +5248,8 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			einkHintOffered: raw?.einkHintOffered === true,
 			scribbleHintOffered: raw?.scribbleHintOffered === true,
 			paperStyle: normalizePaperStyle(raw?.paperStyle),
-			penTools: "auto",
+			extendCanvasWhileScrolling: raw?.extendCanvasWhileScrolling === true,
+			penTools: normalizePenToolsMode(raw?.penTools),
 			// A fresh key on purpose: the old boolean keys carried the OLD
 			// default in every data.json (full-object saves), so reading
 			// them pinned the whole fleet to reticle and the stroke default
@@ -5385,6 +5421,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// layout is restored. (The first version of this comment cited line
 		// numbers for both, and both had moved by the time anyone read it.)
 		this.applyPaperTo(document, this.settings.paperStyle);
+		setScrollExpansionEnabled(this.settings.extendCanvasWhileScrolling);
 		this.app.workspace.onLayoutReady(() => {
 			if (this.unloaded) return;
 			this.applyPaper(this.settings.paperStyle);
@@ -5960,7 +5997,7 @@ export function gatedCommandGroups(commands: readonly PaletteCommand[] = gatedCo
  * has no such renderer and calls display(), which paints the same list by
  * hand. Neither path has a row the other lacks.
  */
-class HandwritingSettingTab extends PluginSettingTab {
+export class HandwritingSettingTab extends PluginSettingTab {
 	/**
 	 * The fold-order control, while the tab is open.
 	 *
@@ -6001,8 +6038,13 @@ class HandwritingSettingTab extends PluginSettingTab {
 				heading: "Appearance",
 				items: [
 					{
+						name: "Infinite Canvas",
+						desc: "Scroll to the right or down infinitely. Momentum is turned off when this setting is toggled on.",
+						control: { type: "toggle", key: "extendCanvasWhileScrolling" },
+					},
+					{
 						name: "Paper background",
-						desc: "Lined, grid, or dotted paper. Default none.",
+						desc: "Lined, grid, or dotted paper. Global setting. Default none.",
 						control: {
 							type: "dropdown",
 							key: "paperStyle",
@@ -6016,8 +6058,17 @@ class HandwritingSettingTab extends PluginSettingTab {
 				heading: "Toolbar",
 				items: [
 					{
+						name: "Toolbar visibility",
+						desc: "Show or hide the toolbar. Default Auto.",
+						control: {
+							type: "dropdown",
+							key: "penTools",
+							options: { hide: "Off", show: "On", auto: "Auto" },
+						},
+					},
+					{
 						name: "Toolbar placement",
-						desc: "Where the pen toolbar and its pill sit. Default top right.",
+						desc: "Where the toolbar sits. Default top right.",
 						// "Corner" is what this row was called for two releases and
 						// what the setting is still named in data.json, so it stays
 						// searchable: the settings search indexes name, desc and
@@ -6035,7 +6086,7 @@ class HandwritingSettingTab extends PluginSettingTab {
 					{
 						name: "Toolbar buttons",
 						desc:
-							"Drag to set which buttons stay when the toolbar is small. " +
+							"Drag to order which buttons are shown. " +
 							"The bottom of the list disappears first.",
 						// `render` rather than a `control`: there is no toggle or
 						// dropdown shape for a reorderable list, and the two are
@@ -6082,9 +6133,9 @@ class HandwritingSettingTab extends PluginSettingTab {
 							type: "dropdown",
 							key: "inkPdfColorMode",
 							options: {
-								darken: "Darken it for light pages",
-								lighten: "Lighten it for dark pages",
-								keep: "Leave it as I drew it",
+								darken: "Darken for light pages",
+								lighten: "Lighten for dark pages",
+								keep: "Keep original colors",
 							},
 						},
 					},
@@ -6095,24 +6146,13 @@ class HandwritingSettingTab extends PluginSettingTab {
 				heading: "Export",
 				items: [
 					{
-						// DIRECTLY BELOW the theme row on purpose, and the copy has
-						// to earn that position. Two adjacent toggles that look like
-						// the same idea with opposite defaults read as a bug unless
-						// the text says why, so this one names the difference: your
-						// own canvas versus a file you are making for somewhere else.
-						// That sentence is an acceptance condition of the slice, not
-						// decoration.
-						name: "Keep exported ink readable",
-						desc:
-							// Alan's words, 2026-09-09, verbatim. This row and its ~90-word
-							// description were flagged UNAPPROVED on 2026-09-08 and rode the
-							// build for a day. This is the approval. Do not restore the old
-							// text, which explained the reasoning at length and named the
-							// neighbouring setting that has since been deleted.
-							"Darkens or lightens pen ink that would disappear when you export, print, or " +
-							"snip. Ink on screen and its saved color stay unchanged. Highlighter is left " +
-							"alone. Default on.",
-						control: { type: "toggle", key: "inkReadableInExports" },
+						name: "Ink color when exporting",
+						desc: "Keep pen ink readable in exports, prints, and snips. Default automatic readability.",
+						aliases: ["print", "snip", "highlighter"],
+						control: {
+							type: "dropdown", key: "inkReadableInExports",
+							options: { auto: "Automatic readability", keep: "Keep original colors" },
+						},
 					},
 				],
 			},
@@ -6122,15 +6162,8 @@ class HandwritingSettingTab extends PluginSettingTab {
 				items: [
 					{
 						name: "Ink prediction",
-						// The e-ink flicker advice came out with 1.3.9: that flicker was the
-						// wet canvas asking for the low-latency path, not prediction, so
-						// sending people here to fix it cost a boox user a pointless toggle
-						// and told us nothing. Flicking past sharp corners is a real
-						// prediction artefact and stays.
-						desc:
-							"Draws a little ahead of the pen to hide latency. " +
-							"Turn it off if the line runs ahead of the nib or flicks past sharp corners. " +
-							"Default on.",
+						desc: "Reduce visible pen lag. Default on.",
+						aliases: ["latency", "nib", "sharp corners"],
 						control: {
 							type: "toggle",
 							key: "strokePrediction",
@@ -6139,9 +6172,7 @@ class HandwritingSettingTab extends PluginSettingTab {
 					},
 					{
 						name: "Boox mode",
-						desc:
-							"For e-ink. Pen prediction sized for e-ink delays; smoothing, the pen reticle and animations " +
-							"off - every redraw costs on e-ink. Your settings come back when it's off. Default off.",
+						desc: "Adjust pen input and animations for e-ink screens. Default off.",
 						control: { type: "toggle", key: "booxMode" },
 					},
 				],
@@ -6152,9 +6183,8 @@ class HandwritingSettingTab extends PluginSettingTab {
 				items: [
 					{
 						name: "Pressure sensitivity",
-						desc:
-							"Line width follows how hard you press. Off gives an even line; " +
-							"strokes still thin with speed and taper at the ends. Default on.",
+						desc: "Adjust line width with pen pressure. Default on.",
+						aliases: ["recalibrate", "calibration"],
 						// The command palette used to carry two separate commands for
 						// this row - "Pressure sensitivity: toggle" and "Pen pressure:
 						// recalibrate" - and Alan ruled both out of the palette
@@ -6174,14 +6204,28 @@ class HandwritingSettingTab extends PluginSettingTab {
 						// this on the same day (boox thread, 2026-08-30) and were told to turn
 						// prediction off, which is a different feature and did nothing.
 						name: "Ink smoothing",
-						desc:
-							"Shapes the line: thinner when you move fast, tapered at each end. " +
-							"Off draws an unshaped stroke that follows the pen more literally. Default on.",
+						desc: "Smooth and taper strokes. Default on.",
+						aliases: ["shaping", "speed"],
 						control: {
 							type: "toggle",
 							key: "inkSmoothing",
 							disabled: () => this.plugin.settings.booxMode,
 						},
+					},
+					{
+						name: "Pen reticle",
+						desc: "Show a dot at the pen tip. Default on.",
+						aliases: ["cursor"],
+						control: {
+							type: "toggle",
+							key: "penReticle",
+							disabled: () => this.plugin.settings.booxMode,
+						},
+					},
+					{
+						name: "Shape snap",
+						desc: "Hold at the end of a stroke to snap it into a shape. Default on.",
+						control: { type: "toggle", key: "shapeSnap" },
 					},
 				],
 			},
@@ -6191,22 +6235,9 @@ class HandwritingSettingTab extends PluginSettingTab {
 				items: [
 					{
 						name: "Mouse ink",
-						desc: "Left click draws. Default off.",
+						desc: "Draw with the left mouse button. Default off.",
+						aliases: ["left click"],
 						control: { type: "toggle", key: "mouseInk" },
-					},
-					{
-						name: "Pen reticle",
-						desc: "Shows a dot where the pen is. Default on.",
-						control: {
-							type: "toggle",
-							key: "penReticle",
-							disabled: () => this.plugin.settings.booxMode,
-						},
-					},
-					{
-						name: "Shape snap",
-						desc: "Hold the pen still at the end of a stroke to snap your drawing into a shape. Default on.",
-						control: { type: "toggle", key: "shapeSnap" },
 					},
 				],
 			},
@@ -6229,21 +6260,10 @@ class HandwritingSettingTab extends PluginSettingTab {
 							"command per color",
 							"per color command",
 							"Hotkeys for colors and sizes",
+							"command palette",
 						],
 						desc:
-							// Alan's words, 2026-09-09, verbatim. He sent it twice: the first
-							// read "For mouse or pen hotkey users" and he trimmed it to "For
-							// hotkey users." Do not restore the inventory this replaced - the
-							// old text listed every command in parentheses and ran to 84 words.
-							"For hotkey users. Adds tool toggles, color and size controls, and quick pens " +
-							"to the command palette. Each can take its own hotkey. Default off." +
-							// The switch is live (setControlValue -> the plugin's
-							// applyGatedCommandRegistration), so the reload sentence it
-							// carried since 1.4.6 would now be a lie - except on an
-							// Obsidian with no way to un-register a command, where
-							// turning it off really does wait for a reload. Asked at
-							// render time, so the row says what is true of the app it is
-							// being drawn in.
+							"Add tool, color, size, and quick pen commands for hotkeys. Default off." +
 							(this.plugin.gatedCommandRemovalAvailable()
 								? ""
 								: " Turning it off takes effect after the plugin reloads."),
@@ -6297,8 +6317,7 @@ class HandwritingSettingTab extends PluginSettingTab {
 					{
 						name: "Developer diagnostics",
 						desc:
-							"Shows the developer diagnostics commands in the palette. " +
-							"Takes effect after the plugin reloads.",
+							"Show diagnostic commands after reloading the plugin. Default off.",
 						control: { type: "toggle", key: "devDiagnostics" },
 					},
 				],
@@ -6312,9 +6331,8 @@ class HandwritingSettingTab extends PluginSettingTab {
 	 * (`applyBooxMode`'s `&& !on`), while prediction is forced ON
 	 * (`applyBooxMode`'s `on || settings.strokePrediction` - Boox EXTENDS
 	 * prediction rather than pausing it, see applyBooxMode). `applyBooxMode`
-	 * restores the stored preference the moment the mode goes off, which is
-	 * the promise its description makes ("Your settings come back when it's
-	 * off"). The rows were still reporting the STORED value, not the forced
+	 * restores the stored preference the moment the mode goes off. The rows
+	 * were still reporting the STORED value, not the forced
 	 * one, so a Boox user saw toggles that disagreed with what was actually
 	 * happening, with no way to tell.
 	 *
@@ -6336,6 +6354,7 @@ class HandwritingSettingTab extends PluginSettingTab {
 	}
 
 	getControlValue(key: string): unknown {
+		if (key === "inkReadableInExports") return this.plugin.settings.inkReadableInExports ? "auto" : "keep";
 		if (this.overriddenByBoox(key)) return this.BOOX_OVERRIDES[key as SettingKey];
 		// Mouse ink is the one row whose LIVE value can differ from the saved
 		// one, and it started to the day a quiet arm stopped being written
@@ -6376,6 +6395,10 @@ class HandwritingSettingTab extends PluginSettingTab {
 		const on = value === true;
 		const str = typeof value === "string" ? value : "";
 		switch (key) {
+			case "extendCanvasWhileScrolling":
+				s.extendCanvasWhileScrolling = on;
+				setScrollExpansionEnabled(on);
+				break;
 			case "pressureSensitivity":
 				s.pressureSensitivity = on;
 				setPressureSensitivity(on);
@@ -6424,8 +6447,10 @@ class HandwritingSettingTab extends PluginSettingTab {
 				s.inkPdfColorMode = normalizePdfPageAssumption(str);
 				break;
 			case "inkReadableInExports":
-				s.inkReadableInExports = on;
-				setInkExportReadability(on);
+				// Keep the persisted boolean and its existing renderer semantics.
+				// Boolean callers remain compatible with the former toggle.
+				s.inkReadableInExports = value === true || str === "auto";
+				setInkExportReadability(s.inkReadableInExports);
 				// No repaint: this setting cannot change a pixel on screen. It is
 				// read only inside an export, a print swap or a snip, and every
 				// one of those paints from scratch when it runs.

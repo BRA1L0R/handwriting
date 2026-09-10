@@ -1,8 +1,7 @@
 /**
- * Lined and grid paper (roadmap). A writing aid, not a document property:
- * the choice is per device, applied as a body class that styles.css turns
- * into a background on every editor scroller, and never written into any
- * note or sidecar. `background-attachment: local` makes the ruling scroll
+ * Editing paper styles. The per-device default is applied as a body class;
+ * NotePaper provides optional per-note frontmatter overrides, without ink
+ * or sidecar changes. `background-attachment: local` makes the ruling scroll
  * with the text, so lines behave like paper instead of like a window decal.
  *
  * One style at a time, cycled by a single command: none -> lines -> grid ->

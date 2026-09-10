@@ -22,4 +22,10 @@ declare module "node:url" {
  */
 declare module "node:fs" {
 	export function readFileSync(path: string, encoding: "utf8"): string;
+	export function writeFileSync(path: string, data: string): void;
+}
+
+/** Optional exact-baseline control and trace output for scroll expansion. */
+declare module "node:child_process" {
+	export function execFileSync(command: string, args: string[], options: { cwd: string; encoding: "utf8" }): string;
 }

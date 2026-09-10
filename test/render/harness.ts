@@ -72,6 +72,20 @@ const here = (rel: string): string => fileURLToPath(new URL(rel, import.meta.url
  */
 export const stylesCss = (): string => rawStyles;
 
+export async function openPaperPicker(browser: Browser, width: number, current = "lines", global = "dots", dark = false): Promise<Page> {
+	const page = await browser.newPage({ viewport: { width, height: 700 } });
+	await injectSheets(page, "paper picker", {});
+	// Approximate Obsidian's Modal shell, including its normal generous width.
+	await page.addStyleTag({ content: `body { margin:0; padding:12px; box-sizing:border-box; background:${dark ? "#181818" : "#eeeeee"}; }
+body { --background-primary:${dark ? "#242424" : "#ffffff"}; --background-secondary:${dark ? "#303030" : "#f6f6f6"}; --background-modifier-border:${dark ? "#606060" : "#cccccc"}; --text-normal:${dark ? "#eeeeee" : "#222222"}; --text-muted:${dark ? "#bbbbbb" : "#666666"}; --text-on-accent:#ffffff; }
+.modal { position:relative; box-sizing:border-box; width:700px; margin:12px auto; padding:20px; border:1px solid var(--background-modifier-border); border-radius:12px; background:var(--background-primary); color:var(--text-normal); }
+.modal-title { font:600 20px sans-serif; margin:0 32px 6px 0; } .modal-close-button { position:absolute; right:8px; top:8px; } #picker-opener { position:absolute; opacity:0; }
+` });
+	await page.addScriptTag({ content: await pageBundle("./paperPickerPage.ts") });
+	await page.evaluate(({current,global}) => { window.__paperPicker = window.openPaperPicker(current,global); }, {current,global});
+	return page;
+}
+
 /**
  * One of the host's stylesheets, as this suite keeps them: a HAND REDUCTION
  * in `test/render/fixtures/`, naming its source, its values and the date it
@@ -175,7 +189,7 @@ async function pageBundle(entry: string): Promise<string> {
 		format: "iife",
 		platform: "browser",
 		target: "es2022",
-		alias: { obsidian: here("../obsidian-stub.ts") },
+		alias: { obsidian: here(entry === "./paperPickerPage.ts" ? "./paperPickerObsidian.ts" : "../obsidian-stub.ts") },
 	});
 	const file = out.outputFiles[0];
 	if (!file) throw new Error(`esbuild produced no output for ${entry}`);

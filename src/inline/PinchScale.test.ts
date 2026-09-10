@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
 	MAX_PINCH_SCALE,
-	MIN_PINCH_SCALE,
+	fitInkBounds,
 	anchoredScroll,
 	clampPinchScale,
 	counterSizePercent,
@@ -22,9 +22,9 @@ describe("pinchScale", () => {
 		expect(pinchScale(start, 1)).toBe(start);
 	});
 
-	it("clamps at both ends", () => {
+	it("caps magnification and preserves positive lower requests", () => {
 		expect(pinchScale(1, 100)).toBe(MAX_PINCH_SCALE);
-		expect(pinchScale(1, 0.001)).toBe(MIN_PINCH_SCALE);
+		expect(pinchScale(1, 0.001)).toBe(0.001);
 	});
 
 	it("holds still on junk rather than collapsing the editor", () => {
@@ -39,10 +39,8 @@ describe("counterSizePercent", () => {
 		// Scaled 2x, the box must claim half the width to paint at 100%.
 		expect(counterSizePercent(2)).toBe(50);
 		expect(counterSizePercent(1)).toBe(100);
-		// Below 1 no longer exists to ask about: the scale it would counter
-		// is clamped away, because a shrunk editor leaves dead space that
-		// only a reflow could fill. See MIN_PINCH_SCALE.
-		expect(counterSizePercent(0.5)).toBe(100);
+		// Zooming out expands the viewport while the text column stays fixed.
+		expect(counterSizePercent(0.5)).toBe(200);
 	});
 });
 
@@ -95,4 +93,21 @@ describe("anchoredScroll", () => {
 		expect(anchoredScroll(120, 300, 0, 2)).toBe(120);
 		expect(anchoredScroll(120, 300, 1, Number.NaN)).toBe(120);
 	});
+});
+
+describe("fitInkBounds",()=>{
+ const g={viewportWidthScreen:640,viewportHeightScreen:480,externalScale:1,fontZoom:1,marginScreen:24};
+ it("fits distant ink below the former floor and accounts for font/external exactly once",()=>{
+  const bounds={x:0,y:0,width:18000,height:22000};
+  expect(fitInkBounds({...g,bounds})).toEqual({kind:"fit",zoom:432/22000});
+  expect(fitInkBounds({...g,bounds,fontZoom:1.5,externalScale:2})).toEqual({kind:"fit",zoom:432/(22000*3)});
+ });
+ it("caps a point at normal size and returns an explicit empty plan",()=>{
+  expect(fitInkBounds({...g,bounds:{x:10,y:20,width:0,height:0}})).toEqual({kind:"fit",zoom:1});
+  expect(fitInkBounds({...g,bounds:null})).toEqual({kind:"empty",zoom:1});
+ });
+ it("refuses invalid geometry and finite bounds outside native representation",()=>{
+  expect(fitInkBounds({...g,bounds:{x:0,y:0,width:1e20,height:1}})).toEqual({kind:"unrepresentable"});
+  expect(fitInkBounds({...g,viewportWidthScreen:0,bounds:null})).toEqual({kind:"unrepresentable"});
+ });
 });

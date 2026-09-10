@@ -117,7 +117,14 @@ export class StrokeBuilder {
 		return result;
 	}
 
-	private buildStroke(points: InkPoint[], createdAt = Date.now()): InkStroke | undefined {
+	/** Read-only pause snapshot, with exactly the release filter used at lift. */
+	snapshotReleaseFiltered(): InkStroke[] {
+		return this.releaseFilteredPointGroups()
+			.map(points => this.buildStroke(points.map(point => ({ ...point })), this.startedAt, "snap-preview"))
+			.filter((stroke): stroke is InkStroke => stroke !== undefined);
+	}
+
+	private buildStroke(points: InkPoint[], createdAt = Date.now(), id?: string): InkStroke | undefined {
 		if (points.length === 0) return undefined;
 		// A single tap should still leave a dot: duplicate the point slightly
 		// so segment-based renderers have something to draw.
@@ -125,7 +132,7 @@ export class StrokeBuilder {
 			? [points[0]!, { ...points[0]!, x: points[0]!.x + 0.01, t: points[0]!.t + 1 }]
 			: points;
 		return {
-			id: newStrokeId(),
+			id: id ?? newStrokeId(),
 			tool: this.tool,
 			color: this.color,
 			width: this.width,

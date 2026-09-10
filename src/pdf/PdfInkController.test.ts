@@ -3669,6 +3669,21 @@ describe("PdfInkController: the pen off on a pdf claims nothing", () => {
 		h(ev as unknown as Event);
 	}
 
+	function mouseEvent(type: string, timestamp: number, pointerId: number, buttons: number): PointerEvent {
+		const ev = penEvent(type, timestamp, {
+			pointerType: "mouse",
+			pointerId,
+			buttons,
+		}) as unknown as PointerEvent & { defaultPrevented: boolean };
+		let wasPrevented = false;
+		Object.defineProperty(ev, "defaultPrevented", { configurable: true, get: () => wasPrevented });
+		ev.preventDefault = () => {
+			wasPrevented = true;
+			prevented++;
+		};
+		return ev;
+	}
+
 	it("hands a pen contact back to the viewer while the pen is off", () => {
 		setPenInk(false);
 
@@ -3697,6 +3712,46 @@ describe("PdfInkController: the pen off on a pdf claims nothing", () => {
 		expect(priv.builder, "the pdf refused the pen after it was turned back on").not.toBe(null);
 		expect(controller.idle).toBe(false);
 		expect(prevented, "a claimed contact was left to the viewer").toBeGreaterThan(0);
+	});
+
+	it("preserves a claimed pdf mouse through the registered Keyboard pause fanout", () => {
+		setTipMode("nib");
+		setMouseInk(true);
+		setPenInk(true);
+		priv.pair = {
+			wetCanvas: { setCssProps: () => {} },
+			headCanvas: { setCssProps: () => {} },
+			wet: { clear: () => {}, clearStroke: () => {} },
+			tail: { clear: () => {}, clearAll: () => {} },
+		};
+		priv.wetHostPage = 1;
+		priv.tools = toolsStub();
+		const fire = (ev: PointerEvent) => scroller.handlers.get(ev.type)!(ev);
+		const down = mouseEvent("pointerdown", 100, 41, 1);
+		fire(down);
+		expect(controller.idle).toBe(false);
+		const undo = addStripSurface(() => {}, undefined, undefined, undefined, (preserveMouse) =>
+			controller.endLiveStroke(preserveMouse)
+		);
+		try {
+			setPenInk(false);
+			endLiveStrokesEverywhere(true);
+			expect(controller.idle, "Keyboard pause force-finished the PDF mouse").toBe(false);
+			expect(ops).toEqual([]);
+			fire(mouseEvent("pointermove", 108, 41, 1));
+			fire(mouseEvent("pointerrawupdate", 112, 41, 1));
+			const up = mouseEvent("pointerup", 120, 41, 0);
+			fire(up);
+			expect(ops.length, "the owned mouse did not commit at its own lift").toBe(1);
+			expect(controller.idle).toBe(true);
+			expect(up.defaultPrevented).toBe(true);
+			const fresh = mouseEvent("pointerdown", 128, 42, 1);
+			fire(fresh);
+			expect(fresh.defaultPrevented, "a paused fresh mouse was claimed").toBe(false);
+			expect(ops.length).toBe(1);
+		} finally {
+			undo();
+		}
 	});
 
 	/**
@@ -3773,7 +3828,7 @@ describe("PdfInkController: the pen off on a pdf claims nothing", () => {
 		expect(
 			mainSrc.slice(from, to),
 			"main.ts registers no end-live-stroke callback, so a pdf stroke survives the pen going off"
-		).toContain("c.endLiveStroke()");
+		).toContain("c.endLiveStroke(preserveMouse)");
 	});
 });
 

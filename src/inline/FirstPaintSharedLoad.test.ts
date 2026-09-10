@@ -100,6 +100,7 @@ interface Rig {
 
 function makeRig(path: string): Rig {
 	const o = Object.create(InkOverlayPlugin.prototype) as Fields;
+ o.pinchScaleNow = 1;
 	const trace: string[] = [];
 	const canvasLog: CanvasLog = { sizes: [], ops: [] };
 

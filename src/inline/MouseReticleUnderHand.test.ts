@@ -54,6 +54,7 @@ import { Camera } from "../camera/Camera";
 import { StrokeFrame } from "./StrokeFrame";
 import { setTipMode } from "./TipMode";
 import { setMouseInk } from "./MouseInk";
+import { resetPenInkForTest, setPenInk } from "./PenInk";
 import { PEN_HOVER_CLASS } from "./PenCursor";
 import { fakeEl, installFakeWindow } from "../../test/routerHarness";
 import type { PenSample } from "../input/PointerRouter";
@@ -244,6 +245,7 @@ describe("the mouse's hover reticle stands down while a hand is on the glass", (
 	afterEach(() => {
 		rig.dispose();
 		setMouseInk(false);
+		resetPenInkForTest();
 		setPenReticle(true);
 		releaseTipModes();
 	});
@@ -390,5 +392,26 @@ describe("the mouse's hover reticle stands down while a hand is on the glass", (
 		expect(rig.cursorStyle.display, "the mouse lost the ring of its own gesture").toBe("block");
 		expect(rig.cursorStyle.transform).toBe(ringAt(500, 500));
 		expect(rig.inst.mouseStroke, "the gesture was not recorded as a mouse's").toBe(true);
+	});
+
+	it("Keyboard mode cannot repaint a claimed mouse cursor after the hide fanout", () => {
+		rig.fire(ptr("pointermove", "mouse", 1, 500, 500));
+		expect(rig.cursorStyle.display).toBe("block");
+		setPenInk(false);
+		rig.proto.hidePenCursor.call(rig.inst);
+		rig.inst.mouseStroke = true;
+		rig.proto.showPenCursor.call(
+			rig.inst,
+			{ x: 520, y: 480, pressure: 0.5, timestamp: 0, tiltX: 0, tiltY: 0 },
+			"mouse"
+		);
+		expect(rig.cursorStyle.display).toBe("none");
+		expect(rig.scrollerClasses.has(PEN_HOVER_CLASS)).toBe(false);
+		rig.proto.showPenCursor.call(
+			rig.inst,
+			{ x: 530, y: 470, pressure: 0.5, timestamp: 0, tiltX: 0, tiltY: 0 }
+		);
+		expect(rig.cursorStyle.display).toBe("none");
+		expect(rig.scrollerClasses.has(PEN_HOVER_CLASS)).toBe(false);
 	});
 });

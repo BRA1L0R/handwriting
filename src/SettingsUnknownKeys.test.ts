@@ -27,7 +27,8 @@
  */
 import { beforeEach, describe, expect, it } from "vitest";
 
-import HandwritingPlugin from "./main";
+import HandwritingPlugin, { HandwritingSettingTab } from "./main";
+import { exportInkColor, inkExportReadabilityEnabled } from "./ink/InkTheme";
 import { clampInkSize } from "./ink/InkSize";
 import { clampEraserRadius } from "./ink/EraserSize";
 import { normalizePenToolsMode, resetPenToolsForTest } from "./inline/PenToolsMode";
@@ -93,6 +94,48 @@ async function loadThenSave(raw: unknown): Promise<Harness> {
 	await proto.persistSettings.call(plugin);
 	return plugin;
 }
+
+describe("settings control consistency preserves saved behavior", () => {
+	it("presents both color controls as dropdowns and identifies global paper scope", async () => {
+		const plugin = await loadThenSave({});
+		(plugin as unknown as Record<string, unknown>).manifest = { version: "1.5.0" };
+		const tab = Object.create(HandwritingSettingTab.prototype);
+		tab.plugin = plugin;
+		type Row = { name?: string; desc?: string; items?: Row[]; control?: { type: string; key: string; options?: Record<string, string> } };
+		const flatten = (items: Row[]): Row[] => items.flatMap(item => item.items ? flatten(item.items) : [item]);
+		const rows = flatten(tab.getSettingDefinitions());
+		const exported = rows.find(row => row.name === "Ink color when exporting")!;
+		const pdf = rows.find(row => row.name === "Ink color when flattening PDFs")!;
+		expect(exported.control).toEqual({ type: "dropdown", key: "inkReadableInExports", options: { auto: "Automatic readability", keep: "Keep original colors" } });
+		expect(pdf.control?.type).toBe("dropdown");
+		expect(pdf.control?.options).toEqual({ darken: "Darken for light pages", lighten: "Lighten for dark pages", keep: "Keep original colors" });
+		expect(rows.find(row => row.name === "Paper background")?.desc).toBe("Lined, grid, or dotted paper. Global setting. Default none.");
+	});
+	it.each([undefined, true, false])("maps legacy export %s to dropdown without changing color policy", async value => {
+		const plugin = await loadThenSave(value === undefined ? {} : { inkReadableInExports: value });
+		const tab = Object.create(HandwritingSettingTab.prototype);
+		tab.plugin = plugin;
+		expect(tab.getControlValue("inkReadableInExports")).toBe(value === false ? "keep" : "auto");
+		const before = [exportInkColor("#ffffff", "#ffffff", "pen"), exportInkColor("#000000", "#000000", "pen")];
+		(plugin as unknown as Record<string, unknown>).saveSettingsNow = () => undefined;
+		tab.setControlValue("inkReadableInExports", "keep");
+		expect(plugin.settings.inkReadableInExports).toBe(false);
+		expect(exportInkColor("#ffffff", "#ffffff", "pen")).toBe("#ffffff");
+		tab.setControlValue("inkReadableInExports", "auto");
+		expect(plugin.settings.inkReadableInExports).toBe(true);
+		expect(inkExportReadabilityEnabled()).toBe(true);
+		expect(exportInkColor("#ffffff", null, "pen")).toBe("#ffffff");
+		expect(exportInkColor("#ffffff", "#ffffff", "highlighter")).toBe("#ffffff");
+		if(value !== false) expect([exportInkColor("#ffffff", "#ffffff", "pen"), exportInkColor("#000000", "#000000", "pen")]).toEqual(before);
+		await proto.persistSettings.call(plugin);
+		expect(plugin.saved?.inkReadableInExports).toBe(true);
+	});
+	it.each([undefined, "auto", "show", "hide"])("preserves toolbar visibility %s", async mode => {
+		const plugin = await loadThenSave(mode === undefined ? {} : { penTools: mode });
+		expect(plugin.settings.penTools).toBe(mode ?? "auto");
+		expect(plugin.saved?.penTools).toBe(mode ?? "auto");
+	});
+});
 
 describe("loadSettings carries keys this build does not know", () => {
 	beforeEach(resetPenToolsForTest);

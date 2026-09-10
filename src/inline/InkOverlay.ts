@@ -129,7 +129,8 @@ import { drawCommitted,
 import { snipViewport } from "../pdf/PageMap";
 import { TailRenderer } from "../ink/TailRenderer";
 import { WetInkRenderer } from "../ink/WetInkRenderer";
-import { PenSample } from "../input/PointerRouter";
+import { PenSample, silentLift } from "../input/PointerRouter";
+import { SnapPreview, SnapPreviewCanvas } from "./SnapPreview";
 import { padBBox, pointInBBox } from "../objects/Selection";
 import { SelectionModel } from "../objects/SelectionModel";
 import { runDetached } from "../util/Detached";
@@ -184,12 +185,20 @@ import { ExtentInputs, FrontierCache, sameExtentInputs } from "./FrontierCache";
 import { DamageLedger } from "../ink/DamageLedger";
 import { StrokeIndex } from "../ink/StrokeIndex";
 import { DWELL_MS, snapStroke } from "../ink/ShapeSnap";
+import { beginUndoWindow, discardUndoTrace, isUndoRedoKey, registerUndoTraceView, unregisterUndoTraceView } from "../diag/UndoHistoryTrace";
 
 const sessionStartMs = Date.now();
-import { anchoredScroll, pinchScale } from "./PinchScale";
+import { anchoredScroll, pinchScale, fitInkBounds, MAX_VIEWPORT_LAYOUT, type InkFitBounds } from "./PinchScale";
 import { ERASER_CURSOR_CLASS } from "./PenCursor";
 import { DEFAULT_ERASER_RADIUS_PX, clampEraserRadius } from "../ink/EraserSize";
-import { backingScale, effectiveScale, fontZoomFactor, noteToVisual, visualToNote } from "./ZoomScale";
+import {
+	backingScale,
+	ownedEffectiveScale,
+	validCameraScale,
+	fontZoomFactor,
+	noteToVisual,
+	visualToNote,
+} from "./ZoomScale";
 import {
 	isPenProbeEnabled,
 	markMappedTip,
@@ -202,7 +211,7 @@ import { armMouseInkQuietly, markToolPicked, mouseInkEnabled, toolPickedHere } f
 import { penInkEnabled } from "./PenInk";
 import { fingerInkEligible } from "./FingerInk";
 import { describeEl, setHitProbeContext } from "./PenHitProbe";
-import { Extent, inkFrontier, isScrollableOverflow, ScrollAxisGuard, spacerPosition, surfaceExtents, surfaceOriginInScroller, writeFrontier, ZERO_EXTENT, zoomFrontier } from "./SurfaceExtent";
+import { Extent, inkFrontier, isScrollableOverflow, ScrollAxisGuard, ScrollExpansionDemand, spacerPosition, surfaceExtents, surfaceOriginInScroller, writeFrontier, ZERO_EXTENT, zoomFrontier } from "./SurfaceExtent";
 import { ProbeBox, capturePresented, parseHexColor, regionCensus } from "./PresentProbe";
 import {
 	bboxVisibleInViewport,
@@ -381,6 +390,7 @@ export function getInkSizeMult(tool: InkTool): number {
 
 export function setInkSizeMult(tool: InkTool, mult: number): void {
 	inkSizeMult[tool] = clampInkSize(mult);
+	for (const overlay of instances) overlay.clearSnapPreview();
 }
 
 export function getInlineTool(): InkTool {
@@ -389,6 +399,7 @@ export function getInlineTool(): InkTool {
 
 export function setInlineTool(tool: InkTool): void {
 	inlineTool = tool;
+	for (const overlay of instances) overlay.clearSnapPreview();
 	// THE NIB HALF OF "a tool has been picked" (MouseInk.ts, `toolPicked`).
 	// Here rather than in the two tool commands, the strip's two nib buttons,
 	// the colour commands and the quick-pen chips, because every one of them
@@ -573,7 +584,7 @@ const hideCursorSurfaces = new Set<() => void>();
  * - the failure `abandonActiveStroke` was written for, reached a different
  * way.
  */
-const endStrokeSurfaces = new Set<() => void>();
+const endStrokeSurfaces = new Set<(preserveMouse?: boolean) => void>();
 
 /** Register an extra strip to refresh with the editors. Returns the undo. */
 export function addStripSurface(
@@ -581,7 +592,7 @@ export function addStripSurface(
 	onTipMode?: () => void,
 	onRepaint?: () => void,
 	onHideCursor?: () => void,
-	onEndLiveStroke?: () => void
+	onEndLiveStroke?: (preserveMouse?: boolean) => void
 ): () => void {
 	stripSurfaces.add(refresh);
 	if (onTipMode) tipModeSurfaces.add(onTipMode);
@@ -646,6 +657,7 @@ let shapeSnapOn = true;
 
 export function setShapeSnap(on: boolean): void {
 	shapeSnapOn = on;
+	if (!on) for (const overlay of instances) overlay.clearSnapPreview();
 }
 
 export function setPenReticle(on: boolean): void {
@@ -752,6 +764,16 @@ export function applyInkSize(tool: InkTool, mult: number): void {
 export const inlineInk = new InlineInkStore();
 const instances = new Set<InkOverlayPlugin>();
 
+let scrollExpansionEnabled = false;
+export function setScrollExpansionEnabled(on: boolean): void {
+	if (on === scrollExpansionEnabled) return;
+	scrollExpansionEnabled = on;
+	for (const overlay of instances) {
+		overlay.setCanvasMomentumDisabled(on);
+		overlay.scheduleRepaint("scroll-expansion-setting");
+	}
+}
+
 function prepareFingerInkEverywhere(): void {
 	for (const p of instances) p.prepareFingerInk();
 }
@@ -842,6 +864,8 @@ export function refreshPenToolsAll(): void {
  * still open - that would strip the standing touch-action guard off the
  * scroller on every toggle made just after a stroke, which is the lit-nib
  * regression its own header spells out.
+ * `preserveMouse` is the Keyboard-OFF exception: an owned mouse stays live
+ * until its own up/cancel; blur and teardown use the default false.
  *
  * EVERY SURFACE, like the state itself. This walked `instances` alone while
  * the pen-off state was note-only; the owner's reversal ("why would you take
@@ -852,9 +876,9 @@ export function refreshPenToolsAll(): void {
  * and for the reason `stripSurfaces` states: this module is imported BY the
  * pdf surface, so importing back would close the loop.
  */
-export function endLiveStrokesEverywhere(): void {
-	for (const p of instances) p.endLiveStroke();
-	for (const end of endStrokeSurfaces) end();
+export function endLiveStrokesEverywhere(preserveMouse = false): void {
+	for (const p of instances) p.endLiveStroke(preserveMouse);
+	for (const end of endStrokeSurfaces) end(preserveMouse);
 }
 
 /**
@@ -966,7 +990,7 @@ export function armMouseInkQuietlyEverywhere(): void {
  * so nothing else would.
  */
 export function repaintAllInkOverlays(): void {
-	for (const p of instances) p.scheduleRepaint("shaping-toggle");
+	for (const p of instances) { p.clearSnapPreview(); p.scheduleRepaint("shaping-toggle"); }
 	for (const repaint of repaintSurfaces) repaint();
 }
 
@@ -1235,6 +1259,9 @@ export class InkOverlayPlugin {
 	 * per-offer and takes itself down.
 	 */
 	private readonly snapChip = new SnapChip();
+	private snapPreview: SnapPreview | null = null;
+	private snapCanvas: SnapPreviewCanvas | null = null;
+	private snapContactId: number | null = null;
 
 	// gesture state (one pen contact at a time; mode decided at pen-down)
 	private mode: PenMode = "ink";
@@ -1372,6 +1399,7 @@ export class InkOverlayPlugin {
 	private offInkChanged: (() => void) | null = null;
 	/** What updateExtent last acted on; equal inputs mean equal output. */
 	private lastExtentInputs: ExtentInputs | null = null;
+	private scrollExpansion: ScrollExpansionDemand | null = null;
 	/** The `.markdown-source-view` ancestor carrying the `handwriting-page` class. */
 	private pageClassHost: HTMLElement | null = null;
 	/** Keeps the page-id-only Properties block class in step with Obsidian's DOM. */
@@ -1435,6 +1463,15 @@ export class InkOverlayPlugin {
 	private lastSyncFontStr = "";
 	/** CSS-transform scale alone (visual px per layout px), fontZoom excluded. */
 	private cssScale = 1;
+	private scaleGeometryValid = true;
+ private viewportGeneration = 0;
+ private viewportPaneObserver: ResizeObserver | null = null;
+ private viewportStyleObserver: MutationObserver | null = null;
+ private viewportStyleFrame = 0;
+ private viewportStyleStamp = "";
+ private viewportStyleDirty: {path:string|null;container:HTMLElement|null} | null = null;
+ private viewportLayout: {parent:HTMLElement; paneWidth:number; paneHeight:number; externalScale:number; baseTransform:string; width:number; height:number; column:number; left:string; right:string; styles:Map<string,{value:string;priority:string}>} | null = null;
+
 	private fontZoom = 1;
 	/** overflow-x re-checked once per resize/mount, not per repaint. */
 	private axisChecked = false;
@@ -1502,6 +1539,8 @@ export class InkOverlayPlugin {
 	// paint present while the glass is blank = presentation/compositor.
 	/** The file this editor was last showing. Ink isolation depends on it. */
 	private lastPath: string | null = null;
+	private undoIdentity: object | null = null;
+	private undoIdentityStale = false;
 	/**
 	 * What this overlay has already said about an empty page, so an eraser
 	 * scrub - many contacts, one piece of news - says it once. See
@@ -1783,7 +1822,7 @@ export class InkOverlayPlugin {
 			// undefined, which reads as "never off", because there is no
 			// keyboard use case on a pdf and taking the pen away there would
 			// answer a request nobody made.
-			penOff: () => !penInkEnabled(),
+			penOff: () => !penInkEnabled() || this.scaleGeometryValid === false,
 			claimBandContact: (ev) =>
 				bandEraserIntent(
 					ev.pointerType,
@@ -1809,6 +1848,7 @@ export class InkOverlayPlugin {
 			() => this.cssScale
 		);
 
+		this.router.setCanvasMomentumDisabled(scrollExpansionEnabled);
 		this.resizeObserver = new ResizeObserver(() => this.handleResize());
 		this.resizeObserver.observe(host);
 		this.contentResizeObserver = new ResizeObserver(() => {
@@ -1851,6 +1891,7 @@ export class InkOverlayPlugin {
 		});
 
 		this.scrollFn = () => {
+			this.clearSnapPreview();
 			const during = this.router?.isStroking ?? false;
 			if (during) this.scrollsDuringStroke++;
 			// Nothing here moves the ink any more. The layer is a child of
@@ -1977,6 +2018,7 @@ export class InkOverlayPlugin {
 		runDetached(
 			inlineInk.ensureLoaded(path).then((changed) => {
 				if (this.filePath() === path) {
+					this.mobileTools?.refresh();
 					this.updateHandwritingPageClass();
 					if (changed) this.scheduleRepaint();
 				}
@@ -2099,6 +2141,12 @@ export class InkOverlayPlugin {
 		if (!app?.commands) return;
 		const commands = app.commands;
 		this.mobileTools = new MobileTools(this.chromeHost(), {
+   noteViewport: {
+    getNoteViewportState:()=>this.getNoteViewportState(),
+    zoomNoteBy:factor=>this.zoomNoteBy(factor),
+    resetNoteZoom:()=>this.resetNoteZoom(),
+    fitHandwriting:()=>this.fitHandwriting(),
+   },
 			exec: (id) => {
 				{
 					// "editor:undo" and "editor:redo" are NOT Obsidian
@@ -2234,6 +2282,7 @@ export class InkOverlayPlugin {
 	}
 
 	unmount(): void {
+		if (diagnosticsEnabled() && this.undoIdentity) discardUndoTrace(this.undoIdentity);
 		this.router?.dispose();
 		this.router = null;
 		this.resizeObserver?.disconnect();
@@ -2295,11 +2344,7 @@ export class InkOverlayPlugin {
 		// OUTLIVES this overlay: unmounting while zoomed used to leave the
 		// editor painted at scale in a fraction-width box, with the only
 		// code that could undo it now unloaded.
-		const host = this.view.dom;
-		host.style.removeProperty("transform");
-		host.style.removeProperty("transform-origin");
-		host.style.removeProperty("width");
-		host.style.removeProperty("height");
+		this.restoreViewportLayout();
 		this.pinchScaleNow = 1;
 		this.pinchRasterScale = 1;
 		this.pinchRefScale = null;
@@ -2350,6 +2395,20 @@ export class InkOverlayPlugin {
 
 		const path = this.filePath();
 		if (path !== this.lastPath) {
+			if (diagnosticsEnabled() && this.undoIdentity) {
+				discardUndoTrace(this.undoIdentity);
+				unregisterUndoTraceView(this.view.dom);
+				this.undoIdentity = null;
+				this.undoIdentityStale = false;
+			} else if (this.undoIdentity) {
+				this.undoIdentity = null;
+				this.undoIdentityStale = true;
+			}
+   this.restoreViewportLayout();
+   this.pinchScaleNow=1; this.pinchRasterScale=1;
+   this.pinchPending=null; this.pinchAnchor=null; this.pinchRefScale=null;
+   this.view.scrollDOM.scrollLeft=0; this.view.scrollDOM.scrollTop=0;
+   this.scrollExpansion?.rebase(0,0);
 			this.lastPath = path;
 			this.updateHandwritingPageClass();
 			// A fresh note starts reading, so the strip starts as the pill.
@@ -2427,6 +2486,36 @@ export class InkOverlayPlugin {
 	}
 
 	handleKeyDown(event: KeyboardEvent): boolean {
+		const undoKind = diagnosticsEnabled() ? isUndoRedoKey(event) : null;
+		if (undoKind) {
+			if (this.undoIdentityStale) {
+				unregisterUndoTraceView(this.view.dom);
+				this.undoIdentityStale = false;
+			}
+			this.undoIdentity ??= registerUndoTraceView(this.view.dom, {});
+			const selection = this.view.state.selection.main;
+			const target = event.target instanceof Element && this.view.dom.contains(event.target) ? "editor" : "other";
+			beginUndoWindow(this.undoIdentity, {
+				kind: undoKind,
+				key: {
+					key: event.key.toLowerCase() as "z" | "y",
+					ctrl: event.ctrlKey,
+					meta: event.metaKey,
+					shift: event.shiftKey,
+					alt: event.altKey,
+					defaultPrevented: event.defaultPrevented,
+					target,
+				},
+				selection: {
+					from: selection.from,
+					to: selection.to,
+					anchor: selection.anchor,
+					head: selection.head,
+					empty: selection.empty,
+				},
+				scroll: { x: this.view.scrollDOM.scrollLeft, y: this.view.scrollDOM.scrollTop, phase: "before", axes: "" },
+			});
+		}
 		// Escape deselects, like everywhere else lassos exist.
 		if (event.key === "Escape" && !this.selection.isEmpty) {
 			this.selection.clear();
@@ -2559,6 +2648,10 @@ export class InkOverlayPlugin {
 	}
 
 	/** The live overlay container, for the census's ghost detection. */
+	setCanvasMomentumDisabled(on: boolean): void {
+		this.router?.setCanvasMomentumDisabled(on);
+	}
+
 	containerEl(): Element | null {
 		return this.container;
 	}
@@ -2569,9 +2662,11 @@ export class InkOverlayPlugin {
 	 * no-op when nothing is live, and no chrome call of its own because
 	 * `finishActiveStroke` reaches `penUp()` through `onPenUp` and that is
 	 * where the strip already comes down.
+	 * `preserveMouse` keeps an owned mouse live for Keyboard-OFF; other callers
+	 * use the default and commit immediately.
 	 */
-	endLiveStroke(): void {
-		this.router?.finishActiveStroke();
+	endLiveStroke(preserveMouse = false): void {
+		this.router?.finishActiveStroke({ preserveMouse });
 	}
 
 	routerCounters(): {
@@ -2593,7 +2688,27 @@ export class InkOverlayPlugin {
 	// ---- geometry -----------------------------------------------------------
 
 	private handleResize(): void {
+  this.mobileTools?.refresh();
+  this.scrollExpansion?.rebase(this.view.scrollDOM.scrollLeft,this.view.scrollDOM.scrollTop);
+  const layout=this.viewportLayout;
+  if(layout && !this.frame.locked && layout.parent.clientWidth>0 && layout.parent.clientHeight>0 &&
+   (layout.parent.clientWidth!==layout.paneWidth||layout.parent.clientHeight!==layout.paneHeight)) {
+   const width=layout.width+layout.parent.clientWidth-layout.paneWidth;
+   const height=layout.height+layout.parent.clientHeight-layout.paneHeight;
+   if(width>0&&height>0&&width/this.pinchScaleNow<=MAX_VIEWPORT_LAYOUT&&height/this.pinchScaleNow<=MAX_VIEWPORT_LAYOUT) {
+    layout.width=width;layout.height=height;layout.paneWidth=layout.parent.clientWidth;layout.paneHeight=layout.parent.clientHeight;
+    const host=this.view.dom;
+    host.classList.remove("handwriting-note-viewport");
+    host.setCssStyles({width:`${width}px`,height:`${height}px`});
+    const style=this.winRef.getComputedStyle(this.view.contentDOM);
+    layout.column=this.view.contentDOM.offsetWidth;layout.left=style.marginLeft;layout.right=style.marginRight;
+    this.commitCameraScale(this.pinchScaleNow);
+    return;
+   }
+  }
+		this.clearSnapPreview();
 		if (!this.container) return;
+		if (scrollExpansionEnabled) this.lastExtentInputs = null;
 		// The container no longer inherits the editor's box, so its size is
 		// whatever syncBand last wrote. Resize it FIRST or every measurement
 		// below - including the zero-size check that releases the backings in
@@ -2602,6 +2717,10 @@ export class InkOverlayPlugin {
 		const prevScale = this.scale;
 		const rect = this.container.getBoundingClientRect();
 		if (rect.width === 0 || rect.height === 0) {
+			if (!this.frame.locked) {
+				this.scaleGeometryValid = false;
+				this.router?.cameraTransformChanged();
+			}
 			// A background tab keeps its editor - and this overlay - alive
 			// at zero size. Five full-size backings on an invisible surface
 			// are ~70MB at high dpr (seen live: a 0x0 editor holding a
@@ -2629,11 +2748,18 @@ export class InkOverlayPlugin {
 		// the untransformed box and give the backing store the extra device
 		// pixels the scale demands, so ink stays crisp instead of being
 		// upscaled by the compositor.
-		const measuredCssScale = effectiveScale({
+		const measuredCssScale = ownedEffectiveScale({
 			visualWidth: rect.width,
 			layoutWidth: this.container.offsetWidth,
 			cmScaleX: this.view.scaleX,
-		});
+		}, this.pinchScaleNow);
+		if (measuredCssScale === null) {
+			if (!this.frame.locked) {
+				this.scaleGeometryValid = false;
+				this.router?.cameraTransformChanged();
+			}
+			return;
+		}
 		// Quick-font-size zoom (Ctrl+scroll / touchpad pinch) is a reflow:
 		// dpr and the transform scale both stay put while the text grows.
 		// The current/mount-time font ratio is the missing zoom factor.
@@ -2665,9 +2791,14 @@ export class InkOverlayPlugin {
 		// measured values regardless, so canvas resolution is unaffected and
 		// the reallocation path behaves exactly as it did.
 		if (!this.frame.locked) {
+			this.scaleGeometryValid = true;
+			if (Math.abs(measuredCssScale - this.cssScale) > this.cssScale * SCALE_EPSILON)
+				this.router?.cameraTransformChanged();
 			this.cssScale = measuredCssScale;
+   if(this.viewportLayout && Math.abs(measuredCssScale/this.pinchScaleNow-this.viewportLayout.externalScale)>SCALE_EPSILON) this.viewportLayout.externalScale=measuredCssScale/this.pinchScaleNow;
 			this.fontZoom = measuredFontZoom;
 			this.scale = this.cssScale * this.fontZoom;
+			this.updatePaperSpacing();
 		}
 		const layoutW = this.container.offsetWidth || rect.width;
 		const layoutH = this.container.offsetHeight || rect.height;
@@ -3014,11 +3145,17 @@ export class InkOverlayPlugin {
 		// compressed toward the top-left. Which code path failed to refill
 		// the cache stopped mattering once the pen measures for itself: the
 		// scale and the camera now come from one read and cannot disagree.
-		const measured = effectiveScale({
+		const measured = ownedEffectiveScale({
 			visualWidth: overlay.width,
 			layoutWidth: this.container.offsetWidth,
 			cmScaleX: this.view.scaleX,
-		});
+		}, this.pinchScaleNow);
+		if (measured === null) {
+			this.scaleGeometryValid = false;
+			this.router?.cameraTransformChanged();
+			return;
+		}
+		this.scaleGeometryValid = true;
 		// Adopt it only when it MEANS something. Rect widths are fractional,
 		// so this quotient wobbles in its last decimals every frame; letting
 		// that through moved the camera origin every frame, and repaint()
@@ -3029,7 +3166,9 @@ export class InkOverlayPlugin {
 		// thousands of times larger than this threshold, so nothing that
 		// matters is filtered out.
 		if (Math.abs(measured - this.cssScale) > this.cssScale * SCALE_EPSILON) {
+			this.router?.cameraTransformChanged();
 			this.cssScale = measured;
+   if(this.viewportLayout && Math.abs(measured/this.pinchScaleNow-this.viewportLayout.externalScale)>SCALE_EPSILON) this.viewportLayout.externalScale=measured/this.pinchScaleNow;
 		}
 		// And the FONT zoom, which until 1.4.10 only `handleResize` ever
 		// wrote. The two observers do not fire together: changing the editor
@@ -3152,6 +3291,9 @@ export class InkOverlayPlugin {
 	// ---- pen path (frozen pipeline) ----------------------------------------
 
 	private penDown(sample: PenSample, ev: PointerEvent): void {
+		// A new owned gesture invalidates any previous camera/reveal continuation.
+		this.viewportGeneration++;
+		this.clearSnapPreview();
 		// The router cancels pointerdown so the pen cannot move CodeMirror's
 		// caret. That also cancels native focus. Give keyboard ownership back to
 		// this editor before freezing geometry, or Delete and undo go wherever
@@ -3405,7 +3547,40 @@ export class InkOverlayPlugin {
 			);
 			this.probeSample(sample, ev, point, 1, true, "down");
 		}
+		this.beginSnapPreview(sample, ev);
 		noteProbeStroke();
+	}
+
+	/** The builder and note are captured once; a stale timer cannot follow either. */
+	private beginSnapPreview(sample: Pick<PenSample, "x" | "y">, ev: PointerEvent): void {
+		this.clearSnapPreview();
+		if (!shapeSnapOn || ev.pointerType !== "pen" || !this.strokePenGesture || !this.builder || !this.container) return;
+		const builder = this.builder;
+		const path = this.filePath();
+		if (!path) return;
+		const tool = inlineTool;
+		const color = getInkColorHex(tool);
+		const size = getInkSizeMult(tool);
+		this.snapContactId = ev.pointerId;
+		this.snapCanvas ??= new SnapPreviewCanvas();
+		this.snapPreview = new SnapPreview({
+			clock: this.winRef,
+			valid: () => shapeSnapOn && this.builder === builder && this.strokePenGesture && this.mode === "ink" &&
+				this.filePath() === path && !!this.container && inlineTool === tool &&
+				getInkColorHex(tool) === color && getInkSizeMult(tool) === size,
+			snapshot: () => builder.snapshotReleaseFiltered(),
+			show: stroke => !!this.container && this.snapCanvas!.show(this.container, this.camera.snapshot,
+				stroke, this.cssWidth, this.cssHeight, this.backingNow()),
+			hide: () => this.snapCanvas?.clear(),
+		});
+		this.snapPreview.start(sample.x, sample.y);
+	}
+
+	clearSnapPreview(): void {
+		this.snapPreview?.clear();
+		this.snapPreview = null;
+		this.snapContactId = null;
+		this.snapCanvas?.clear();
 	}
 
 	private penRaw(samples: PenSample[], ev: PointerEvent): void {
@@ -3450,6 +3625,7 @@ export class InkOverlayPlugin {
 		let accepted = 0;
 		let lastAccepted: { x: number; y: number } | undefined;
 		for (const s of samples) {
+			this.snapPreview?.move(s.x, s.y);
 			if (Math.hypot(s.x - this.rawLastMoveX, s.y - this.rawLastMoveY) > 4) {
 				this.rawLastMoveT = s.timestamp;
 				this.rawLastMoveX = s.x;
@@ -3657,6 +3833,7 @@ export class InkOverlayPlugin {
 		// Whatever the gesture was, it is over: the frame is live again and
 		// re-reads the editor's current origin.
 		this.frame.end();
+		if(this.viewportStyleDirty)this.scheduleViewportStyleRefresh();
 		// The stroke is over: the strip returns (a beat later, so an eraser
 		// scrub's rapid lift-and-reland does not strobe it) and its buttons
 		// catch up with what undo can do now. The catch-up is a microtask,
@@ -3738,18 +3915,26 @@ export class InkOverlayPlugin {
 			// anyway. §5g/G1.
 			this.frontierCache.invalidate(path);
 			this.repaintPath(path);
+			// The successful erase already explained why this note is empty.
+			// Consume the episode after save/change notifications have settled.
+			if (inlineInk.inkPresence(path) === "none") this.emptyNotice.claim(path, "erase");
 			return;
 		}
 		metrics.end(performance.now());
 		this.stopFrameTicker();
 		const builder = this.builder;
-		this.builder = null;
+		const wasPen = this.strokePenGesture;
 		// Finish before clearing the wet layer. Release filtering may produce
 		// several stored strokes from one contact, but every committed segment
 		// is drawn underneath the still-visible wet pixels before they clear.
 		if (this.strokePenGesture) observeStrokeMax(this.strokeRawMax);
-		this.strokePenGesture = false;
 		let strokes = builder?.finishReleaseFiltered() ?? [];
+		const lift = !!ev && ev.pointerType === "pen" && ev.pointerId === this.snapContactId &&
+			(ev.type === "pointerup" || ((ev.type === "pointermove" || ev.type === "pointerrawupdate") && silentLift(ev)));
+		const visibleSnap = this.snapPreview?.take(strokes, lift) ?? null;
+		this.clearSnapPreview();
+		this.builder = null;
+		this.strokePenGesture = false;
 		// Hold the pen still at the end and the figure snaps to the clean
 		// shape it meant (line, triangle, rectangle, circle, ellipse). The
 		// dwell is the request; an ordinary lift never gets here.
@@ -3758,7 +3943,12 @@ export class InkOverlayPlugin {
 		// on the mouse branch below; the offer is made after the commit, since
 		// what the chip replaces is the stroke that has already landed.
 		let snapOffered: InkStroke | null = null;
-		if (shapeSnapOn && strokes.length === 1) {
+		if (wasPen && visibleSnap && strokes.length === 1) {
+			snapReplaced = strokes[0]!;
+			strokes = [{ ...visibleSnap, createdAt: strokes[0]!.createdAt }];
+		}
+		// Mouse offers and finger input retain the existing release behavior.
+		if (!wasPen && shapeSnapOn && strokes.length === 1) {
 			const heldMs = performance.now() - this.rawLastMoveT;
 			if (heldMs >= DWELL_MS) {
 				const snapped = snapStroke(strokes[0]!, true);
@@ -4286,6 +4476,7 @@ export class InkOverlayPlugin {
 		centroid: { x: number; y: number }
 	): void {
 		if (phase === "start") {
+			if(this.getNoteViewportState().busy) return;
 			this.pinchRefScale = this.pinchScaleNow;
 			// The anchor is captured ONCE, here. Every frame of the gesture
 			// is then computed from this state, so the view cannot chase the
@@ -4364,59 +4555,225 @@ export class InkOverlayPlugin {
 	 * the overlay itself scale as one object and no stored coordinate moves.
 	 * The overlay picks the new scale up on its own: `effectiveScale` measures
 	 * painted width against layout width, which is exactly what a transform
-	 * changes. Sizing the box to 100/k percent first keeps the painted result
-	 * filling the pane instead of hanging outside it.
+	 * changes. This path retains the current magnification-only layout.
 	 */
 	private applyPinchScale(next: number, settle: boolean): void {
 		const anchor = this.pinchAnchor;
 		if (!anchor) return;
-		const host = this.view.dom;
 		const scroller = this.view.scrollDOM;
 		// Both scales come from the GESTURE, not from the previous frame: the
 		// reference the gesture started at, and where it is being asked to go.
 		const from = this.pinchRefScale ?? this.pinchScaleNow;
-		const nextLeft = anchoredScroll(anchor.scrollLeft, anchor.offsetX, from, next);
-		const nextTop = anchoredScroll(anchor.scrollTop, anchor.offsetY, from, next);
+		const external=this.cssScale/this.pinchScaleNow;
+		const nextLeft = anchoredScroll(anchor.scrollLeft, anchor.offsetX, from*external, next*external);
+		const nextTop = anchoredScroll(anchor.scrollTop, anchor.offsetY, from*external, next*external);
 
-		this.pinchScaleNow = next;
-		// Transform ONLY - never width or height. The counter-sized box made
-		// the text re-wrap while zooming (words changed lines while the
-		// world-anchored ink stayed put), and the re-wrap is a full document
-		// reflow, which is why every variant of it was laggy. A magnified
-		// note keeps its exact layout: lines overhang the pane and the
-		// scroller reaches them, the same as any canvas or pdf viewer. The
-		// transform is compositor work, so the live gesture costs nothing.
-		if (next === 1) {
-			host.style.removeProperty("transform");
-			host.style.removeProperty("transform-origin");
-		} else {
-			host.setCssStyles({ transform: `scale(${next})`, transformOrigin: "0 0" });
-		}
+		if (!this.commitCameraScale(next, {left:nextLeft,top:nextTop})) return;
 		// A final native scroll write needs the final range first. Browsers clamp
 		// against the old range synchronously and do not retry after the extent
 		// grows, so settle before committing the original-anchor offsets.
 		if (settle) this.settlePinchRaster();
-		scroller.scrollLeft = nextLeft;
-		scroller.scrollTop = nextTop;
+		this.setViewportScroll(nextLeft,nextTop);
 		// Stamp AFTER the writes: the scroll events they queue are the ones
 		// the handler above should let pass without a repaint.
 		this.pinchScrollAt = performance.now();
 	}
 
-	/**
-	 * Pinch over: re-raster the ink crisply at the final scale. A no-op when
-	 * nothing changed since the last raster, because `handleResize`
-	 * reallocates both committed canvases and redraws every stroke - too
-	 * much to spend on a two-finger settle that crossed the slop and
-	 * changed nothing.
-	 */
+
+ private restoreViewportLayout():void {
+  this.viewportGeneration++;
+  this.viewportPaneObserver?.disconnect();this.viewportPaneObserver=null;
+  this.viewportStyleObserver?.disconnect();this.viewportStyleObserver=null;
+  this.viewportStyleDirty=null;
+  if(this.viewportStyleFrame){this.winRef.cancelAnimationFrame(this.viewportStyleFrame);this.viewportStyleFrame=0;}
+  const layout=this.viewportLayout;
+  if(!layout) return;
+  const host=this.view.dom;
+  host.classList.remove("handwriting-note-viewport");
+  layout.parent.classList.remove("handwriting-note-viewport-pane");
+  for(const [name,saved] of layout.styles) {
+   if(saved.value) host.style.setProperty(name,saved.value,saved.priority); else host.style.removeProperty(name);
+  }
+  this.viewportLayout=null;
+ }
+
+ private prepareViewportLayout():boolean {
+  const host=this.view.dom,parent=host.parentElement;
+  if(!parent||!host.clientWidth||!host.clientHeight) return false;
+  if(!this.viewportLayout) {
+   const names=["width","height","transform","transform-origin","--handwriting-note-column-width","--handwriting-note-column-margin-left","--handwriting-note-column-margin-right","--handwriting-paper-pitch","--handwriting-paper-rule"];
+   const style=this.winRef.getComputedStyle(this.view.contentDOM);
+   this.viewportLayout={parent,paneWidth:parent.clientWidth,paneHeight:parent.clientHeight,externalScale:this.cssScale/this.pinchScaleNow,baseTransform:this.winRef.getComputedStyle(host).transform,width:host.clientWidth,height:host.clientHeight,column:this.view.contentDOM.offsetWidth,left:style.marginLeft,right:style.marginRight,styles:new Map(names.map(n=>[n,{value:host.style.getPropertyValue(n),priority:host.style.getPropertyPriority(n)}]))};
+  }
+  if(!this.viewportPaneObserver) {
+   this.viewportPaneObserver=new ResizeObserver(()=>this.handleResize());
+   this.viewportPaneObserver.observe(parent);
+   const doc=host.ownerDocument;
+   const stamp=()=>[doc.documentElement.className,doc.documentElement.getAttribute("style"),doc.body.className,doc.body.getAttribute("style"),parent.className.replace(/handwriting-note-viewport-pane/g,""),parent.getAttribute("style")].join("|");
+   this.viewportStyleStamp=stamp();
+   this.viewportStyleObserver=new MutationObserver(records=>{
+    const next=stamp();
+    if(next===this.viewportStyleStamp&&!records.some(r=>doc.head.contains(r.target)))return;
+    this.viewportStyleStamp=next;
+    this.viewportStyleDirty={path:this.filePath(),container:this.container};
+    this.scheduleViewportStyleRefresh();
+   });
+   this.viewportStyleObserver.observe(doc.head,{childList:true,subtree:true,characterData:true});
+   for(const el of new Set([doc.documentElement,doc.body,parent]))this.viewportStyleObserver.observe(el,{attributes:true,attributeFilter:["class","style"]});
+  }
+  return true;
+ }
+
+
+
+ private scheduleViewportStyleRefresh():void {
+  if(!this.viewportStyleDirty||this.viewportStyleFrame)return;
+  this.viewportStyleFrame=this.winRef.requestAnimationFrame(()=>{
+   this.viewportStyleFrame=0;
+   const dirty=this.viewportStyleDirty;
+   if(!dirty)return;
+   if(dirty.path!==this.filePath()||dirty.container!==this.container){this.viewportStyleDirty=null;return;}
+   // Keep one dirty marker; pen-up schedules the single retry, never a loop.
+   if(this.frame.locked)return;
+   this.viewportStyleDirty=null;
+   this.refreshViewportColumn();
+  });
+ }
+
+ /** Re-measure the ordinary column when a theme changes at constant pane size. */
+ private refreshViewportColumn():void {
+  const layout=this.viewportLayout;
+  if(!layout||this.frame.locked||!this.container)return;
+  const host=this.view.dom;
+  host.classList.remove("handwriting-note-viewport");
+  host.setCssStyles({width:`${layout.width}px`,height:`${layout.height}px`});
+  const style=this.winRef.getComputedStyle(this.view.contentDOM);
+  const column=this.view.contentDOM.offsetWidth,left=style.marginLeft,right=style.marginRight;
+  const changed=column!==layout.column||left!==layout.left||right!==layout.right;
+  host.classList.add("handwriting-note-viewport");
+  host.setCssStyles({width:`${layout.width/this.pinchScaleNow}px`,height:`${layout.height/this.pinchScaleNow}px`});
+  if(changed){layout.column=column;layout.left=left;layout.right=right;this.commitCameraScale(this.pinchScaleNow);}
+ }
+
+ private setViewportScroll(left:number,top:number):void {
+  const scroller=this.view.scrollDOM;
+  scroller.scrollLeft=left;scroller.scrollTop=top;
+  this.scrollExpansion?.rebase(scroller.scrollLeft,scroller.scrollTop);
+ }
+
+ private updatePaperSpacing():void {
+  if(!this.viewportLayout||!Number.isFinite(this.cssScale)||this.cssScale<=0)return;
+  // Keep every power-of-two rule at low CSS zoom. Font size does not
+  // scale CSS backgrounds. Levels stay bounded by the camera's layout range.
+  const level=Math.min(20,Math.max(0,Math.ceil(Math.log2(1/this.cssScale)-1e-6)));
+  const host=this.view.dom;
+  for(const [name,value] of [["--handwriting-paper-pitch",`${28*2**level}px`],["--handwriting-paper-rule",`${1/Math.min(1,this.cssScale)}px`]]) {
+   if(host.style.getPropertyValue(name!)!==value)host.style.setProperty(name!,value!);
+  }
+ }
+
+ getNoteViewportState():{zoom:number;busy:boolean;fitAvailable:boolean} {
+  const path=this.filePath();
+  const busy=!this.container || !path || !inlineInk.isLoaded(path) || inlineInk.deleteAllReadiness(path).kind==="unsettled" || this.frame.locked || this.builder!==null || this.mode!=="ink";
+  return {zoom:this.pinchScaleNow,busy,fitAvailable:!busy&&this.scaleGeometryValid!==false};
+ }
+
+ zoomNoteBy(factor:number):boolean {
+  if(this.getNoteViewportState().busy||!Number.isFinite(factor)||factor<=0) return false;
+  return this.zoomAroundCenter(Math.min(4,this.pinchScaleNow*factor));
+ }
+ resetNoteZoom():boolean {
+  return !this.getNoteViewportState().busy && this.zoomAroundCenter(1);
+ }
+ private zoomAroundCenter(next:number):boolean {
+  const scroller=this.view.scrollDOM,rect=scroller.getBoundingClientRect();
+  const external=this.cssScale/this.pinchScaleNow;
+  return this.commitCameraScale(next,{left:anchoredScroll(scroller.scrollLeft,rect.width/2,this.cssScale,next*external),top:anchoredScroll(scroller.scrollTop,rect.height/2,this.cssScale,next*external)});
+ }
+
+ fitHandwriting():"fit"|"empty"|"busy"|"unrepresentable" {
+  if(this.getNoteViewportState().busy) return "busy";
+  const refuse=()=>{new Notice("Handwriting: this ink cannot fit in the current view.");return "unrepresentable" as const;};
+  const path=this.filePath()!;
+  let bounds:InkFitBounds|null=null;
+  for(const stroke of inlineInk.strokes(path)) {
+   // Loaded and freshly built bboxes already include width*2 allowance.
+   const b=stroke.bbox;
+   if(![b.x,b.y,b.width,b.height].every(Number.isFinite)||b.width<0||b.height<0) return refuse();
+   const x=b.x,y=b.y,right=b.x+b.width,bottom=b.y+b.height;
+   if(!bounds) bounds={x,y,width:right-x,height:bottom-y};
+   else {const endX=Math.max(bounds.x+bounds.width,right),endY=Math.max(bounds.y+bounds.height,bottom);bounds.x=Math.min(bounds.x,x);bounds.y=Math.min(bounds.y,y);bounds.width=endX-bounds.x;bounds.height=endY-bounds.y;}
+  }
+  const scroller=this.view.scrollDOM,rect=scroller.getBoundingClientRect();
+  const external=this.viewportLayout?.externalScale??this.cssScale/this.pinchScaleNow;
+  const screenWidth=this.viewportLayout?this.viewportLayout.width*external:rect.width;
+  const screenHeight=this.viewportLayout?this.viewportLayout.height*external:rect.height;
+  const plan=fitInkBounds({bounds,viewportWidthScreen:screenWidth,viewportHeightScreen:screenHeight,externalScale:external,fontZoom:this.fontZoom,marginScreen:24});
+  if(plan.kind==="unrepresentable") return refuse();
+  if(!bounds) return this.commitCameraScale(1,{left:0,top:0})?"empty":refuse();
+  const origin=surfaceOriginInScroller({contentLeftVisual:this.columnLeft(),documentTopVisual:this.view.documentTop,scrollRectLeft:rect.left,scrollRectTop:rect.top,scrollLeft:scroller.scrollLeft,scrollTop:scroller.scrollTop,scale:this.cssScale});
+  const scale=external*plan.zoom;
+  const left=Math.max(0,origin.left+(bounds.x+bounds.width/2)*this.fontZoom-screenWidth/scale/2);
+  const top=Math.max(0,origin.top+(bounds.y+bounds.height/2)*this.fontZoom-screenHeight/scale/2);
+  if(origin.left+bounds.x*this.fontZoom<0||origin.top+bounds.y*this.fontZoom<0) return refuse();
+  return this.commitCameraScale(plan.zoom,{left,top})?"fit":refuse();
+ }
+
+ /** One validated transaction owns layout, transform, native range and scroll. */
+ commitCameraScale(next:number,scroll?:{left:number;top:number}):boolean {
+  if(this.frame.locked||this.scaleGeometryValid===false||next>4||!validCameraScale(next,this.view.dom.clientWidth,this.view.dom.clientHeight))return false;
+  const previous=this.pinchScaleNow,effective=this.cssScale/previous*next;
+  if(!validCameraScale(effective)||!this.prepareViewportLayout())return false;
+  const layout=this.viewportLayout!;
+  const width=layout.width/next,height=layout.height/next;
+  const target=scroll??{left:this.view.scrollDOM.scrollLeft,top:this.view.scrollDOM.scrollTop};
+  if(![width,height,target.left,target.top].every(n=>Number.isFinite(n)&&n>=0&&n<=MAX_VIEWPORT_LAYOUT)||width===0||height===0)return false;
+  if(next!==previous)this.router?.cameraTransformChanged();
+  const host=this.view.dom;
+  const generation=++this.viewportGeneration,path=this.filePath();
+  this.pinchScaleNow=next;this.cssScale=effective;this.scale=effective*this.fontZoom;
+  this.updatePaperSpacing();
+  host.classList.add("handwriting-note-viewport");layout.parent.classList.add("handwriting-note-viewport-pane");
+  host.style.setProperty("--handwriting-note-column-width",`${layout.column}px`);
+  host.style.setProperty("--handwriting-note-column-margin-left",layout.left);
+  host.style.setProperty("--handwriting-note-column-margin-right",layout.right);
+  host.setCssStyles({width:`${width}px`,height:`${height}px`,transform:`${layout.baseTransform!=="none"?layout.baseTransform+" ":""}scale(${next})`,transformOrigin:"0 0"});
+  this.scrollExpansion?.rebase(this.view.scrollDOM.scrollLeft,this.view.scrollDOM.scrollTop);
+  this.handleResize();this.updateExtent(true);this.setViewportScroll(target.left,target.top);
+  const settledLeft=this.view.scrollDOM.scrollLeft,settledTop=this.view.scrollDOM.scrollTop;
+  this.view.requestMeasure({key:this,read:()=>generation===this.viewportGeneration&&path===this.filePath()&&!!this.container&&this.view.scrollDOM.scrollLeft===settledLeft&&this.view.scrollDOM.scrollTop===settledTop,write:valid=>{
+   if(!valid||generation!==this.viewportGeneration||path!==this.filePath()||this.frame.locked)return;
+   this.handleResize();this.updateExtent(true);this.setViewportScroll(target.left,target.top);this.scheduleRepaint();
+   // CodeMirror adjusts its text scroll anchor after measurement writes.
+   // Finish this explicit camera navigation after that adjustment, before
+   // the next input event, retaining the same note/gesture ownership guards.
+   queueMicrotask(()=>{
+    if(generation!==this.viewportGeneration||path!==this.filePath()||!this.container||this.frame.locked)return;
+    this.setViewportScroll(target.left,target.top);this.scheduleRepaint();
+   });
+  }});
+  this.mobileTools?.refresh();
+  return true;
+ }
+
 	private settlePinchRaster(): void {
 		if (this.pinchScaleNow === this.pinchRasterScale) return;
 		this.pinchRasterScale = this.pinchScaleNow;
+		// A transform does not resize CodeMirror's layout box. Refresh its
+		// measured scale before a later Undo captures a viewport snapshot.
+		this.view.requestMeasure();
 		this.handleResize();
 	}
 
 	private showPenCursor(sample: PenSample, pointerType?: string): void {
+		// Keyboard mode is an overarching pause for mouse ink. The router keeps
+		// an already-claimed mouse alive so its samples can commit, and these
+		// in-gesture wrappers intentionally omit pointerType; do not let either
+		// path repaint the drawing cursor after the keyboard command hid it.
+		const mousePaused =
+			!penInkEnabled() &&
+			(pointerType === "mouse" || (pointerType === undefined && this.mouseStroke));
+		if (mousePaused) return;
 		// Visibility for anything that can ink - a mouse hovering with mouse
 		// ink armed still wants the strip, and gating that would silently take
 		// the toolbar away from every mouse-ink user. Alan ruled for exactly
@@ -4690,6 +5047,7 @@ export class InkOverlayPlugin {
 		this.frameTicking = true;
 		const tick = (ts: number): void => {
 			if (!this.frameTicking) return;
+			this.snapPreview?.check();
 			metrics.recordFrame(ts);
 			this.winRef.requestAnimationFrame(tick);
 		};
@@ -5258,6 +5616,7 @@ export class InkOverlayPlugin {
 
 	/** The strip's active-tool marks are stale; recompute them. */
 	refreshStrip(): void {
+		this.snapPreview?.check();
 		this.mobileTools?.refresh();
 	}
 
@@ -5391,6 +5750,7 @@ export class InkOverlayPlugin {
 	}
 
 	private resetGestureState(): void {
+		this.clearSnapPreview();
 		// Lifecycle rule (v0.13.6 fix): every gesture-state reset releases the
 		// stroke frame lock. File switch and unmount reach here mid-stroke;
 		// leaving the lock held froze the NEXT note's camera and repaints
@@ -6021,7 +6381,12 @@ export class InkOverlayPlugin {
 		// object and the G1 skip guard below would hold the pre-contact extent
 		// for a whole gesture (1.4.6 §5n).
 		const writtenOn = inlineInk.strokes(path).length > 0 || penSeenThisSession();
+		const scroller = this.view.scrollDOM;
+		const expansion = this.scrollExpansion ?? (scrollExpansionEnabled ? (this.scrollExpansion = new ScrollExpansionDemand()) : null);
+		const scrollRevision = expansion?.sample(path, scrollExpansionEnabled, scroller.scrollLeft, scroller.scrollTop) ?? 0;
 		const inputs: ExtentInputs = {
+			scrollRevision,
+			granted: surfaceExtents.get(path),
 			path,
 			frontier: this.frontierCache.get(path, inlineInk.strokes(path)),
 			writtenOn,
@@ -6036,7 +6401,6 @@ export class InkOverlayPlugin {
 		};
 		if (!force && sameExtentInputs(this.lastExtentInputs, inputs)) return;
 		this.lastExtentInputs = inputs;
-		const scroller = this.view.scrollDOM;
 		// The origin is needed BEFORE growing now: the zoom frontier is
 		// origin-relative, and it joins the ink frontier in one grow so a
 		// magnified note's overhang is scrollable (see zoomFrontier).
@@ -6055,7 +6419,7 @@ export class InkOverlayPlugin {
 		// Shared with writeFrontier below - both need the same document-bottom
 		// number and neither may re-read layout to get it.
 		const contentBottom = (contentRect.bottom - preRect.top) / this.cssScale + scroller.scrollTop;
-		const zoom = zoomFrontier({
+		const zoom = this.viewportLayout ? ZERO_EXTENT : zoomFrontier({
 			clientWidth: scroller.clientWidth,
 			clientHeight: scroller.clientHeight,
 			contentBottom,
@@ -6068,15 +6432,23 @@ export class InkOverlayPlugin {
 		// byte-identical extent.
 		const write = inputs.writtenOn
 			? writeFrontier({
-					clientHeight: scroller.clientHeight,
+					clientHeight: this.viewportLayout?.height ?? scroller.clientHeight,
 					contentBottom,
 					origin,
 					fontZoom: this.fontZoom,
 				})
 			: ZERO_EXTENT;
+		const scroll = scrollExpansionEnabled && expansion ? expansion.reserve({
+			left: scroller.scrollLeft, top: scroller.scrollTop,
+			nativeWidth: scroller.clientWidth, nativeHeight: scroller.clientHeight,
+			width: scroller.clientWidth,
+			height: scroller.clientHeight,
+			edgeX: scroller.scrollWidth, edgeY: scroller.scrollHeight,
+			origin, fontZoom: this.fontZoom, pinchScale: this.pinchScaleNow,
+		}) : ZERO_EXTENT;
 		const granted = surfaceExtents.grow(path, {
-			x: Math.max(ink.x, zoom.x),
-			y: Math.max(ink.y, zoom.y, write.y),
+			x: Math.max(ink.x, zoom.x, scroll.x),
+			y: Math.max(ink.y, zoom.y, write.y, scroll.y),
 		});
 		if (!this.spacer && granted.x === 0 && granted.y === 0) return;
 		if (!this.spacer) {
@@ -6102,6 +6474,7 @@ export class InkOverlayPlugin {
 			x: granted.x * this.fontZoom,
 			y: granted.y * this.fontZoom,
 		});
+		expansion?.applied(pos.left + 1, pos.top + 1);
 		let moved = false;
 		if (pos.left !== this.spacerLeft) {
 			this.spacerLeft = pos.left;

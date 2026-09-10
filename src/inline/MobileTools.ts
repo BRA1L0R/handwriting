@@ -42,7 +42,7 @@ import { stripEscapeVerdict } from "./StripEscape";
 import { gridColumns, overflowPlan, type OverflowPlan } from "./StripOverflow";
 import { popRightOffset } from "./PopPlacement";
 import { stripClearance } from "./StripClearance";
-import { deviceHasNeverSeenAPen, penHardwareEverSeen, penHardwareSeen } from "./PenToolsMode";
+import { deviceHasNeverSeenAPen, getPenToolsMode, onPenToolsChanged, penHardwareEverSeen, penHardwareSeen } from "./PenToolsMode";
 import { markMousePutDown, markToolPicked, mouseDrawsFromLitTool, toolIsLit } from "./MouseInk";
 import { penInkEnabled, setPenInk } from "./PenInk";
 import { DEFAULT_PEN, HIGHLIGHTER_PEN } from "../ink/PenStyle";
@@ -51,6 +51,13 @@ import { describeEl } from "./PenHitProbe";
 import { traceStripClick } from "./InlinePenRouter";
 
 export interface MobileToolsHost {
+ noteViewport?: {
+  getNoteViewportState():{zoom:number;busy:boolean;fitAvailable:boolean};
+  zoomNoteBy(factor:number):boolean;
+  resetNoteZoom():boolean;
+  fitHandwriting():string;
+ };
+
 	/** Execute a command by its full id (e.g. "handwriting:inline-tool-pen"). */
 	exec(commandId: string): void;
 	/** The active nib: "pen" or "highlighter". */
@@ -389,7 +396,8 @@ export const nibIsLit = (h: MobileToolsHost, tool: "pen" | "highlighter"): boole
  * rediscover which of the two switches to ask about.
  */
 const mouseDrawsHere = (h: MobileToolsHost): boolean =>
-	h.mouseInkOn() || mouseDrawsFromLitTool(deviceHasNeverSeenAPen(), toolIsLit(h.penInksHere()));
+	h.penInksHere() &&
+	(h.mouseInkOn() || mouseDrawsFromLitTool(deviceHasNeverSeenAPen(), toolIsLit(h.penInksHere())));
 
 /**
  * Pixel<->multiplier conversion for the nib sliders (Alan, 2026-09: "aligning
@@ -1103,6 +1111,7 @@ export class MobileTools {
 	private readonly rowOrder: HTMLElement[] = [];
 	/** The plan last APPLIED, so an unchanged one costs no DOM moves. */
 	private appliedPlan = "";
+	private appliedOrder = "";
 	/**
 	 * The grid last WRITTEN - `"<columns>:<cell px>"` - for the same reason
 	 * `appliedPlan` exists. Both custom properties are re-derived on every
@@ -1111,6 +1120,8 @@ export class MobileTools {
 	 */
 	private appliedGrid = "";
 	private resizeWatch: { disconnect(): void } | null = null;
+	private inking = false;
+	private stopModeWatch: (() => void) | null = null;
 	/**
 	 * The corner this strip is parked in, kept because item 5's clearance
 	 * needs to know which way to dodge and `setCorner` otherwise wrote the
@@ -1423,12 +1434,31 @@ export class MobileTools {
 		}
 	};
 
+	private viewportControls: HTMLElement | null = null;
+	private viewportButtons: HTMLButtonElement[] = [];
+
 	constructor(parent: HTMLElement, private host: MobileToolsHost, opts: MobileToolsOptions = {}) {
 		// Read once into a local: the flag is consulted from the resize
 		// observer's callback, which outlives this call, and a closure over one
 		// boolean is cheaper to reason about than a field nothing else reads.
 		const preview = opts.preview === true;
 		this.pane = parent;
+  if (host.noteViewport && !preview) {
+   const group=parent.createDiv({cls:"handwriting-note-viewport-controls",attr:{role:"group","aria-label":"Note zoom"}});
+   this.viewportControls=group;
+   for(const [label,text,action] of [
+    ["Zoom out","−",()=>host.noteViewport!.zoomNoteBy(.5)],
+    ["Reset note zoom to 100%","100%",()=>host.noteViewport!.resetNoteZoom()],
+    ["Zoom in","+",()=>host.noteViewport!.zoomNoteBy(2)],
+    ["Fit handwriting","Fit",()=>host.noteViewport!.fitHandwriting()],
+   ] as const) {
+    const button=group.createEl("button",{text,attr:{type:"button","aria-label":label,title:label}});
+    button.addEventListener("pointerdown",e=>e.preventDefault());
+    button.addEventListener("click",()=>{action();this.refresh();});
+    this.viewportButtons.push(button);
+   }
+  }
+
 		// The collapsed form: one small pen button that brings the strip back.
 		this.pill = parent.createEl("button", {
 			cls: "handwriting-pen-pill",
@@ -1710,11 +1740,32 @@ export class MobileTools {
 				// hands the mouse back to text. Pen and touch keep the tap
 				// (hover already opened the slider for anything that hovers).
 				const ptr = ev.pointerType;
+				const claimsTip =
+					nib !== null ||
+					spec.commandId === "handwriting:inline-tool-eraser" ||
+					spec.commandId === "handwriting:inline-tool-lasso" ||
+					spec.commandId === "handwriting:inline-tool-space" ||
+					spec.commandId === "handwriting:inline-tool-pan";
 				// `mouseDrawsHere`, not `mouseInkOn()`: on a pen-less device the
 				// mouse draws because a tool is PICKED, with nothing armed, so
 				// the old guard left that user's lit button unable to put
 				// itself down at all.
-				if (
+				if (claimsTip && !this.host.penInksHere()) {
+					// A paused tool is selected, not put down. Run Pen while still
+					// paused so its command cannot toggle a newly lit pen off.
+					if (nib === "pen" || !spec.isActive?.(this.host)) this.host.exec(spec.commandId);
+					markToolPicked();
+					if (!this.host.penInksHere()) this.host.exec(PEN_INK_TOGGLE);
+					if (ptr === "mouse" && !this.host.mouseInkOn()) this.host.armMouseInkQuietly();
+					if (nib) this.host.prepareFingerInk?.();
+					this.host.setEditorFocus(false);
+					this.openInkSlider = nib;
+					this.sliderFromHover = false;
+					if (spec.commandId === "handwriting:inline-tool-eraser") {
+						this.eraserPopClosed = false;
+						this.eraserPopFromHover = false;
+					}
+				} else if (
 					nib &&
 					ptr === "touch" &&
 					(this.host.fingerInkAvailable?.() ?? false) &&
@@ -1886,12 +1937,6 @@ export class MobileTools {
 					// mode toggles it off, and turning a thing off must not
 					// claim the mouse. The exec's own toast names what was
 					// picked; the arming is silent beside it.
-					const claimsTip =
-						nib !== null ||
-						spec.commandId === "handwriting:inline-tool-eraser" ||
-						spec.commandId === "handwriting:inline-tool-lasso" ||
-						spec.commandId === "handwriting:inline-tool-space" ||
-						spec.commandId === "handwriting:inline-tool-pan";
 					const wasActive = spec.isActive?.(this.host) ?? false;
 					// Computed BEFORE exec, and now that matters in two ways
 					// rather than one. It always had to be: exec is what
@@ -2243,6 +2288,7 @@ export class MobileTools {
 		// fold order is a setting, and a change to it has to reach the strips
 		// that are already open. Dropped again in `destroy()`.
 		liveStrips.add(this);
+		if (!preview) this.stopModeWatch = onPenToolsChanged(() => this.setInking(this.inking));
 		this.layoutOverflow();
 		// Item 5 rides the same two triggers as item 4 - a first pass now, and
 		// the observer below - because they answer the same question about the
@@ -2457,15 +2503,24 @@ export class MobileTools {
 		// to land them where they already are is the kind of chrome cost that
 		// shows up as stroke lag on the e-ink devices this plugin is used on.
 		const key = plan.chevron ? plan.moved.join(",") : "";
-		if (key === this.appliedPlan) return;
+		const priority = [...foldOrder].reverse();
+		const orderKey = priority.join(",");
+		if (key === this.appliedPlan && orderKey === this.appliedOrder) return;
 		this.appliedPlan = key;
+		this.appliedOrder = orderKey;
 		this.el.toggleClass("is-more-needed", plan.chevron);
 		if (!plan.chevron) this.setMoreOpen(false);
 		const moved = new Set(plan.moved);
-		// Row one first, in its canonical order, each node put back before the
-		// chevron - which is what keeps a returning button between the right
-		// dividers instead of at the end of the row.
-		for (const node of this.rowOrder) {
+		// Keep fixed controls/dividers in their slots; saved priority fills
+		// only the draggable slots, including when every button fits.
+		const ordered = priority.flatMap(id => {
+			const button = this.buttons.find(b => b.spec.commandId === id);
+			return button ? [button.el] : [];
+		});
+		const draggable = new Set(ordered);
+		let slot = 0;
+		for (const original of this.rowOrder) {
+			const node = draggable.has(original) ? ordered[slot++]! : original;
 			const spec = this.buttons.find((b) => b.el === node)?.spec;
 			if (spec && moved.has(spec.commandId)) continue;
 			this.el.insertBefore(node, this.moreBtn);
@@ -2516,6 +2571,12 @@ export class MobileTools {
 
 	/** The synchronous body; the constructor uses it before first paint. */
 	refreshNow(): void {
+  const viewport=this.host.noteViewport?.getNoteViewportState();
+  if(viewport) this.viewportButtons.forEach((button,i)=>{
+   button.disabled=viewport.busy || (i===3&&!viewport.fitAvailable) || (i===2&&viewport.zoom>=4);
+   if(i===1) button.textContent=`${Number((viewport.zoom*100).toPrecision(3))}%`;
+  });
+
 		this.recordingDot.toggleClass("is-recording", this.host.recordingOn());
 		for (const { el, spec } of this.buttons) {
 			// The lights follow the TOOL state and nothing else. They used to
@@ -2977,8 +3038,10 @@ export class MobileTools {
 	 * handler.
 	 */
 	setInking(on: boolean): void {
-		this.el.toggleClass("is-inking", on);
-		this.pill.toggleClass("is-inking", on);
+		this.inking = on;
+		const hide = on && getPenToolsMode() === "auto";
+		this.el.toggleClass("is-inking", hide);
+		this.pill.toggleClass("is-inking", hide);
 	}
 
 	/**
@@ -3526,6 +3589,8 @@ export class MobileTools {
 	}
 
 	destroy(): void {
+		this.stopModeWatch?.();
+		this.stopModeWatch = null;
 		this.cancelSliderClose();
 		// Every timer this strip can have armed, cancelled before the elements
 		// they would touch are removed. A strip is destroyed and rebuilt on a
@@ -3558,6 +3623,7 @@ export class MobileTools {
 		this.heldSlider = null;
 		this.el.remove();
 		this.pill.remove();
+		this.viewportControls?.remove();
 		this.buttons = [];
 	}
 

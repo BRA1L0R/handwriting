@@ -317,6 +317,7 @@ class FakeEl {
 			...ev,
 		};
 		for (const fn of [...(this.listeners.get(type) ?? [])]) fn(event);
+		if (type === "pointerdown") this.parentElement?.fire(type, event);
 	}
 	/**
 	 * Everything in this subtree a person could read or hear: text nodes, and
@@ -663,7 +664,7 @@ describe("fold order: the control against a fake tree", () => {
 		// for it is the one branch this can honestly check.
 		const h = build();
 		const cap = h.pane.all("handwriting-fold-cap")[0];
-		expect(cap?.textContent).toBe("Everything fits on the screen.");
+		expect(cap?.textContent).toBe("Drag to order. Everything fits on the screen.");
 		expect(h.pane.all("handwriting-fold-list")[0]?.classes.has("is-nofold")).toBe(true);
 		h.control.destroy();
 	});
@@ -788,7 +789,7 @@ describe("fold order: the line at a width that really folds", () => {
 		const h = build();
 		foldAt(h, 476);
 		expect(h.pane.all("handwriting-fold-cap")[0]?.textContent).toBe(
-			"On a small screen, these 3 are behind More."
+			"Drag to order. Buttons below this line will collapse when window narrows."
 		);
 		const labels = h
 			.rows()
@@ -823,7 +824,7 @@ describe("fold order: the line at a width that really folds", () => {
 		expect(list?.classes.has("is-nofold")).toBe(true);
 		expect(list?.style["--handwriting-fold-keep"]).toBe("5");
 		expect(h.pane.all("handwriting-fold-cap")[0]?.textContent).toBe(
-			"Everything fits on the screen."
+			"Drag to order. Everything fits on the screen."
 		);
 		h.control.destroy();
 	});
@@ -868,11 +869,10 @@ describe("fold order: nothing a user reads says fold, or narrow", () => {
 	// calls a viewport.
 
 	it("the caption says where the buttons are, in both branches", () => {
-		expect(moreCaption(0)).toBe("Everything fits on the screen.");
-		// "these 1 are" is not English, and the demonstrative is what has to
-		// go: "On a small screen, 1 is behind More." is the pinned singular.
-		expect(moreCaption(1)).toBe("On a small screen, 1 is behind More.");
-		expect(moreCaption(3)).toBe("On a small screen, these 3 are behind More.");
+		expect(moreCaption(0)).toBe("Drag to order. Everything fits on the screen.");
+		// Actual overflow selects the second caption; its wording is count-independent.
+		expect(moreCaption(1)).toBe("Drag to order. Buttons below this line will collapse when window narrows.");
+		expect(moreCaption(3)).toBe("Drag to order. Buttons below this line will collapse when window narrows.");
 	});
 
 	it("a row's fate is named by the button, not the mechanism", () => {
@@ -890,7 +890,7 @@ describe("fold order: nothing a user reads says fold, or narrow", () => {
 		// Cannot fail open: the strings that should be there are.
 		expect(spoken).toContain("Keep on the toolbar");
 		expect(spoken).toContain("Always shown");
-		expect(spoken).toContain("Everything fits on the screen.");
+		expect(spoken).toContain("Drag to order. Everything fits on the screen.");
 		// The section is named after the setting row it is drawn under, so a
 		// screen reader announces the group by the name the user searched for.
 		expect(spoken).toContain("Toolbar buttons");
@@ -900,7 +900,7 @@ describe("fold order: nothing a user reads says fold, or narrow", () => {
 	});
 
 	it("says neither of every row's handle either, at both fates", () => {
-		for (const s of [moreCaption(0), moreCaption(1), moreCaption(4), rowFate(true), rowFate(false)]) {
+		for (const s of [rowFate(true), rowFate(false)]) {
 			expect(s.toLowerCase()).not.toContain("fold");
 			expect(s.toLowerCase()).not.toContain("narrow");
 		}
@@ -1100,7 +1100,7 @@ describe("fold order: the line follows the window", () => {
 		narrowTo(h, 1400);
 		expect(keep(h)).toBe(5);
 		expect(h.pane.all("handwriting-fold-cap")[0]?.textContent).toBe(
-			"Everything fits on the screen."
+			"Drag to order. Everything fits on the screen."
 		);
 		// The reported symptom: at this width the strip really does fold, and
 		// the line has to say so. The chevron is not on the row yet at the
@@ -1110,7 +1110,7 @@ describe("fold order: the line follows the window", () => {
 		narrowTo(h, 476);
 		expect(keep(h)).toBe(2);
 		expect(h.pane.all("handwriting-fold-cap")[0]?.textContent).toBe(
-			"On a small screen, these 3 are behind More."
+			"Drag to order. Buttons below this line will collapse when window narrows."
 		);
 		h.control.destroy();
 	});

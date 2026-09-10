@@ -41,6 +41,7 @@ import { PenSample } from "../input/PointerRouter";
 import { resetTipModeForTest } from "../inline/TipMode";
 import { setPenReticle } from "../inline/InkOverlay";
 import { setMouseInk } from "../inline/MouseInk";
+import { resetPenInkForTest, setPenInk } from "../inline/PenInk";
 import { fakeEl, installFakeWindow, penEvent } from "../../test/routerHarness";
 
 class NoopObserver {
@@ -93,6 +94,7 @@ describe("PdfInkController reticle - the mouse stands down while a hand is on th
 		resetTipModeForTest();
 		setPenReticle(true);
 		setMouseInk(false);
+		resetPenInkForTest();
 		cursorStyle = { display: "none" };
 		const el = fakeEl() as ReturnType<typeof fakeEl> & Record<string, unknown>;
 		el.querySelector = () => null;
@@ -140,6 +142,7 @@ describe("PdfInkController reticle - the mouse stands down while a hand is on th
 	afterEach(() => {
 		priv.router?.dispose();
 		setMouseInk(false);
+		resetPenInkForTest();
 		setPenReticle(true);
 	});
 
@@ -236,5 +239,19 @@ describe("PdfInkController reticle - the mouse stands down while a hand is on th
 		expect(outcome).toBe("wrote");
 		expect(cursorStyle.display).toBe("block");
 		expect(scroller.classList.contains("handwriting-pdf-hover")).toBe(true);
+	});
+
+	it("Keyboard mode cannot repaint a claimed mouse reticle after the hide fanout", () => {
+		priv.showCursor(sample(10, 10), "mouse");
+		expect(cursorStyle.display).toBe("block");
+		(priv as typeof priv & { mouseStroke: boolean }).mouseStroke = true;
+		setPenInk(false);
+		(controller as unknown as { hideCursor(): void }).hideCursor();
+		const mouseOutcome = priv.showCursor(sample(20, 20), "mouse");
+		const inGestureOutcome = priv.showCursor(sample(30, 30));
+		expect(mouseOutcome).toBe("off");
+		expect(inGestureOutcome).toBe("off");
+		expect(cursorStyle.display).toBe("none");
+		expect(scroller.classList.contains("handwriting-pdf-hover")).toBe(false);
 	});
 });

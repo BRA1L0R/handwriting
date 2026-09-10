@@ -33,7 +33,10 @@ vi.mock("obsidian", async (importOriginal) => {
 	};
 });
 
-import { InkOverlayPlugin, inlineInk } from "./InkOverlay";
+import { InkOverlayPlugin, inlineInk, setEraserWholeStrokes } from "./InkOverlay";
+import { StrokeIndex } from "../ink/StrokeIndex";
+import { onInkChanged } from "./InkEvents";
+import { inkChangeRearmsNotice } from "./EmptyPageNotice";
 import { resetTipModeForTest, setTipMode } from "./TipMode";
 import { SelectionModel } from "../objects/SelectionModel";
 import { InkStroke } from "../ink/Stroke";
@@ -97,6 +100,7 @@ function makeEraseRig(path: string) {
 		penDown(this: unknown, sample: unknown, ev: unknown): void;
 	};
 	return {
+		view,
 		penDown() {
 			const sample = { x: 50, y: 50, pressure: 0.5, timestamp: 0, tiltX: 0, tiltY: 0 };
 			const ev = { buttons: 1, button: 0, clientX: 50, clientY: 50 };
@@ -299,6 +303,81 @@ describe("empty-page notices on the note surface", () => {
 			"Handwriting: no ink on the page to erase",
 			"Handwriting: no ink on the page to erase",
 		]);
+	});
+});
+
+describe("successful final erase handles the empty-page episode", () => {
+	beforeEach(() => {
+		resetTipModeForTest();
+		setTipMode("eraser");
+		notices.messages = [];
+	});
+	afterEach(() => {
+		resetTipModeForTest();
+		setEraserWholeStrokes(true);
+	});
+
+	it.each([[true, true], [false, true], [true, false], [false, false]])(
+		"handles a final erase but not a miss, whole=%s hit=%s", (whole, hit) => {
+		const path = `final-erase-${whole}-${hit}.md`;
+		const ink = stroke("final");
+		const at = hit ? 50 : 500;
+		ink.points = ink.points.map((p) => ({ ...p, x: at, y: at }));
+		ink.bbox = { x: at - 1, y: at - 1, width: 2, height: 2 };
+		inlineInk.commit(path, ink);
+		setEraserWholeStrokes(whole);
+		const rig = makeEraseRig(path);
+		const view = rig.view;
+		delete view.eraseAt;
+		view.erasePieces = new Set<string>();
+		view.strokeIndex = new StrokeIndex();
+		view.indexDirty = true;
+		view.damage = { addRect: () => undefined };
+		view.scheduleRepaint = () => undefined;
+		view.stopFrameTicker = () => undefined;
+		view.hideEraserCursor = () => undefined;
+		view.frontierCache = { invalidate: () => undefined };
+		view.view = { hasFocus: true, dispatch: vi.fn() };
+		const changed: string[] = [];
+		const off = onInkChanged((p) => {
+			if (p !== path) return;
+			changed.push(inlineInk.inkPresence(p));
+			if (inkChangeRearmsNotice(inlineInk.inkPresence(p))) {
+				(view.emptyNotice as { forget(path: string): void }).forget(p);
+			}
+		});
+		const up = () => (InkOverlayPlugin.prototype as unknown as {
+			penUp(this: unknown): void;
+		}).penUp.call(view);
+		try {
+			rig.penDown();
+			if (!hit) {
+				expect(inlineInk.strokes(path)).toEqual([ink]);
+				up();
+				expect(changed).toEqual([]);
+				inlineInk.takeLive(path, [ink.id]);
+				inlineInk.save(path);
+				rig.penDown(); up();
+				expect(notices.messages).toEqual(["Handwriting: no ink on the page to erase"]);
+				return;
+			}
+			expect(inlineInk.strokes(path)).toEqual([]);
+			up();
+			expect(changed).toEqual(["none"]);
+			for (let i = 0; i < 3; i++) { rig.penDown(); up(); }
+			expect(notices.messages).toEqual([]);
+			// The erase episode does not consume the independent lasso warning.
+			(InkOverlayPlugin.prototype as unknown as {
+				sayIfPageEmpty(this: unknown, path: string, kind: string): void;
+			}).sayIfPageEmpty.call(view, path, "select");
+			expect(notices.messages).toEqual(["Handwriting: no ink on the page to select"]);
+			// New ink re-arms; losing it elsewhere earns a fresh warning.
+			inlineInk.commit(path, ink);
+			inlineInk.takeLive(path, [ink.id]);
+			inlineInk.save(path);
+			rig.penDown(); up();
+			expect(notices.messages.at(-1)).toBe("Handwriting: no ink on the page to erase");
+		} finally { off(); }
 	});
 });
 

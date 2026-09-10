@@ -21,6 +21,7 @@ import {
 	summarizeAcquisitions,
 	TraceCapture,
 } from "./InlinePenRouter";
+import { analyzePointerDeliveryTrace } from "./PointerDeliveryTrace";
 import { harness, installFakeWindow, penEvent } from "../../test/routerHarness";
 import { replayTrace } from "../../test/replayTrace";
 
@@ -115,6 +116,45 @@ describe("capture: the trace records what the ink consumed", () => {
 		};
 		expect(back.futureField).toBe("from-2.0");
 		expect((back.events[0] as { futureNote?: string }).futureNote).toBe("kept");
+	});
+
+	it("export analysis deduplicates the router's sample and annotation rows", () => {
+		const h = harness();
+		h.fire(penEvent("pointerdown", 100));
+		h.fire(penEvent("pointerrawupdate", 116, { coalescedSamples: [
+			{ t: 104, x: 101, y: 100, pressure: 0.4 },
+			{ t: 112, x: 105, y: 101, pressure: 0.5 },
+		] }));
+		h.fire(penEvent("pointerup", 120, { pressure: 0, buttons: 0 }));
+		const cap = captureInlinePenTrace({ note: "router" });
+		const analysis = analyzePointerDeliveryTrace(cap.events, cap.traceMeta);
+		expect(analysis.available).toBe(true);
+		expect(analysis.streams.pointerrawupdate).toMatchObject({ parentCount: 1, sampleCount: 2 });
+		expect(analysis.incomplete).toBe(false);
+	});
+
+	it("off/on without clear produces separate analysis epochs", () => {
+		const h = harness();
+		h.fire(penEvent("pointerdown", 100));
+		h.fire(penEvent("pointerup", 110, { pressure: 0, buttons: 0 }));
+		setDiagnosticsEnabled(false);
+		setDiagnosticsEnabled(true);
+		h.fire(penEvent("pointerdown", 200));
+		h.fire(penEvent("pointerup", 210, { pressure: 0, buttons: 0 }));
+		const cap = captureInlinePenTrace({ note: "epochs" });
+		expect(cap.analysis?.epochs.length).toBe(2);
+		expect(Object.keys(cap.analysis?.contacts ?? {})).toHaveLength(2);
+	});
+
+	it("records silent lift as annotation rather than a fabricated raw sample", () => {
+		const h = harness();
+		h.fire(penEvent("pointerdown", 100));
+		h.fire(penEvent("pointerrawupdate", 110, { pressure: 0, buttons: 0 }));
+		const cap = captureInlinePenTrace({ note: "silent" });
+		const silent = cap.events.find((event) => event.note.includes("SILENT LIFT"));
+		expect(silent?.role).toBe("lifecycle");
+		expect(silent?.termination).toBe("silent-lift");
+		expect(cap.analysis?.incomplete).toBe(false);
 	});
 });
 

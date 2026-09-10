@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 import type { Picture } from "./embedReplacementPage";
@@ -15,12 +16,38 @@ beforeAll(async () => {
 	page = await browser.newPage();
 	page.on("pageerror", error => errors.push(error.message));
 	await page.setContent("<!doctype html><html><body></body></html>");
+	await page.addStyleTag({ content: readFileSync(fileURLToPath(new URL("../../styles.css", import.meta.url)), "utf8") });
 	await page.addScriptTag({ content: bundle.outputFiles[0]!.text });
 });
 afterAll(async () => { await browser?.close(); });
 async function run(kind: string): Promise<Picture[]> {
 	return page.evaluate(kind => (window as any).embedReplacement(kind), kind);
 }
+it.each([false, true])("reading recovery survives reconciliation and new-sizer resize, second document=%s", async popout => {
+	const trace = await page.evaluate(popout => (window as any).readingRecovery(popout), popout);
+	expect(trace.survivedEviction).toBe(true);
+	expect(trace.initial.parent).toBe("markdown-preview-view");
+	expect(trace.initial.gap).toEqual([0, 0]);
+	expect(trace.initial.watches).toBe(1);
+	for (const key of ["replacementGap", "resizeGap", "scrollGap", "modeGap", "printGap", "resizedPrintGap"]) {
+		expect(trace[key], key).toEqual([0, 0]);
+	}
+	expect(trace.readsAfterResize, "recovery must not need another paint/provider read").toBe(1);
+	expect(trace.painted).toBe(true);
+	expect(trace.nestedParent).toBe(true);
+	expect(trace.printFill).toBeTruthy();
+	expect(["white", "#fff", "#ffffff"]).not.toContain(trace.printFill?.toLowerCase());
+	expect(trace.printRestored).toBe(true);
+	expect(trace.detachedWatches).toBe(0);
+	expect(trace.currentSizerObserved).toBe(true);
+	expect(trace.detachedObserversStopped).toBe(true);
+	expect(trace.reenteredGap).toEqual([0, 0]);
+	expect(trace.reenteredWatches).toBe(1);
+	expect(trace.allObserversStopped).toBe(true);
+	expect(trace.layersRemoved).toBe(true);
+	expect(trace.stoppedWatches).toBe(0);
+	expect(errors).toEqual([]);
+});
 function painted(picture: Picture, expected: string[]) {
 	expect(picture.ok).toBe(true);
 	expect(picture.ids).toEqual(expected);

@@ -17,32 +17,28 @@
  * Everything here is pure.
  */
 
-/**
- * No zooming out. One, not a half.
- *
- * The transform has `transform-origin: 0 0` and the layout box is deliberately
- * never resized, so a scale below 1 paints the editor into the top-left
- * FRACTION of its own box and leaves the remainder empty - not just blank but
- * dead: nothing to click, nothing to draw on. At the old floor of 0.5 that was
- * three quarters of the pane (alan, hardware).
- *
- * There is no fix for that short of counter-sizing the box, which is retired
- * below and for good reason: a resized box re-wraps the text and slides words
- * out from under ink anchored to note coordinates. Zooming IN has a coherent
- * story without it - the note overhangs the pane and the scroller reaches it,
- * the same as any pdf viewer - and zooming out simply never had one.
- *
- * Nothing is really lost. Shrinking a note to see more of it is what the
- * editor's own font zoom is for, and that reflows honestly instead of
- * pretending to.
- */
-export const MIN_PINCH_SCALE = 1;
+import { validCameraScale } from "./ZoomScale";
+
 export const MAX_PINCH_SCALE = 4;
 
-/** Keep a live or restored scale inside something usable. */
+/** Positive representable requests have no arbitrary percentage floor. */
 export function clampPinchScale(scale: number): number {
-	if (!Number.isFinite(scale) || scale <= 0) return 1;
-	return Math.min(MAX_PINCH_SCALE, Math.max(MIN_PINCH_SCALE, scale));
+ return validCameraScale(scale) ? Math.min(MAX_PINCH_SCALE, scale) : 1;
+}
+
+export interface InkFitBounds { x:number; y:number; width:number; height:number; }
+export type InkFitPlan = { kind:"fit"; zoom:number } | { kind:"empty"; zoom:1 } | { kind:"unrepresentable" };
+/** Native Chromium layout has a finite range; refuse before saturating it. */
+export const MAX_VIEWPORT_LAYOUT = 8_000_000;
+export function fitInkBounds(g:{bounds:InkFitBounds|null; viewportWidthScreen:number; viewportHeightScreen:number; externalScale:number; fontZoom:number; marginScreen:number}):InkFitPlan {
+ const {bounds:b,viewportWidthScreen:w,viewportHeightScreen:h,externalScale:e,fontZoom:f}=g;
+ if (![w,h,e,f].every(n=>Number.isFinite(n)&&n>0) || !Number.isFinite(g.marginScreen)||g.marginScreen<0) return {kind:"unrepresentable"};
+ if (!b) return {kind:"empty",zoom:1};
+ if (![b.x,b.y,b.width,b.height,b.x+b.width,b.y+b.height].every(Number.isFinite)||b.width<0||b.height<0) return {kind:"unrepresentable"};
+ const margin=Math.min(g.marginScreen,w/4,h/4);
+ const zoom=Math.min(1,(w-2*margin)/(Math.max(1,b.width)*e*f),(h-2*margin)/(Math.max(1,b.height)*e*f));
+ if (!validCameraScale(zoom,w/e,h/e)||Math.max(w/(e*zoom),h/(e*zoom),Math.abs(b.x*f),Math.abs(b.y*f),(b.x+b.width)*f,(b.y+b.height)*f)>MAX_VIEWPORT_LAYOUT) return {kind:"unrepresentable"};
+ return {kind:"fit",zoom};
 }
 
 /**
@@ -56,15 +52,7 @@ export function pinchScale(referenceScale: number, ratio: number): number {
 	return clampPinchScale(referenceScale * ratio);
 }
 
-/**
- * RETIRED, kept only so an old import fails loudly in review rather than
- * silently at runtime: counter-sizing the box was wrong twice over. The
- * narrower layout box made the text RE-WRAP while zooming, so words changed
- * lines while world-anchored ink stayed put - the exact misregistration this
- * module exists to prevent - and the re-wrap is a full document reflow,
- * which is why every variant of it was laggy. A magnified note keeps its
- * layout and overhangs the pane; that is what the scroller is for.
- */
+/** Counter-size the viewport; its text column is held independently. */
 export function counterSizePercent(scale: number): number {
 	const k = clampPinchScale(scale);
 	return 100 / k;

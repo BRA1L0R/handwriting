@@ -297,6 +297,7 @@ interface Rig {
 
 function makeRig(): Rig {
 	const o = Object.create(InkOverlayPlugin.prototype) as Fields;
+ o.pinchScaleNow = 1;
 
 	let documentTop = DOC_TOP_EARLY;
 	/** What CodeMirror believes `.cm-content`'s top padding is. 0 at mount. */

@@ -8,14 +8,14 @@ type Picture={top:number;left:number;selection:unknown;doc:string;applied:string
 const errors:string[]=[];
 async function call(method:string,...args:unknown[]):Promise<Picture>{return page.evaluate(({method,args})=>(window as any).inkUndoPage[method](...args),{method,args});}
 beforeAll(async()=>{
- const bundle=await build({entryPoints:[fileURLToPath(new URL("./inkUndoPage.ts",import.meta.url))],bundle:true,write:false,format:"iife",platform:"browser",target:"es2022"});
+ const bundle=await build({entryPoints:[fileURLToPath(new URL("./inkUndoPage.ts",import.meta.url))],bundle:true,write:false,format:"iife",platform:"browser",target:"es2022",alias:{obsidian:fileURLToPath(new URL("../obsidian-stub.ts",import.meta.url))}});
  browser=await chromium.launch({headless:true}); page=await browser.newPage(); page.on("pageerror",e=>errors.push(e.message)); await page.setContent("<!doctype html><html><body></body></html>"); await page.addScriptTag({content:bundle.outputFiles[0]!.text});
 });
 afterAll(async()=>{await browser?.close();});
 describe("ink undo keeps the viewport in a real editor",()=>{
- for(const caret of [0,900])for(const operation of ["add","remove","move","replace"]){
-  it(`${operation} undo/redo keeps both axes and current selection with caret ${caret}`,async()=>{
-   const before=await call("setup",caret,"ink",operation);
+ for(const scale of [1,1.5,2])for(const caret of [0,900])for(const operation of ["add","remove","move","replace"]){
+  it(`${operation} undo/redo keeps both axes and current selection with caret ${caret} at ${scale}x`,async()=>{
+   const before=await call("setup",caret,"ink",operation,scale);
    expect(before.top).toBeGreaterThan(1000);expect(before.left).toBeGreaterThan(100);
    const undone=await call("run","undo"); const redone=await call("run","redo");
    for(const result of [undone,redone]){expect(result.ok).toBe(true);expect(result.top).toBe(before.top);expect(result.left).toBe(before.left);expect(result.selection).toEqual(before.selection);expect(result.doc).toBe(before.doc);}

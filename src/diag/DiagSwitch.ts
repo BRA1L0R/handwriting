@@ -25,9 +25,14 @@
  */
 
 let enabled = false;
+let recordingEpoch = 0;
 
 export function diagnosticsEnabled(): boolean {
 	return enabled;
+}
+
+export function diagnosticsEpoch(): number {
+	return recordingEpoch;
 }
 
 /**
@@ -47,6 +52,7 @@ export function setDiagnosticsChangedListener(fn: (() => void) | null): void {
 
 export function setDiagnosticsEnabled(on: boolean): void {
 	if (enabled === on) return;
+	if (on) recordingEpoch++;
 	enabled = on;
 	onChanged?.();
 }
