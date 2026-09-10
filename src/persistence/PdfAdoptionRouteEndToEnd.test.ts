@@ -10,7 +10,7 @@ import { FakeAdapter, gate } from "./FakeAdapter";
 import { isLiveSidecarName } from "./InkFolder";
 import { emptyPage, parsePage, serializePage, type PageData } from "../model/PageData";
 import { PdfInkStore } from "../pdf/PdfInkStore";
-import { installLiveReloadPoll } from "../LiveReloadTestHarness";
+import { installLiveReloadPoll } from "../testUtils/LiveReloadTestHarness";
 import type { InkStroke } from "../ink/Stroke";
 
 const PDF_ID = "pdf-a1b2c3d4";

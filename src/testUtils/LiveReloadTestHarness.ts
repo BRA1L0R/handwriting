@@ -1,6 +1,6 @@
 import { expect } from "vitest";
 import { transformSync } from "esbuild";
-import mainSource from "./main.ts?raw";
+import mainSource from "../main.ts?raw";
 
 // Execute the actual production registration and its real backoff closure.
 // Fail closed if either extraction boundary or registration shape changes.

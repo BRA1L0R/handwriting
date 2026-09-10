@@ -33,7 +33,7 @@ vi.mock("obsidian", () => ({
 	Notice: class {},
 }));
 
-import { installLiveReloadPoll } from "./LiveReloadTestHarness";
+import { installLiveReloadPoll } from "./testUtils/LiveReloadTestHarness";
 import { PageStore, contentStamp, type PreparedExternalAdoption } from "./persistence/PageStore";
 import { FakeAdapter, gate } from "./persistence/FakeAdapter";
 import { InlineInkStore } from "./inline/InlineInkStore";

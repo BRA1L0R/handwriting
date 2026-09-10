@@ -2757,9 +2757,9 @@ export class SlidesDeck {
 			// `position` this file wrote outliving the presentation is a change
 			// to Reveal's own layout that nobody would think to look here for.
 			const saved = this.revealEl.style.position;
-			this.revealEl.style.position = "relative";
+			this.revealEl.setCssStyles({ position: "relative" });
 			this.disposers.push(() => {
-				this.revealEl.style.position = saved;
+				this.revealEl.setCssStyles({ position: saved });
 			});
 			log("reveal element was position:static; patched to relative");
 		}

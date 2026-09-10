@@ -5,7 +5,7 @@ import { emptyPage, serializePage } from "./model/PageData";
 import { PdfInkStore } from "./pdf/PdfInkStore";
 import { FakeAdapter, gate } from "./persistence/FakeAdapter";
 import { PageStore } from "./persistence/PageStore";
-import { installLiveReloadPoll } from "./LiveReloadTestHarness";
+import { installLiveReloadPoll } from "./testUtils/LiveReloadTestHarness";
 
 function stroke(x: number, id = "stroke-a"): InkStroke {
 	return { id, page: 1, tool: "pen", color: "#111111", width: 2, createdAt: 0,

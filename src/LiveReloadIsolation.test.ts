@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { installLiveReloadPoll as install } from "./LiveReloadTestHarness";
+import { installLiveReloadPoll as install } from "./testUtils/LiveReloadTestHarness";
 import type { ExternalAdoptionResult } from "./inline/InlineInkStore";
 
 type Options = {

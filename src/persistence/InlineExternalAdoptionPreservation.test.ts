@@ -38,7 +38,7 @@ import {
 } from "../inline/InlineInkStore";
 import { PageData, emptyPage, parsePage, serializePage } from "../model/PageData";
 import { InkStroke } from "../ink/Stroke";
-import { installLiveReloadPoll } from "../LiveReloadTestHarness";
+import { installLiveReloadPoll } from "../testUtils/LiveReloadTestHarness";
 
 const DEBOUNCE_MS = 700;
 const PATH = "note.md";

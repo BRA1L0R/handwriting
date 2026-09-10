@@ -1086,6 +1086,10 @@ class FakeEl {
 		this.attributes.set(name, value);
 	}
 
+	setCssStyles(styles: Record<string, string>): void {
+		Object.assign(this.style, styles);
+	}
+
 	addEventListener(type: string, fn: (ev: unknown) => void): void {
 		this.listeners.push({ type, fn });
 	}

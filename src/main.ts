@@ -2081,7 +2081,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		//
 		// Registered HERE, above the live-reload poll, on purpose: that poll's
 		// registration block is sliced out of this file's source and EXECUTED by
-		// src/LiveReloadTestHarness.ts, which pins it to exactly one
+		// src/testUtils/LiveReloadTestHarness.ts, which pins it to exactly one
 		// `this.registerInterval(` and one `window.setInterval(`. An interval
 		// added between `let reloadTickBusy` and the pen command lands inside
 		// that window and fails those suites closed. Keep this outside it.
