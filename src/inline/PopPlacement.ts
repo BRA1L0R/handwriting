@@ -10,10 +10,10 @@
  * SPLIT FOR THE SAME REASON `overflowPlan` and `stripClearance` are: the
  * suite has no layout at all, so a rule that lives inside the code that
  * measures can only be tested by not testing it. The measuring stays in
- * MobileTools; the arithmetic is here, and the six anchors are pinned.
+ * MobileTools; the arithmetic is here, and all nine anchors are pinned.
  */
 
-import { type ToolbarCorner } from "./ToolbarCorner";
+import { toolbarAnchorRow, type ToolbarCorner } from "./ToolbarCorner";
 
 /** Which way a pop opens away from the strip. */
 export type PopFlip = "up" | "down";
@@ -24,15 +24,15 @@ export type PopFlip = "up" | "down";
  * at the screen's edge opened into the edge (alan, 2026-08-31, on a
  * bottom-corner strip). Bottom anchors open upward instead.
  *
- * Keyed on the edge alone, so the two middles answer the same as the corners
- * they share an edge with - a bottom-middle strip is exactly as close to the
- * bottom of the glass as a bottom-corner one.
+ * Keyed on the row alone. The middle row has room below and follows the normal
+ * downward rule; only the bottom row is close enough to the glass edge to
+ * require the upward override.
  *
  * The stylesheet implements this; a test pins the two together, so a new
  * anchor cannot get a rule here and no rule there.
  */
 export function popFlipFor(corner: ToolbarCorner): PopFlip {
-	return corner.startsWith("bottom") ? "up" : "down";
+	return toolbarAnchorRow(corner) === "bottom" ? "up" : "down";
 }
 
 /** The horizontal span of something already on screen, in viewport pixels. */
@@ -59,7 +59,7 @@ export interface PopOffsetInput {
  * offset arithmetic drifted a full button's width in the bottom-left corner
  * before it was measured from real rects (glass, 2026-08-31).
  *
- * THEN CLAMPED TO THE PANE, which is new with the middle anchors and is why
+ * THEN CLAMPED TO THE PANE, which arrived with the centre-column anchors and is why
  * this moved out of the closure. The old clamp was `Math.max(0, right)`: it
  * stopped the pop escaping past the strip's own right edge, which is the
  * correct instinct in a right-hand corner, where the strip's edge and the

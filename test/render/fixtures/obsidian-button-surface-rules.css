@@ -1,0 +1,26 @@
+/*
+ * Obsidian's OWN surface for a `button` that is not a `.clickable-icon` -
+ * the rule that gives every button a plugin builds the theme's face at
+ * rest. Reduced by hand to the surface declarations; the BOX declarations
+ * of the same element are `obsidian-button-rules.css` beside this file, and
+ * a page that wants the whole reduced host loads both. This is NOT a copy
+ * of the app's stylesheet and the suite does not need one.
+ *
+ * Source: the CSS bundled in the installed app
+ * (C:/Program Files/Obsidian/resources/obsidian.asar, the
+ * `button:not(.clickable-icon) {` block directly after `button {`), read
+ * on 2026-09-07 from the build dated 2025-08-12. The tokens it reads are
+ * left as parameters: `--interactive-normal` is set four different ways
+ * across the app's themes and platforms, `--input-shadow` five, and
+ * `--text-color` resolves to `--text-normal` on a plain button.
+ *
+ * Specificity (0,1,1): one pseudo-class and one type. It beats the
+ * plugin's `.handwriting-mobile-tool` (0,1,0) for the strip's RESTING
+ * surface, and that is the owner's ruling, not a defect - see
+ * `StripRestSurface.test.ts` and the comment at the rule in styles.css.
+ */
+button:not(.clickable-icon) {
+	color: var(--text-color);
+	background-color: var(--interactive-normal);
+	box-shadow: var(--input-shadow);
+}

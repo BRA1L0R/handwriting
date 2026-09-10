@@ -30,11 +30,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Browser, Page } from "playwright";
-import { fileURLToPath } from "node:url";
-import { readFileSync } from "node:fs";
-import { INJECTED, launch, openStrip, stylesCss } from "./harness";
-
-const here = (rel: string): string => fileURLToPath(new URL(rel, import.meta.url));
+import { hostFixture, hostVars, INJECTED, launch, openStrip, stylesCss } from "./harness";
 
 let browser: Browser;
 beforeAll(async () => {
@@ -217,10 +213,74 @@ const readKnob = async (page: Page, dataUrl: string): Promise<KnobPixels> =>
 		};
 	}, dataUrl);
 
+/**
+ * Where the CONTROL's own box is, in the same screenshot's device pixels.
+ *
+ * The slider paints no background of its own, so its box is invisible in a
+ * screenshot and the only edge the image offers is the clip's - which is the
+ * control's top rounded to a whole device pixel by the screenshotter, an
+ * edge nobody draws. For one read the probe paints the control's background
+ * a red tint no other part of the pop uses (the pop, the track and the
+ * thumb's shadow are greys; the accent is a purple), takes a second shot of
+ * the same box, and reads the painted rows back. Coverage-weighted at both
+ * edges for the same reason as the knob's centroid.
+ */
+const readControlBox = async (
+	page: Page,
+	dataUrl: string
+): Promise<{ controlTop: number; controlBottom: number }> =>
+	page.evaluate(async (url: string) => {
+		const img = new Image();
+		img.src = url;
+		await img.decode();
+		const canvas = document.createElement("canvas");
+		canvas.width = img.naturalWidth;
+		canvas.height = img.naturalHeight;
+		const ctx = canvas.getContext("2d");
+		if (!ctx) throw new Error("no 2d context for the control screenshot");
+		ctx.drawImage(img, 0, 0);
+		const { data, width, height } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+		const redness = (x: number, y: number): number => {
+			const i = (y * width + x) * 4;
+			return (data[i] ?? 0) - ((data[i + 1] ?? 0) + (data[i + 2] ?? 0)) / 2;
+		};
+		// Each row's reddest pixel: the thumb and the track cover only part
+		// of any row, so a row inside the control always has some of the
+		// tint showing, and a row outside it has none.
+		const rows: number[] = [];
+		let most = 0;
+		for (let y = 0; y < height; y++) {
+			let r = 0;
+			for (let x = 0; x < width; x++) {
+				const v = redness(x, y);
+				if (v > r) r = v;
+			}
+			rows.push(r);
+			if (r > most) most = r;
+		}
+		if (most < 20) throw new Error(`the painted control did not reach the screenshot: reddest row is ${most.toFixed(2)}`);
+		const cover = rows.map((r) => Math.min(1, Math.max(0, r / most)));
+		let first = -1;
+		let last = -1;
+		cover.forEach((c, y) => {
+			if (c > 0.02) {
+				if (first < 0) first = y;
+				last = y;
+			}
+		});
+		if (first < 0) throw new Error("the painted control has no rows");
+		// A partly covered edge row means the edge sits partway down it.
+		return {
+			controlTop: first + (1 - (cover[first] ?? 1)),
+			controlBottom: last + (cover[last] ?? 1),
+		};
+	}, dataUrl);
+
+/** One nudge's reading: the knob, and the control it sits in. */
+type KnobReading = KnobPixels & { nudge: number; controlTop: number; controlBottom: number };
+
 /** Open the eraser pop at `ratio`, nudge the page, and read the knob. */
-const knobAt = async (
-	ratio: number
-): Promise<{ worst: KnobPixels & { nudge: number }; all: (KnobPixels & { nudge: number })[] }> => {
+const knobAt = async (ratio: number): Promise<{ worst: KnobReading; all: KnobReading[] }> => {
 	const h = await openStrip(browser, { deviceScaleFactor: ratio });
 	try {
 		// Through the same probe every other pop measurement uses, so this
@@ -235,14 +295,25 @@ const knobAt = async (
 			const max = Number(el.max || "100");
 			el.value = String((min + max) / 2);
 		});
-		const all: (KnobPixels & { nudge: number })[] = [];
+		const all: KnobReading[] = [];
 		for (const nudge of NUDGES) {
 			await h.page.evaluate((n: number) => {
 				document.body.style.paddingTop = `${n}px`;
 			}, nudge);
 			const shot = await slider.screenshot();
 			const read = await readKnob(h.page, `data:image/png;base64,${shot.toString("base64")}`);
-			all.push({ ...read, nudge });
+			// The control's own box, from a second shot of the same clip
+			// with its background painted. Paint does not lay out, so the
+			// box - and the clip - are the ones the knob was just read in.
+			await slider.evaluate((el: HTMLInputElement) => {
+				el.style.backgroundColor = "rgb(255, 200, 200)";
+			});
+			const painted = await slider.screenshot();
+			await slider.evaluate((el: HTMLInputElement) => {
+				el.style.backgroundColor = "";
+			});
+			const box = await readControlBox(h.page, `data:image/png;base64,${painted.toString("base64")}`);
+			all.push({ ...read, ...box, nudge });
 		}
 		const worst = all.reduce((a, b) =>
 			Math.abs(a.thumbCentre - a.trackCentre) >= Math.abs(b.thumbCentre - b.trackCentre)
@@ -313,61 +384,121 @@ describe("the eraser pop's knob sits on the track's centre line", () => {
 	}
 
 	/**
-	 * THE ASSERTION THAT WAS WATCHED RED, and the honest reading of what it
-	 * caught.
+	 * THE ASSERTION THAT WAS WATCHED RED, and what it turned out to measure.
 	 *
 	 * The one above was not enough on its own. Reverted to `margin-top: -7px`
 	 * over a 4px track and run at 1.389, it stayed GREEN: the knob came out
 	 * 0.092 device pixels off the line, against 0.028 for the construction
-	 * that replaced it. Tighter, but not a defect a tolerance of a device
-	 * pixel can see, and headless chromium is not alan's screen.
+	 * that replaced it. Headless chromium is not alan's screen.
 	 *
-	 * What the same revert DOES move, by a whole CSS pixel, is where the
-	 * assembly sits inside the control. Measured, thumb centre from the
-	 * control's own top edge:
+	 * So this test compared where the thumb sat in the CONTROL at the two
+	 * ratios, and the figure it had was the thumb's centre from the top edge
+	 * of the screenshot. Measured at every nudge (2026-09-07), that edge is
+	 * not the control's: the screenshotter rounds the clip to a whole device
+	 * pixel and the page paints the control where layout put it, and from
+	 * nudge 0.5 on the two are a row apart - at BOTH ratios, with nothing in
+	 * the stylesheet changed. Thumb centre from the clip's top edge:
 	 *
-	 *              ratio 1      ratio 1.389     drift
-	 *   -7px       11.014 css   11.945 css      0.931 css
-	 *   this       11.014 css   10.944 css      0.070 css
+	 *                     nudge 0 - 0.4     nudge 0.5 - 0.9
+	 *   ratio 1           11.014 css        12.006 css
+	 *   ratio 1.389       10.944 css        11.945 css
 	 *
-	 * That is the hand-computed offset failing at a fractional ratio, in the
-	 * dimension this engine happens to express it in: a thumb pulled 7px
-	 * above its track overflows the slider's container, and the size of that
-	 * overflow is what stops being exact when a device pixel is not a CSS
-	 * pixel. Two boxes of equal height overflow by nothing, so there is
-	 * nothing left to round - which is why the row below is flat.
+	 * Each ratio's reading was taken at whichever nudge centred worst, so the
+	 * "drift" between them was 0.070 or 0.93 depending on which side of 0.5
+	 * each ratio's worst nudge fell - a number that any layout change above
+	 * the slider could flip (a 10px taller chip row read 0.791) and that the
+	 * old `margin-top: -7px` table, 11.014 against 11.945, is the same two
+	 * readings of. Measured from the control's OWN painted top edge instead,
+	 * the thumb sits at 10.94 - 11.03 css at every nudge and both ratios, and
+	 * the old construction reads the same. The guard was reading the
+	 * screenshotter.
 	 *
-	 * A different engine, a different chromium, a GPU rasteriser or a browser
-	 * zoom on top of the ratio can spend the same rounding error in the other
-	 * dimension, and that is the one alan is looking at. This test cannot
-	 * settle which; it can settle that the geometry no longer depends on the
-	 * ratio at all.
+	 * What a reader can see is the thumb against the track, at their ratio,
+	 * which the assertions above measure to a device pixel; and the thumb
+	 * against the row it sits in, which must not wander as the pop lands on
+	 * different fractions of a pixel. So this test now reads the control's box
+	 * out of the pixels - see `readControlBox` - and asserts the thumb's
+	 * place in it is ONE number across every nudge at both ratios: the spread
+	 * of all twenty readings, not a pair of worst cases. The limit is kept: a
+	 * quarter of a CSS pixel, against a measured spread of 0.09.
+	 *
+	 * What it does NOT do is reproduce the defect on orion. In this engine no
+	 * construction tried - equal boxes, the 4px track with `-7px`, `-7px`
+	 * alone, a half-pixel offset - moves the thumb with the ratio at all;
+	 * that is the engine laying out in CSS pixels and scaling the paint. The
+	 * construction that makes the centring hold in every engine is the two
+	 * equal boxes with no offset, and the test after this one holds the
+	 * stylesheet to it, because no pixel here can.
 	 */
-	it("puts the knob in the same place whatever the device pixel ratio", async () => {
+	it("keeps the knob in the same place in its control at every sub-pixel position and ratio", async () => {
 		const high = await knobAt(1.389);
 		const one = await knobAt(1);
-		const css = (r: { thumbCentre: number; trackCentre: number }, ratio: number) => ({
-			thumb: r.thumbCentre / ratio,
-			track: r.trackCentre / ratio,
-		});
-		const a = css(high.worst, 1.389);
-		const b = css(one.worst, 1);
+		const inControl = (all: KnobReading[], ratio: number) =>
+			all.map((r) => ({
+				nudge: r.nudge,
+				thumb: (r.thumbCentre - r.controlTop) / ratio,
+				track: (r.trackCentre - r.controlTop) / ratio,
+				height: (r.controlBottom - r.controlTop) / ratio,
+			}));
+		const readings = [...inControl(high.all, 1.389), ...inControl(one.all, 1)];
+		// THE BOX READ IS THE CONTROL. Its painted height is the 22px row
+		// the stylesheet declares, at both ratios; a paint that missed the
+		// control, or a clip that missed the paint, reads something else.
+		for (const r of readings) expect(r.height, "the painted box is not the 22px control").toBeCloseTo(22, 0);
+
+		const spread = (key: "thumb" | "track") => {
+			const v = readings.map((r) => r[key]);
+			return Math.max(...v) - Math.min(...v);
+		};
+		const show = (all: ReturnType<typeof inControl>) =>
+			all.map((r) => `${r.nudge}: ${r.thumb.toFixed(3)}/${r.track.toFixed(3)}`).join(", ");
 		// eslint-disable-next-line no-console
 		console.log(
-			`knob placement in the control: thumb ${b.thumb.toFixed(3)} css @1 vs ${a.thumb.toFixed(
+			`knob in the control (thumb/track css from its top edge) @1.389: ${show(
+				inControl(high.all, 1.389)
+			)}; @1: ${show(inControl(one.all, 1))}; spread thumb ${spread("thumb").toFixed(
 				3
-			)} css @1.389 (drift ${Math.abs(a.thumb - b.thumb).toFixed(
-				3
-			)}); track ${b.track.toFixed(3)} vs ${a.track.toFixed(3)} (drift ${Math.abs(
-				a.track - b.track
-			).toFixed(3)})`
+			)}, track ${spread("track").toFixed(3)}`
 		);
-		// A QUARTER OF A CSS PIXEL. Far below the 0.931 the hand-computed
-		// offset drifts by, and far above the 0.070 this construction leaves,
-		// so it is a line between the two and not a line drawn round the
-		// current number.
-		expect(Math.abs(a.thumb - b.thumb), "the thumb moves with the device pixel ratio").toBeLessThan(0.25);
-		expect(Math.abs(a.track - b.track), "the track moves with the device pixel ratio").toBeLessThan(0.25);
+		// A QUARTER OF A CSS PIXEL, across all twenty readings.
+		expect(spread("thumb"), "the thumb's place in its control moves with the nudge or the ratio").toBeLessThan(0.25);
+		expect(spread("track"), "the track's place in its control moves with the nudge or the ratio").toBeLessThan(0.25);
+	});
+
+	/**
+	 * The construction itself, held in the stylesheet: the webkit track box
+	 * is the thumb's height, and the thumb carries no offset - no
+	 * `margin-top`, and `position: static` so the host's `top` is inert.
+	 * That is what makes the centring an identity rather than an arithmetic,
+	 * in every engine, at every ratio, and it is the one thing a pixel
+	 * measured in headless chromium cannot vouch for (see above). Both ends:
+	 * the declarations are found, and they agree.
+	 */
+	it("builds the knob from two equal boxes and no offset", () => {
+		const css = stylesCss();
+		const block = (pseudo: string): string => {
+			const open = `.handwriting-slider-pop .handwriting-eraser-slider::${pseudo} {`;
+			const start = css.indexOf(open);
+			if (start < 0) throw new Error(`no ::${pseudo} block for the eraser slider`);
+			const close = css.indexOf("}", start);
+			if (close < 0) throw new Error(`the ::${pseudo} block never closes`);
+			return css.slice(start + open.length, close);
+		};
+		const declared = (body: string, prop: string): string | undefined => {
+			// The declaration, read past the comments the block carries.
+			const bare = body.replace(/\/\*[\s\S]*?\*\//g, "");
+			const m = bare.match(new RegExp("(?:^|;)\\s*" + prop + "\\s*:\\s*([^;]+);", "m"));
+			return m?.[1]?.trim();
+		};
+		const track = block("-webkit-slider-runnable-track");
+		const thumb = block("-webkit-slider-thumb");
+		const trackHeight = declared(track, "height");
+		const thumbHeight = declared(thumb, "height");
+		expect(trackHeight, "the track declares no height").toMatch(/^\d+px$/);
+		expect(thumbHeight, "the thumb declares no height").toMatch(/^\d+px$/);
+		expect(trackHeight, "the track box is not the thumb's height").toBe(thumbHeight);
+		expect(declared(thumb, "margin-top"), "the thumb carries an offset").toBe("0");
+		expect(declared(thumb, "position"), "the host's `top` can reach the thumb").toBe("static");
 	});
 });
 
@@ -565,7 +696,7 @@ describe("the strip's grip is visible", () => {
  * control, the knob without the host's stylesheet, and this block is the same
  * measurement with it.
  */
-const HOST_RANGE_CSS = readFileSync(here("./fixtures/obsidian-range-rules.css"), "utf8");
+const HOST_RANGE_CSS = hostFixture("obsidian-range-rules.css");
 
 /** The two values of `--slider-thumb-y` the installed app ships, in CSS px. */
 const HOST_SHIFTS = [-6, -9] as const;
@@ -585,10 +716,9 @@ const knobUnderHost = async (
 ): Promise<{ worst: KnobPixels & { nudge: number }; all: (KnobPixels & { nudge: number })[] }> => {
 	const h = await openStrip(browser, {
 		deviceScaleFactor: ratio,
-		// The host's rules first and ours after, in the order Obsidian loads
-		// a plugin's stylesheet. Specificity decides the conflicts either
-		// way; the order is kept so the page is the real cascade.
-		css: [HOST_RANGE_CSS, `:root { --slider-thumb-y: ${shift}px; }`, stylesCss()].join("\n"),
+		// The host's rules UNDER ours, which is where the harness puts a
+		// host sheet; the plugin's own `styles.css` is still the one on disk.
+		hostCss: [HOST_RANGE_CSS, hostVars({ "--slider-thumb-y": `${shift}px` })],
 	});
 	try {
 		await h.pop({ tool, presets: 0 });

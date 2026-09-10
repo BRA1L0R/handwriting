@@ -126,6 +126,36 @@ export const RELEASE_NOTES: Record<string, string[]> = {
 		"bug fixes",
 		"data safety fixes",
 	],
+	// Opened ahead of the cut, safe for the reason the 1.4.12 comment above
+	// gives: `notesSince` filters on `compareVersions(v, current) <= 0`, so
+	// nothing here reaches a reader until manifest.json says 1.4.13. The key
+	// order in this literal is cosmetic - `notesSince` sorts by version - so
+	// it sits after 1.4.12 to keep the file ascending the way it reads.
+	"1.4.13": [
+		"slides added!!",
+		"data safety 2.0",
+		// ALAN'S OWN LINE, TYPED BY HIM AND SIGNED BY HIM (2026-09-09 23:32, at
+		// source in queue.md / lead-engineer.md / astra.md). It is a direct
+		// message from him to his readers asking for a reply, and the
+		// informality is the point: lowercase throughout, no trailing period,
+		// `-alan` with no space after the hyphen. Do not capitalise it, do not
+		// punctuate it, do not expand "changes" into a description.
+		//
+		// NO PERIOD HERE IS NOT AN OVERSIGHT. He ruled trailing periods back
+		// ON for the delete-all refusal sentences the same day; that ruling was
+		// about those strings and he typed this one bare.
+		"ink pressure changes (let me know how it feels -alan)",
+		"pdf ink color setting added",
+		"cursor fixes",
+		"lasso fixes",
+		"undo fix",
+		"toolbar fixes",
+		"new toolbar anchors (drag toolbar to new locations!)",
+		"notification spam fix",
+		"dev mode",
+		"boox/ipad hints",
+		"bug fixes",
+	],
 };
 
 /** One release's own notes, kept apart so the toast can label them honestly. */

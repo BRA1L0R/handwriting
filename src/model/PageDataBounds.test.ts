@@ -45,16 +45,32 @@ describe("sidecar coordinate bounds", () => {
 		expect(pts.map((p) => p.y)).toEqual([20, 21]);
 	});
 
-	// A corrupt DELTA is unrecoverable: the distance it carried is gone, so
-	// every later point shifts by exactly that much and no more. This pins
-	// the bound on the damage, and separates it from the bounds-drop case
-	// above, where the delta is intact and alignment is preserved exactly.
-	it("a bad v2 quadruple costs its own delta and nothing further", () => {
+	// A corrupt DELTA is unrecoverable: the distance it carried is gone. This
+	// case used to pin the OLD contract (534ab82, 2026-09-01) - keep decoding,
+	// let every later point shift by the lost step, and call that "the bound
+	// on the damage". It now pins the contract that SUPERSEDES it: stop at the
+	// unreadable delta, emit only what is exact, and report the loss.
+	//
+	// Why the rule changed, and it is dated: on 2026-09-01 dropping the tail
+	// and keeping a shifted one were BOTH permanently lossy, so keeping more
+	// ink was the reasonable choice. 090916e (2026-09-08) then made a file
+	// reported as damaged PRESERVE its original bytes on the next save. Under
+	// the old contract the shift is silent - the point still decodes, so
+	// `lost` never flips, `damaged` stays false, and the next save overwrites
+	// the true ink with the drifted copy for good. Under this one nothing is
+	// lost permanently: the in-memory stroke is short but right, and the
+	// original is kept. The bounds-drop case above is unchanged - a delta that
+	// READS still advances the running position through a refused point.
+	it("a bad v2 quadruple ends the stroke there, exactly, and is reported", () => {
 		const flat = packPointsV2([ok, okToo, { x: 12, y: 22, pressure: 0.5, t: 9 }]);
 		flat[4] = "junk" as unknown as number; // dx of the second point (+1)
-		const pts = unpackPointsV2(flat);
-		expect(pts.map((p) => p.x)).toEqual([10, 11]);
-		expect(pts.map((p) => p.y)).toEqual([20, 22]);
+		const loss = { lost: false };
+		const pts = unpackPointsV2(flat, loss);
+		// Only the first point is knowable. Not [10, 11] - that 11 was a 12
+		// displaced by the lost step, and the old pin recorded it as correct.
+		expect(pts.map((p) => p.x)).toEqual([10]);
+		expect(pts.map((p) => p.y)).toEqual([20]);
+		expect(loss.lost).toBe(true);
 	});
 
 	it("a whole stroke of out-of-range points is dropped as unreadable", () => {

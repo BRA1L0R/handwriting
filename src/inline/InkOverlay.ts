@@ -3,6 +3,7 @@ import { Prec } from "@codemirror/state";
 import type { Extension } from "@codemirror/state";
 import { isolateHistory, redo, redoDepth, undo, undoDepth } from "@codemirror/commands";
 import { Notice, Platform, editorInfoField } from "obsidian";
+import type { Editor, TFile } from "obsidian";
 import { runGatedCommand } from "../CommandPaletteSplit";
 import { Camera } from "../camera/Camera";
 import { CameraState } from "../camera/coordinates";
@@ -99,9 +100,11 @@ import {
 import { deviceHasTouch } from "./DeviceInput";
 import { computeCanvasSize, countPaintedPixels } from "../diag/Raster";
 import { diagnosticsEnabled } from "../diag/DiagSwitch";
+import { routineNoticesVisible } from "../diag/RoutineNotices";
 import { eraserRect, splitStrokeByCircle, strokesHitByCircle } from "../ink/Eraser";
 import { DEFAULT_PEN, HIGHLIGHTER_ALPHA, HIGHLIGHTER_PEN, PenStyle } from "../ink/PenStyle";
 import { clampInkSize } from "../ink/InkSize";
+import { withInkDestination } from "../ink/InkTheme";
 import { applyInkColor, colorsFor, getInkColorHex } from "../ink/InkColor";
 import {
 	applyInkPreset,
@@ -119,6 +122,7 @@ import {
 import { Point2 } from "../ink/Smoothing";
 import { BBox, InkStroke, InkTool, newStrokeId } from "../ink/Stroke";
 import { StrokeBuilder } from "../ink/StrokeBuilder";
+import { strokeWidthPolicy, type StrokeWidthMode } from "../ink/StrokeWidth";
 import { StrokeMetrics } from "../ink/StrokeMetrics";
 import { drawCommitted,
 	drawRegion, drawStroke, ribbonCacheStats } from "../ink/StrokeRenderer";
@@ -140,7 +144,9 @@ import {
 } from "./InkHistory";
 import { SnapChip } from "./SnapChip";
 import {
+	type DeleteSelectionOutcome,
 	InlineSelectionDeleteKeys,
+	lassoDeleteNotice,
 	removeSelectedInlineStrokes,
 } from "./InlineSelectionDelete";
 import { StrokeFrame } from "./StrokeFrame";
@@ -191,9 +197,10 @@ import {
 	recordProbe,
 	setProbeGeometry,
 } from "./PenProbe";
-import { InlinePenRouter, bandEraserIntent } from "./InlinePenRouter";
-import { armMouseInkQuietly, markToolPicked, mouseInkEnabled } from "./MouseInk";
+import { InlinePenRouter, anyHandOnGlass, bandEraserIntent } from "./InlinePenRouter";
+import { armMouseInkQuietly, markToolPicked, mouseInkEnabled, toolPickedHere } from "./MouseInk";
 import { penInkEnabled } from "./PenInk";
+import { fingerInkEligible } from "./FingerInk";
 import { describeEl, setHitProbeContext } from "./PenHitProbe";
 import { Extent, inkFrontier, isScrollableOverflow, ScrollAxisGuard, spacerPosition, surfaceExtents, surfaceOriginInScroller, writeFrontier, ZERO_EXTENT, zoomFrontier } from "./SurfaceExtent";
 import { ProbeBox, capturePresented, parseHexColor, regionCensus } from "./PresentProbe";
@@ -244,6 +251,74 @@ const SELECTION_COLOR = "#7f9cf5";
 const SELECTION_GRAB_PAD = 8;
 /** Minimum spacing between lasso vertices, in screen px. */
 const LASSO_MIN_STEP_PX = 2;
+
+/** Whether one centerline segment crosses a screen-space viewport rectangle. */
+function segmentIntersectsViewport(
+	ax: number,
+	ay: number,
+	bx: number,
+	by: number,
+	left: number,
+	top: number,
+	right: number,
+	bottom: number,
+): boolean {
+	if (![ax, ay, bx, by].every(Number.isFinite)) return false;
+	let enter = 0;
+	let leave = 1;
+	const dx = bx - ax;
+	const dy = by - ay;
+	for (const [p, q] of [
+		[-dx, ax - left],
+		[dx, right - ax],
+		[-dy, ay - top],
+		[dy, bottom - ay],
+	] as const) {
+		if (p === 0) {
+			if (q < 0) return false;
+			continue;
+		}
+		const ratio = q / p;
+		if (p < 0) {
+			if (ratio > leave) return false;
+			if (ratio > enter) enter = ratio;
+		} else {
+			if (ratio < enter) return false;
+			if (ratio < leave) leave = ratio;
+		}
+	}
+	return true;
+}
+
+/** Actual stroke geometry, not its possibly-empty bounding-box interior. */
+function strokeIntersectsViewport(
+	stroke: InkStroke,
+	cam: Readonly<CameraState>,
+	viewW: number,
+	viewH: number,
+	offsetX: number,
+	offsetY: number,
+): boolean {
+	if (stroke.points.length === 0 || viewW <= 0 || viewH <= 0) return false;
+	const pad = Math.max(1, (stroke.width * cam.zoom) / 2);
+	const screen = (point: InkStroke["points"][number]): { x: number; y: number } => ({
+		x: (point.x - cam.x) * cam.zoom + offsetX,
+		y: (point.y - cam.y) * cam.zoom + offsetY,
+	});
+	if (stroke.points.length === 1) {
+		const point = screen(stroke.points[0]!);
+		return point.x >= -pad && point.y >= -pad && point.x <= viewW + pad && point.y <= viewH + pad;
+	}
+	let from = screen(stroke.points[0]!);
+	for (let i = 1; i < stroke.points.length; i++) {
+		const to = screen(stroke.points[i]!);
+		if (segmentIntersectsViewport(from.x, from.y, to.x, to.y, -pad, -pad, viewW + pad, viewH + pad)) {
+			return true;
+		}
+		from = to;
+	}
+	return false;
+}
 
 type PenMode = "ink" | "erase" | "lasso" | "space" | "pan";
 
@@ -325,6 +400,10 @@ export function setInlineTool(tool: InkTool): void {
 	// eraser. While this cleared one flag of four, "Switch between pen and
 	// highlighter" left the tip panning while announcing a nib change.
 	releaseTipMode();
+	// Commands and strip buttons both end here. If that pick makes iPhone
+	// finger ink eligible, commit its pre-contact guard on every mounted note;
+	// a toolbar-only hook would leave command entry in a native-scroll window.
+	prepareFingerInkEverywhere();
 }
 
 /**
@@ -593,6 +672,17 @@ export function setPersistEraserMode(fn: ((on: boolean) => void) | null): void {
 }
 
 /**
+ * A way in for a host that cannot reach `persistEraserMode` itself. The note
+ * host pairs `setEraserWholeStrokes(on)` with `persistEraserMode?.(on)`
+ * inline (the strip spec below) because both live in this module; the PDF
+ * host builds its strip spec in a different file and needs a call to make
+ * the same pairing there.
+ */
+export function persistEraserModeNow(on: boolean): void {
+	persistEraserMode?.(on);
+}
+
+/**
  * Put the ink marker on the system clipboard so ctrl+v can recognize it.
  * Best-effort by design: a denied clipboard (no user gesture, locked-down
  * platform) costs the keyboard paste and nothing else - the command and
@@ -629,7 +719,7 @@ export function pickStripColor(name: string, hex: string): void {
 	// Every strip, not just the tapped one: exiting a mode here must dim
 	// its light on every open pane, exactly as the commands do.
 	refreshAllStrips();
-	new Notice(`Handwriting: ${tool} ${name}`);
+	if (routineNoticesVisible()) new Notice(`Handwriting: ${tool} ${name}`);
 }
 
 export function commitEraserRadius(): void {
@@ -661,10 +751,21 @@ export function applyInkSize(tool: InkTool, mult: number): void {
 
 export const inlineInk = new InlineInkStore();
 const instances = new Set<InkOverlayPlugin>();
+
+function prepareFingerInkEverywhere(): void {
+	for (const p of instances) p.prepareFingerInk();
+}
 /** Shared across editors so an A/B session accumulates one summary list. */
 /** Same area cap as the pdf snip (MAX_OVERLAY_PX there): one budget for
  * every raster this plugin produces. */
 const NOTE_SNIP_CAP_PX = 4_000_000;
+
+/**
+ * The page a note snip paints for itself, and therefore the destination its
+ * ink has to be readable on. One constant so the fill and the readability
+ * rule cannot be changed apart.
+ */
+const SNIP_PAGE = "#ffffff";
 
 const metrics = new StrokeMetrics();
 
@@ -681,6 +782,33 @@ export function setInlineInkEnabled(on: boolean): void {
 export function overlayForPath(path: string): InkOverlayPlugin | null {
 	for (const p of instances) {
 		if (p.showsPath(path)) return p;
+	}
+	return null;
+}
+
+/**
+ * The mounted overlay that IS the editor the user is working in.
+ *
+ * `overlayForPath` answers the FIRST overlay showing a path. That is the right
+ * answer for a background repaint, where every pane on the path shows the same
+ * ink, and the wrong one for a command: two panes on one note share a path, so
+ * the palette and the hotkeys reached whichever pane mounted first - deleting
+ * ink the user could see was not selected, and leaving the undo step in a pane
+ * they were not looking at.
+ *
+ * IDENTITY, NEVER A PATH, on both halves. Two `TFile` objects can name one
+ * path, and Obsidian reuses editors, so an `Editor` can still be paired with
+ * the file it used to show. Either comparison alone can be satisfied by the
+ * wrong pane.
+ *
+ * NULL RATHER THAN A GUESS. No fallback to the path, and never to another
+ * pane's selection: a command that refuses is recoverable, and ink deleted in
+ * a pane the user is not looking at is not. `overlayForPath` itself keeps its
+ * policy unchanged for every caller that wants the old, broader question.
+ */
+export function overlayForActiveEditor(editor: Editor, file: TFile): InkOverlayPlugin | null {
+	for (const p of instances) {
+		if (p.ownsActiveEditor(editor, file)) return p;
 	}
 	return null;
 }
@@ -953,6 +1081,79 @@ export function copyInlineSurfaceReport(): string {
 	let n = 0;
 	for (const p of instances) parts.push(`\n--- editor ${++n} ---`, p.surfaceReport());
 	return parts.join("\n");
+}
+
+/**
+ * What a lasso cut actually did, `DeleteSelectionOutcome`'s
+ * (InlineSelectionDelete.ts) own shape for `cutSelectedInk`, and for the
+ * same reason: a bare count answered 0 both when nothing was selected and
+ * when the copy worked but the delete matched nothing in the store, and
+ * every caller that reached 0 said "lasso some ink first" over ink that had,
+ * in fact, just been copied and left on the page.
+ *
+ * Defined here rather than in `InlineSelectionDelete.ts`: that module owns
+ * the delete outcome and nothing about cutting, and a cut is copy-then-
+ * delete, a fact only this file knows.
+ */
+export type CutSelectionOutcome =
+	/** Copied and removed. `count` is how many strokes. */
+	| { kind: "cut"; count: number }
+	/** Nothing was selected, or there is no path to cut from. */
+	| { kind: "empty" }
+	/** Copied, but the delete matched nothing in the store - the ink and the
+	 *  lasso both stayed on the page. */
+	| { kind: "unmatched"; count: number };
+
+/**
+ * The notice a lasso copy owes the user.
+ *
+ * Same shape and same reason as `cutSelectionNotice` below: ONE owner for
+ * the sentence, so the strip button and the registered command cannot drift
+ * into two wordings for one outcome. Both strings are exactly the ones the
+ * command site's ternary produced before this function existed - moved, not
+ * rewritten - and the empty-selection one stays byte-identical, as it has
+ * through every box that has touched this row.
+ */
+export function copySelectionNotice(copied: number): string {
+	if (copied > 0) return `Handwriting: copied ${copied} stroke(s)`;
+	return "Handwriting: lasso some ink first";
+}
+
+/**
+ * Which arm of `copySelectionNotice` a call is going to take, so a caller can
+ * hide the routine one behind the developer switch without hiding the other.
+ *
+ * BRANCH-AWARE ON PURPOSE (root, 2026-09-09). The count is a routine success
+ * and goes quiet; "lasso some ink first" is no-op guidance and must keep
+ * showing. Gating the CALL would have taken both. This sits beside the string
+ * helper rather than inside it so the helper's API and its exact sentences are
+ * untouched, and so the wording still has one owner.
+ */
+export function copySelectionNoticeIsRoutine(copied: number): boolean {
+	return copied > 0;
+}
+
+/**
+ * The notice a lasso cut owes the user, `lassoDeleteNotice`'s
+ * (InlineSelectionDelete.ts) own shape and reason: pinned by execution
+ * rather than by reading a caller as text, and the empty-selection string
+ * must stay byte-identical, since it was always true.
+ */
+export function cutSelectionNotice(outcome: CutSelectionOutcome): string {
+	if (outcome.kind === "cut") return `Handwriting: cut ${outcome.count} stroke(s)`;
+	if (outcome.kind === "empty") return "Handwriting: lasso some ink first";
+	return `Handwriting: copied ${outcome.count} stroke(s) but could not remove them - the lasso has been kept`;
+}
+
+/**
+ * `copySelectionNoticeIsRoutine`'s counterpart, and the reason this one is
+ * worth stating separately: `cutSelectionNotice` has THREE arms, and only the
+ * first is routine. "empty" is no-op guidance and the third is a partial
+ * FAILURE - ink was copied but could not be removed - which is the last
+ * sentence that should ever be hidden behind a developer switch.
+ */
+export function cutSelectionNoticeIsRoutine(outcome: CutSelectionOutcome): boolean {
+	return outcome.kind === "cut";
 }
 
 export class InkOverlayPlugin {
@@ -1356,6 +1557,22 @@ export class InkOverlayPlugin {
 		return this.container !== null && this.filePath() === path;
 	}
 
+	/**
+	 * Whether this mounted overlay is the pane behind `editor`, showing
+	 * `file`. The predicate half of `overlayForActiveEditor`, here because the
+	 * view is private and stays that way.
+	 *
+	 * Read live from the same `editorInfoField` `filePath()` reads, and for
+	 * the same reason it is read live: Obsidian reuses editors, so a cached
+	 * answer can outlive the pairing it was true for.
+	 */
+	ownsActiveEditor(editor: Editor, file: TFile): boolean {
+		if (this.container === null) return false;
+		const info = this.view.state.field(editorInfoField, false);
+		if (!info) return false;
+		return info.editor === editor && info.file === file;
+	}
+
 	/** The file behind this editor, resolved live, because Obsidian reuses editors. */
 	private filePath(): string | null {
 		const info = this.view.state.field(editorInfoField, false);
@@ -1545,6 +1762,19 @@ export class InkOverlayPlugin {
 				// pan branch reads the pointer's position off it to put the
 				// reticle back where the hand actually is.
 				onPenUp: (ev) => this.penUp(ev),
+				// Ordinary-note iPhone only. The predicate is read at contact,
+				// after a toolbar command has explicitly picked the current nib.
+				// PDF supplies no callback, so its touch behavior cannot widen.
+				fingerInk: () =>
+					fingerInkEligible({
+						isIosApp: Platform.isIosApp,
+						isPhone: Platform.isPhone,
+						toolPicked: toolPickedHere(),
+						penInkEnabled: penInkEnabled(),
+						tipMode: tipMode(),
+						tool: inlineTool,
+					}),
+				onFingerInkCancelled: () => this.cancelFingerInkForPinch(),
 			// PEN OFF (PenInk.ts, design §5): the note surface is the only
 			// one that answers this. Off means the router claims nothing, so
 			// the pen is a native pointer here - taps place the caret and
@@ -1816,6 +2046,21 @@ export class InkOverlayPlugin {
 		}
 	}
 
+	/** One eligibility-scoped entry shared by commands and this note's strip. */
+	prepareFingerInk(): void {
+		if (
+			!fingerInkEligible({
+				isIosApp: Platform.isIosApp,
+				isPhone: Platform.isPhone,
+				toolPicked: toolPickedHere(),
+				penInkEnabled: penInkEnabled(),
+				tipMode: tipMode(),
+				tool: inlineTool,
+			})
+		) return;
+		this.router?.prepareFingerInk();
+	}
+
 	private ensurePenToolsInner(): void {
 		const want =
 			this.container !== null &&
@@ -1868,6 +2113,40 @@ export class InkOverlayPlugin {
 					// definitionally equal to Ctrl+Z.
 					if (id === "editor:undo") undo(this.view);
 					else if (id === "editor:redo") redo(this.view);
+					// The trash acts on THIS overlay, never on whichever editor
+					// `overlayForPath` would pick. That lookup answers the FIRST
+					// mounted editor showing the note, so with two editors open
+					// on the same file and this one active, routing the button
+					// through the registered command (which resolves the
+					// surface via `overlayForPath`) deleted - or refused to find
+					// - the OTHER editor's selection instead of this strip's
+					// own. The pdf strip's `stripExec` faced the identical
+					// thing first (PdfInkController.ts) and answers it the same
+					// way: the button knows its own overlay and asks it
+					// directly. Same notice the registered command shows, off
+					// the same `lassoDeleteNotice`, so the two paths can never
+					// drift into two sentences for one outcome.
+					else if (id === "handwriting:delete-selected-ink") {
+						const said = lassoDeleteNotice(this.deleteSelectedInk());
+						if (said) new Notice(said);
+					}
+					// Copy and cut for the same reason and by the same route. Cut is
+					// the one that mattered most: routed through the command it
+					// DELETED from whichever editor `overlayForPath` answered first,
+					// which is not the one the button is sitting in. Both take their
+					// sentence from the same helper the registered command uses, so
+					// no wording is written twice.
+					else if (id === "handwriting:copy-selected-ink") {
+						// The copy runs either way; only the success sentence is routine.
+						const copied = this.copySelectedInk();
+						if (routineNoticesVisible() || !copySelectionNoticeIsRoutine(copied))
+							new Notice(copySelectionNotice(copied));
+					}
+					else if (id === "handwriting:cut-selected-ink") {
+						const outcome = this.cutSelectedInk();
+						if (routineNoticesVisible() || !cutSelectionNoticeIsRoutine(outcome))
+							new Notice(cutSelectionNotice(outcome));
+					}
 					// The eraser, lasso, insert-space and pan buttons run
 					// commands that "Extra commands for hotkeys" keeps out of
 					// the palette while it is off - executeCommandById would
@@ -1935,6 +2214,13 @@ export class InkOverlayPlugin {
 			// answers the same read for the same reason (MobileTools.ts's
 			// `penInksHere`, design §5).
 			penInksHere: () => penInkEnabled(),
+			// Capability, not current mode: Keyboard remains reachable after it
+			// turns pen input off. PDF deliberately supplies no such capability.
+			fingerInkAvailable: () => Platform.isIosApp && Platform.isPhone,
+			// Close any native-scroll window while the toolbar contact is still
+			// between gestures. Doing this at the next note pointerdown is too late:
+			// WebKit has already snapshotted touch-action for that contact.
+			prepareFingerInk: () => this.prepareFingerInk(),
 			// The DEVICE's digitizer, not this pane's anything - the rule and
 			// its reasoning live in DeviceInput.ts, and both surfaces read the
 			// one implementation so a phone cannot get a different answer on a
@@ -2176,14 +2462,28 @@ export class InkOverlayPlugin {
 		) {
 			const k = event.key.toLowerCase();
 			if (k === "c" || k === "x") {
-				const n = k === "c" ? this.copySelectedInk() : this.cutSelectedInk();
-				if (n > 0) {
-					event.preventDefault();
-					new Notice(`Handwriting: ${k === "c" ? "copied" : "cut"} ${n} stroke(s)`);
-					// The strip's paste button wakes now, without waiting for
-					// the next tap or stroke.
-					this.mobileTools?.refresh();
-					return true;
+				if (k === "c") {
+					const n = this.copySelectedInk();
+					if (n > 0) {
+						event.preventDefault();
+						if (routineNoticesVisible()) new Notice(`Handwriting: copied ${n} stroke(s)`);
+						// The strip's paste button wakes now, without waiting for
+						// the next tap or stroke.
+						this.mobileTools?.refresh();
+						return true;
+					}
+				} else {
+					// Cut answers an outcome now, not a count: a copy that worked
+					// followed by a removal that did not is neither a cut nor an
+					// empty lasso, and `cutSelectionNotice` is what says so.
+					const outcome = this.cutSelectedInk();
+					if (outcome.kind !== "empty") {
+						event.preventDefault();
+						if (routineNoticesVisible() || !cutSelectionNoticeIsRoutine(outcome))
+							new Notice(cutSelectionNotice(outcome));
+						this.mobileTools?.refresh();
+						return true;
+					}
 				}
 			}
 		}
@@ -2210,7 +2510,7 @@ export class InkOverlayPlugin {
 			return true;
 		}
 		const n = this.pasteInkHere();
-		if (n > 0) new Notice(`Handwriting: pasted ${n} stroke(s)`);
+		if (n > 0 && routineNoticesVisible()) new Notice(`Handwriting: pasted ${n} stroke(s)`);
 		return true;
 	}
 
@@ -2856,7 +3156,9 @@ export class InkOverlayPlugin {
 		// caret. That also cancels native focus. Give keyboard ownership back to
 		// this editor before freezing geometry, or Delete and undo go wherever
 		// focus happened to be before the pen landed.
-		focusClaimedPenEditor(this.view, Platform.isMobileApp);
+		if (ev.pointerType !== "touch") {
+			focusClaimedPenEditor(this.view, Platform.isMobileApp);
+		}
 		// Hide the DOT only. The hover class stays on: it is what holds
 		// `cursor: none` over the scroller, and dropping it here handed every
 		// stroke to CodeMirror's I-beam - the reticle "flickered" because each
@@ -2922,7 +3224,7 @@ export class InkOverlayPlugin {
 		// contact, with no way out but dismissing the selection first. The
 		// rule was already written three lines down ("Tip and eraser return
 		// the pen to normal behavior"); only the code disagreed with it.
-		if (!eraser && !this.selection.isEmpty) {
+		if (ev.pointerType !== "touch" && !eraser && !this.selection.isEmpty) {
 			const w = this.camera.screenToWorld(sample.x, sample.y);
 			const bounds = this.selectionBounds();
 			if (
@@ -3020,15 +3322,19 @@ export class InkOverlayPlugin {
 			(tool === "highlighter" ? HIGHLIGHTER_PEN.baseWidth : DEFAULT_PEN.baseWidth) *
 			getInkSizeMult(tool);
 		this.activeStyle.color = getInkColorHex(tool);
+		const fromMouse = this.mouseStroke;
+		const fromFinger = ev.pointerType === "touch";
+		const widthMode: StrokeWidthMode | undefined = fromFinger ? "uniform" : undefined;
+		const widthPolicy = strokeWidthPolicy(this.activeStyle, widthMode);
+		this.activeStyle = widthPolicy.style;
 		// Same split as showPenCursor: the strip appears for any stroke, but
 		// only a real pen proves the tip inks without mouse ink. A mouse
 		// stroke reaches here whenever mouse ink is armed, and marking that
 		// as hardware is the second of the two writers that left the nib
-		// light stuck on. Touch never reaches this line at all -
-		// InlinePenRouter.pointerDown returns on every branch of its touch
-		// block - so there is no third pointer type to rule on.
+		// light stuck on. The iPhone finger reaches this same ink path now,
+		// but it proves neither pen hardware nor mouse intent and marks neither.
 		if (ev.pointerType === "pen") markPenHardwareSeen();
-		else markPenSeen();
+		else if (ev.pointerType === "mouse") markPenSeen();
 		this.ensurePenTools();
 		// The strip stepped aside at contact, above; a strip only just created
 		// by ensurePenTools has not heard that yet, so tell it now.
@@ -3042,13 +3348,12 @@ export class InkOverlayPlugin {
 		// The same question `mouseStroke` was just asked, read back rather than
 		// re-derived: two spellings of one fact in one method is how they come
 		// apart.
-		const fromMouse = this.mouseStroke;
-		this.wet.shape = !fromMouse;
+		this.wet.shape = widthPolicy.shapeWidth && !fromMouse;
 		// A mouse's constant 0.5 is neither evidence about the pen hardware
 		// nor something to amplify: gain 1, and its max is never reported.
-		this.strokeGain = fromMouse ? 1 : strokeGain();
+		this.strokeGain = fromMouse || fromFinger ? 1 : strokeGain();
 		this.strokeRawMax = 0;
-		this.strokePenGesture = !fromMouse;
+		this.strokePenGesture = !fromMouse && !fromFinger;
 		this.rawLastMoveT = sample.timestamp;
 		this.rawLastMoveX = sample.x;
 		this.rawLastMoveY = sample.y;
@@ -3062,7 +3367,8 @@ export class InkOverlayPlugin {
 			this.activeStyle.color,
 			this.activeStyle.baseWidth,
 			undefined,
-			fromMouse ? "mouse" : undefined
+			fromMouse ? "mouse" : undefined,
+			widthMode
 		);
 		this.builder.start(sample.timestamp);
 		const w = this.camera.screenToWorld(sample.x, sample.y);
@@ -3495,15 +3801,10 @@ export class InkOverlayPlugin {
 			);
 		}
 		if (!stroke || !path) {
-			// Boox mode clears the stroke's own box; everyone else keeps the full
-			// clear until an e-ink user has confirmed the box on hardware.
-			if (predictionEinkOn()) {
-				this.activeWet.clearStroke(this.cssWidth, this.cssHeight);
-				this.tail.clear();
-			} else {
-				this.activeWet.clear(this.cssWidth, this.cssHeight);
-				this.tail.clearAll(this.cssWidth, this.cssHeight);
-			}
+			// Every device clears the stroke's own box (see clearTransient below
+			// for why the gate went, and why the tail keeps one).
+			this.activeWet.clearStroke(this.cssWidth, this.cssHeight);
+			this.tail.clear(this.cssWidth, this.cssHeight);
 			this.highlightWetCanvas.setCssStyles({ opacity: String(HIGHLIGHTER_ALPHA) });
 			return;
 		}
@@ -3555,15 +3856,40 @@ export class InkOverlayPlugin {
 				}
 			},
 			clearTransient: () => {
-				// Boox mode clears the stroke's own box; everyone else keeps the full
-				// clear until an e-ink user has confirmed the box on hardware.
-				if (predictionEinkOn()) {
-					this.activeWet.clearStroke(this.cssWidth, this.cssHeight);
-					this.tail.clear();
-				} else {
-					this.activeWet.clear(this.cssWidth, this.cssHeight);
-					this.tail.clearAll(this.cssWidth, this.cssHeight);
-				}
+				// The wet layer clears the stroke's OWN BOX on every device.
+				//
+				// This used to be Boox-only, "until an e-ink user has confirmed
+				// the box on hardware". Nobody on this project has an e-ink
+				// device, so that confirmation was never going to arrive, and
+				// the whole-canvas clearRect stayed on the default path where
+				// it damages the entire canvas once per pen-up. What replaced
+				// the confirmation is a pixel proof: every one of the four
+				// `appendPoint` branches, over four path shapes, at both zooms,
+				// both device pixel ratios and both pens' width laws - 128
+				// cases - drawn in real Chromium and read back EXHAUSTIVELY
+				// (every pixel, no stride) leaves nothing behind, each against
+				// a paired control that does leave a rim. See
+				// `test/measure/WetClearBox.test.ts`. `clearStroke` also falls
+				// back to clearing everything when it has no box or a NaN one,
+				// so the failure mode is the old behaviour, not stale ink.
+				//
+				// The TAIL takes its dirty rect here too, and for the same
+				// reason - leaving it on `clearAll` would have kept a
+				// whole-canvas damage per pen-up on the layer above, which
+				// defeats most of the change below it. It has its own proof
+				// (`test/measure/TailClearBox.test.ts`): the head and the
+				// head-plus-prediction states are erased completely by the
+				// dirty rect at both zooms and both device pixel ratios.
+				//
+				// It is conditional on the FALLBACK. The two classes were not
+				// symmetric: `clear()` was `if (!this.dirty) return;`, and
+				// three paths here paint and then null the box without leaving
+				// one - so against a nulled box it erased nothing at all. It
+				// now falls back to the whole canvas when handed a size, which
+				// is why a size is handed to it here and not on the per-event
+				// callers. See `TailRenderer.clear`.
+				this.activeWet.clearStroke(this.cssWidth, this.cssHeight);
+				this.tail.clear(this.cssWidth, this.cssHeight);
 				// Cleared, so it is safe to be visible again for the next
 				// stroke. Restoring here rather than on the next pen-down
 				// keeps the element's resting state honest.
@@ -3675,8 +4001,10 @@ export class InkOverlayPlugin {
 		// Same order as `applyInkOp`'s replace leg, for the reason written
 		// there: out first, or the index the op carries names a list that no
 		// longer exists.
-		inlineInk.applyRemove(path, [freehand.id]);
-		inlineInk.applyAdd(path, [snapped], [at]);
+		inlineInk.takeLive(path, [freehand.id]);
+		inlineInk.applyAddLive(path, [snapped], [at]);
+		// Publish once, after the complete replacement is visible to subscribers.
+		inlineInk.save(path);
 		// The eraser answers from `strokeIndex`, and a swap it never heard
 		// about leaves it hit-testing a stroke that is gone - the 1.4.6 defect
 		// `InlineEraseFresh.test.ts` exists over.
@@ -3973,17 +4301,20 @@ export class InkOverlayPlugin {
 			return;
 		}
 		if (phase === "end") {
-			this.pinchRefScale = null;
-			this.pinchAnchor = null;
 			// Nothing may still be queued behind the settle: a live frame
 			// running after it would write the mid-gesture styles back.
 			if (this.pinchRaf !== 0) {
 				this.winRef.cancelAnimationFrame(this.pinchRaf);
 				this.pinchRaf = 0;
 			}
-			// Settle: the box and the ink raster catch up with the final
-			// scale, once, where the cost is invisible.
-			this.flushPinch(true);
+			try {
+				// Settle while the gesture-start anchor and scale are still
+				// available to the final coalesced move.
+				this.flushPinch(true);
+			} finally {
+				this.pinchRefScale = null;
+				this.pinchAnchor = null;
+			}
 			return;
 		}
 		if (this.pinchRefScale === null || this.pinchAnchor === null) return;
@@ -4022,7 +4353,8 @@ export class InkOverlayPlugin {
 		this.pinchPending = null;
 		if (!pending && !settle) return;
 		if (pending) this.applyPinchScale(pending.next, settle);
-		else if (settle) this.settlePinchRaster();
+		else if (settle && this.pinchScaleNow !== this.pinchRasterScale)
+			this.applyPinchScale(this.pinchScaleNow, true);
 	}
 
 	/**
@@ -4060,14 +4392,15 @@ export class InkOverlayPlugin {
 		} else {
 			host.setCssStyles({ transform: `scale(${next})`, transformOrigin: "0 0" });
 		}
+		// A final native scroll write needs the final range first. Browsers clamp
+		// against the old range synchronously and do not retry after the extent
+		// grows, so settle before committing the original-anchor offsets.
+		if (settle) this.settlePinchRaster();
 		scroller.scrollLeft = nextLeft;
 		scroller.scrollTop = nextTop;
 		// Stamp AFTER the writes: the scroll events they queue are the ones
 		// the handler above should let pass without a repaint.
 		this.pinchScrollAt = performance.now();
-		// The measured scale changed, so the ink geometry has to be rebuilt at
-		// the new backing resolution - but only once the fingers are gone.
-		if (settle) this.settlePinchRaster();
 	}
 
 	/**
@@ -4183,7 +4516,14 @@ export class InkOverlayPlugin {
 		// `router` is null before `mount()` and stubbed in the surface's unit
 		// rigs, both of which read as "nothing is on the glass" - which is
 		// what the hover behaved as before this rule existed.
-		if (mousePointer && (this.router?.handOnGlass?.() ?? false)) return;
+		// EVERY OPEN SURFACE, not just this one (1.4.13). `handOnGlass` is
+		// per-surface because the router is, so a finger writing in one pane
+		// left the mouse's ring lit in the other - the same smudge, in the
+		// pane the user is not touching. `anyHandOnGlass` (InlinePenRouter.ts)
+		// ORs the same derived answer over every live router and carries the
+		// cost note; it is read only under `mousePointer`, so nothing on the
+		// pen or touch path pays for it.
+		if (mousePointer && anyHandOnGlass()) return;
 		// Every branch below returns, so the watchdog is settled here, once.
 		if (mousePointer) this.clearHoverWatchdog();
 		else this.armHoverWatchdog();
@@ -4856,7 +5196,7 @@ export class InkOverlayPlugin {
 			return;
 		}
 		inlineInk.save(path);
-		const op: InkOp = { type: "move", path, strokeIds, dx: 0, dy };
+		const op = this.stampInkIdentity({ type: "move", path, strokeIds, dx: 0, dy });
 		try {
 			this.view.dispatch({
 				changes: change.changes ?? undefined,
@@ -5035,6 +5375,21 @@ export class InkOverlayPlugin {
 		this.tail.clearAll(this.cssWidth, this.cssHeight);
 	}
 
+	/**
+	 * A second finger changes intent from drawing to pinch. Clear every
+	 * provisional surface without entering penUp: there is no persistence,
+	 * no undo record, and no ghost wet/tail frame left behind.
+	 */
+	private cancelFingerInkForPinch(): void {
+		// penUp normally balances both of these, but pinch cancellation must
+		// never enter penUp because that commits. End only the instrumentation
+		// lifecycle before clearing the provisional surface state below.
+		metrics.end(performance.now());
+		this.stopFrameTicker();
+		this.strokePenGesture = false;
+		this.strokeAbandoned();
+	}
+
 	private resetGestureState(): void {
 		// Lifecycle rule (v0.13.6 fix): every gesture-state reset releases the
 		// stroke frame lock. File switch and unmount reach here mid-stroke;
@@ -5147,16 +5502,29 @@ export class InkOverlayPlugin {
 			out.height = Math.max(1, Math.round((vp.y1 - vp.y0) * vp.scale));
 			const ctx = out.getContext("2d");
 			if (!ctx) return { ok: false, reason: "the image could not be drawn" };
-			ctx.fillStyle = "#ffffff";
+			// ONE constant for the page and the destination, because the two
+			// must not drift: the ink is made readable against exactly the
+			// rectangle that was just painted under it.
+			ctx.fillStyle = SNIP_PAGE;
 			ctx.fillRect(0, 0, out.width, out.height);
 			ctx.setTransform(1, 0, 0, 1, -vp.x0 * vp.scale, -vp.y0 * vp.scale);
 			const cam = { x: 0, y: 0, zoom: vp.scale };
-			// The pdf snip's layering exactly: highlighter as a wash under
-			// the pen, both from committed geometry.
-			ctx.globalAlpha = 0.35;
-			for (const st of strokes) if (st.tool === "highlighter") drawStroke(ctx, cam, st, undefined, true);
-			ctx.globalAlpha = 1;
-			for (const st of strokes) if (st.tool !== "highlighter") drawStroke(ctx, cam, st, undefined, true);
+			// A snip PNG is NOT transparent and does not inherit the note's
+			// theme - it lands on the white rectangle above whatever theme it
+			// was taken under - so its destination is known here and the ink
+			// adapts to it, same direction as the PDF and for the same reason.
+			//
+			// The scope, rather than an argument: these strokes are drawn by
+			// the shared committed renderer, whose colour accessor is the hot
+			// path and may not grow a per-stroke parameter.
+			withInkDestination(SNIP_PAGE, () => {
+				// The pdf snip's layering exactly: highlighter as a wash under
+				// the pen, both from committed geometry.
+				ctx.globalAlpha = 0.35;
+				for (const st of strokes) if (st.tool === "highlighter") drawStroke(ctx, cam, st, undefined, true);
+				ctx.globalAlpha = 1;
+				for (const st of strokes) if (st.tool !== "highlighter") drawStroke(ctx, cam, st, undefined, true);
+			});
 			const blob = await new Promise<Blob | null>((resolve) => out.toBlob(resolve, "image/png"));
 			if (!blob) return { ok: false, reason: "the image could not be encoded" };
 			return { ok: true, bytes: new Uint8Array(await blob.arrayBuffer()) };
@@ -5185,11 +5553,17 @@ export class InkOverlayPlugin {
 		return n;
 	}
 
-	/** Copy, then delete as one normal history step. Returns the count. */
-	cutSelectedInk(): number {
+	/** Copy, then delete as one normal history step. */
+	cutSelectedInk(): CutSelectionOutcome {
 		const n = this.copySelectedInk();
-		if (n > 0) this.deleteSelectedInk();
-		return n;
+		if (n === 0) return { kind: "empty" };
+		// A cut is a copy AND a delete. When the delete removes nothing the
+		// ink is still on the page, so answering "cut" here would report a
+		// cut that did not happen - the clipboard holds the strokes and so
+		// does the note. `cutSelectionNotice` owns the honest sentence for
+		// that case, the same way `lassoDeleteNotice` owns the delete one.
+		const outcome = this.deleteSelectedInk();
+		return outcome.kind === "deleted" ? { kind: "cut", count: n } : { kind: "unmatched", count: n };
 	}
 
 	/**
@@ -5212,13 +5586,49 @@ export class InkOverlayPlugin {
 		// the viewport, scroll to it rather than pasting into the void.
 		this.selection.selectExactly(strokes.map((st) => st.id));
 		this.redrawSelectionUI();
-		const bounds = this.selectionBounds();
-		if (bounds) {
-			const cam = this.camera.snapshot;
-			const topY = (bounds.y - cam.y) * cam.zoom;
-			const viewH = this.view.scrollDOM.clientHeight;
-			if (topY < 0 || topY > viewH - 40) {
-				this.view.scrollDOM.scrollTop += topY - Math.min(120, viewH / 4);
+		// A blank note has no extent spacer yet. Grow it synchronously before
+		// writing either scroll offset: browsers clamp an early write to the
+		// old zero range, and the repaint that later creates the spacer does
+		// not retry it. Fixed-grid ink can be offscreen on either axis.
+		this.updateExtent(true);
+		// Re-read the camera AFTER that layout change. The viewport mapping
+		// below also reads fresh element rects, and a cached pre-extent camera
+		// combined with post-extent rects would mix two coordinate frames.
+		// syncCamera itself respects the active-stroke frame lock.
+		this.syncCamera();
+		const cam = this.camera.snapshot;
+		const scroller = this.view.scrollDOM;
+		const viewW = scroller.clientWidth;
+		const viewH = scroller.clientHeight;
+		// Camera screen coordinates are relative to the moving canvas BAND,
+		// while scroll offsets and client sizes describe the scroller viewport.
+		// Carry the band's current visual offset into the same layout-px space.
+		const overlayRect = this.container?.getBoundingClientRect();
+		const viewportRect = overlayRect ? scroller.getBoundingClientRect() : null;
+		const offsetX = overlayRect && viewportRect
+			? visualToNote(overlayRect.left - viewportRect.left, this.cssScale) - scroller.clientLeft
+			: 0;
+		const offsetY = overlayRect && viewportRect
+			? visualToNote(overlayRect.top - viewportRect.top, this.cssScale) - scroller.clientTop
+			: 0;
+		const pastedInkIsVisible = strokes.some((stroke) =>
+			strokeIntersectsViewport(stroke, cam, viewW, viewH, offsetX, offsetY)
+		);
+		if (!pastedInkIsVisible) {
+			// A sparse selection can span the pane while its union bbox starts
+			// in an EMPTY in-view corner (one stroke far right, one far below).
+			// One bent stroke's bbox can do the same. Reveal a real centerline
+			// point, not either kind of empty bounding-box corner.
+			const target = strokes.find((stroke) => stroke.points.length > 0)?.points[0];
+			if (target) {
+				const leftX = (target.x - cam.x) * cam.zoom + offsetX;
+				const topY = (target.y - cam.y) * cam.zoom + offsetY;
+				if (leftX < 0 || leftX > viewW - 40) {
+					scroller.scrollLeft += leftX - Math.min(120, viewW / 4);
+				}
+				if (topY < 0 || topY > viewH - 40) {
+					scroller.scrollTop += topY - Math.min(120, viewH / 4);
+				}
 			}
 		}
 		this.mobileTools?.refresh();
@@ -5229,18 +5639,59 @@ export class InkOverlayPlugin {
 	 * Delete the current lasso selection as one normal editor-history step.
 	 * Returns how many strokes went, so callers can say "nothing selected".
 	 */
-	deleteSelectedInk(): number {
+	deleteSelectedInk(): DeleteSelectionOutcome {
 		const path = this.filePath();
-		if (!path) return 0;
-		const n = this.selection.strokeIds.length;
-		const op = removeSelectedInlineStrokes(inlineInk, path, this.selection.strokeIds);
+		// Copied before the store is asked: the ids are the evidence the
+		// unresolved root-cause question needs, and on both failure paths
+		// below the selection must survive to be logged AND to stay on
+		// screen.
+		const ids = [...this.selection.strokeIds];
+		const n = ids.length;
+		if (!path) {
+			// A live selection with no resolvable path is not "nothing
+			// selected" either - the user did lasso something, there is just
+			// nowhere to look it up. Reuses "unmatched" rather than a third
+			// kind: from the caller's side this and a selection the store
+			// matched nothing in are the same fact, a real selection that
+			// could not be removed, so they earn the same honest sentence and
+			// the same kept lasso.
+			if (n === 0) return { kind: "empty" };
+			console.error("[handwriting] lasso delete with no resolvable path", { path: null, strokeIds: ids });
+			return { kind: "unmatched", count: n };
+		}
+		const op = removeSelectedInlineStrokes(inlineInk, path, ids);
+		// THE CHECK COMES BEFORE THE CLEAR. It used to come after, so a delete
+		// that removed nothing still destroyed the lasso, and the user was told
+		// to "lasso some ink first" with their selection already wiped -
+		// re-lassoing the same strokes then failed identically.
+		if (!op && n > 0) {
+			// The one thing nobody was collecting. Which of the two candidate
+			// causes this is - a selection holding ids an external sidecar
+			// reload replaced, or `filePath()` resolving somewhere the strokes
+			// are not stored - is not decided here, and these two values are
+			// what decides it.
+			console.error("[handwriting] lasso delete matched no strokes", { path, strokeIds: ids });
+			return { kind: "unmatched", count: n };
+		}
 		this.selection.clear();
 		this.redrawSelectionUI();
-		if (!op) return 0;
+		if (!op) return { kind: "empty" };
 		this.dispatchInk(op);
 		this.scheduleRepaint();
 		this.repaintPath(path);
-		return n;
+		return { kind: "deleted", count: n };
+	}
+
+	/** Bind every live publication to its record before asynchronous claims settle. */
+	private stampInkIdentity(op: InkOp): InkOp {
+		if (op.historyIdentity === undefined) {
+			op = { ...op, historyIdentity: inlineInk.captureHistoryIdentity(op.path) };
+		}
+		if (op.pageId === undefined) {
+			const id = inlineInk.pageIdOf(op.path);
+			if (id) op = { ...op, pageId: id };
+		}
+		return op;
 	}
 
 	/**
@@ -5250,14 +5701,7 @@ export class InkOverlayPlugin {
 	 * each gesture its own undo step; strokes never merge into one entry.
 	 */
 	private dispatchInk(op: InkOp): void {
-		// Stamp the note's IDENTITY on the way into the editor's history. The
-		// op outlives the path it was recorded at: the view keeps its history
-		// across a rename, and an undo afterwards named a path nothing lives
-		// at any more. See InkOpIdentity.
-		if (op.pageId === undefined) {
-			const id = inlineInk.pageIdOf(op.path);
-			if (id) op = { ...op, pageId: id };
-		}
+		op = this.stampInkIdentity(op);
 		try {
 			this.view.dispatch({
 				effects: inkEffect.of(op),
@@ -5271,18 +5715,16 @@ export class InkOverlayPlugin {
 	/**
 	 * Where an op from the editor's history should land now.
 	 *
-	 * Not `op.path`: the view survives a rename with its history intact, so
-	 * an op recorded before one names the old location. Applying it there put
-	 * the ink into a record for a path nothing lives at - and a note later
-	 * created at that name inherited it. The page id is in the file and does
-	 * not move, so it answers correctly across any number of renames.
-	 *
-	 * Null means "do not apply": the op knows which note it belongs to and
-	 * that note is not open, so there is nothing to apply it to and guessing
-	 * by path is how the ink ends up somewhere else.
+	 * The session token follows the record through renames and page-id
+	 * reassignment, including before the first claim. A missing token target
+	 * means the record was removed: skip without guessing by page id or path.
+	 * Older ops without a token retain their page-id/path resolution.
 	 */
 	private opPath(op: InkOp): string | null {
-		if (op.pageId === undefined) return op.path; // unclaimed, or recorded by an older build
+		if (op.historyIdentity !== undefined) {
+			return inlineInk.pathForHistoryIdentity(op.historyIdentity);
+		}
+		if (op.pageId === undefined) return op.path;
 		return inlineInk.pathForPageId(op.pageId);
 	}
 
@@ -5309,8 +5751,10 @@ export class InkOverlayPlugin {
 				// Order matters: take the old ones out before putting the new
 				// ones back at their recorded positions, or the indices the op
 				// carries describe a list that no longer exists.
-				inlineInk.applyRemove(op.path, op.removed.map((st) => st.id));
-				inlineInk.applyAdd(op.path, op.inserted, op.insertedAt);
+				inlineInk.takeLive(op.path, op.removed.map((st) => st.id));
+				inlineInk.applyAddLive(op.path, op.inserted, op.insertedAt);
+				// Persist and notify only the complete replacement, never its removal half.
+				inlineInk.save(op.path);
 				break;
 		}
 		const current = this.filePath();

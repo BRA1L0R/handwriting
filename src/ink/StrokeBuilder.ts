@@ -1,4 +1,5 @@
 import { InkPoint, InkStroke, InkTool, computeBBox, newStrokeId } from "./Stroke";
+import type { StrokeWidthMode } from "./StrokeWidth";
 
 /**
  * Some pens keep reporting contact while the nib is already leaving the
@@ -28,7 +29,14 @@ export class StrokeBuilder {
 	/** Min world-space movement to accept a new sample (dedupe threshold). */
 	private minDist: number;
 
-	constructor(tool: InkTool, color: string, width: number, minDistWorld = 0.15, private device?: "mouse") {
+	constructor(
+		tool: InkTool,
+		color: string,
+		width: number,
+		minDistWorld = 0.15,
+		private device?: "mouse",
+		private widthMode?: StrokeWidthMode
+	) {
 		this.tool = tool;
 		this.color = color;
 		this.width = width;
@@ -114,6 +122,7 @@ export class StrokeBuilder {
 			bbox: computeBBox(finishedPoints, this.width * 2),
 			createdAt,
 			...(this.device === "mouse" ? { device: this.device } : {}),
+			...(this.widthMode === "uniform" ? { widthMode: this.widthMode } : {}),
 		};
 	}
 

@@ -1,5 +1,6 @@
 import { invertedEffects } from "@codemirror/commands";
-import { Annotation, StateEffect } from "@codemirror/state";
+import { Annotation, Prec, StateEffect, Transaction } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import type { Extension } from "@codemirror/state";
 import { InkStroke } from "../ink/Stroke";
 
@@ -42,11 +43,16 @@ import { InkStroke } from "../ink/Stroke";
  * restored on the real note, and a note later created at the old name
  * inherited it. The page id does not move when the file does.
  *
- * Optional because an unclaimed note has no id yet, and because ops recorded
- * by an older build are still in the editor's history after an update; both
- * fall back to `path`, which is what they always used.
+ * Live inline ops carry a session-only record token, available before the
+ * first durable claim. It follows renames and page-id reassignment without
+ * retaining the record or its ink arrays. Removing the record invalidates
+ * the token; replay must then skip, even if the path or page id is reused.
+ *
+ * Both fields are optional for legacy and PDF callers: without a token,
+ * resolve the page id when supplied, otherwise use the captured path.
  */
 export interface InkOpIdentity {
+	historyIdentity?: symbol;
 	pageId?: string;
 }
 
@@ -164,13 +170,12 @@ export function eraseRemovalIndices(
 
 export function invertInkOp(op: InkOp): InkOp {
 	switch (op.type) {
-		// pageId travels through every inverse: an op that loses it on the
-		// way to the undo stack is one rename away from the bug it exists to
-		// prevent, and redo would be the leg that got it wrong.
+		// Both identities travel through every inverse, including redo.
 		case "add":
 			return {
 				type: "remove",
 				path: op.path,
+				historyIdentity: op.historyIdentity,
 				pageId: op.pageId,
 				strokes: op.strokes,
 				indices: op.indices ?? [],
@@ -179,6 +184,7 @@ export function invertInkOp(op: InkOp): InkOp {
 			return {
 				type: "add",
 				path: op.path,
+				historyIdentity: op.historyIdentity,
 				pageId: op.pageId,
 				strokes: op.strokes,
 				indices: op.indices,
@@ -187,6 +193,7 @@ export function invertInkOp(op: InkOp): InkOp {
 			return {
 				type: "move",
 				path: op.path,
+				historyIdentity: op.historyIdentity,
 				pageId: op.pageId,
 				strokeIds: op.strokeIds,
 				dx: -op.dx,
@@ -196,6 +203,7 @@ export function invertInkOp(op: InkOp): InkOp {
 			return {
 				type: "replace",
 				path: op.path,
+				historyIdentity: op.historyIdentity,
 				pageId: op.pageId,
 				removed: op.inserted,
 				removedAt: op.insertedAt,
@@ -207,11 +215,26 @@ export function invertInkOp(op: InkOp): InkOp {
 
 /** The facet registration that makes the editor history invert ink ops. */
 export function inkHistorySupport(): Extension {
-	return invertedEffects.of((tr) => {
+	return [invertedEffects.of((tr) => {
 		const inverted: StateEffect<InkOp>[] = [];
 		for (const effect of tr.effects) {
 			if (effect.is(inkEffect)) inverted.push(inkEffect.of(invertInkOp(effect.value)));
 		}
 		return inverted;
-	});
+	}), Prec.highest(EditorView.updateListener.of((update) => {
+		const [tr] = update.transactions;
+		// History bypasses transaction filters. Its effect-only undo still
+		// asks the view to reveal the old text caret, which may be pages away
+		// from the ink. Replace that pending scroll with the current viewport
+		// before the view measures it; no timer or extra history step.
+		// A later listener's transaction takes precedence over this update.
+		if (update.view.state !== update.state || update.transactions.length !== 1 || !tr ||
+			tr.docChanged || !(tr.isUserEvent("undo") || tr.isUserEvent("redo")) ||
+			tr.effects.length === 0 || !tr.effects.every((effect) => effect.is(inkEffect))) return;
+		update.view.dispatch({
+			selection: update.startState.selection,
+			effects: update.view.scrollSnapshot(),
+			annotations: Transaction.addToHistory.of(false),
+		});
+	}))];
 }

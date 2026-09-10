@@ -154,15 +154,14 @@ A small floating strip of tools, in the corner of the pane. On mobile it's
 the only way to reach most of this - the stylus fix keeps the keyboard down,
 and the command palette lives above the keyboard - so it's always there.
 On desktop it appears the first time a pen is seen and stays for the session;
-Settings > **Pen toolbar** can force it on or off, and **Toolbar placement**
-moves it: the four corners, or the middle of the top or bottom edge. Six in
-all - top left, top middle, top right, bottom left, bottom middle, bottom
-right. A middle placement centres the strip on that edge and keeps it centred
-as buttons fold away, and its pops open away from the edge it sits on.
+**Toolbar placement**
+moves it to a 3x3 grid: left, centre or right on the top, middle or bottom row.
+The centre-column placements keep the strip centred as buttons fold away, and
+only bottom-row pops open upward to stay on the screen.
 
 You can also drag the toolbar by its grip - the six dots at its left-hand end,
-or the pill itself when it's collapsed - to any corner or the top or bottom
-middle; it snaps to the nearest one when you let go, and the setting follows.
+or the pill itself when it's collapsed - to any of the nine placements; it
+snaps to the nearest one when you let go, and the setting follows.
 
 Left to right: **Pen** and **Highlighter**, then the other things the tip can
 be - **Eraser**, **Lasso**, **Insert space** - then **Delete selection**,
@@ -393,6 +392,36 @@ canvas page's file.
 
 It predates inline ink and is still supported, though the inline surface is
 where the work goes now.
+
+## slides
+
+Start Obsidian's own Slides plugin on a note and the pen writes on the
+presentation. Every slide keeps its own ink, there the next time you present
+that note. A slide boundary is a horizontal rule on its own line with a blank
+line above it, exactly as Obsidian's presenter counts slides; a `---` directly
+under a single line of text is that line's heading underline, not a boundary.
+
+The tip inks and the eraser end erases, same as everywhere else. `Eraser`
+also puts the tip to work erasing on a slide, for pens without a tail end,
+and a partial erase there follows the same `Stroke` / `Reticle` choice on the
+eraser's own strip button that your notes already use. A pen TAP
+on the arrows, or on the close button, still turns the page or closes the
+presentation - only a real stroke, one that moves or that you hold down for
+a moment, draws instead. Touch and mouse click and swipe the deck exactly as
+they always have; only the pen inks or erases.
+
+Ink for the presentation lives in its own file, `<page id>.slides`, beside
+the note's own ink file in `.handwriting/`. Add a slide above ones you've
+already drawn on, and the ink stays with its own slide instead of sliding
+down to the next number. A slide it can't place - one you rewrote, or one
+whose text now appears twice in the deck - keeps the slide number it was
+drawn on rather than being deleted or guessed at, so after a big edit that
+ink can turn up on a different slide; the console line at load says how many
+slides that happened to.
+
+Slides ink is on by default and has no settings-tab row of its own yet;
+`Toggle slides ink` in the command palette is the way to turn it off, or
+back on.
 
 ## limitations
 

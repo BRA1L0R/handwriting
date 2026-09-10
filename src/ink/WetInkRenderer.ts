@@ -6,6 +6,7 @@ import { IncrementalSmoother, Point2 } from "./Smoothing";
 import { RibbonPt, flattenSegment, flattenSegmentHw } from "./Ribbon";
 import { IncrementalShaper, centerlineSmoothed, inkShapingEnabled } from "./InkShape";
 import { fillRibbon } from "./RibbonRenderer";
+import { inkColorFor } from "./InkTheme";
 import { drawSegment } from "./StrokeRenderer";
 
 /**
@@ -162,7 +163,7 @@ export class WetInkRenderer {
 					hw: widthForPressure(style, p.pressure) / 2,
 				});
 				const strip: RibbonPt[] = [this.lastRibbon ?? rp(prev), rp(point)];
-				fillRibbon(this.ctx, cam, strip, style.color);
+				fillRibbon(this.ctx, cam, strip, inkColorFor(style));
 				this.growDirtyStrip(cam, strip);
 				this.lastRibbon = strip[strip.length - 1];
 			} else if (this.smooth) {
@@ -193,7 +194,7 @@ export class WetInkRenderer {
 					const strip: RibbonPt[] = this.lastRibbon
 						? [this.lastRibbon, ...flatSeg]
 						: flatSeg;
-					fillRibbon(this.ctx, cam, strip, style.color);
+					fillRibbon(this.ctx, cam, strip, inkColorFor(style));
 					this.growDirtyStrip(cam, strip);
 					this.lastRibbon = strip[strip.length - 1];
 				}
@@ -293,32 +294,26 @@ export class WetInkRenderer {
 	}
 
 	/**
-	 * The pen-down dot's world half-width: the shaped width, floored at the
-	 * nib.
+	 * The pen-down dot's world half-width: exactly one nib.
 	 *
 	 * The contact dot is the one head draw that is NOT gated on `head()`, and
-	 * at pen-down the shaper has just reset to the tip floor - 12% of
-	 * nominal - while the wet layer has painted nothing at all. So for a TAP
-	 * this dot is the entire visible mark, and handing it the bare shaped
-	 * width renders a tap at 12% of the nib: the near-invisible sliver that
-	 * `applyEndTaper`'s `total < style.baseWidth` guard exists to prevent on
-	 * the committed path. That guard's mechanism cannot be reused here - it
-	 * is a whole-stroke length test, and at pen-down there is no stroke - but
-	 * its intent is this line.
+	 * at pen-down the wet layer has painted nothing at all. For a TAP this dot
+	 * is the entire visible mark. The pressure-aware wet ribbon now starts at
+	 * the width the committed ribbon will use, which may exceed the nib under
+	 * exp7; the contact dot is deliberately separate so that accepted line
+	 * starts do not silently enlarge Alan's accepted nib-sized taps.
 	 *
 	 * The floor is the nib's own base width (Alan, 2026-09-02): a tap should
 	 * look like the nib, not like the start of a stroke. `baseWidth` is a
 	 * FULL width, so the floor on a half-width is `baseWidth / 2`; flooring
 	 * at `baseWidth` itself would draw every tap at twice the nib.
 	 *
-	 * Note what this means in practice, since it is a behaviour change and
-	 * not only a guard: `widthForPressure` never exceeds `baseWidth`, and the
-	 * shaped width multiplies that by two factors that are both <= 1, so the
-	 * floor always wins here. A tap draws at exactly the nib whatever the
-	 * pressure sample says. That is the ruling, stated plainly.
+	 * A tap draws at exactly the nib whatever the pressure sample says. That
+	 * was already the ruling; making it explicit preserves it now that the ON
+	 * curve is allowed to exceed `baseWidth`.
 	 */
-	contactHalfWidth(style: PenStyle, pressure: number): number {
-		return Math.max(this.liveHalfWidth(style, pressure), style.baseWidth / 2);
+	contactHalfWidth(style: PenStyle, _pressure: number): number {
+		return style.baseWidth / 2;
 	}
 
 	/**
@@ -343,7 +338,7 @@ export class WetInkRenderer {
 		const strip: RibbonPt[] = this.lastRibbon
 			? [this.lastRibbon, ...flatSeg]
 			: flatSeg;
-		fillRibbon(this.ctx, cam, strip, style.color);
+		fillRibbon(this.ctx, cam, strip, inkColorFor(style));
 		this.growDirtyStrip(cam, strip);
 		this.lastRibbon = strip[strip.length - 1];
 	}

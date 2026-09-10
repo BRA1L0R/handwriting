@@ -28,6 +28,11 @@
 
 import { InkStroke } from "../ink/Stroke";
 import { PageData, ParseResult, emptyPage } from "../model/PageData";
+import type {
+	ExternalAdoptionHeldReason,
+	ExternalAdoptionResult,
+} from "../inline/InlineInkStore";
+import type { ExternalAdoptionPrep, PreparedExternalAdoption } from "../persistence/PageStore";
 import { runDetached } from "../util/Detached";
 
 const EMPTY: readonly InkStroke[] = [];
@@ -44,6 +49,18 @@ const EMPTY: readonly InkStroke[] = [];
 function inkFingerprint(strokes: readonly InkStroke[]): string {
 	return strokes.map((s) => `${s.page}/${s.id}:${s.bbox.x},${s.bbox.y}`).join("|");
 }
+
+/** A detached lossless copy captured before preservation begins awaiting I/O. */
+function freezePage(page: PageData): PageData | null {
+	const clone = (globalThis as { structuredClone?: <T>(value: T) => T }).structuredClone;
+	return clone ? clone(page) : null;
+}
+
+function adoptionHeld(reason: ExternalAdoptionHeldReason): ExternalAdoptionResult {
+	return { outcome: "held", changed: false, reason };
+}
+
+const ADOPTION_UNAVAILABLE: ExternalAdoptionResult = { outcome: "unavailable", changed: false };
 
 /**
  * The coordinate convention every pdf stroke is written in: page-local css px
@@ -81,10 +98,14 @@ export interface PdfInkHost {
 	load(id: string): Promise<ParseResult | null>;
 	schedule(id: string, data: PageData): void;
 	notice(message: string): void;
+	prepareExternalAdoption?(id: string, outgoing: PageData): Promise<ExternalAdoptionPrep>;
+	acceptExternalAdoption?(prepared: PreparedExternalAdoption): void;
 }
 
 interface PdfRecord {
 	strokes: InkStroke[];
+	/** Monotonic session generation; catches A -> B -> A across an await. */
+	mutationGeneration: number;
 	load: "no" | "loading" | "yes";
 	/** The parsed sidecar, kept so unknown keys survive a round-trip. */
 	basePage: PageData | null;
@@ -105,6 +126,7 @@ interface PdfRecord {
 function freshRecord(): PdfRecord {
 	return {
 		strokes: [],
+		mutationGeneration: 0,
 		load: "no",
 		basePage: null,
 		claimedPaths: null,
@@ -135,6 +157,38 @@ export class PdfInkStore {
 
 	hasInk(id: string): boolean {
 		return (this.byId.get(id)?.strokes.length ?? 0) > 0;
+	}
+
+	/**
+	 * Can this document's ink reach the disk right now?
+	 *
+	 * A read-only question, asked by destructive commands that need to know
+	 * their safety copy is worth anything. It reports existing state and
+	 * changes none: no host is attached, no load is started or finished, no
+	 * lock is cleared, no write is scheduled, no identity is invented.
+	 *
+	 * The conditions are `persist`'s own refusals asked positively. Session
+	 * memory, an unfinished read, and the two locks are exactly the states in
+	 * which a scheduled write never lands - so the ink on screen is not in the
+	 * file and a copy of that file does not contain it. `reloadExternal`
+	 * refuses on the same three flags, for the neighbouring reason. The
+	 * completed load is the fourth: a record that has not read its sidecar
+	 * cannot say what is in it yet.
+	 *
+	 * Deliberately NOT a question about queued writes. `preserve` settles
+	 * those on purpose, and treating a pending save as unready would refuse
+	 * every ordinary deletion.
+	 */
+	canPersist(id: string): boolean {
+		const rec = this.byId.get(id);
+		if (!rec) return false; // never touched: nothing is loaded
+		return (
+			this.host !== null &&
+			rec.load === "yes" &&
+			!rec.loadInFlight &&
+			!rec.unreadableLocked &&
+			!rec.futureLocked
+		);
 	}
 
 	/** Diagnostics: documents held, and how much ink between them. */
@@ -177,7 +231,7 @@ export class PdfInkStore {
 				rec.unreadableLocked = true;
 				this.noteOnce(
 					rec,
-					"Handwriting: this PDF's ink file could not be read. Ink drawn on it is not saved."
+					"Handwriting: this PDF's ink file could not be read. ink drawn on it is not saved."
 				);
 				return false;
 			}
@@ -193,7 +247,7 @@ export class PdfInkStore {
 				rec.futureLocked = true;
 				this.noteOnce(
 					rec,
-					"Handwriting: this PDF's ink was written by a newer version of Handwriting. Ink drawn on it is not saved."
+					"Handwriting: this PDF's ink was written by a newer version of Handwriting. ink drawn on it is not saved."
 				);
 				// Zero strokes out of a schema we do not fully understand is
 				// ambiguous - erased, or written in a form we cannot decode -
@@ -213,6 +267,7 @@ export class PdfInkStore {
 			const persisted = result.data.strokes.filter((s) => typeof s.page === "number");
 			const seen = new Set(rec.strokes.map((s) => s.id));
 			rec.strokes = [...persisted.filter((s) => !seen.has(s.id)), ...rec.strokes];
+			rec.mutationGeneration++;
 			return persisted.length > 0;
 		} finally {
 			rec.load = "yes";
@@ -225,6 +280,7 @@ export class PdfInkStore {
 	commit(id: string, stroke: InkStroke): void {
 		const rec = this.record(id);
 		rec.strokes.push(stroke);
+		rec.mutationGeneration++;
 		this.persist(id, rec);
 	}
 
@@ -238,6 +294,7 @@ export class PdfInkStore {
 	replaceAll(id: string, strokes: readonly InkStroke[]): void {
 		const rec = this.record(id);
 		rec.strokes = [...strokes];
+		rec.mutationGeneration++;
 		this.persist(id, rec);
 	}
 
@@ -251,7 +308,9 @@ export class PdfInkStore {
 	 * with the pen; the disk does not. `save` is the single write at pen-up.
 	 */
 	replaceAllLive(id: string, strokes: readonly InkStroke[]): void {
-		this.record(id).strokes = [...strokes];
+		const rec = this.record(id);
+		rec.strokes = [...strokes];
+		rec.mutationGeneration++;
 	}
 
 	/** Write the current state now: the end of a live gesture. */
@@ -283,6 +342,7 @@ export class PdfInkStore {
 		// the file has gone rather than merely being unreadable it throws away
 		// the only remaining copy of the ink.
 		const kept = rec.strokes;
+		rec.mutationGeneration++;
 		rec.load = "no";
 		rec.strokes = [];
 		rec.basePage = null;
@@ -303,6 +363,74 @@ export class PdfInkStore {
 		this.byId.delete(id);
 	}
 
+	/**
+	 * Preserve both external-adoption revisions before replacing a settled PDF
+	 * record. Every established-record refusal is a typed hold; initial loading
+	 * is the only unavailable state.
+	 */
+	async adoptExternal(
+		id: string,
+		stillEligible?: () => boolean
+	): Promise<ExternalAdoptionResult> {
+		const rec = this.byId.get(id);
+		if (!rec) return ADOPTION_UNAVAILABLE;
+		const host = this.host;
+		if (!host) return adoptionHeld("missing-capability");
+		const prepare = host.prepareExternalAdoption;
+		const accept = host.acceptExternalAdoption;
+		if (!prepare || !accept || !stillEligible) return adoptionHeld("missing-capability");
+		if (rec.load !== "yes" || rec.loadInFlight) return adoptionHeld("unsettled");
+		if (rec.unreadableLocked || rec.futureLocked) return adoptionHeld("existing-lock");
+		const outgoing = this.snapshot(id, rec);
+		if (!outgoing) return adoptionHeld("no-snapshot");
+		// Capture both content and the monotonic generation before the first await.
+		// Content proves exact present state; generation catches A -> B -> A.
+		const frozen = freezePage(outgoing);
+		if (!frozen) return adoptionHeld("missing-capability");
+		const capturedJson = JSON.stringify(frozen);
+		const generation = rec.mutationGeneration;
+		const before = JSON.stringify(rec.strokes);
+
+		let prep: ExternalAdoptionPrep;
+		try {
+			prep = await prepare.call(host, id, frozen);
+		} catch (err) {
+			console.error("[handwriting] pdf external adoption could not be prepared", id, err);
+			return adoptionHeld("io-failure");
+		}
+		if (prep.kind === "unavailable") return adoptionHeld("preservation-unavailable");
+		if (prep.kind === "stale") return adoptionHeld("stale");
+		if (prep.prepared.pageId !== id) return adoptionHeld("stale");
+
+		// No await follows these checks. The baseline acknowledgement and record
+		// replacement are one synchronous commit after both store and host state
+		// have been requalified.
+		if (this.byId.get(id) !== rec) return adoptionHeld("unsettled");
+		if (rec.load !== "yes" || rec.loadInFlight) return adoptionHeld("unsettled");
+		if (rec.unreadableLocked || rec.futureLocked) return adoptionHeld("existing-lock");
+		if (rec.mutationGeneration !== generation) return adoptionHeld("unsettled");
+		const current = this.snapshot(id, rec);
+		if (!current || JSON.stringify(current) !== capturedJson) return adoptionHeld("unsettled");
+		try {
+			if (!stillEligible()) return adoptionHeld("unsettled");
+		} catch {
+			return adoptionHeld("unsettled");
+		}
+
+		accept.call(host, prep.prepared);
+		rec.basePage = prep.prepared.data;
+		rec.strokes = prep.prepared.data.strokes.filter((s) => typeof s.page === "number");
+		const incomingPaths = prep.prepared.data.pdfPaths ?? [];
+		rec.claimedPaths = [...new Set([...incomingPaths, ...(rec.claimedPaths ?? [])])];
+		rec.mutationGeneration++;
+		return {
+			outcome: "adopted",
+			changed: JSON.stringify(rec.strokes) !== before,
+			outgoingPath: prep.prepared.outgoingPath,
+			incomingPath: prep.prepared.incomingPath,
+		};
+	}
+
 	private persist(id: string, rec: PdfRecord): void {
 		if (!this.host) return; // session-memory mode
 		if (rec.unreadableLocked || rec.futureLocked) return; // already noticed
@@ -317,6 +445,13 @@ export class PdfInkStore {
 			);
 			return;
 		}
+		const page = this.snapshot(id, rec);
+		if (page) this.host.schedule(id, page);
+	}
+
+	/** One composition function for writes and exact adoption qualification. */
+	private snapshot(id: string, rec: PdfRecord): PageData | null {
+		if (rec.unreadableLocked || rec.futureLocked) return null;
 		const base = rec.basePage ?? emptyPage(id);
 		// Strokes the read could not place are carried through untouched. They
 		// are filtered out of the session because a stroke with no page cannot be
@@ -324,14 +459,14 @@ export class PdfInkStore {
 		// keeps unknown KEYS for exactly this reason. A stroke we cannot explain
 		// is the last thing to throw away.
 		const unplaceable = base.strokes.filter((s) => typeof s.page !== "number");
-		this.host.schedule(id, {
+		return {
 			...base,
 			pageId: id,
 			surface: "pdf",
 			coordSpace: PDF_COORD_SPACE,
 			...(rec.claimedPaths !== null ? { pdfPaths: rec.claimedPaths } : {}),
 			strokes: [...unplaceable, ...rec.strokes],
-		});
+		};
 	}
 
 	/**
@@ -345,6 +480,7 @@ export class PdfInkStore {
 		const rec = this.record(id);
 		if (rec.claimedPaths?.includes(path)) return;
 		rec.claimedPaths = [...(rec.claimedPaths ?? []), path];
+		rec.mutationGeneration++;
 		if (rec.basePage !== null) this.persist(id, rec);
 	}
 
@@ -353,6 +489,7 @@ export class PdfInkStore {
 		const rec = this.record(id);
 		const kept = (rec.claimedPaths ?? []).filter((p) => p !== oldPath && p !== newPath);
 		rec.claimedPaths = [...kept, newPath];
+		rec.mutationGeneration++;
 		if (rec.basePage !== null) this.persist(id, rec);
 	}
 

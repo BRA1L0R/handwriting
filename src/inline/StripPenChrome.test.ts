@@ -275,6 +275,10 @@ const FOCUS_ALLOWED: Readonly<Record<string, Exemption>> = {
 		max: 1,
 		why: "the text box editor taking the caret when a box opens for editing - the user asked to type, which is the ordinary reason to call focus and the opposite of the pen-gesture case",
 	},
+	"/src/slides/SlidesInkSurface.ts": {
+		max: 1,
+		why: "the slides surface focusing REVEAL'S OWN DECK WRAPPER before it claims a pen contact, never an ink surface and never the editor. Reveal is embedded with keyboardCondition:\"focused\" and focuses itself off the same pointerdown (S4); doing it first, in the capture phase, is what keeps the focus/blur cycle from straddling the start of a stroke. Nothing here strips a native focus, so there is nothing for stripPenFocus to restore",
+	},
 	"/src/inline/FoldOrderControl.ts": {
 		max: 2,
 		why: "a settings list keeping focus on the drag handle the user is holding. One after ArrowUp/ArrowDown moved that row and took its grip with it, without which the second arrow press goes nowhere; one on pointerdown, because the drag preventDefaults the gesture (a finger would scroll the pane, a mouse would select the row's text) and that is what stops the grip taking focus by itself, leaving drag-then-arrow dead. A settings tab, not an ink surface: no pen gesture, no PointerRouter, nothing stripped a native focus these could be restoring",

@@ -50,6 +50,7 @@
  */
 
 import { Notice } from "obsidian";
+import { routineNoticesVisible } from "../diag/RoutineNotices";
 import { InkTool } from "./Stroke";
 import {
 	InkPreset,
@@ -104,7 +105,7 @@ export interface InkPresetStore {
  * showing - because two copies of the hide-if-showing rule are two things
  * that can drift apart.
  */
-function ownedPresetNotice(): (message: string) => void {
+function ownedPresetNotice(): (message: string, routine?: boolean) => void {
 	let notice: Notice | null = null;
 	const clear = (): void => {
 		// The same dead-Notice probe main.ts documents at length: a hidden or
@@ -114,8 +115,17 @@ function ownedPresetNotice(): (message: string) => void {
 		notice = null;
 	};
 	ownedNoticeHiders.push(clear);
-	return (message: string) => {
+	return (message: string, routine = false) => {
+		// CLEAR FIRST, ALWAYS - including when the message itself stays silent.
+		// This slot is SHARED by all four preset sentences, and two of them are
+		// retained ("... is empty.", "removed ..."). Without this, a retained
+		// toast left on screen would outlive the action it described: pick a
+		// preset up successfully while "preset 2 is empty." is showing, and the
+		// stale sentence would sit there describing the previous attempt.
+		// `showPenToggleNotice` needs no equivalent - each toggle owns its own
+		// slot, so with the switch off nothing ever writes to it.
 		clear();
+		if (routine && !routineNoticesVisible()) return;
 		notice = new Notice(message);
 	};
 }
@@ -175,12 +185,12 @@ export function installInkPresetActions(store: InkPresetStore): void {
 			// Every strip, not just the one that was tapped: the nib tint and
 			// the chip's ring are per-pane drawings of one global choice.
 			refreshAllStrips();
-			sayPreset(`Handwriting: ${presetLabel(preset)}`);
+			sayPreset(`Handwriting: ${presetLabel(preset)}`, true);
 		},
 		star: (tool) => {
 			const preset = livePreset(tool);
 			write(addPreset(store.list(), preset));
-			sayPreset(`Handwriting: starred ${presetLabel(preset)}`);
+			sayPreset(`Handwriting: starred ${presetLabel(preset)}`, true);
 		},
 		remove: (tool, index) => {
 			const gone = inkPresetsFor(tool)[index];

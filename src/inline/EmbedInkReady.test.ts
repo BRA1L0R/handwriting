@@ -416,6 +416,24 @@ describe("attachEmbedInkOnceReady: route 3, no container and a section not yet i
 		expect(embedInkPendingWaitCount()).toBe(0);
 	});
 
+	it("the poll timer lands on the section's own window, not the global - the popout case", () => {
+		// A popout has its own window object, and a timer scheduled on the
+		// main one for an element in a popout goes on firing after that
+		// popout has closed (setTimer's own doc comment). Proof that the poll
+		// honours the view it was given rather than the ambient global: the
+		// fake view's queue gets the timer, and the real global setTimeout is
+		// never touched.
+		const globalTimeout = vi.spyOn(globalThis, "setTimeout");
+		const env = fakeEnv();
+		const viewWithoutMO = { ...env.view, MutationObserver: undefined };
+		const section = fakeSection(viewWithoutMO, {});
+
+		attachEmbedInkOnceReady(asEl(section), null, "note.md", noStrokes);
+
+		expect(env.pendingTimers(), "the timer landed in the section's own window's queue").toBe(1);
+		expect(globalTimeout).not.toHaveBeenCalled();
+	});
+
 	it("outlasts a renderer that takes seconds, where thirty frames would not have", () => {
 		const env = fakeEnv();
 		const lines = recordDiagnostics();

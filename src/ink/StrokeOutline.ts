@@ -19,6 +19,7 @@ import { flattenStroke, ribbonSides, jointIndices, RibbonPt } from "./Ribbon";
 import { flattenStrokeShaped } from "./InkShape";
 import { PenStyle, shapeFor } from "./PenStyle";
 import { InkStroke } from "./Stroke";
+import { strokeWidthPolicy } from "./StrokeWidth";
 
 /** Density for curve flattening: world px are CSS px, 2 samples per px. */
 export const EXPORT_PX_PER_WORLD = 2;
@@ -47,13 +48,15 @@ export function ribbonOf(stroke: InkStroke): RibbonPt[] {
 	const pts = stroke.points;
 	if (pts.length === 0) return [];
 	const flat = stroke.tool === "highlighter";
+	const shape = shapeFor(flat);
 	// drawStroke's exact style derivation, so the widths match the note.
-	const style: PenStyle = {
+	const baseStyle: PenStyle = {
 		color: stroke.color,
 		baseWidth: stroke.width,
-		minWidthFactor: shapeFor(flat).minWidthFactor,
-		gamma: shapeFor(flat).gamma,
+		...shape,
 	};
+	const widthPolicy = strokeWidthPolicy(baseStyle, stroke.widthMode);
+	const style = widthPolicy.style;
 	// Exports are always shaped (§5n, Alan, 2026-09-02): inkShapingEnabled()
 	// used to gate this too, so a Boox user - whose boox mode turns shaping
 	// off to save e-ink redraw cost on screen - was exporting rough geometry
@@ -68,7 +71,7 @@ export function ribbonOf(stroke: InkStroke): RibbonPt[] {
 	// have sent every one of them into every SVG and PDF as a raw polyline,
 	// following an on-screen setting that by rule never reaches here. Nothing
 	// but the default says so, so it is said here (§5l/AE7).
-	return !flat && stroke.device !== "mouse"
+	return widthPolicy.shapeWidth && !flat && stroke.device !== "mouse"
 		? flattenStrokeShaped(pts, style, EXPORT_PX_PER_WORLD)
 		: flattenStroke(pts, style, EXPORT_PX_PER_WORLD);
 }

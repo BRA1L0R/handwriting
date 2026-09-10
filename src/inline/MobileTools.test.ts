@@ -210,6 +210,20 @@ describe("nibIsLit", () => {
 		);
 	});
 
+	it("uses the explicit picked grant for an iPhone finger without claiming pen hardware", () => {
+		const phone = fakeHost({
+			activeTool: () => "pen",
+			fingerInkAvailable: () => true,
+		});
+		expect(nibIsLit(phone, "pen")).toBe(false);
+		markToolPicked();
+		expect(nibIsLit(phone, "pen")).toBe(true);
+		expect(penHardwareSeen()).toBe(false);
+		setPenInk(false);
+		expect(nibIsLit(phone, "pen")).toBe(false);
+		resetPenInkForTest();
+	});
+
 	/**
 	 * A SECOND CASE of the same new rule, for symmetry with the pen: ADDED,
 	 * not a rewrite of an existing assertion. The `markToolPicked()` is the
@@ -387,6 +401,96 @@ interface ElOpts {
 	text?: string;
 	attr?: Record<string, string>;
 }
+
+describe("MobileTools: iPhone finger entry", () => {
+	beforeEach(() => {
+		resetPenToolsForTest();
+		resetPenInkForTest();
+		clearToolPicked();
+	});
+	afterEach(() => {
+		resetPenInkForTest();
+		resetPenToolsForTest();
+		clearToolPicked();
+	});
+
+	function buildPhone() {
+		const doc = new FakeDoc();
+		const pane = new FakeEl("div", doc);
+		let active = "pen";
+		const execed: string[] = [];
+		const focused: boolean[] = [];
+		const host = fakeHost({
+			activeTool: () => active,
+			fingerInkAvailable: () => true,
+			exec: (id) => {
+				execed.push(id);
+				if (id === "handwriting:inline-tool-pen") active = "pen";
+				if (id === "handwriting:inline-tool-highlighter") active = "highlighter";
+				if (id === "handwriting:inline-tool-pen" || id === "handwriting:inline-tool-highlighter") {
+					markToolPicked();
+				}
+				if (id === "handwriting:pen-ink-toggle") setPenInk(!penInkEnabled());
+			},
+			setEditorFocus: (on) => void focused.push(on),
+		});
+		const strip = new MobileTools(pane as unknown as HTMLElement, host);
+		return { doc, pane, strip, execed, focused, host };
+	}
+
+	it("builds Keyboard before any pen has ever been seen", () => {
+		const { pane } = buildPhone();
+		expect(penHardwareEverSeen()).toBe(false);
+		expect(pane.findByTipLabel("Keyboard mode (pen input off)")).not.toBeNull();
+	});
+
+	it("the apparent default Pen tap picks and arms instead of opening its slider", () => {
+		const { doc, pane, strip, execed, focused, host } = buildPhone();
+		const pen = pane.findByTipLabel("Pen");
+		if (!pen) throw new Error("no Pen button");
+		expect(nibIsLit(host, "pen")).toBe(false);
+
+		pen.fire("click", { pointerType: "touch" });
+		doc.flushFrames();
+		expect(execed).toEqual(["handwriting:inline-tool-pen"]);
+		expect(toolPickedHere()).toBe(true);
+		expect(penInkEnabled()).toBe(true);
+		expect(focused).toEqual([false]);
+		expect(strip.openNibSlider).toBeNull();
+		expect(nibIsLit(host, "pen")).toBe(true);
+	});
+
+	it("Keyboard exit can re-enter through Pen or Highlighter", () => {
+		const { doc, pane, execed, focused, host } = buildPhone();
+		const keyboard = pane.findByTipLabel("Keyboard mode (pen input off)");
+		const pen = pane.findByTipLabel("Pen");
+		const highlighter = pane.findByTipLabel("Highlighter");
+		if (!keyboard || !pen || !highlighter) throw new Error("missing phone tool");
+
+		keyboard.fire("click", { pointerType: "touch" });
+		doc.flushFrames();
+		expect(penInkEnabled()).toBe(false);
+		expect(toolPickedHere()).toBe(false);
+		pen.fire("click", { pointerType: "touch" });
+		doc.flushFrames();
+		expect(penInkEnabled()).toBe(true);
+		expect(nibIsLit(host, "pen")).toBe(true);
+
+		keyboard.fire("click", { pointerType: "touch" });
+		doc.flushFrames();
+		highlighter.fire("click", { pointerType: "touch" });
+		doc.flushFrames();
+		expect(penInkEnabled()).toBe(true);
+		expect(nibIsLit(host, "highlighter")).toBe(true);
+		expect(execed).toEqual([
+			"handwriting:pen-ink-toggle",
+			"handwriting:inline-tool-pen",
+			"handwriting:pen-ink-toggle",
+			"handwriting:inline-tool-highlighter",
+		]);
+		expect(focused).toEqual([true, false, true, false]);
+	});
+});
 
 class FakeDoc {
 	readonly listeners = new Map<string, Array<(ev: unknown) => void>>();
@@ -4058,7 +4162,7 @@ describe("MobileTools: a strip destroyed inside a timer's window fires nothing",
  * DRAG TO ANCHOR (1.4.12). Alan: "drag to anchor we can get out in 1.4.12?
  * do it".
  *
- * The arithmetic - has this contact become a drag, and which of the six did
+ * The arithmetic - has this contact become a drag, and which of the nine did
  * it land on - is `ToolbarDrag.ts` and is pinned in its own file, against a
  * real pane with real boxes, which this suite cannot supply by accident.
  * What is pinned HERE is everything the class does around those two answers:
@@ -4236,6 +4340,23 @@ describe("MobileTools: dragging the toolbar to an anchor", () => {
 		expect(rig.el.classes.has("is-dragging")).toBe(false);
 	});
 
+	it("a drag to the right-middle row persists that anchor and does not collapse", () => {
+		const rig = buildDrag();
+		rig.pane.rect = { left: 0, top: 0, right: 1000, bottom: 800, width: 1000, height: 800 };
+		rig.el.rect = { left: 592, top: 8, right: 992, bottom: 48, width: 400, height: 40 };
+
+		// The strip starts centred at (792, 28). Moving it down 372px puts its
+		// centre exactly on the new middle-right resting centre, (792, 400).
+		gesture(rig, rig.grip, 0, 372);
+
+		expect(rig.placed).toEqual(["middle-right"]);
+		expect(rig.el.style.transform).toBe("");
+		expect(rig.el.classes.has("is-dragging")).toBe(false);
+		expect(rig.el.classes.has("is-collapsed"), "the drag was mistaken for a tap/collapse").toBe(
+			false
+		);
+	});
+
 	it("Escape mid-drag puts the strip back and writes no placement", () => {
 		const rig = buildDrag();
 		rig.pane.rect = { left: 0, top: 0, right: 1000, bottom: 800, width: 1000, height: 800 };
@@ -4313,7 +4434,7 @@ describe("MobileTools: dragging the toolbar to an anchor", () => {
 	 * The box the drop reasons from is read off the live element and carries
 	 * the actions-row dodge. `anchorRestingCentre` has no dodge term - it
 	 * answers where the stylesheet puts a strip - so the drop was comparing a
-	 * dodged centre against six un-dodged predictions of it. On a pdf, where
+	 * dodged centre against nine un-dodged predictions of it. On a pdf, where
 	 * the dodge is the whole width of the three-dots row, that is a hundred px
 	 * or two of error in the one direction the top anchors are told apart by:
 	 * the strip is dropped where the user is not looking, off a gesture that
@@ -4352,7 +4473,7 @@ describe("MobileTools: dragging the toolbar to an anchor", () => {
 		// inside the strip (`.handwriting-mobile-tools-more`), so the strip
 		// stands 88px tall open and 40px shut, and the fake says so by reading
 		// the very class `setMoreOpen` toggles.
-		const resting = { left: 8, top: 372, width: 300, height: 40 };
+		const resting = { left: 8, top: 190, width: 300, height: 40 };
 		liveRect(rig.el, resting);
 		const boxed = rig.el.getBoundingClientRect.bind(rig.el);
 		rig.el.getBoundingClientRect = () => {
@@ -4364,12 +4485,12 @@ describe("MobileTools: dragging the toolbar to an anchor", () => {
 		more.fire("click", {});
 		expect(rig.el.classes.has("is-more-open"), "the chevron did not open the row").toBe(true);
 
-		// The nudge is HORIZONTAL, so the vertical answer is the thing
-		// under test. The strip rests just above the pane's midline at
-		// 800/2 = 400: shut, its centre is 392 and the drop is a top anchor.
-		// Measured while the second row is still in the box, the same strip
-		// reads 416 - below the line - and lands on a bottom one, for a
-		// gesture that never left the top half.
+		// The nudge is HORIZONTAL, so the vertical answer is the thing under
+		// test. The top/middle anchor boundary depends on the measured height: shut,
+		// the centres are 28 and 400 and a strip centred at 210 is still on the
+		// top side. Measured while the second row is still in the box, the top
+		// centre becomes 52 and the live centre 234, which is nearer the middle
+		// row - for a gesture that never moved vertically.
 		gesture(rig, rig.grip, 8, 0);
 
 		expect(

@@ -1,15 +1,34 @@
 /**
- * Choose a free name and create it, racing nobody.
+ * Choose a free name and create it, one caller at a time.
  *
- * `Vault.create`/`Vault.createBinary` throw when the path already exists
- * (obsidian.d.ts: "@throws Error if file already exists"), which is what
- * makes a bounded retry possible here at all - unlike the old
- * `firstFreePath` then `vault.adapter.write*` pattern (main.ts, pre-1.4.6),
- * where checking existence and writing were two separate awaits with a gap
- * between them. Two exports started close together could both see the same
- * name as free and the second `adapter.write*` would silently overwrite the
- * first - the exact failure `firstFreePath`'s own comment promised would not
- * happen.
+ * THE OLD HEADER HERE SAID "racing nobody" AND THAT WAS WRONG, which is
+ * why exports lost each other's output. `Vault.create`/`createBinary` is
+ * documented as throwing when the path exists (obsidian.d.ts: "@throws
+ * Error if file already exists"), and a bounded retry was built on that.
+ * But a documented rejection is NOT an atomic reservation: the host checks
+ * existence and then writes, two awaits with a gap between them, and the
+ * write is overwrite-capable. So two exports starting close together both
+ * saw the same name free, both were told their create SUCCEEDED, and the
+ * second replaced the first snapshot - measured on the published tag and
+ * two later refs, with both notices naming the same destination. Nothing
+ * was rejected, so no amount of retrying could have caught it. That is the
+ * same shape as the pre-1.4.6 `firstFreePath` then `adapter.write*`
+ * pattern this helper was written to end - it moved the gap rather than
+ * closing it.
+ *
+ * The gap is closed by holding a turn instead: one caller runs from BEFORE
+ * it chooses a name until it has created the file or finally failed, so no
+ * second caller can be handed a name the first is about to occupy. The
+ * choice has to be inside the turn - locking only the create would leave
+ * two callers holding the same name and take the defect nowhere.
+ *
+ * WHAT THIS DOES NOT COVER, and it is worth being exact because the old
+ * header's over-claim is what let this run: the guarantee is between
+ * callers sharing THIS module instance in THIS process. Another process,
+ * another device, a sync client, or a second copy of the plugin can still
+ * take a destination between the host's existence check and its write.
+ * Callers that create files without coming through here are not covered at
+ * all.
  *
  * `choose` is asked again on every attempt (not just once, memoized) because
  * the reason for the retry - somebody else just took the name `choose` is
@@ -33,18 +52,44 @@
  * anybody notices, and the alternative is matching error text that has no
  * contract, so the cost stays.
  */
+/**
+ * The tail of the turn queue: module-wide, because the point is that every
+ * caller of this helper in this process shares one. It is deliberately kept
+ * settled-and-never-rejected - each turn's outcome is delivered to its own
+ * caller, and the tail only carries "the previous turn is over", so one
+ * failed export cannot poison or bypass the ones queued behind it.
+ */
+let turn: Promise<void> = Promise.resolve();
+
 export async function createFreshFile<T>(
 	choose: () => Promise<string>,
 	create: (path: string) => Promise<T>,
 	attempts = 8
 ): Promise<{ path: string; result: T }> {
-	for (let attempt = 1; ; attempt++) {
-		const path = await choose();
-		try {
-			const result = await create(path);
-			return { path, result };
-		} catch (error) {
-			if (attempt >= attempts) throw error;
+	// The whole turn: choose, create, and every retry between them. `choose`
+	// is still asked again on each attempt - the reason for a retry is that
+	// somebody took the name, and now that somebody can only be outside this
+	// process.
+	const run = async (): Promise<{ path: string; result: T }> => {
+		for (let attempt = 1; ; attempt++) {
+			const path = await choose();
+			try {
+				const result = await create(path);
+				return { path, result };
+			} catch (error) {
+				if (attempt >= attempts) throw error;
+			}
 		}
-	}
+	};
+	// Admission order is fixed HERE, synchronously, before this function ever
+	// awaits - so callers are served in the order they arrived rather than in
+	// whatever order their first await happens to resolve.
+	const mine = turn.then(run, run);
+	// The tail advances on success OR failure, and swallows both: the caller
+	// below still gets the original error from `mine`.
+	turn = mine.then(
+		() => undefined,
+		() => undefined
+	);
+	return mine;
 }

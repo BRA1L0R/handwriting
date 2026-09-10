@@ -1,15 +1,26 @@
 /*
  * Obsidian's OWN rules for a range input - the ones that reach a plugin's
  * slider whether or not the plugin styles it. Reduced by hand to the
- * declarations that can move a thumb; this is NOT a copy of the app's
- * stylesheet and the suite does not need one.
+ * declarations that can move or recolour a thumb; this is NOT a copy of the
+ * app's stylesheet and the suite does not need one.
  *
  * Source: the CSS bundled in the installed app
  * (C:/Program Files/Obsidian/resources/obsidian.asar, the plain-text block
- * around "slider-runnable-track"), read on 2026-09-06 from the build dated
- * 2025-08-12. The same bundle sets `--slider-thumb-y` twice: -6px in its
- * `body` variables and -9px in its `.is-mobile` block. Both ship, so the test
- * that loads this file supplies the value and runs at both.
+ * around "slider-runnable-track"), read on 2026-09-06 and again on
+ * 2026-09-07 from the build dated 2025-08-12. The same bundle sets
+ * `--slider-thumb-y` twice: -6px in its `body` variables and -9px in its
+ * `.is-mobile` block. Both ship, so the test that loads this file supplies
+ * the value and runs at both.
+ *
+ * The hover/active pair below is the host's own, at specificity (0,3,2):
+ * one type (`input`), one attribute, one `:not()` carrying a pseudo-class,
+ * one pseudo-element, one state pseudo-class. It repaints the thumb in
+ * `--slider-thumb-background-hover` - white in both of the app's themes -
+ * under the mouse and under press, which is the white knob the owner sent
+ * back (2026-09-07). The `transition` on the base rule is kept because the
+ * colour read has to wait for it. LEFT OUT on purpose: the host's `:active`
+ * width, height and opacity, which on a non-mac desktop resolve to the
+ * base size and on macOS are the pressed growth the owner ruled to keep.
  */
 input[type='range']::-webkit-slider-runnable-track {
 	height: 6px;
@@ -19,6 +30,14 @@ input[type='range']::-webkit-slider-thumb {
 	-webkit-appearance: none;
 	position: relative;
 	top: var(--slider-thumb-y);
+	transition: all 0.1s linear;
+}
+input[type='range']:not(:disabled)::-webkit-slider-thumb:hover,
+input[type='range']:not(:disabled)::-webkit-slider-thumb:active {
+	background: var(--slider-thumb-background-hover);
+	border-color: var(--background-modifier-border-focus);
+	box-shadow: var(--slider-thumb-shadow-hover);
+	transition: all 0.1s linear;
 }
 input[type='range']:not(:disabled)::-webkit-slider-thumb:active {
 	top: var(--slider-thumb-y-active, var(--slider-thumb-y));

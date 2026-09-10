@@ -40,6 +40,7 @@ import { clearInkClipboard, clipboardSize } from "../inline/InkClipboard";
 import { setDiagnosticsEnabled } from "../diag/DiagSwitch";
 import { captureInlinePenTrace, clearInlinePenTrace } from "../inline/InlinePenRouter";
 import { setMouseInk } from "../inline/MouseInk";
+import { predictionEinkOn } from "../inline/StrokePrediction";
 // The one element fake the router's own suites drive it with; see
 // `test/routerHarness.ts`. Used by the pointerleave suite at the bottom of
 // this file, which needs a REAL router rather than a captured callbacks bag.
@@ -765,6 +766,10 @@ describe("the contact draw is floored and the moving draw is not", () => {
 			headCanvas: { setCssProps: () => {} },
 			wet: {
 				clear: () => {},
+				// Pen-up takes the stroke-box clear on EVERY device since
+				// 1.4.13, not just under the Boox toggle, so a wet stub that
+				// answers only `clear` no longer survives one.
+				clearStroke: () => {},
 				shape: true,
 				beginStroke: () => {},
 				appendPoint: () => {},
@@ -3189,21 +3194,42 @@ describe("PdfInkController: a stroke torn down with no pointerup stands the surf
 		const wetCleared: number[][] = [];
 		const tailCleared: number[][] = [];
 		const dressed: string[] = [];
+		// WHICH method, not just the size. `wetCleared` above cannot tell the
+		// whole-canvas `clear` from the stroke-box `clearStroke` - both push
+		// the same pair of numbers - and which of the two a pen-up takes IS
+		// the behaviour the box-clear change is. See the Boox-off test below.
+		const wetCalls: string[] = [];
+		const tailCalls: string[] = [];
 		const pair = {
 			wetCanvas: {
 				setCssProps: (css: Record<string, string>) => void dressed.push(css.opacity ?? ""),
 			},
 			headCanvas: { setCssProps: () => {} },
 			wet: {
-				clear: (w: number, h: number) => void wetCleared.push([w, h]),
-				clearStroke: (w: number, h: number) => void wetCleared.push([w, h]),
+				clear: (w: number, h: number) => {
+					wetCalls.push("clear");
+					wetCleared.push([w, h]);
+				},
+				clearStroke: (w: number, h: number) => {
+					wetCalls.push("clearStroke");
+					wetCleared.push([w, h]);
+				},
 			},
 			tail: {
-				clear: () => void tailCleared.push([]),
-				clearAll: (w: number, h: number) => void tailCleared.push([w, h]),
+				// The size is optional on the real method and the pen-up sites
+				// pass it - it is what selects the no-box fallback - so it is
+				// recorded here the same way `clearAll`'s is.
+				clear: (w?: number, h?: number) => {
+					tailCalls.push("clear");
+					tailCleared.push(w === undefined || h === undefined ? [] : [w, h]);
+				},
+				clearAll: (w: number, h: number) => {
+					tailCalls.push("clearAll");
+					tailCleared.push([w, h]);
+				},
 			},
 		};
-		return { pair, wetCleared, tailCleared, dressed };
+		return { pair, wetCleared, tailCleared, wetCalls, tailCalls, dressed };
 	}
 
 	let controller: PdfInkController;
@@ -3421,6 +3447,67 @@ describe("PdfInkController: a stroke torn down with no pointerup stands the surf
 		// And the gesture is over even though the ink is not lost: `idle` is
 		// what main.ts asks before swapping another device's ink in.
 		expect(controller.idle).toBe(true);
+	});
+
+	/**
+	 * The behaviour change of 1.4.13, EXECUTED on both of this surface's
+	 * pen-up exits with the Boox toggle OFF.
+	 *
+	 * The box clear (`clearStroke`) shipped in 1.4.4 gated behind
+	 * `predictionEinkOn()` - default false - because the comment beside it
+	 * said everyone else waits "until an e-ink user has confirmed the box on
+	 * hardware", and nobody on this project has the device to give that
+	 * confirmation. A 128-case pixel proof replaced it
+	 * (`test/measure/WetClearBox.test.ts`, outside the gate): every
+	 * `appendPoint` branch, four path shapes, both zooms, both device pixel
+	 * ratios, both pens, read back exhaustively, leave nothing behind.
+	 *
+	 * `wetCleared` above cannot see this: `clear` and `clearStroke` push the
+	 * same pair of numbers into it, so it was green before the change and
+	 * would be green if the gate were put back. `wetCalls` records WHICH.
+	 */
+	it("clears the wet layer's own box on both pen-up exits, with Boox OFF", () => {
+		expect(predictionEinkOn(), "the e-ink toggle was on, so this proves nothing").toBe(false);
+
+		// Exit 1: the commit branch at the end of `penUp`, reached the way the
+		// test above reaches it - a blur through `finishActiveStroke`.
+		inkContact();
+		priv.tools = toolsStub();
+		const committed = wetStub();
+		priv.pair = committed.pair;
+		priv.wetHostPage = 1;
+		blur();
+		expect(
+			committed.wetCalls,
+			"the commit handoff took the whole-canvas clear, damaging the whole canvas"
+		).toEqual(["clearStroke"]);
+		// The tail takes its dirty rect too, and is handed the page size so
+		// `clear()`'s no-box fallback is armed - see `TailRenderer.clear` and
+		// `test/measure/TailClearBox.test.ts`. Both halves are asserted: a
+		// `clear()` called WITHOUT the size would leave a nulled box painted.
+		expect(committed.tailCalls, "the tail stayed on the whole-canvas clear").toEqual([
+			"clear",
+		]);
+		expect(
+			committed.tailCleared,
+			"the tail's clear was not handed the size, so the fallback is disarmed"
+		).toEqual([[600, 800]]);
+
+		// Exit 2: `clearWetTrail`, the abandoned-stroke path, reached through
+		// the in-place document switch. It needs a contact of its OWN - the
+		// blur above already stood the gesture down, and a switch with nothing
+		// live clears nothing.
+		inkContact();
+		const abandoned = wetStub();
+		priv.pair = abandoned.pair;
+		priv.wetHostPage = 1;
+		controller.forgetHistory();
+		expect(
+			abandoned.wetCalls,
+			"clearWetTrail took the whole-canvas clear"
+		).toEqual(["clearStroke"]);
+		expect(abandoned.tailCalls).toEqual(["clear"]);
+		expect(abandoned.tailCleared).toEqual([[600, 800]]);
 	});
 
 	it("and the in-place document switch stands down exactly the same things", () => {

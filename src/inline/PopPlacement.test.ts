@@ -1,9 +1,9 @@
 /**
- * Where a pop opens, for all six anchors, without a layout.
+ * Where a pop opens, for all nine anchors, without a layout.
  *
  * The vertical rule used to live only in the stylesheet and the horizontal
  * one only inside a closure that read live rects, which meant neither could
- * be tested at all - and the two middle anchors are exactly the case where
+ * be tested at all - and the centre-column anchors are exactly the case where
  * both of them are easy to get wrong. Both are pinned here, and the CSS half
  * is pinned AGAINST this module so an anchor cannot get a rule in one place
  * and not the other.
@@ -21,9 +21,15 @@ describe("popFlipFor: which way a pop opens", () => {
 		expect(popFlipFor("top-center")).toBe("down");
 	});
 
+	it("opens downward from every middle-row anchor", () => {
+		expect(popFlipFor("middle-left")).toBe("down");
+		expect(popFlipFor("middle-center")).toBe("down");
+		expect(popFlipFor("middle-right")).toBe("down");
+	});
+
 	// The 2026-08-31 rule: at the bottom of the glass, "under the strip" is
-	// off the screen. The middle is as close to that edge as either corner.
-	it("opens upward from every bottom anchor, the middle included", () => {
+	// off the screen. The centre column is as close to that edge as either side.
+	it("opens upward from every bottom anchor, the centre column included", () => {
 		expect(popFlipFor("bottom-left")).toBe("up");
 		expect(popFlipFor("bottom-right")).toBe("up");
 		expect(popFlipFor("bottom-center")).toBe("up");

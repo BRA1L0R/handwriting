@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { WetInkRenderer } from "./WetInkRenderer";
-import { setInkShaping } from "./InkShape";
+import { flattenStrokeShaped, setInkShaping } from "./InkShape";
 import type { CameraState } from "../camera/coordinates";
 import { DEFAULT_PEN, HIGHLIGHTER_PEN, widthForPressure } from "./PenStyle";
 
@@ -147,8 +147,9 @@ describe("WetInkRenderer takes the tool's flatness from the stroke", () => {
 
 	it("shapes the width only for a non-flat tool on a shaping device", () => {
 		// liveWidthPx reports the shaper's half-width doubled when shaping is
-		// on for the stroke, and the raw pressure width when it is not. At
-		// pen-down the shaper is at the tip floor, so the two are far apart.
+		// on for the stroke, and the raw pressure width when it is not. The ON
+		// stroke now starts at its pressure-aware width, so drive one sample to
+		// let velocity thinning distinguish the shaped route from the flat one.
 		const raw = widthForPressure(style, 0.5);
 		const at = (shape: boolean, flat: boolean) => {
 			const { canvas } = fakeCanvas();
@@ -156,9 +157,10 @@ describe("WetInkRenderer takes the tool's flatness from the stroke", () => {
 			wet.smooth = true;
 			wet.shape = shape;
 			wet.beginStroke({ x: 0, y: 0, pressure: 0.5, t: 0 }, style, flat);
+			wet.appendPoint(cam, style, { x: 20, y: 0, pressure: 0.5, t: 5 });
 			return wet.liveWidthPx({ x: 0, y: 0, zoom: 1 }, style, 0.5);
 		};
-		expect(at(true, false)).toBeLessThan(raw / 2);
+		expect(at(true, false)).toBeLessThan(raw);
 		expect(at(true, true)).toBeCloseTo(raw, 10);
 		expect(at(false, false)).toBeCloseTo(raw, 10);
 	});
@@ -248,11 +250,11 @@ describe("WetInkRenderer.contactHalfWidth", () => {
 		return wet;
 	};
 
-	it("holds the tap at the nib when the shaped width is at the tip floor", () => {
+	it("holds the tap at the nib when the pressure-aware live line is wider", () => {
 		const wet = atPenDown({ shape: true, flat: false, pressure: 0.5 });
-		// Precondition: without the floor this dot draws at the tip floor,
-		// which is where the near-invisible tap came from.
-		expect(wet.liveHalfWidth(style, 0.5)).toBeLessThan(style.baseWidth / 2 / 4);
+		// The two answers are deliberately separate: a held-pressure line uses
+		// accepted exp7 width, while a tap remains exactly one nominal nib.
+		expect(wet.liveHalfWidth(style, 0.5)).toBeGreaterThan(style.baseWidth / 2);
 		expect(wet.contactHalfWidth(style, 0.5)).toBeCloseTo(style.baseWidth / 2, 10);
 	});
 
@@ -281,13 +283,31 @@ describe("WetInkRenderer.contactHalfWidth", () => {
 	});
 
 	it("never falls below the nib whatever the pressure sample says", () => {
-		// widthForPressure tops out AT baseWidth and the shaped width scales
-		// it by two factors that are both <= 1, so the floor always wins
-		// here: a tap draws at the nib, full stop. That is the ruling, and
-		// it is a behaviour change rather than only a guard.
+		// The exp7 ON curve can exceed baseWidth, but the accepted contact dot
+		// remains one nib. A future wet-start parity correction must preserve it.
 		for (const pressure of [0, 0.25, 0.5, 0.75, 1]) {
 			const wet = atPenDown({ shape: true, flat: false, pressure });
 			expect(wet.contactHalfWidth(style, pressure)).toBeCloseTo(style.baseWidth / 2, 10);
 		}
+	});
+
+	it("keeps the nib-sized contact while the wet stroke starts at the committed high-pressure width", () => {
+		const points = Array.from({ length: 40 }, (_, i) => ({
+			x: i * 3,
+			y: 0,
+			pressure: 1,
+			t: i * 5,
+		}));
+		const committed = flattenStrokeShaped(points, style, 1);
+		const wet = atPenDown({ shape: true, flat: false, pressure: 1 });
+
+		expect(wet.contactHalfWidth(style, 1), "the accepted tap remains one nib").toBeCloseTo(
+			style.baseWidth / 2,
+			10
+		);
+		expect(wet.liveHalfWidth(style, 1), "the wet line does not fatten at handoff").toBeCloseTo(
+			committed[0]!.hw,
+			10
+		);
 	});
 });

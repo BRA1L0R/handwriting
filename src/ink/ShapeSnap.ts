@@ -535,5 +535,6 @@ export function snapStroke(stroke: InkStroke, dwellConfirmed = false): InkStroke
 		bbox: computeBBox(result.points, width * 2),
 		createdAt: stroke.createdAt,
 		...(stroke.device === "mouse" ? { device: stroke.device } : {}),
+		...(stroke.widthMode === "uniform" ? { widthMode: stroke.widthMode } : {}),
 	};
 }

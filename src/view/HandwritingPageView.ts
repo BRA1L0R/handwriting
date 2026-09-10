@@ -475,7 +475,7 @@ export class HandwritingPageView extends TextFileView {
 			new Notice(
 				"Handwriting cannot read this page's saved ink and layout. The file has not been overwritten. The page opens read-only for ink until that file is repaired or removed."
 			);
-		} else if (result?.recovered && !result.damagedKeptAs) {
+		} else if (result?.recovered && !result.damagedKeptAs && !result.fromInkTrash) {
 			// (The corrupt-file promotion announces itself through the
 			// store's onRecovered, with the kept path; this is the bare
 			// interrupted-save case.)

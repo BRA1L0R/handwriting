@@ -120,6 +120,19 @@ export function embedInkPrintSwaps(): number {
 	return printSwaps;
 }
 
+/**
+ * What the print vector layer is landing on.
+ *
+ * This layer exists ONLY while a print or an export is happening, and what it
+ * lands on then is paper or a PDF page rather than the reading view's theme -
+ * a print stylesheet drops the page to white whatever the editor looked like.
+ * That is why the ink is made readable against white here and NOT against the
+ * body's background: the swap is the moment the destination stops being the
+ * screen. Outside the swap this module paints canvases, which are on-screen
+ * surfaces and are left alone.
+ */
+const PRINT_PAGE_WHITE = "#ffffff";
+
 const CAM: CameraState = { x: 0, y: 0, zoom: 1 };
 
 /** Live rendered roots, each mapped to the note path it shows. */
@@ -608,8 +621,8 @@ function watchBodyForSections(
  */
 function setTimer(view: Window | null, fn: () => void, ms: number): number {
 	const set = view?.setTimeout;
-	if (typeof set === "function") return set.call(view, fn, ms) as unknown as number;
-	return setTimeout(fn, ms) as unknown as number;
+	if (typeof set === "function") return set.call(view, fn, ms);
+	return setTimeout(fn, ms);
 }
 
 function clearTimer(view: Window | null, handle: number): void {
@@ -806,7 +819,7 @@ function usePrintVector(on: boolean): void {
 		// formatted numbers - but assigning markup is flagged on sight by
 		// the community review, and building nodes costs nothing here.
 		while (svg.firstChild) svg.removeChild(svg.firstChild);
-		const layers = inkSvgLayers(strokes);
+		const layers = inkSvgLayers(strokes, PRINT_PAGE_WHITE);
 		if (layers.highlighter.length > 0) {
 			const g = root.ownerDocument.createElementNS(SVG_NS, "g");
 			g.setAttribute("opacity", String(HIGHLIGHTER_ALPHA));

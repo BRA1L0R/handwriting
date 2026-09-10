@@ -1,0 +1,28 @@
+/*
+ * Obsidian's OWN rule for a `button` - the one that reaches every button a
+ * plugin builds, whether or not the plugin styles it. Reduced by hand to
+ * what can move a box; this is NOT a copy of the app's stylesheet and the
+ * suite does not need one.
+ *
+ * Source: the CSS bundled in the installed app
+ * (C:/Program Files/Obsidian/resources/obsidian.asar, the `button {` block
+ * near "app-region: no-drag"), read on 2026-09-07 from the build dated
+ * 2025-08-12. The tokens it reads are left as parameters: the app sets
+ * `--input-height` to 30px in its `body` variables and to `--touch-size-m`
+ * (44px) in its `.is-mobile` block, and `--input-font-weight` to 400 and
+ * 500 in the same two places. Both ship, so the test that loads this file
+ * supplies the values and runs at both.
+ */
+button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	font-size: var(--font-ui-small);
+	border-radius: var(--button-radius);
+	border: 0;
+	padding: var(--size-4-1) var(--size-4-3);
+	height: var(--input-height);
+	font-weight: var(--input-font-weight);
+	font-family: inherit;
+	white-space: nowrap;
+}

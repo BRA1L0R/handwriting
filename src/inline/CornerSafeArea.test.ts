@@ -21,7 +21,13 @@
 
 import { describe, expect, it } from "vitest";
 import css from "../../styles.css?raw";
-import { TOOLBAR_CORNERS, isMiddleAnchor, toolbarCornerClass } from "./ToolbarCorner";
+import {
+	TOOLBAR_CORNERS,
+	isCenterColumnAnchor,
+	toolbarAnchorColumn,
+	toolbarAnchorRow,
+	toolbarCornerClass,
+} from "./ToolbarCorner";
 
 /** Comments hold commas and selector-shaped text; drop them before parsing. */
 const bare = css.replace(/\/\*[\s\S]*?\*\//g, " ");
@@ -40,67 +46,43 @@ function declarationsFor(selector: string): string[] {
 	return out;
 }
 
-/** Which physical edge a corner is anchored to, and the inset that edge needs. */
-function edgeOf(corner: string): "top" | "bottom" {
-	return corner.startsWith("top") ? "top" : "bottom";
+/** Every value assigned to one property by rules containing this selector. */
+function valuesFor(selector: string, property: string): string[] {
+	return declarationsFor(selector).flatMap((body) =>
+		[...body.matchAll(new RegExp(`(?:^|;)\\s*${property}\\s*:([^;]*)`, "g"))].map((m) =>
+			m[1]!.trim()
+		)
+	);
 }
 
-/**
- * The HORIZONTAL edge, which matters for the same reason and is easier to
- * forget: rotate a notched iphone and the island moves to a side, so
- * inset-top collapses and inset-left/right become the large ones. A fix that
- * wraps only the vertical offsets protects portrait and rotates away.
- */
-function sideOf(corner: string): "left" | "right" {
-	return corner.endsWith("right") ? "right" : "left";
-}
-
-/**
- * Every selector that sets a vertical offset for a corner, and the base
- * offset it is documented to use. The android rules are deliberately absent:
- * they are asserted separately, and they must NOT gain a second inset.
- */
-function insetBearingSelectors(cls: string): Array<{ selector: string; base: number }> {
-	return [
-		// The strip and the pill share this one - both are listed on it.
-		{ selector: `.handwriting-mobile-tools.${cls}`, base: 8 },
-		{ selector: `.handwriting-pen-pill.${cls}`, base: 8 },
-		// The pill re-declares the offset to sit concentric with the corner
-		// button it replaces: 11px on desktop, 15px on mobile.
-		{ selector: `.handwriting-pen-pill.${cls}`, base: 11 },
-		{ selector: `.is-mobile .handwriting-pen-pill.${cls}`, base: 15 },
-	];
-}
-
-describe("styles.css - toolbar corners clear the phone's unsafe edges", () => {
+describe("styles.css - toolbar anchors clear every unsafe edge they touch", () => {
 	for (const corner of TOOLBAR_CORNERS) {
 		const cls = toolbarCornerClass(corner);
-		const edge = edgeOf(corner);
-
-		// A MIDDLE HAS NO SIDE. It is centred between both edges, so demanding
-		// `left: env(safe-area-inset-left)` of it would be demanding the wrong
-		// rule - and getting it would push the strip off centre by the inset.
-		// The vertical requirement is unchanged, and it is the one that
-		// matters most here: a notched phone's island is centred, which is
-		// exactly where a top-middle strip sits.
-		const axes = isMiddleAnchor(corner) ? [edgeOf(corner)] : [edgeOf(corner), sideOf(corner)];
+		const row = toolbarAnchorRow(corner);
+		const column = toolbarAnchorColumn(corner);
+		const vertical = row === "middle" ? (["top", "bottom"] as const) : ([row] as const);
+		const horizontal = column === "center" ? [] : ([column] as const);
+		const axes = [...vertical, ...horizontal];
 
 		it.each(axes)(`${corner}: every rule that sets %s adds the safe-area inset`, (axis) => {
-			const seen = new Set<string>();
-			for (const { selector } of insetBearingSelectors(cls)) {
-				if (seen.has(selector)) continue;
-				seen.add(selector);
+			const selectors = [
+				`.handwriting-mobile-tools.${cls}`,
+				`.handwriting-pen-pill.${cls}`,
+			];
+			// Edge rows re-declare their vertical pill offset on mobile; side
+			// columns do the same horizontally, including on the middle row.
+			if (row !== "middle" || axis === "left" || axis === "right") {
+				selectors.push(`.is-mobile .handwriting-pen-pill.${cls}`);
+			}
 
-				const bodies = declarationsFor(selector);
-				expect(bodies.length, `rule missing: ${selector}`).toBeGreaterThan(0);
-
-				for (const body of bodies) {
-					const decl = body.match(new RegExp(`(?:^|;)\\s*${axis}\\s*:([^;]*)`));
-					expect(decl, `${selector} sets no ${axis}`).not.toBeNull();
+			for (const selector of selectors) {
+				const values = valuesFor(selector, axis);
+				expect(values.length, `${selector} sets no ${axis}`).toBeGreaterThan(0);
+				for (const value of values) {
 					// A bare pixel offset here is the bug: it measures from the
 					// screen edge, which on a notched phone is behind the chrome.
 					expect(
-						decl![1],
+						value,
 						`${selector} sets ${axis} from the raw screen edge, not the safe area`
 					).toMatch(new RegExp(`env\\(\\s*safe-area-inset-${axis}\\s*,\\s*0px\\s*\\)`));
 				}
@@ -108,14 +90,14 @@ describe("styles.css - toolbar corners clear the phone's unsafe edges", () => {
 		});
 	}
 
-	// HOW the middles centre, pinned because the obvious way is the wrong
+	// HOW the centre COLUMN centres horizontally, pinned because the obvious way is the wrong
 	// way here: `applyHeaderClearance` writes an inline `transform` on both
 	// elements to dodge the pane's actions row, and it replaces the whole
 	// property - so centring that lived in a CSS transform would be erased
 	// the first time the strip dodged. Auto margins survive that, and leave
 	// transform free for the dodge and for drag-to-anchor.
-	it("the middles centre with auto margins, not with a transform", () => {
-		for (const corner of TOOLBAR_CORNERS.filter((c) => isMiddleAnchor(c))) {
+	it("the centre column uses inline auto margins, not a transform", () => {
+		for (const corner of TOOLBAR_CORNERS.filter((c) => isCenterColumnAnchor(c))) {
 			const cls = toolbarCornerClass(corner);
 			for (const selector of [
 				`.handwriting-mobile-tools.${cls}`,
@@ -144,6 +126,53 @@ describe("styles.css - toolbar corners clear the phone's unsafe edges", () => {
 		}
 	});
 
+	it("the middle row centres vertically between safe bounds without a transform", () => {
+		for (const corner of ["middle-left", "middle-center", "middle-right"] as const) {
+			const cls = toolbarCornerClass(corner);
+			for (const selector of [
+				`.handwriting-mobile-tools.${cls}`,
+				`.handwriting-pen-pill.${cls}`,
+			]) {
+				const body = declarationsFor(selector).join(";");
+				expect(valuesFor(selector, "top")).toContain(
+					"calc(env(safe-area-inset-top, 0px) + 8px)"
+				);
+				expect(valuesFor(selector, "bottom")).toContain(
+					"calc(env(safe-area-inset-bottom, 0px) + 8px)"
+				);
+				expect(body, `${selector} has no auto top margin`).toMatch(
+					/(?:^|;)\s*margin-top\s*:\s*auto/
+				);
+				expect(body, `${selector} has no auto bottom margin`).toMatch(
+					/(?:^|;)\s*margin-bottom\s*:\s*auto/
+				);
+				expect(body, `${selector} centres with a transform`).not.toMatch(/transform\s*:/);
+			}
+			const strip = declarationsFor(`.handwriting-mobile-tools.${cls}`).join(";");
+			expect(strip, `${corner} strip can stretch between its bounds`).toMatch(
+				/(?:^|;)\s*height\s*:\s*fit-content/
+			);
+		}
+	});
+
+	it("the middle row's sides keep safe-area and concentric pill offsets", () => {
+		for (const [corner, side] of [
+			["middle-left", "left"],
+			["middle-right", "right"],
+		] as const) {
+			const cls = toolbarCornerClass(corner);
+			expect(valuesFor(`.handwriting-mobile-tools.${cls}`, side)).toContain(
+				`calc(env(safe-area-inset-${side}, 0px) + 8px)`
+			);
+			expect(valuesFor(`.handwriting-pen-pill.${cls}`, side)).toContain(
+				`calc(env(safe-area-inset-${side}, 0px) + 11px)`
+			);
+			expect(valuesFor(`.is-mobile .handwriting-pen-pill.${cls}`, side)).toEqual([
+				`calc(env(safe-area-inset-${side}, 0px) + 15px)`,
+			]);
+		}
+	});
+
 	// THE PILL IS A CIRCLE AT EVERY PLACEMENT, and only the middles could
 	// ever have broken it. Centring sets `width: fit-content` so the STRIP
 	// shrink-wraps and the auto margins have something to centre - but that
@@ -153,7 +182,7 @@ describe("styles.css - toolbar corners clear the phone's unsafe edges", () => {
 	// squished"). The pill re-asserts its width AFTER that rule, so what
 	// this pins is the LAST width to win, not the absence of any.
 	it("the pill is still a circle at the middles, and the strip still shrink-wraps", () => {
-		for (const corner of TOOLBAR_CORNERS.filter((c) => isMiddleAnchor(c))) {
+		for (const corner of TOOLBAR_CORNERS.filter((c) => isCenterColumnAnchor(c))) {
 			const cls = toolbarCornerClass(corner);
 
 			// Document order, so the last declaration is the one that paints.
@@ -180,7 +209,7 @@ describe("styles.css - toolbar corners clear the phone's unsafe edges", () => {
 		for (const corner of TOOLBAR_CORNERS) {
 			const cls = toolbarCornerClass(corner);
 			const bodies = declarationsFor(`.handwriting-mobile-tools.${cls}`);
-			expect(bodies.length, `base strip rule missing for ${corner}`).toBe(1);
+			expect(bodies.length, `base strip rule missing for ${corner}`).toBeGreaterThan(0);
 		}
 		expect(bare).not.toMatch(/\.handwriting-ios\s+\.handwriting-(mobile-tools|pen-pill)/);
 	});
@@ -190,17 +219,25 @@ describe("styles.css - toolbar corners clear the phone's unsafe edges", () => {
 		// NOT a safe-area allowance. If these ever appear on a rule without the
 		// android class, ios has been handed 48px it does not want.
 		for (const [selector, expected] of [
+			[".handwriting-android .handwriting-mobile-tools.handwriting-corner-top-center", 48],
 			[".handwriting-android .handwriting-mobile-tools.handwriting-corner-top-right", 48],
 			[".handwriting-android .handwriting-mobile-tools.handwriting-corner-top-left", 48],
+			[".handwriting-android .handwriting-pen-pill.handwriting-corner-top-center", 55],
 			[".handwriting-android .handwriting-pen-pill.handwriting-corner-top-right", 55],
 			[".handwriting-android .handwriting-pen-pill.handwriting-corner-top-left", 55],
 		] as Array<[string, number]>) {
-			const bodies = declarationsFor(selector);
-			expect(bodies.length, `android rule missing: ${selector}`).toBeGreaterThan(0);
-			const joined = bodies.join(";");
-			expect(joined).toMatch(
-				new RegExp(`top:\\s*calc\\(\\s*env\\(\\s*safe-area-inset-top\\s*,\\s*0px\\s*\\)\\s*\\+\\s*${expected}px\\s*\\)`)
+			const values = valuesFor(selector, "top");
+			expect(values.length, `android rule missing: ${selector}`).toBeGreaterThan(0);
+			expect(values[values.length - 1], `${selector} ends on the wrong shade offset`).toMatch(
+				new RegExp(`calc\\(\\s*env\\(\\s*safe-area-inset-top\\s*,\\s*0px\\s*\\)\\s*\\+\\s*${expected}px\\s*\\)`)
 			);
+		}
+
+		for (const corner of ["middle-left", "middle-center", "middle-right"] as const) {
+			for (const kind of ["handwriting-mobile-tools", "handwriting-pen-pill"] as const) {
+				const selector = `.handwriting-android .${kind}.${toolbarCornerClass(corner)}`;
+				expect(declarationsFor(selector), `${selector} must not inherit the top-row shade`).toEqual([]);
+			}
 		}
 
 		// The shade constants live nowhere else: every 48px/55px top offset in

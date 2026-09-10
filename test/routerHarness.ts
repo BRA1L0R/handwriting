@@ -111,6 +111,8 @@ export function fakeEl() {
 // ---- event factory ---------------------------------------------------------
 
 export interface PenOpts {
+	pointerId?: number;
+	isPrimary?: boolean;
 	x?: number;
 	y?: number;
 	pressure?: number;
@@ -135,12 +137,14 @@ export function penEvent(type: string, ts: number, opts: PenOpts = {}): PointerE
 		tiltY = 0,
 		coalesced,
 		coalescedSamples,
+		pointerId = 7,
+		isPrimary = true,
 	} = opts;
 	const base = {
 		type,
 		pointerType,
-		pointerId: 7,
-		isPrimary: true,
+		pointerId,
+		isPrimary,
 		clientX: x,
 		clientY: y,
 		pressure,

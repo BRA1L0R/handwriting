@@ -91,7 +91,7 @@ export interface PageData {
 	 * overwrite a canvas sidecar, and vice-versa nothing reinterprets legacy
 	 * geometry until it is deliberately migrated.
 	 */
-	surface?: "inline" | "pdf";
+	surface?: "inline" | "pdf" | "slides";
 	/**
 	 * Which coordinate convention the geometry is written in, for surfaces
 	 * where that could ever change. `"page-css@1"` = page-local css px at
@@ -113,6 +113,28 @@ export interface PageData {
 	 * the first opener. See PdfIdentity.chooseInstance.
 	 */
 	pdfPaths?: string[];
+	/**
+	 * Slides sidecars only: the LOGICAL deck size the ink was drawn against
+	 * (Reveal's `.slides` client box, 960x700 by default).
+	 *
+	 * Stored because the geometry is meaningless without it. A theme that
+	 * declares a different deck size, or a future Reveal default, would
+	 * otherwise reinterpret every stored coordinate silently; with the size
+	 * on the file a later build can tell "these numbers were written against
+	 * a 960x700 deck" apart from "these numbers are wrong".
+	 */
+	deck?: { width: number; height: number };
+	/**
+	 * Slides sidecars only: which slide each `page` index meant when the ink
+	 * was written, by a hash of that section's source text.
+	 *
+	 * The index alone is not an identity - inserting one `---` above the
+	 * first slide shifts every later index by one - so the hash is what lets
+	 * a load re-attach stored ink to the section it was drawn on. Never used
+	 * to DELETE ink: a section whose hash no longer matches anything keeps
+	 * its index (see SlidesInkSurface.remapSlides).
+	 */
+	slides?: { index: number; hash: string }[];
 	textBoxes: TextBoxData[];
 	images: ImageData[];
 	strokes: InkStroke[];
@@ -133,10 +155,37 @@ export interface ParseResult {
 	/** True when the sidecar existed but could not be understood. */
 	recovered: boolean;
 	/**
-	 * True when the persisted payload was UNREADABLE (JSON parse failure or
-	 * I/O failure): `data` is a placeholder, not the user's ink. Callers
-	 * must fail closed: render nothing, and above all REFUSE to persist for
-	 * this page, or the placeholder overwrites whatever the file held.
+	 * WHICH recovery this was: the ink came back out of the ink TRASH.
+	 *
+	 * `recovered` carries four different events and its readers could not tell
+	 * them apart, so a page restored from the trash was announced to the user
+	 * as an interrupted save - a different event with a different cause.
+	 *
+	 * THE TWO EVENTS CANNOT SHARE A MESSAGE, which is what forces this field.
+	 * Alan ruled the restore's own sentence on 2026-09-09 ("Handwriting
+	 * restored the ink on ... from trash"), and that sentence is FALSE for the
+	 * corrupt-file promotion exactly as "from an interrupted save" was false
+	 * for the restore. One flag cannot carry both.
+	 *
+	 * Set ONLY on the ink-trash paths. The store already knew which event had
+	 * happened and recorded it in `problem`, which is prose written for a human
+	 * and cannot be branched on; this is that same fact as a shape.
+	 */
+	fromInkTrash?: boolean;
+	/**
+	 * True when the persisted payload did not come back whole. Two shapes,
+	 * and callers must fail closed for both - render nothing new over it and
+	 * above all REFUSE to persist for this page, or what we did decode
+	 * overwrites whatever the file actually held:
+	 *
+	 * - UNREADABLE (JSON parse failure or I/O failure): `data` is a
+	 *   placeholder, not the user's ink.
+	 * - PARTLY DECODABLE: the JSON parsed, but strokes or samples inside it
+	 *   did not survive validation (`problem` says how many of each). `data`
+	 *   then holds the readable REMNANT - real ink, just not all of it - so
+	 *   a caller that wants to show what survived can, and a caller that
+	 *   writes would destroy the rest.
+	 *
 	 * Distinct from `recovered`, which also covers the benign
 	 * tmp-file-after-interrupted-write path where the parse SUCCEEDED.
 	 */
@@ -224,13 +273,15 @@ const KNOWN_TOP = new Set([
 	"surface",
 	"coordSpace",
 	"pdfPaths",
+	"deck",
+	"slides",
 	"textBoxes",
 	"images",
 	"strokes",
 ]);
 const KNOWN_BOX = new Set(["id", "x", "y", "width", "z"]);
 const KNOWN_IMAGE = new Set(["id", "x", "y", "width", "height", "z"]);
-const KNOWN_STROKE = new Set(["id", "tool", "color", "width", "createdAt", "device", "pts",
+const KNOWN_STROKE = new Set(["id", "tool", "color", "width", "createdAt", "device", "widthMode", "pts",
 	"ptsd", "points", "page"]);
 
 /** Everything in `raw` that is not a key we claim to own. */
@@ -288,7 +339,7 @@ export function packPointsV2(points: InkPoint[]): number[] {
 	return out;
 }
 
-export function unpackPointsV2(flat: unknown): InkPoint[] {
+export function unpackPointsV2(flat: unknown, loss?: PointLoss): InkPoint[] {
 	if (!Array.isArray(flat)) return [];
 	const out: InkPoint[] = [];
 	let x = 0;
@@ -300,25 +351,42 @@ export function unpackPointsV2(flat: unknown): InkPoint[] {
 		const dy = num(flat[i + 1]);
 		const dp = num(flat[i + 2]);
 		const dt = num(flat[i + 3]);
-		// Every value here is a DELTA, so the running position has to advance
-		// even for a quadruple we refuse to emit. Skipping the accumulation
-		// (what this did before) shifted every later point in the stroke by
-		// the dropped delta, which reads as ink sliding off the words rather
-		// than as one missing sample.
-		x += dx ?? 0;
-		y += dy ?? 0;
-		pr += dp ?? 0;
-		t += dt ?? 0;
-		if (dx === undefined || dy === undefined) continue;
+		// Every value here is a DELTA, and that cuts two ways.
+		//
+		// A READABLE delta must advance the running position even when the
+		// point it lands on is refused below (outside MAX_COORD). Skipping
+		// that accumulation shifted every later point by the dropped step,
+		// which read as ink sliding off the words rather than as one missing
+		// sample. That rule stands.
+		//
+		// An UNREADABLE delta is a different case, and folding it into the
+		// same rule with `?? 0` was the defect: there is no step to advance
+		// by, and a guessed zero is a permanent offset applied to every later
+		// sample - the same drift, silently, inside the one content type that
+		// already has a loss detector, which could not see it because the
+		// point still decoded. A pure delta stream has no re-anchor, so from
+		// an unknown step onward every absolute value is unknowable, and any
+		// point emitted past it is a guess dressed as data. The only
+		// reconstruction in which nothing emitted is wrong is to STOP HERE.
+		// Everything before is exact; the shortfall is counted by
+		// notePointLoss below (decoded falls short of flat.length / 4), and
+		// through it the file is reported damaged, so the next save preserves
+		// the original bytes instead of overwriting them with the guess.
+		if (dx === undefined || dy === undefined || dp === undefined || dt === undefined) break;
+		x += dx;
+		y += dy;
+		pr += dp;
+		t += dt;
 		const px = x / 100;
 		const py = y / 100;
 		if (px < -MAX_COORD || px > MAX_COORD || py < -MAX_COORD || py > MAX_COORD) continue;
 		out.push({ x: px, y: py, pressure: pr / 1000, t });
 	}
+	notePointLoss(flat, out.length, loss);
 	return out;
 }
 
-function unpackPoints(flat: unknown): InkPoint[] {
+function unpackPoints(flat: unknown, loss?: PointLoss): InkPoint[] {
 	if (!Array.isArray(flat)) return [];
 	const out: InkPoint[] = [];
 	for (let i = 0; i + 3 < flat.length; i += 4) {
@@ -334,7 +402,33 @@ function unpackPoints(flat: unknown): InkPoint[] {
 			t: t === undefined ? 0 : t,
 		});
 	}
+	notePointLoss(flat, out.length, loss);
 	return out;
+}
+
+/**
+ * Out-parameter for the point codecs: a payload that did not decode whole.
+ *
+ * Deliberately a per-call object rather than module state - two pages can be
+ * parsed in the same tick (a folder scan, a sync burst), and a shared counter
+ * would attribute one file's loss to another.
+ */
+export interface PointLoss {
+	lost: boolean;
+}
+
+/**
+ * Whether a packed point array lost anything, given how many points came out.
+ *
+ * Two ways to lose ink from one nonempty array, and both count: a tuple was
+ * REJECTED (an unreadable coordinate, or one outside MAX_COORD), or the array
+ * ENDS MID-TUPLE, in which case those trailing values are never even read -
+ * the loop stops at `i + 3 < length`. A stroke-count comparison sees neither,
+ * which is the whole reason this exists.
+ */
+function notePointLoss(flat: unknown[], decoded: number, loss?: PointLoss): void {
+	if (!loss || flat.length === 0) return;
+	if (decoded < Math.floor(flat.length / 4) || flat.length % 4 !== 0) loss.lost = true;
 }
 
 function round(n: number, places: number): number {
@@ -356,6 +450,11 @@ function str(v: unknown): string | undefined {
 	return typeof v === "string" ? v : undefined;
 }
 
+/** A non-empty string, or undefined - an empty slide hash is not a hash. */
+function nonEmptyStr(v: unknown): string | undefined {
+	return typeof v === "string" && v !== "" ? v : undefined;
+}
+
 export function serializePage(page: PageData, version: number = SCHEMA_VERSION): string {
 	return JSON.stringify(
 		withUnknown(
@@ -365,6 +464,19 @@ export function serializePage(page: PageData, version: number = SCHEMA_VERSION):
 				...(page.surface ? { surface: page.surface } : {}),
 				...(page.coordSpace ? { coordSpace: page.coordSpace } : {}),
 				...(page.pdfPaths ? { pdfPaths: page.pdfPaths } : {}),
+				// Slides only. Emitted only when present, so every sidecar the
+				// note and PDF surfaces write stays byte-identical to before.
+				...(page.deck
+					? {
+							deck: {
+								width: round(page.deck.width, 2),
+								height: round(page.deck.height, 2),
+							},
+						}
+					: {}),
+				...(page.slides
+					? { slides: page.slides.map((s) => ({ index: s.index, hash: s.hash })) }
+					: {}),
 				textBoxes: page.textBoxes.map((b) =>
 					withUnknown(
 						{
@@ -399,6 +511,7 @@ export function serializePage(page: PageData, version: number = SCHEMA_VERSION):
 							width: round(s.width, 3),
 							createdAt: s.createdAt,
 							...(s.device === "mouse" ? { device: s.device } : {}),
+							...(s.widthMode === "uniform" ? { widthMode: s.widthMode } : {}),
 							...(typeof s.page === "number" ? { page: s.page } : {}),
 							...(version >= 2
 								? { ptsd: packPointsV2(s.points) }
@@ -417,8 +530,132 @@ export function serializePage(page: PageData, version: number = SCHEMA_VERSION):
  * Tolerant by design (§61: "sidecar missing, malformed sidecar"). A page whose
  * sidecar is corrupt must still open, with whatever survived, rather than
  * throwing the user out of their note.
+ *
+ * See DecodeLoss below for the other half of that bargain: what it survived
+ * WITHOUT has to travel with it, or the next save writes the remnant back.
  */
-export function migratePageData(raw: unknown, fallbackPageId: string): PageData {
+
+/**
+ * What a migration had to discard, counted per call.
+ *
+ * The migration is deliberately tolerant (§61): a stroke it cannot use is
+ * skipped so the rest of the page still opens. Tolerant is right for OPENING
+ * and catastrophic for SAVING - the skipped strokes are gone from the model,
+ * and writing that model back over the file destroys the only copy of them.
+ * So the loss has to leave the migration with the data, which is what this
+ * carries and what `parsePage` turns into a damage verdict.
+ */
+export interface DecodeLoss {
+	/** Strokes dropped because the sidecar gave them no usable id. */
+	unusableId: number;
+	/** Strokes whose nonempty point payload decoded to nothing at all. */
+	unreadablePoints: number;
+	/** Strokes that decoded some of their samples, but not all of them. */
+	partialPoints: number;
+	/** Text boxes dropped because the entry was not an object at all. */
+	unreadableBoxes: number;
+	/** Text boxes dropped because the sidecar gave them no usable id or position. */
+	unusableBoxes: number;
+	/** Images dropped because the entry was not an object at all. */
+	unreadableImages: number;
+	/** Images dropped because the sidecar gave them no usable id or position. */
+	unusableImages: number;
+	/** Strokes dropped because the entry was not an object at all. */
+	unreadableStrokes: number;
+	/**
+	 * The sidecar HAD a `strokes` key and it was not an array, so every stroke
+	 * it claimed to hold was skipped without any of the counters above seeing
+	 * it. A boolean, not a count, because the loop never ran: there is nothing
+	 * to count. An ABSENT key is not this - absent means the page has none,
+	 * which is what every sidecar written before a field existed looks like.
+	 */
+	unreadableStrokeList: boolean;
+	/** Same for `textBoxes`: the key was there and was not an array. */
+	unreadableBoxList: boolean;
+	/** Same for `images`: the key was there and was not an array. */
+	unreadableImageList: boolean;
+}
+
+function emptyDecodeLoss(): DecodeLoss {
+	return {
+		unusableId: 0,
+		unreadablePoints: 0,
+		partialPoints: 0,
+		unreadableBoxes: 0,
+		unusableBoxes: 0,
+		unreadableImages: 0,
+		unusableImages: 0,
+		unreadableStrokes: 0,
+		unreadableStrokeList: false,
+		unreadableBoxList: false,
+		unreadableImageList: false,
+	};
+}
+
+function wasLossy(loss: DecodeLoss): boolean {
+	return (
+		loss.unusableId > 0 ||
+		loss.unreadablePoints > 0 ||
+		loss.partialPoints > 0 ||
+		loss.unreadableBoxes > 0 ||
+		loss.unusableBoxes > 0 ||
+		loss.unreadableImages > 0 ||
+		loss.unusableImages > 0 ||
+		loss.unreadableStrokes > 0 ||
+		loss.unreadableStrokeList ||
+		loss.unreadableBoxList ||
+		loss.unreadableImageList
+	);
+}
+
+/**
+ * Counts only, never content: this string travels into logs, and a sidecar's
+ * coordinates are the user's handwriting.
+ */
+function describeDecodeLoss(loss: DecodeLoss): string {
+	const groups: string[] = [];
+	const parts: string[] = [];
+	if (loss.unreadableStrokes > 0) parts.push(`${loss.unreadableStrokes} unreadable`);
+	if (loss.unusableId > 0) parts.push(`${loss.unusableId} with no usable id`);
+	if (loss.unreadablePoints > 0) parts.push(`${loss.unreadablePoints} with unreadable points`);
+	if (loss.partialPoints > 0) parts.push(`${loss.partialPoints} missing some points`);
+	if (parts.length > 0) groups.push(`strokes ${parts.join(", ")}`);
+	const boxes: string[] = [];
+	if (loss.unreadableBoxes > 0) boxes.push(`${loss.unreadableBoxes} unreadable`);
+	if (loss.unusableBoxes > 0) boxes.push(`${loss.unusableBoxes} with no usable id or position`);
+	if (boxes.length > 0) groups.push(`text boxes ${boxes.join(", ")}`);
+	const images: string[] = [];
+	if (loss.unreadableImages > 0) images.push(`${loss.unreadableImages} unreadable`);
+	if (loss.unusableImages > 0) images.push(`${loss.unusableImages} with no usable id or position`);
+	if (images.length > 0) groups.push(`images ${images.join(", ")}`);
+	const lists: string[] = [];
+	if (loss.unreadableStrokeList) lists.push("strokes");
+	if (loss.unreadableBoxList) lists.push("text boxes");
+	if (loss.unreadableImageList) lists.push("images");
+	if (lists.length > 0) groups.push(`${lists.join(", ")} not a readable list`);
+	return `partly decodable sidecar: ${groups.join("; ")}`;
+}
+
+/**
+ * A content collection the sidecar HAS and this build cannot read.
+ *
+ * `Array.isArray` alone cannot tell ABSENT from PRESENT-AND-WRONG, and the
+ * two mean opposite things: absent is "this page has none", which every
+ * sidecar written before the field existed looks like, while a present
+ * non-array claims a collection whose entries we then silently drop. Only
+ * the second is damage. A JSON-parsed object never holds `undefined`, so
+ * `!== undefined` is exactly "the key is present" for anything parsePage
+ * can hand us.
+ */
+function unreadableList(v: unknown): boolean {
+	return v !== undefined && !Array.isArray(v);
+}
+
+export function migratePageData(
+	raw: unknown,
+	fallbackPageId: string,
+	loss?: DecodeLoss
+): PageData {
 	const page = emptyPage(fallbackPageId);
 	if (!raw || typeof raw !== "object") return page;
 	const o = raw as Record<string, unknown>;
@@ -431,16 +668,56 @@ export function migratePageData(raw: unknown, fallbackPageId: string): PageData 
 	// scale 1 - and must never be confused with note-surface geometry. The
 	// stores are separate instances and each refuses the other's sidecars.
 	if (o.surface === "pdf") page.surface = "pdf";
+	// The slides surface is a third coordinate world - Reveal's logical deck
+	// units, which are negative in the letterbox margin - and it is isolated
+	// the same way the pdf one is, one step harder: its sidecar does not even
+	// share the note's id. It lives at `<pageId>.slides`, an id the note and
+	// canvas paths can never ask for because they only ever load the bare
+	// `handwriting-page-id` out of frontmatter. So an old build cannot open
+	// slides ink as a page, and this build cannot open a note as slides ink.
+	if (o.surface === "slides") page.surface = "slides";
 	if (typeof o.coordSpace === "string" && o.coordSpace !== "") page.coordSpace = o.coordSpace;
+	// Both are slides fields and both are optional, but they fail differently
+	// on purpose. `deck` is all-or-nothing: a size with one bad number says
+	// nothing about the other, so the pair is dropped whole. `slides` is
+	// filtered PER ENTRY: a bad entry is skipped and its siblings are kept,
+	// because the list is a set of independent index->hash facts and throwing
+	// away the good ones would strand every slide's ink on its old number.
+	// Dropped either way means "unknown", which is what an absent field means
+	// too, and neither ever deletes a stroke.
+	if (o.deck && typeof o.deck === "object") {
+		const d = o.deck as Record<string, unknown>;
+		const w = coord(d.width);
+		const h = coord(d.height);
+		if (w !== undefined && h !== undefined && w > 0 && h > 0) page.deck = { width: w, height: h };
+	}
+	if (Array.isArray(o.slides)) {
+		const list: { index: number; hash: string }[] = [];
+		for (const item of o.slides) {
+			if (!item || typeof item !== "object") continue;
+			const s = item as Record<string, unknown>;
+			const index = num(s.index);
+			const hash = nonEmptyStr(s.hash);
+			if (index === undefined || !Number.isInteger(index) || index < 0 || !hash) continue;
+			list.push({ index, hash });
+		}
+		if (list.length > 0) page.slides = list;
+	}
 	if (Array.isArray(o.pdfPaths)) {
 		const paths = o.pdfPaths.filter((p): p is string => typeof p === "string" && p !== "");
 		if (paths.length > 0) page.pdfPaths = paths;
 	}
 	page.unknownTop = unknownKeys(o, KNOWN_TOP);
 
+	if (loss && unreadableList(o.textBoxes)) loss.unreadableBoxList = true;
 	if (Array.isArray(o.textBoxes)) {
 		for (const item of o.textBoxes) {
-			if (!item || typeof item !== "object") continue;
+			// Dropped exactly as before, and now counted: the entry is still on
+			// disk, so losing it silently is what lets the next save overwrite it.
+			if (!item || typeof item !== "object") {
+				if (loss) loss.unreadableBoxes++;
+				continue;
+			}
 			const b = item as Record<string, unknown>;
 			// The id becomes a key of unknownByObject and, on the next save, is
 			// echoed straight back into the sidecar - the same shape check that
@@ -451,7 +728,10 @@ export function migratePageData(raw: unknown, fallbackPageId: string): PageData 
 			const id = isSafePageId(b.id) ? b.id : undefined;
 			const x = coord(b.x);
 			const y = coord(b.y);
-			if (!id || x === undefined || y === undefined) continue;
+			if (!id || x === undefined || y === undefined) {
+				if (loss) loss.unusableBoxes++;
+				continue;
+			}
 			page.textBoxes.push({
 				id,
 				x,
@@ -464,15 +744,23 @@ export function migratePageData(raw: unknown, fallbackPageId: string): PageData 
 		}
 	}
 
+	if (loss && unreadableList(o.images)) loss.unreadableImageList = true;
 	if (Array.isArray(o.images)) {
 		for (const item of o.images) {
-			if (!item || typeof item !== "object") continue;
+			// See the textBoxes loop above: same two exits, counted the same way.
+			if (!item || typeof item !== "object") {
+				if (loss) loss.unreadableImages++;
+				continue;
+			}
 			const im = item as Record<string, unknown>;
 			// See the textBoxes loop above: same id shape check, same reason.
 			const id = isSafePageId(im.id) ? im.id : undefined;
 			const x = coord(im.x);
 			const y = coord(im.y);
-			if (!id || x === undefined || y === undefined) continue;
+			if (!id || x === undefined || y === undefined) {
+				if (loss) loss.unusableImages++;
+				continue;
+			}
 			page.images.push({
 				id,
 				x,
@@ -486,24 +774,44 @@ export function migratePageData(raw: unknown, fallbackPageId: string): PageData 
 		}
 	}
 
+	if (loss && unreadableList(o.strokes)) loss.unreadableStrokeList = true;
 	if (Array.isArray(o.strokes)) {
 		for (const item of o.strokes) {
-			if (!item || typeof item !== "object") continue;
+			// Counted like its two neighbours: the entry is still on disk.
+			if (!item || typeof item !== "object") {
+				if (loss) loss.unreadableStrokes++;
+				continue;
+			}
 			const s = item as Record<string, unknown>;
 			// See the textBoxes loop above: same id shape check, same reason.
 			const id = isSafePageId(s.id) ? s.id : undefined;
-			if (!id) continue;
+			// Skipped exactly as before - an id we cannot write back to is
+			// unusable - but the stroke's points are still on disk, so losing
+			// it silently is what the caller must not do.
+			if (!id) {
+				if (loss) loss.unusableId++;
+				continue;
+			}
 			// Accept every shape ever written: v2 deltas, v1 packed, and a
 			// raw points array, so a hand-edited or future-written sidecar
 			// still loads.
+			const sample: PointLoss = { lost: false };
 			const points = Array.isArray(s.ptsd)
-				? unpackPointsV2(s.ptsd)
+				? unpackPointsV2(s.ptsd, sample)
 				: Array.isArray(s.pts)
-					? unpackPoints(s.pts)
+					? unpackPoints(s.pts, sample)
 					: Array.isArray(s.points)
-						? unpackObjectPoints(s.points)
+						? unpackObjectPoints(s.points, sample)
 						: [];
-			if (points.length === 0) continue;
+			if (points.length === 0) {
+				// A stroke with no readable samples still cannot be drawn, so
+				// it is dropped as before. Whether that is LOSS depends on
+				// what was there: an empty array (or no point field at all)
+				// had nothing to lose; a nonempty one did.
+				if (loss && sample.lost) loss.unreadablePoints++;
+				continue;
+			}
+			if (loss && sample.lost) loss.partialPoints++;
 			// Width is bbox padding as well as a line thickness, so an absurd
 			// one reaches the index the same way an absurd coordinate does.
 			// Out of range falls back to the default instead of clamping: the
@@ -523,6 +831,7 @@ export function migratePageData(raw: unknown, fallbackPageId: string): PageData 
 				bbox: computeBBox(points, width * 2),
 				createdAt: num(s.createdAt) ?? Date.now(),
 				...(s.device === "mouse" ? { device: "mouse" as const } : {}),
+				...(s.widthMode === "uniform" ? { widthMode: "uniform" as const } : {}),
 				// Page numbers are 1-based; anything else is not a page and is
 				// dropped rather than stored as a number that indexes nowhere.
 				...(Number.isInteger(s.page) && (s.page as number) >= 1
@@ -536,7 +845,7 @@ export function migratePageData(raw: unknown, fallbackPageId: string): PageData 
 	return page;
 }
 
-function unpackObjectPoints(arr: unknown[]): InkPoint[] {
+function unpackObjectPoints(arr: unknown[], loss?: PointLoss): InkPoint[] {
 	const out: InkPoint[] = [];
 	for (const item of arr) {
 		if (!item || typeof item !== "object") continue;
@@ -546,6 +855,8 @@ function unpackObjectPoints(arr: unknown[]): InkPoint[] {
 		if (x === undefined || y === undefined) continue;
 		out.push({ x, y, pressure: num(p.pressure) ?? 0.5, t: num(p.t) ?? 0 });
 	}
+	// One object per point, so the arithmetic is simply how many came back.
+	if (loss && arr.length > 0 && out.length < arr.length) loss.lost = true;
 	return out;
 }
 
@@ -556,11 +867,27 @@ export function parsePage(json: string, fallbackPageId: string): ParseResult {
 			raw && typeof raw === "object"
 				? num((raw as Record<string, unknown>).schemaVersion)
 				: undefined;
-		const data = migratePageData(raw, fallbackPageId);
+		const loss = emptyDecodeLoss();
+		const data = migratePageData(raw, fallbackPageId, loss);
 		// A newer Handwriting wrote this. We can still render what we recognise, but
 		// the caller must not write it back.
+		//
+		// Checked BEFORE the loss below, and it wins: a future sidecar is
+		// already read-only, so nothing can overwrite it, and half of what
+		// "did not decode" is simply a schema this build does not speak.
+		// Calling that damage would swap a precise refusal for a vaguer one.
 		if (declared !== undefined && declared > READ_SCHEMA_VERSION) {
 			return { data, recovered: false, futureVersion: declared };
+		}
+		// The file parsed, and part of its ink did not survive decoding. `data`
+		// is the readable remnant and worth keeping, but this must NOT be
+		// reported as an ordinary load: PageStore.load records an undamaged
+		// input as the page's known revision, and the next save then writes
+		// the filtered model back with no conflict copy - over the only copy
+		// of the strokes that failed. Damage is what makes the stores hold
+		// the original bytes and stop writing.
+		if (wasLossy(loss)) {
+			return { data, recovered: false, damaged: true, problem: describeDecodeLoss(loss) };
 		}
 		return { data, recovered: false };
 	} catch (err) {

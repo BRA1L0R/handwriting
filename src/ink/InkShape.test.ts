@@ -6,7 +6,7 @@
  * exactly.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
 	IncrementalShaper,
 	PEN_SHAPE,
@@ -16,7 +16,7 @@ import {
 	shapedHalfWidths,
 } from "./InkShape";
 import { flattenStroke } from "./Ribbon";
-import { DEFAULT_PEN, widthForPressure } from "./PenStyle";
+import { DEFAULT_PEN, setPressureSensitivity, widthForPressure } from "./PenStyle";
 import { InkPoint } from "./Stroke";
 
 /** Shaping disabled through its own parameters: must equal the unshaped law. */
@@ -37,6 +37,8 @@ function line(n: number, spacing: number, dtMs: number, pressure = 0.5): InkPoin
 	}
 	return out;
 }
+
+afterEach(() => setPressureSensitivity(true));
 
 describe("shapedHalfWidths — pressure filtering and velocity thinning", () => {
 	it("is deterministic: same samples, same widths", () => {
@@ -83,11 +85,11 @@ describe("applyEndTaper — tips, not blunt caps", () => {
 		return out;
 	}
 
-	it("pulls both ends down toward the tip floor and leaves the middle alone", () => {
+	it("keeps equal-width endpoints blunt and leaves the middle alone", () => {
 		const pts = ribbon(101, 1, 2); // 100 units long, taper zone ~5.3
 		applyEndTaper(pts, DEFAULT_PEN, PEN_SHAPE);
-		expect(pts[0]!.hw).toBeCloseTo(2 * PEN_SHAPE.tipFloor, 6);
-		expect(pts[100]!.hw).toBeLessThan(0.5);
+		expect(pts[0]!.hw).toBeCloseTo(2, 6);
+		expect(pts[100]!.hw).toBeCloseTo(2, 6);
 		expect(pts[50]!.hw).toBeCloseTo(2, 6);
 	});
 
@@ -98,11 +100,11 @@ describe("applyEndTaper — tips, not blunt caps", () => {
 		for (let i = 93; i < 100; i++) expect(pts[i + 1]!.hw).toBeLessThanOrEqual(pts[i]!.hw);
 	});
 
-	it("a short stroke tapers over its capped share, never to nothing", () => {
+	it("a short equal-width stroke keeps its pressure-shaped endpoints", () => {
 		const pts = ribbon(11, 0.5, 2); // 5 units long
 		applyEndTaper(pts, DEFAULT_PEN, PEN_SHAPE);
 		for (const p of pts) expect(p.hw).toBeGreaterThan(0);
-		expect(pts[5]!.hw).toBeGreaterThan(pts[0]!.hw);
+		expect(pts.every((p) => p.hw === 2)).toBe(true);
 	});
 
 	it("leaves a tap alone: a ribbon of two ends is not a line", () => {
@@ -131,23 +133,46 @@ describe("applyEndTaper — tips, not blunt caps", () => {
 		expect(pts.map((p) => p.hw)).toEqual([1.1, 1.1, 1.1]);
 	});
 
-	it("still tapers as soon as the stroke is longer than the nib is wide", () => {
+	it("still tapers a narrow endpoint as soon as the stroke is longer than the nib", () => {
 		// The boundary is one nib width (2.2 for the default pen), and just
 		// past it the taper is back - a short flick is a line, not a dot.
 		const pts = [
-			{ x: 0, y: 0, hw: 1.1 },
+			{ x: 0, y: 0, hw: 0.2 },
 			{ x: 1.5, y: 0, hw: 1.1 },
-			{ x: 3, y: 0, hw: 1.1 },
+			{ x: 3, y: 0, hw: 0.2 },
 		];
 		applyEndTaper(pts, DEFAULT_PEN, PEN_SHAPE);
-		expect(pts[0]!.hw).toBeLessThan(1.1);
-		expect(pts[2]!.hw).toBeLessThan(1.1);
+		expect(pts[0]!.hw).toBeLessThan(0.2);
+		expect(pts[2]!.hw).toBeLessThan(0.2);
 	});
 
 	it("leaves a dot (single point) untouched", () => {
 		const pts = [{ x: 0, y: 0, hw: 2 }];
 		applyEndTaper(pts, DEFAULT_PEN, PEN_SHAPE);
 		expect(pts[0]!.hw).toBe(2);
+	});
+
+	it("uses accepted shaped-width-aware endpoint floors while pressure is ON", () => {
+		const pts = [
+			{ x: 0, y: 0, hw: 0.2 },
+			{ x: 10, y: 0, hw: 1 },
+			{ x: 20, y: 0, hw: 0.8 },
+		];
+		applyEndTaper(pts, DEFAULT_PEN, PEN_SHAPE);
+		expect(pts[0]!.hw).toBeCloseTo(0.04, 12);
+		expect(pts[2]!.hw).toBeCloseTo(0.64, 12);
+	});
+
+	it("preserves the historical geometric endpoint floor while pressure is OFF", () => {
+		setPressureSensitivity(false);
+		const pts = [
+			{ x: 0, y: 0, hw: 0.2 },
+			{ x: 10, y: 0, hw: 1 },
+			{ x: 20, y: 0, hw: 0.8 },
+		];
+		applyEndTaper(pts, DEFAULT_PEN, PEN_SHAPE);
+		expect(pts[0]!.hw).toBeCloseTo(0.2 * PEN_SHAPE.tipFloor, 12);
+		expect(pts[2]!.hw).toBeCloseTo(0.8 * PEN_SHAPE.tipFloor, 12);
 	});
 });
 
@@ -164,12 +189,30 @@ describe("flattenStrokeShaped — the committed geometry", () => {
 		}
 	});
 
-	it("with pen shaping, the ends are thinner than the middle", () => {
+	it("with pen shaping, a held-pressure start stays blunt while the slowed end narrows", () => {
 		const pts = line(40, 3, 5, 0.5);
 		const shaped = flattenStrokeShaped(pts, DEFAULT_PEN, 1);
 		const mid = shaped[Math.floor(shaped.length / 2)]!.hw;
-		expect(shaped[0]!.hw).toBeLessThan(mid);
+		expect(shaped[0]!.hw).toBeGreaterThanOrEqual(mid);
 		expect(shaped[shaped.length - 1]!.hw).toBeLessThan(mid);
+	});
+
+	it("keeps a constant high-pressure start at its shaped width", () => {
+		const pts = line(40, 3, 5, 1);
+		const shaped = flattenStrokeShaped(pts, DEFAULT_PEN, 1);
+		expect(shaped[0]!.hw).toBeCloseTo(widthForPressure(DEFAULT_PEN, 1) / 2, 10);
+	});
+
+	it("erases raw pressure from the full OFF ribbon, while ON still responds", () => {
+		const low = line(24, 3, 5, 0.06);
+		const high = line(24, 3, 5, 0.959);
+		expect(flattenStrokeShaped(low, DEFAULT_PEN, 1)).not.toEqual(
+			flattenStrokeShaped(high, DEFAULT_PEN, 1)
+		);
+		setPressureSensitivity(false);
+		expect(flattenStrokeShaped(low, DEFAULT_PEN, 1)).toEqual(
+			flattenStrokeShaped(high, DEFAULT_PEN, 1)
+		);
 	});
 });
 
@@ -187,7 +230,8 @@ describe("IncrementalShaper — the wet layer speaks the same law", () => {
 		}
 	});
 
-	it("start taper ramps the first samples up from the tip", () => {
+	it("preserves the historical geometric wet start taper while pressure is OFF", () => {
+		setPressureSensitivity(false);
 		const pts = line(25, 0.5, 5, 0.6);
 		const inc = new IncrementalShaper();
 		inc.reset(pts[0], DEFAULT_PEN);

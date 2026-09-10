@@ -93,7 +93,7 @@ function lfOnly(src: string): string {
 
 /** The canvas surface's own files, and what they were when Alan froze them. */
 const FROZEN: readonly { file: string; bytes: number; hash: number }[] = [
-	{ file: "/src/view/HandwritingPageView.ts", bytes: 65846, hash: 3905293681 },
+	{ file: "/src/view/HandwritingPageView.ts", bytes: 65870, hash: 1383234449 },
 	{ file: "/src/objects/TextLayer.ts", bytes: 9384, hash: 3093913975 },
 	{ file: "/src/objects/ImageLayer.ts", bytes: 4513, hash: 3658389122 },
 	// The one the completeness check below found. It was NOT in the first

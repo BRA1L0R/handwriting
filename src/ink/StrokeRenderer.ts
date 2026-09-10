@@ -9,9 +9,11 @@ import { SmoothSegment } from "./Smoothing";
 import { flattenStroke, RibbonPt } from "./Ribbon";
 import { centerlineSmoothed, flattenStrokeShaped, inkShapingEnabled } from "./InkShape";
 import { fillRibbon } from "./RibbonRenderer";
-import { InkPoint, InkStroke } from "./Stroke";
+import { InkPoint, InkStroke, InkTool } from "./Stroke";
 import { paintPurgeSentinel } from "./PurgeSentinel";
 import { strokeRev } from "./StrokeRev";
+import { inkColorFor } from "./InkTheme";
+import { strokeWidthPolicy } from "./StrokeWidth";
 
 /**
  * Segment-based variable-width polyline rendering, shared by the wet layer
@@ -20,8 +22,13 @@ import { strokeRev } from "./StrokeRev";
  * incremental wet path is per-segment with round caps and joins.
  */
 
-function strokeStyleFor(stroke: { color: string }): string {
-	return stroke.color;
+/**
+ * The one place a committed stroke's colour becomes a canvas colour.
+ * `inkColorFor` decides whether the theme adaptation applies (InkTheme.ts);
+ * the stroke's stored colour is never touched.
+ */
+function strokeStyleFor(stroke: { color: string; tool?: InkTool }): string {
+	return inkColorFor(stroke);
 }
 
 /**
@@ -76,6 +83,7 @@ interface RibbonEntry {
 	smooth: boolean;
 	pressure: boolean;
 	tool: InkStroke["tool"];
+	widthMode: InkStroke["widthMode"];
 	ribbon: RibbonPt[];
 }
 
@@ -136,7 +144,7 @@ export function drawSegment(
 	const y2 = (to.y - cam.y) * cam.zoom;
 	// Average the two samples' pressures for the segment width.
 	const wWorld = widthForPressure(style, (from.pressure + to.pressure) / 2);
-	ctx.strokeStyle = style.color;
+	ctx.strokeStyle = inkColorFor(style);
 	ctx.lineWidth = Math.max(0.5, wWorld * cam.zoom);
 	ctx.lineCap = "round";
 	ctx.lineJoin = "round";
@@ -162,7 +170,7 @@ export function drawSmoothSegment(
 	const cy = (seg.ctrl.y - cam.y) * cam.zoom;
 	const ex = (seg.to.x - cam.x) * cam.zoom;
 	const ey = (seg.to.y - cam.y) * cam.zoom;
-	ctx.strokeStyle = style.color;
+	ctx.strokeStyle = inkColorFor(style);
 	ctx.lineWidth = Math.max(0.5, widthForPressure(style, seg.pressure) * cam.zoom);
 	ctx.lineCap = "round";
 	ctx.lineJoin = "round";
@@ -209,12 +217,22 @@ export function drawStroke(
 	// A stroke describes its own pressure response through its tool, so it looks
 	// right on any layer without the caller having to remember which it was.
 	const flat = stroke.tool === "highlighter";
-	const style: PenStyle = {
-		color: stroke.color,
+	const shape = shapeFor(flat);
+	const baseStyle: PenStyle = {
+		// Adapted here so every consumer of this derived style - the ribbon
+		// fill below, and drawSegment on the unribboned path - paints the one
+		// colour. Resolving an already-resolved colour is a memo hit and a
+		// no-op; the light foreground is not itself near-black or near-white.
+		color: inkColorFor(stroke),
 		baseWidth: stroke.width,
-		minWidthFactor: styleOverride?.minWidthFactor ?? shapeFor(flat).minWidthFactor,
-		gamma: styleOverride?.gamma ?? shapeFor(flat).gamma,
+		minWidthFactor: styleOverride?.minWidthFactor ?? shape.minWidthFactor,
+		gamma: styleOverride?.gamma ?? shape.gamma,
+		maxWidthFactor: styleOverride?.maxWidthFactor ?? shape.maxWidthFactor,
+		pressureOffWidthFactor:
+			styleOverride?.pressureOffWidthFactor ?? shape.pressureOffWidthFactor,
 	};
+	const widthPolicy = strokeWidthPolicy(baseStyle, stroke.widthMode);
+	const style = widthPolicy.style;
 	ctx.lineCap = "round";
 	ctx.lineJoin = "round";
 	ctx.strokeStyle = strokeStyleFor(stroke);
@@ -225,7 +243,8 @@ export function drawStroke(
 		// highlighter's flat chisel wash never shapes.
 		// Mouse strokes take the flat law: no pressure, and velocity says
 		// nothing about intent (see InkStroke.device).
-		const shaping = !flat && stroke.device !== "mouse" && inkShapingEnabled();
+		const shaping =
+			widthPolicy.shapeWidth && !flat && stroke.device !== "mouse" && inkShapingEnabled();
 		// The centerline follows the setting even where the width law does
 		// not. A mouse stroke is unshaped in both settings but still smoothed
 		// when smoothing is on, and the highlighter is smoothed in both.
@@ -258,7 +277,8 @@ export function drawStroke(
 			hit.shaping === shaping &&
 			hit.smooth === smooth &&
 			hit.pressure === pressure &&
-			hit.tool === stroke.tool
+			hit.tool === stroke.tool &&
+			hit.widthMode === stroke.widthMode
 		) {
 			cacheHits++;
 			fillRibbon(ctx, cam, hit.ribbon, strokeStyleFor(stroke), perSegment);
@@ -273,6 +293,7 @@ export function drawStroke(
 			smooth,
 			pressure,
 			tool: stroke.tool,
+			widthMode: stroke.widthMode,
 			ribbon: pts2,
 		});
 		fillRibbon(ctx, cam, pts2, strokeStyleFor(stroke), perSegment);

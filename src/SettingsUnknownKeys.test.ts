@@ -44,7 +44,15 @@ const proto = HandwritingPlugin.prototype as unknown as {
  */
 function ensureDocument(): void {
 	const g = globalThis as unknown as { document?: unknown };
-	g.document ??= { body: { classList: { add: () => {}, toggle: () => {} } } };
+	// `contains` is here for the merge-up: loadSettings also calls
+	// refreshInkTheme, whose isDarkTheme reads
+	// body.classList.contains("theme-dark"). The stub predates that call, and
+	// a fixture missing a member the code under test needs would fail whatever
+	// the settings did. False is the honest answer for a node run with no
+	// theme class on the body.
+	g.document ??= {
+		body: { classList: { add: () => {}, toggle: () => {}, contains: () => false } },
+	};
 }
 
 interface Harness {
@@ -151,5 +159,215 @@ describe("loadSettings carries keys this build does not know", () => {
 		// are written unconditionally, so nothing here is left undefined.
 		expect(fromArray.settings.mouseInk).toBe(false);
 		expect(fromArray.settings.penTools).toBe(normalizePenToolsMode(undefined));
+	});
+});
+
+/**
+ * THE ADAPTATION IS OPT-IN, AND THIS IS WHAT KEEPS IT THAT WAY.
+ *
+ * `inkAdaptsToTheme` draws near-black ink light on a dark theme so an
+ * imported page of black annotations is not invisible. It arrived ON by
+ * default with the slides port, which would have changed how every
+ * dark-theme user's existing ink looked the moment they updated. The owner
+ * ruled it off (2026-09-07): "leave it off default, because expected
+ * behaviour should be default and then the option if they need it".
+ *
+ * TWO PLACES DECIDE THIS AND THEY MUST AGREE. The literal in
+ * DEFAULT_SETTINGS is the obvious one; the load coercion is the one that
+ * actually decides for a real vault, because an existing vault has no stored
+ * value and is therefore decided THERE. It read `raw?.inkAdaptsToTheme !==
+ * false` - absence meaning ON - so flipping only the literal would have left
+ * the default on for every user who had never touched the toggle, while the
+ * source read as though it were off.
+ *
+ * These cases drive the real `loadSettings`, so they fail if either place
+ * moves. A source-text assertion would not: it would pin the spelling of one
+ * of the two and say nothing about what a vault actually loads.
+ */
+describe("ink theme adaptation is off unless a vault asks for it", () => {
+	it("defaults off for a vault that has never stored the key", async () => {
+		ensureDocument();
+		const plugin = fakePlugin({});
+		await proto.loadSettings.call(plugin);
+
+		expect(
+			plugin.settings.inkAdaptsToTheme,
+			"an existing vault must not have its ink redrawn by an update"
+		).toBe(false);
+	});
+
+	it("defaults off for a vault with other settings but not this one", async () => {
+		ensureDocument();
+		const plugin = fakePlugin({ mouseInk: true, inkSmoothing: false });
+		await proto.loadSettings.call(plugin);
+
+		expect(plugin.settings.inkAdaptsToTheme).toBe(false);
+		expect(plugin.settings.mouseInk, "the rest of the file still loads").toBe(true);
+	});
+
+	it("stays on for a vault that turned it on", async () => {
+		ensureDocument();
+		const plugin = fakePlugin({ inkAdaptsToTheme: true });
+		await proto.loadSettings.call(plugin);
+
+		expect(
+			plugin.settings.inkAdaptsToTheme,
+			"off by default must not mean unavailable"
+		).toBe(true);
+	});
+
+	it("stays off for a vault that turned it off", async () => {
+		ensureDocument();
+		const plugin = fakePlugin({ inkAdaptsToTheme: false });
+		await proto.loadSettings.call(plugin);
+
+		expect(plugin.settings.inkAdaptsToTheme).toBe(false);
+	});
+});
+
+/**
+ * THE SAME TRAP, WITH THE SIGN REVERSED - AND THIS IS THE HALF THAT SHIPS ON.
+ *
+ * `inkReadableInExports` guarantees that ink you export can be read where it
+ * lands: white ink on a white PDF page is darkened until it passes 3:1. Alan
+ * ruled it ON by default ("export toggle should default on"), the opposite
+ * answer to the toggle directly above it in the settings tab, because the two
+ * questions are different - on screen you are looking at your own canvas and
+ * expect the colour you picked, in an export you are making something for
+ * elsewhere and expect to be able to read it.
+ *
+ * TWO PLACES DECIDE IT AND ONLY ONE DECIDES FOR A REAL VAULT. The literal in
+ * DEFAULT_SETTINGS is the obvious one; the load coercion is the one that
+ * actually answers for a vault that has never stored the key, which is every
+ * existing user. For default-ON the coercion has to be `!== false` - absence
+ * counting as ON. `=== true` there would leave the literal decorative and
+ * ship the whole fix switched off for everyone who already has a vault, which
+ * is exactly how `inkAdaptsToTheme` went wrong once, pointing the other way.
+ *
+ * These cases drive the real `loadSettings`. A `?raw` source match would pin
+ * the spelling of one of the two places and say nothing about what a vault
+ * actually loads - which is the failure this comment exists to prevent.
+ */
+describe("exported ink is kept readable unless a vault says otherwise", () => {
+	it("defaults ON for a vault that has never stored the key", async () => {
+		ensureDocument();
+		const plugin = fakePlugin({});
+		await proto.loadSettings.call(plugin);
+
+		expect(
+			plugin.settings.inkReadableInExports,
+			"an existing vault must get the fix without having to find a toggle"
+		).toBe(true);
+	});
+
+	it("defaults ON for a vault with other settings but not this one", async () => {
+		ensureDocument();
+		const plugin = fakePlugin({ mouseInk: true, inkAdaptsToTheme: true });
+		await proto.loadSettings.call(plugin);
+
+		expect(plugin.settings.inkReadableInExports).toBe(true);
+		expect(plugin.settings.mouseInk, "the rest of the file still loads").toBe(true);
+	});
+
+	it("stays off for a vault that turned it off", async () => {
+		ensureDocument();
+		const plugin = fakePlugin({ inkReadableInExports: false });
+		await proto.loadSettings.call(plugin);
+
+		expect(
+			plugin.settings.inkReadableInExports,
+			"on by default must not mean compulsory"
+		).toBe(false);
+	});
+
+	it("stays on for a vault that turned it on", async () => {
+		ensureDocument();
+		const plugin = fakePlugin({ inkReadableInExports: true });
+		await proto.loadSettings.call(plugin);
+
+		expect(plugin.settings.inkReadableInExports).toBe(true);
+	});
+
+	it("the two ink-colour toggles load with OPPOSITE defaults, on purpose", async () => {
+		// The pair is the point. If a future edit makes them agree, one of the
+		// two rulings has been lost, and this is where that shows up.
+		ensureDocument();
+		const plugin = fakePlugin({});
+		await proto.loadSettings.call(plugin);
+
+		expect(plugin.settings.inkAdaptsToTheme).toBe(false);
+		expect(plugin.settings.inkReadableInExports).toBe(true);
+	});
+});
+
+/**
+ * THE SAME TRAP, THIRD TIME - BUT NOT THE SAME CHECK, and that is the point.
+ *
+ * `inkPdfColorMode` decides what the flatten writer assumes about pages it
+ * cannot see: darken for light stock, lighten for dark, or leave the stored
+ * colour alone. Alan asked for the third state himself after finding black
+ * ink invisible on a dark page - a boolean could only offer "guess white" or
+ * "guess nothing", and neither is "the page is dark".
+ *
+ * THE BOOLEAN'S `!== false` DOES NOT PORT. An enum's failure is a value it
+ * does not recognise, which is a different question from a value that is
+ * absent, and both have to land on the shipped default. `=== "darken"` would
+ * be the mirror mistake of `=== true`: it would answer "darken" for a vault
+ * that had chosen "lighten" only if the spelling drifted, and silently throw
+ * away a real choice. `normalizePdfPageAssumption` owns the single answer so
+ * the type and the coercion cannot disagree.
+ *
+ * Driven through the real `loadSettings` for the reason the blocks above
+ * give: a `?raw` source match pins a spelling and says nothing about what a
+ * vault actually loads.
+ */
+describe("the pdf ink colour mode falls back to darken unless a vault says otherwise", () => {
+	it("defaults to darken for a vault that has never stored the key", async () => {
+		ensureDocument();
+		const plugin = fakePlugin({});
+		await proto.loadSettings.call(plugin);
+
+		expect(
+			plugin.settings.inkPdfColorMode,
+			"an existing vault must get the guarantee without having to find a setting"
+		).toBe("darken");
+	});
+
+	it("defaults to darken for a vault with other settings but not this one", async () => {
+		ensureDocument();
+		const plugin = fakePlugin({ mouseInk: true, inkReadableInExports: false });
+		await proto.loadSettings.call(plugin);
+
+		expect(plugin.settings.inkPdfColorMode).toBe("darken");
+		expect(plugin.settings.mouseInk, "the rest of the file still loads").toBe(true);
+		expect(
+			plugin.settings.inkReadableInExports,
+			"and the neighbouring toggle is still its own decision"
+		).toBe(false);
+	});
+
+	it("keeps a vault's real choice, both of the non-default ones", async () => {
+		ensureDocument();
+		for (const mode of ["lighten", "keep"] as const) {
+			const plugin = fakePlugin({ inkPdfColorMode: mode });
+			await proto.loadSettings.call(plugin);
+			expect(
+				plugin.settings.inkPdfColorMode,
+				"a default must not mean compulsory"
+			).toBe(mode);
+		}
+	});
+
+	it("falls back to darken for a value it does not recognise", async () => {
+		ensureDocument();
+		// A newer version's value, a hand-edited config, and a wrong type.
+		for (const bad of ["invert", "DARKEN", "", true, 0, null]) {
+			const plugin = fakePlugin({ inkPdfColorMode: bad });
+			await proto.loadSettings.call(plugin);
+			expect(
+				plugin.settings.inkPdfColorMode,
+				`an unrecognised ${JSON.stringify(bad)} must not become a mode`
+			).toBe("darken");
+		}
 	});
 });

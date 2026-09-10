@@ -13,6 +13,8 @@ describe("shapeFor", () => {
 		expect(shapeFor(false)).toEqual({
 			minWidthFactor: DEFAULT_PEN.minWidthFactor,
 			gamma: DEFAULT_PEN.gamma,
+			maxWidthFactor: DEFAULT_PEN.maxWidthFactor,
+			pressureOffWidthFactor: DEFAULT_PEN.pressureOffWidthFactor,
 		});
 	});
 
@@ -20,16 +22,22 @@ describe("shapeFor", () => {
 		expect(shapeFor(true)).toEqual({
 			minWidthFactor: HIGHLIGHTER_PEN.minWidthFactor,
 			gamma: HIGHLIGHTER_PEN.gamma,
+			maxWidthFactor: HIGHLIGHTER_PEN.maxWidthFactor,
+			pressureOffWidthFactor: HIGHLIGHTER_PEN.pressureOffWidthFactor,
 		});
 	});
 
 	it("pins DEFAULT_PEN's current values", () => {
-		expect(DEFAULT_PEN.minWidthFactor).toBe(0.35);
-		expect(DEFAULT_PEN.gamma).toBe(0.75);
+		expect(DEFAULT_PEN.minWidthFactor).toBe(0.18);
+		expect(DEFAULT_PEN.gamma).toBe(1.15);
+		expect(DEFAULT_PEN.maxWidthFactor).toBe(3.2);
+		expect(DEFAULT_PEN.pressureOffWidthFactor).toBeCloseTo(0.9945718882219903, 15);
 	});
 
 	it("pins HIGHLIGHTER_PEN's current values", () => {
 		expect(HIGHLIGHTER_PEN.minWidthFactor).toBe(0.9);
 		expect(HIGHLIGHTER_PEN.gamma).toBe(1);
+		expect(HIGHLIGHTER_PEN.maxWidthFactor).toBe(1);
+		expect(HIGHLIGHTER_PEN.pressureOffWidthFactor).toBe(0.95);
 	});
 });

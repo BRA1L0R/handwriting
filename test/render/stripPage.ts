@@ -688,6 +688,123 @@ export interface ClearanceProbe {
 	wouldOverlap: boolean;
 }
 
+/** Browser-measured boxes for the phone chrome placement regression. */
+export interface MobileChromeProbe {
+	viewport: { width: number; height: number; dpr: number };
+	pane: { left: number; right: number; top: number; bottom: number };
+	strip: { left: number; right: number; top: number; bottom: number };
+	grid: {
+		columns: string;
+		cell: string;
+		buttonWidth: number;
+		buttonHeight: number;
+		startupColumns?: string;
+		startupCell?: string;
+		startupButtonWidth?: number;
+	};
+	header: { left: number; right: number; top: number; bottom: number };
+	bottomNav: { left: number; right: number; top: number; bottom: number };
+	hitsHeader: boolean;
+	hitsBottomNav: boolean;
+}
+
+/**
+ * A Samsung-sized editor pane with host chrome over both usable extremes.
+ *
+ * The obstruction boxes are parameters, not an Obsidian copy: their only job
+ * is to make the reported top and bottom collisions real in Chromium, so the
+ * middle-row assertions cannot pass through zero boxes or an inert fixture.
+ */
+function buildMobileChrome(platform: "android" | "ios" = "android"): HTMLElement {
+	installObsidianDom();
+	document.body.innerHTML = "";
+	document.body.className =
+		platform === "ios"
+			? "is-mobile is-tablet is-phone is-ios"
+			: "is-mobile is-tablet handwriting-android";
+	const pane = document.createElement("div");
+	pane.className = "mobile-placement-pane";
+	pane.style.cssText = "position:relative;width:100vw;height:100vh;";
+	document.body.appendChild(pane);
+
+	const header = document.createElement("div");
+	header.className = "mobile-header-obstruction";
+	header.style.cssText =
+		"position:fixed;z-index:20;left:0;right:0;top:0;height:104px;pointer-events:none;";
+	document.body.appendChild(header);
+
+	const bottomNav = document.createElement("div");
+	bottomNav.className = "mobile-bottom-nav-obstruction";
+	bottomNav.style.cssText =
+		"position:fixed;z-index:20;left:0;right:0;bottom:0;height:80px;pointer-events:none;";
+	document.body.appendChild(bottomNav);
+
+	const tools = new MobileTools(pane, fakeHost());
+	tools.setCollapsed(false);
+	tools.setCorner("top-right");
+	built = tools;
+	return pane;
+}
+
+/** Select and measure either toolbar form against both synthetic host-chrome bands. */
+function setMobileChromeState(corner: ToolbarCorner, collapsed: boolean): void {
+	if (!built) throw new Error("no mobile toolbar has been built");
+	built.setCollapsed(collapsed);
+	built.setCorner(corner);
+}
+
+function mobileChromeProbe(pane: HTMLElement, collapsed: boolean): MobileChromeProbe {
+	const strip = pane.querySelector<HTMLElement>(
+		collapsed ? ".handwriting-pen-pill" : ".handwriting-mobile-tools"
+	);
+	const expandedStrip = pane.querySelector<HTMLElement>(".handwriting-mobile-tools");
+	const header = document.querySelector<HTMLElement>(".mobile-header-obstruction");
+	const bottomNav = document.querySelector<HTMLElement>(".mobile-bottom-nav-obstruction");
+	if (!strip || !expandedStrip || !header || !bottomNav) {
+		throw new Error("the mobile placement fixture is incomplete");
+	}
+	const button = expandedStrip.querySelector<HTMLElement>("button.handwriting-mobile-tool");
+	if (!button) throw new Error("the mobile toolbar has no tool button");
+	const box = (r: DOMRect): MobileChromeProbe["strip"] => ({
+		left: r.left,
+		right: r.right,
+		top: r.top,
+		bottom: r.bottom,
+	});
+	const paneBox = box(pane.getBoundingClientRect());
+	const stripBox = box(strip.getBoundingClientRect());
+	const headerBox = box(header.getBoundingClientRect());
+	const navBox = box(bottomNav.getBoundingClientRect());
+	const buttonBox = button.getBoundingClientRect();
+	const stripStyle = getComputedStyle(expandedStrip);
+	const intersects = (a: MobileChromeProbe["strip"], b: MobileChromeProbe["strip"]): boolean =>
+		a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+	return {
+		viewport: { width: innerWidth, height: innerHeight, dpr: devicePixelRatio },
+		pane: paneBox,
+		strip: stripBox,
+		grid: {
+			columns: stripStyle.getPropertyValue("--hw-strip-cols").trim(),
+			cell: stripStyle.getPropertyValue("--hw-strip-cell").trim(),
+			buttonWidth: buttonBox.width,
+			buttonHeight: buttonBox.height,
+			...(expandedStrip.dataset.startupColumns === undefined
+				? {}
+				: { startupColumns: expandedStrip.dataset.startupColumns }),
+			...(expandedStrip.dataset.startupCell === undefined
+				? {}
+				: { startupCell: expandedStrip.dataset.startupCell }),
+			...(expandedStrip.dataset.startupButtonWidth === undefined
+				? {}
+				: { startupButtonWidth: Number(expandedStrip.dataset.startupButtonWidth) }),
+		},
+		header: headerBox,
+		bottomNav: navBox,
+		hitsHeader: intersects(stripBox, headerBox),
+		hitsBottomNav: intersects(stripBox, navBox),
+	};
+}
+
 /**
  * A pane shaped like a real Obsidian leaf, for item 5.
  *
@@ -704,13 +821,15 @@ export interface ClearanceProbe {
  * with no Obsidian in it can say, and it is the reason the class name is
  * written here exactly once, beside the note saying so.
  *
- * `header` false builds the NOTE's arrangement instead: the strip mounted
- * inside the content area, below the header, where the two cannot meet. That
- * case exists to show the dodge is driven by a measurement rather than by
- * being switched on for everyone.
+ * `header` false builds the NOTE's arrangement instead: the strip is mounted
+ * inside the content area. Normally that content starts below the header;
+ * `overlayHeader` models the mobile arrangement where host actions float over
+ * it, which is the case where the note must find its row through the leaf.
  */
 function buildLeaf(opts: {
 	header: boolean;
+	overlayHeader?: boolean;
+	platform?: "android" | "ios";
 	corner: ToolbarCorner;
 	collapsed: boolean;
 	/** The pane's width. A phone's and a desktop's take different branches. */
@@ -718,16 +837,27 @@ function buildLeaf(opts: {
 }): HTMLElement {
 	installObsidianDom();
 	document.body.innerHTML = "";
+	document.body.className =
+		opts.platform === "ios"
+			? "is-mobile is-tablet is-phone is-ios"
+			: opts.platform === "android"
+				? "is-mobile is-tablet handwriting-android"
+				: "";
 	const leaf = document.createElement("div");
 	leaf.className = "workspace-leaf-content";
 	leaf.style.cssText = `position:relative;width:${opts.width}px;height:700px;`;
 	const head = document.createElement("div");
 	head.className = "view-header";
 	head.style.cssText =
-		"display:flex;align-items:center;justify-content:flex-end;height:40px;width:100%;";
+		"display:flex;align-items:center;justify-content:flex-end;height:40px;width:100%;" +
+		(opts.overlayHeader ? "position:absolute;z-index:20;top:0;right:0;pointer-events:none;" : "");
 	const actions = document.createElement("div");
 	actions.className = "view-actions";
-	actions.style.cssText = "display:flex;gap:4px;padding-right:8px;";
+	actions.style.cssText =
+		"display:flex;gap:4px;padding-right:8px;" +
+		(opts.overlayHeader
+			? "pointer-events:auto;background:var(--background-secondary);border-radius:20px;"
+			: "");
 	for (let i = 0; i < 2; i++) {
 		const a = document.createElement("div");
 		a.className = "clickable-icon view-action";
@@ -816,7 +946,10 @@ declare global {
 		__hw: {
 			buildStrip: typeof buildStrip;
 			buildLeaf: typeof buildLeaf;
+			buildMobileChrome: typeof buildMobileChrome;
+			setMobileChromeState: typeof setMobileChromeState;
 			clearanceProbe: typeof clearanceProbe;
+			mobileChromeProbe: typeof mobileChromeProbe;
 			reapplyCorner: typeof reapplyCorner;
 			popProbe: typeof popProbe;
 			readoutProbe: typeof readoutProbe;
@@ -830,7 +963,10 @@ declare global {
 window.__hw = {
 	buildStrip,
 	buildLeaf,
+	buildMobileChrome,
+	setMobileChromeState,
 	clearanceProbe,
+	mobileChromeProbe,
 	reapplyCorner,
 	popProbe,
 	readoutProbe,

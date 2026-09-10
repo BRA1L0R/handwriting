@@ -59,10 +59,10 @@ function fakeCtx(): CanvasRenderingContext2D {
 
 function makeStroke(tool: InkStroke["tool"]): InkStroke {
 	const points: InkPoint[] = [
-		{ x: 0, y: 0, pressure: 0.4, t: 0 },
-		{ x: 12, y: 6, pressure: 0.7, t: 10 },
-		{ x: 26, y: 4, pressure: 0.55, t: 22 },
-		{ x: 40, y: 18, pressure: 0.6, t: 34 },
+		{ x: 0, y: 0, pressure: 1, t: 0 },
+		{ x: 12, y: 6, pressure: 0.06, t: 10 },
+		{ x: 26, y: 4, pressure: 0.959, t: 22 },
+		{ x: 40, y: 18, pressure: 0.25, t: 34 },
 	];
 	const width = tool === "highlighter" ? 16 : 2.2;
 	return {

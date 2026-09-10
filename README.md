@@ -14,6 +14,14 @@ one line is written to the invisible frontmatter of a note when you first write 
 
 a note you never inked on is never modified.
 
+> **ipad**
+>
+> turn off Scribble or ios will draw its own black ink over your strokes, and its scratch-out gesture may delete ink.
+>
+> **iPad Settings → Apple Pencil → Scribble → Off**
+>
+> ios may discard a canvas’s pixels while Obsidian is in the background or memory is limited. this is more likely on long notes containing images or a pdf. the stroke data remains saved and the ink is repainted when you return to Obsidian.
+
 ## what it does
 
 Here's a demonstration of some of the features: https://youtu.be/TUeniA9BZcc
@@ -48,7 +56,7 @@ Here's a demonstration of some of the features: https://youtu.be/TUeniA9BZcc
 
 ### works on
 
-windows · macos · linux · ios · boox · android
+windows · macos · linux · ipad · boox · android
 
 ## installing
 
@@ -92,50 +100,77 @@ Obsidian 1.12.3 or newer. please send reports.
 
 ### the toolbar
 
-tap any tool in the toolbar to use it: pen, highlighter, eraser, lasso, insert space - and pan, which is only built where there is no touchscreen at all (anything you can pan with a finger already can). hover to see the slider. the keyboard button turns the pen off so a tap places the caret and the on-screen keyboard comes up - `Pen on / off` does the same from the palette. it works on pdfs too: the pen stops inking there and taps go straight to the viewer.
+tap a tool in the toolbar to use it: pen, highlighter, eraser, lasso, insert space or pan. pan lets you drag the page with the pen tip. on a narrow pane, some buttons may move behind **More**.
 
-(mouse users only) run `Handwriting: Mouse on / off` to activate the toolbar, or go into settings and set Pen toolbar's dropdown menu to Show. once it's up, click any tool and the mouse picks it up; click the tool you're using again and the mouse goes back to your cursor.
+tap the pen, highlighter or eraser again while it is selected to open its controls. press `Esc` or tap outside the popover to close it.
+
+the keyboard button disables pen input so a tap can place the caret and open the on-screen keyboard. `Pen on / off` does the same from the command palette.
+
+this also applies to pdfs. with the pen disabled, taps pass through to the pdf viewer.
+
+#### mouse input
+
+to use the toolbar with a mouse, run `Handwriting: Mouse on / off`.
+
+click a tool to use it with the mouse. click the active tool again to return to the normal cursor.
 
 ### eraser modes
 
-the eraser can erase whole strokes or just at the eraser reticle. switch between the two by tapping the eraser button and choosing either stroke or reticle. default erases whole strokes. the eraser button on the toolbar is the way in and out; `Toggle eraser on / off` and `Eraser size: next` do the same from the palette once **Extra commands for hotkeys** is on in settings.
+the eraser has two modes:
 
-### color palette
+- **stroke** erases the entire stroke
+- **reticle** erases only the part beneath the reticle
 
-there is no palette button any more. tap the pen button on the strip and its pop opens with the size slider, the quick-pen chips, and a row of the 8 pen colors; the highlighter button opens the same pop with its own 5. tap a swatch to pick it. it colors the nib you are already holding, and drops any eraser, lasso, insert space or pan mode so the tip goes back to inking - each nib's pop only ever shows its own colors, so a swatch never swaps pen for highlighter.
+tap the eraser button to select a mode. stroke is the default.
 
-the cycles - `Ink color: next`, `Pen color: next`, `Highlighter color: next`, `Ink size: next` - one command per color and per size, the four tool toggles (`Toggle eraser / lasso / insert space / pan on / off`), and the sixteen quick-pen commands (`Pen preset 1` to `4`, `Highlighter preset 1` to `4`, and a `Save current pen as preset N` for each slot) all live behind **Extra commands for hotkeys** in settings. turn it on and they show up in the palette straight away, each ready to take its own hotkey - a starred quick pen can sit on a single key. turning it back off takes them out again and leaves your hotkeys waiting for them. they're off by default because they crowded out the export and flatten commands in the palette.
+the eraser button also toggles the eraser on and off. with **Extra commands for hotkeys** enabled, `Toggle eraser on / off` and `Eraser size: next` are available in the command palette.
+
+### colors and quick pens
+
+there is no separate palette button.
+
+tap the pen button to open its size slider, quick pens and 8 pen colors. tap the highlighter button to open the same controls with its 5 highlighter colors.
+
+selecting a color applies it to the corresponding nib and returns to inking from eraser, lasso, insert space or pan. pen colors do not switch to the highlighter, and highlighter colors do not switch to the pen.
+
+### extra commands for hotkeys
+
+enable **Extra commands for hotkeys** in settings to add these commands to the command palette:
+
+- `Ink color: next`
+- `Pen color: next`
+- `Highlighter color: next`
+- `Ink size: next`
+- toggles for eraser, lasso, insert space and pan
+- `Pen preset 1` through `4`
+- `Highlighter preset 1` through `4`
+- a save command for each preset slot
+
+each command can be assigned its own hotkey.
+
+the commands are hidden by default because their number makes other Handwriting commands harder to find. disabling the setting removes them from the palette but preserves their hotkey assignments.
 
 ### palm rejection
 
-pdfs: a single touch too wide to be a fingertip gets trashed. heel of the hand reports a bigger contact than fingertip so we measure contact shape instead.
+on pdfs, a touch contact too large to be a fingertip is discarded. the heel of a hand produces a larger contact area, which allows it to be distinguished from normal touch input.
 
-notes: we use a different, timing-based rejection.
+notes use a separate, timing-based method.
 
 ### pinch zoom
 
-pinch to zoom works on notes and pdfs. the point you start the pinch on stays under your fingers instead of drifting while you zoom.
+pinch to zoom works on notes and pdfs. the point where the pinch begins remains beneath your fingers while zooming.
 
 ### shape snap
 
-hold the pen still for about a third of a second at the end of a stroke and it redraws as a line, triangle, rectangle, circle or ellipse.
+hold the pen still for about a third of a second at the end of a stroke to snap it into a line, triangle, rectangle, circle or ellipse.
 
-with a mouse, pause at the end of a stroke and a Snap button appears; click it to snap.
-
-### update notice
-
-the first time you open Obsidian after an update a small notice in the corner shows the changelog. it goes away on its own or click it to dismiss it sooner.
-
-### ipad notes
-
-* turn off Scribble or ios will draw its own black ink over your strokes and scratch-out deletes ink
-* iPad Settings > Apple Pencil > Scribble > Toggle off
-* ink that vanishes after switching apps or under memory pressure repaints when you come back to Obsidian. ios can take a canvas's pixels back without telling the page, and on a long note beside photos or a pdf that is most likely while the app is in the background
+with a mouse, pause at the end of a stroke and select **Snap**.
 
 ### obsidian sync notes
 
-* `.handwriting/` is hidden and about half of all sync tools don't carry hidden folders by default (Obsidian Sync, iCloud, and Dropbox don't)
-* if you use one of these services, turn on Compatibility with Obsidian Sync, iCloud and Dropbox in the Handwriting settings panel to get your ink syncing across devices
+`.handwriting/` is a hidden folder. many sync services do not sync hidden folders by default, including Obsidian Sync, iCloud and Dropbox.
+
+if you use one of these services, enable **Compatibility with Obsidian Sync, iCloud and Dropbox** in Handwriting settings.
 
 ## how it works
 

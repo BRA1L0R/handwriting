@@ -152,6 +152,124 @@ function folderOf(path: string): string {
  */
 export const MAX_DIRTY_MS = 5000;
 
+/**
+ * ONE PREPARED EXTERNAL ADOPTION: the incoming revision, parsed and ready to
+ * become the visible page, plus the two recovery artifacts that make the swap
+ * non-destructive.
+ *
+ * `mtime` and `stamp` identify the EXACT incoming generation this preparation
+ * captured. Nothing about it is acknowledged until this object is handed back
+ * to `acceptExternalAdoption`, so a preparation that is never accepted leaves
+ * the store exactly as it found it and the next poll sees the change again.
+ */
+export interface PreparedExternalAdoption {
+	readonly pageId: string;
+	/** The parsed incoming revision. Clean, inline, this build's schema. */
+	readonly data: PageData;
+	readonly outgoingPath: string;
+	readonly incomingPath: string;
+	/** The pair was already on disk and verified; no new artifact was made. */
+	readonly reused: boolean;
+	readonly mtime: number;
+	readonly stamp: string;
+}
+
+/**
+ * What preparing an external adoption produced. Three cases, deliberately
+ * distinct, because a caller must treat them differently:
+ *
+ *  - `prepared`    both revisions are on disk and independently recoverable.
+ *  - `stale`       nothing is wrong, but the world moved while the I/O ran: a
+ *                  newer external generation arrived. Every artifact already
+ *                  written is KEPT, nothing is acknowledged, and the newer
+ *                  revision is still detectable by the next poll. Say nothing.
+ *  - `unavailable` no live sidecar is currently readable, or the incoming
+ *                  revision is damaged, legacy or from a newer build. For an
+ *                  established record this is a hold, never reload authority.
+ *
+ * A genuine FAILURE is deliberately not in this union: it throws. Preservation
+ * that could not be completed must never arrive as a state a caller can
+ * proceed from - that is the shape the loss this exists to prevent had.
+ */
+export type ExternalAdoptionPrep =
+	| { readonly kind: "prepared"; readonly prepared: PreparedExternalAdoption }
+	| { readonly kind: "stale"; readonly why: string }
+	| {
+			readonly kind: "unavailable";
+			readonly why: string;
+			/**
+			 * A typed diagnostic for the hold path. It is not replacement
+			 * authority: both values leave an established record untouched.
+			 * The missing-live case alone starts the existing quiet notice.
+			 */
+			readonly reason: "no-live-sidecar" | "incoming-unusable";
+	  };
+
+/** A typed live-reload observation; only a proven missing path may say missing. */
+export type ExternalChangeObservation = "changed" | "unchanged" | "missing-live-sidecar";
+
+/**
+ * Where the outgoing recovery artifact carries its EXACT capture.
+ *
+ * The persisted codec is lossy on purpose: `packPointsV2` quantizes x/y to 1e-2
+ * and pressure to 1e-3 and rounds `t` to whole ms, and `serializePage` rounds
+ * widths and geometry. That is right for a live sidecar - it is the storage
+ * format, and every save has always written it.
+ *
+ * It is wrong for THIS artifact. A recovery copy exists to give back the
+ * revision that was captured, and a copy that gives back a rounded one is
+ * answering a different question. So the artifact is written as an ordinary,
+ * fully valid sidecar - it parses, and a user can rename it into place - with
+ * the unrounded capture carried verbatim in an unknown top-level field, which
+ * `serializePage`/`parsePage` preserve by construction for exactly this reason.
+ *
+ * The key is part of the on-disk format that a recovery tool reads, so it is
+ * pinned by the acceptance suite as a literal rather than imported from here.
+ */
+export const EXACT_OUTGOING_KEY = "handwriting:exactOutgoing";
+
+/**
+ * The outgoing artifact's bytes: a valid sidecar carrying its own exact
+ * capture. Nothing else in the plugin writes a page this way, and no ordinary
+ * save reaches it - `serializePage` and the live-sidecar path are untouched.
+ */
+function serializeExactOutgoing(outgoing: PageData): string {
+	return serializePage({
+		...outgoing,
+		unknownTop: { ...outgoing.unknownTop, [EXACT_OUTGOING_KEY]: outgoing },
+	});
+}
+
+/**
+ * Reopen a recovery artifact the way a recovery tool should: the exact capture
+ * when the artifact carries one, and the ordinary parsed page otherwise (an
+ * artifact written before this existed, or the incoming leg, which is the other
+ * device's bytes verbatim and has no capture of ours to carry).
+ */
+export function recoverExactPage(parsed: PageData): PageData {
+	const exact = parsed.unknownTop?.[EXACT_OUTGOING_KEY];
+	return exact !== undefined && exact !== null ? (exact as PageData) : parsed;
+}
+
+/**
+ * A cryptographically random token for one preservation pair.
+ *
+ * A runtime with no CSPRNG REFUSES preservation rather than falling back to a
+ * time-only name. Two devices whose clocks agree to the millisecond would
+ * otherwise choose the same sibling name for different ink, and the existence
+ * probe cannot see a write that has not landed yet - so the fallback would
+ * quietly reintroduce, between devices, exactly the overwrite this prevents.
+ */
+function adoptionToken(): string {
+	const source = (globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array } }).crypto;
+	if (!source || typeof source.getRandomValues !== "function") {
+		throw new Error("Handwriting: no secure random source for the recovery copies");
+	}
+	const bytes = new Uint8Array(8);
+	source.getRandomValues(bytes);
+	return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export class PageStore {
 	private pending = new Map<string, PageData>();
 	/**
@@ -174,6 +292,54 @@ export class PageStore {
 	 * pages are different files; they owe each other no ordering.
 	 */
 	private tails = new Map<string, Promise<void>>();
+
+	/**
+	 * How many write attempts for this page have been CLAIMED but have not yet
+	 * settled. Absent means none.
+	 *
+	 * `pending`/`timers`/`maxTimers` describe a batch that is still WAITING.
+	 * They say nothing about a batch that has left the queue and is on its way
+	 * to the adapter, because `writePending` consumes all three synchronously
+	 * and only then awaits the write. For that whole span the ink existed only
+	 * in memory while `busy` and `hasQueuedWrite` both answered "nothing
+	 * queued" - so `externallyChanged` let the live-reload poll adopt another
+	 * device's copy and discard the local stroke, and the stalled write then
+	 * landed carrying its pre-reload snapshot over that device's ink with no
+	 * conflict copy, because the reload had refreshed the known mtime.
+	 *
+	 * A COUNT, deliberately, and not the `tails` map:
+	 *
+	 *  - Not a boolean. Two batches for one page can be outstanding at once (a
+	 *    saveNow chained behind a stalled debounced write). An earlier one
+	 *    settling would clear a flag the later one still needs, re-opening the
+	 *    window it exists to close.
+	 *  - Not `tails`. `clone` records its chained promise under the
+	 *    DESTINATION id and never removes it, so a tails-based observer reports
+	 *    that page queued - and the store busy - for the rest of the session,
+	 *    indefinitely suppressing its live reload and global idle. That trades
+	 *    one silent failure for another.
+	 *
+	 * Claimed synchronously in `writePending` BEFORE the batch is consumed, so
+	 * it also covers an attempt waiting behind another operation in the page
+	 * chain, and released in a `finally` so no outcome - success, failure or
+	 * throw - can leak a permanent block. A failed write re-queues into
+	 * `pending` inside `writeNow`, before its promise settles, so the two
+	 * states overlap and there is no idle instant between them. The retry is a
+	 * fresh `writePending` call with its own claim; nothing is double-counted.
+	 */
+	private outstandingWrites = new Map<string, number>();
+
+	/** Claim an attempt. Synchronous, and always paired with a release. */
+	private beginOutstandingWrite(pageId: string): void {
+		this.outstandingWrites.set(pageId, (this.outstandingWrites.get(pageId) ?? 0) + 1);
+	}
+
+	/** Release one attempt; the key goes when the last one does, so `size` counts pages. */
+	private endOutstandingWrite(pageId: string): void {
+		const left = (this.outstandingWrites.get(pageId) ?? 0) - 1;
+		if (left > 0) this.outstandingWrites.set(pageId, left);
+		else this.outstandingWrites.delete(pageId);
+	}
 
 	/**
 	 * Recovery's seat in the queue is behind EVERY page's writes, not just
@@ -267,6 +433,8 @@ export class PageStore {
 	private errorNotified = new Set<string>();
 	/** Pages whose change-check has already reported a read failure once. */
 	private changeCheckLogged = new Set<string>();
+	/** Typed result of each page's latest completed boolean change check. */
+	private externalChangeObservations = new Map<string, ExternalChangeObservation>();
 	/**
 	 * An external revision this session moved aside but has NOT yet replaced
 	 * with a successful write (RC4). The aside-rename necessarily happens
@@ -277,6 +445,18 @@ export class PageStore {
 	 * then.
 	 */
 	private pendingConflict = new Map<string, string>();
+	/**
+	 * The recovery pair most recently completed for a page, with the identity
+	 * of the exact revision pair it preserves. See `reuseAdoptionPair`: a
+	 * preparation that is refused comes back on the next poll with both
+	 * revisions unchanged, and it must reuse this rather than write a second
+	 * identical copy. Verified evidence, not a cache - it is re-proved against
+	 * disk before it is reused.
+	 */
+	private preservedAdoptions = new Map<
+		string,
+		{ key: string; outgoingPath: string; incomingPath: string }
+	>();
 	/**
 	 * Surface a persistent write failure to the user (set by the plugin).
 	 * `preservedAs` is set when an external revision was moved aside for a
@@ -297,6 +477,25 @@ export class PageStore {
 	 * bytes are kept at `keptAs`.
 	 */
 	onRecovered: ((pageId: string, keptAs: string) => void) | null = null;
+	/**
+	 * Surface an ink-TRASH RESTORE (set by the plugin): no live sidecar
+	 * existed, a readable generation was found in the trash, and it has been
+	 * renamed back into place at `restoredTo`.
+	 *
+	 * SEPARATE FROM `onRecovered` BECAUSE THE TWO EVENTS CANNOT SHARE A
+	 * SENTENCE. `onRecovered`'s is about a file that WAS unreadable and is now
+	 * quarantined under a new name; that is accurate for the corrupt-file
+	 * promotion and false here. This path was raising `onRecovered` and so
+	 * announced a restore as an interrupted save, and named the note's own
+	 * live sidecar - after the rename, the ONLY copy of its ink - as the
+	 * unreadable one.
+	 *
+	 * `restoredTo` IS NOT A KEPT COPY. It is where the ink now lives, which is
+	 * the same value the old call passed; only the claim made about it was
+	 * wrong. Alan's wording ("the file is at ...") is accurate for it as it
+	 * stands, so no path is chosen or invented here.
+	 */
+	onInkTrashRestored: ((pageId: string, restoredTo: string) => void) | null = null;
 
 	constructor(
 		private app: PageStoreHost,
@@ -651,7 +850,13 @@ export class PageStore {
 	 * needs, not a detail to paper over.
 	 */
 	get busy(): boolean {
-		return this.pending.size > 0 || this.timers.size > 0 || this.maxTimers.size > 0;
+		return (
+			this.pending.size > 0 ||
+			this.timers.size > 0 ||
+			this.maxTimers.size > 0 ||
+			// A write already on its way to the adapter is not durable either.
+			this.outstandingWrites.size > 0
+		);
 	}
 
 	/**
@@ -667,7 +872,14 @@ export class PageStore {
 	 * and nothing said.
 	 */
 	hasQueuedWrite(pageId: string): boolean {
-		return this.pending.has(pageId) || this.timers.has(pageId) || this.maxTimers.has(pageId);
+		return (
+			this.pending.has(pageId) ||
+			this.timers.has(pageId) ||
+			this.maxTimers.has(pageId) ||
+			// AND a write that has left the queue but not landed: the ink is
+			// still only in memory, so a reload here would discard it.
+			(this.outstandingWrites.get(pageId) ?? 0) > 0
+		);
 	}
 
 	/**
@@ -681,30 +893,37 @@ export class PageStore {
 	 *
 	 * See hasQueuedWrite above for why a caller must re-ask synchronously.
 	 */
-	async externallyChanged(pageId: string): Promise<boolean> {
-		if (this.hasQueuedWrite(pageId)) return false;
+	private async observeExternalChange(pageId: string): Promise<ExternalChangeObservation> {
+		if (this.hasQueuedWrite(pageId)) return "unchanged";
 		const known = this.knownMtime.get(pageId);
-		if (known === undefined) return false;
+		if (known === undefined) return "unchanged";
 		const adapter = this.app.vault.adapter;
-		let changed: boolean;
+		let observation: ExternalChangeObservation;
 		try {
 			// The file this session would READ, not the one it would write.
 			// Watching only the configured folder meant a page being served
 			// from the other one never appeared to change, so live reload
 			// silently stopped for exactly the vaults the fallback exists for.
-			const watched = await this.resolvePath(pageId);
-			const st = await adapter.stat(watched).catch(() => null);
-			if (!st || st.mtime === known) {
-				changed = false;
+			const watched = await this.resolveFor(pageId);
+			if (!watched.found) {
+				// `resolveFor` checked every eligible path with `exists`. This is
+				// positive absence, unlike a failed stat/read, and lets the inline
+				// caller start its hold notice without changing the shared boolean.
+				observation = "missing-live-sidecar";
 			} else {
-				const stamp = contentStamp(await adapter.read(watched));
-				if (stamp === this.knownHash.get(pageId)) {
-					// mtime churn without content change (a sync tool touching
-					// the file): remember it so the next poll stays one stat.
-					this.knownMtime.set(pageId, st.mtime);
-					changed = false;
+				const st = await adapter.stat(watched.path).catch(() => null);
+				if (!st || st.mtime === known) {
+					observation = "unchanged";
 				} else {
-					changed = true;
+					const stamp = contentStamp(await adapter.read(watched.path));
+					if (stamp === this.knownHash.get(pageId)) {
+						// mtime churn without content change (a sync tool touching
+						// the file): remember it so the next poll stays one stat.
+						this.knownMtime.set(pageId, st.mtime);
+						observation = "unchanged";
+					} else {
+						observation = "changed";
+					}
 				}
 			}
 		} catch (err) {
@@ -720,7 +939,7 @@ export class PageStore {
 					err
 				);
 			}
-			return false;
+			return "unchanged";
 		}
 		// Cleared on ANY completed check, not just one that found a change.
 		// Clearing only on `true` left a page that failed, recovered, and then
@@ -728,7 +947,18 @@ export class PageStore {
 		// new failure later would say nothing, which is the exact silence this
 		// latch exists to break.
 		this.changeCheckLogged.delete(pageId);
-		return changed;
+		return observation;
+	}
+
+	async externallyChanged(pageId: string): Promise<boolean> {
+		const observation = await this.observeExternalChange(pageId);
+		this.externalChangeObservations.set(pageId, observation);
+		return observation === "changed";
+	}
+
+	/** Typed detail from the latest `externallyChanged` call for this page. */
+	externalChangeObservation(pageId: string): ExternalChangeObservation {
+		return this.externalChangeObservations.get(pageId) ?? "unchanged";
 	}
 
 	async load(pageId: string): Promise<ParseResult | null> {
@@ -935,7 +1165,7 @@ export class PageStore {
 				// The ink is still in the trash and still readable; returning
 				// it un-restored is better than failing the load.
 				console.error("[handwriting] could not restore recycled ink", pageId, err);
-				return { ...parsed, recovered: true, problem: "recovered from the ink trash" };
+				return { ...parsed, recovered: true, fromInkTrash: true, problem: "recovered from the ink trash" };
 			}
 			const st = await adapter.stat(final).catch(() => null);
 			// Restored into the folder its own trash belongs to, and that is
@@ -945,8 +1175,13 @@ export class PageStore {
 			this.provisional.delete(pageId);
 			if (st) this.knownMtime.set(pageId, st.mtime);
 			this.knownHash.set(pageId, contentStamp(text));
-			this.onRecovered?.(pageId, final);
-			return { ...parsed, recovered: true, problem: "restored from the ink trash" };
+			// The RESTORE's own callback, not the corrupt-file promotion's.
+			// Raising `onRecovered` here announced a trash restore as an
+			// interrupted save and called `final` - the live sidecar the ink
+			// was just renamed back into, and the only copy of it - the
+			// unreadable file. Same value, correct claim.
+			this.onInkTrashRestored?.(pageId, final);
+			return { ...parsed, recovered: true, fromInkTrash: true, problem: "restored from the ink trash" };
 		}
 		return null;
 	}
@@ -1335,16 +1570,266 @@ export class PageStore {
 		return dest;
 	}
 
+	/**
+	 * PREPARE AN EXTERNAL ADOPTION WITHOUT ACKNOWLEDGING IT.
+	 *
+	 * The loss this closes: a sidecar replaced by another device is adopted by
+	 * rebuilding the record through `load`, and `load` stamps `knownMtime` and
+	 * `knownHash` with the incoming file. From that instant the outgoing
+	 * revision has no representation anywhere - it is out of the record and the
+	 * write-path guard no longer has a reason to preserve anything. Merging the
+	 * two is NOT the fix and is not attempted here: `mergePages` is a union,
+	 * and its own docstring says this layer cannot tell a stroke the other
+	 * device DELETED from one it never SAW. Across devices that are offline for
+	 * hours the second case is ordinary, so a blind union would resurrect real
+	 * deletions - a zombie bug traded for a loss bug.
+	 *
+	 * So both revisions are made independently recoverable FIRST, and the swap
+	 * happens only after that succeeded. Neither artifact depends on the live
+	 * file or on its pair to be read back.
+	 *
+	 * `preserve(pageId)` is deliberately not reused: it reads the file that is
+	 * there NOW - which after a replacement is the incoming one - and it may
+	 * first flush a queued write. It answers a different question.
+	 *
+	 * Nothing here touches the synced live sidecar, and nothing here updates
+	 * the known baseline. Both are `acceptExternalAdoption`'s job, and it is
+	 * synchronous so no await can separate the caller's re-qualification from
+	 * the acknowledgement.
+	 *
+	 * `expectedSurface` is caller authority, not a globally widened clause: an
+	 * inline caller must never adopt a PDF page merely because this shared
+	 * preservation mechanism also serves the PDF store.
+	 */
+	async prepareExternalAdoption(
+		pageId: string,
+		outgoing: PageData,
+		expectedSurface: "inline" | "pdf" = "inline"
+	): Promise<ExternalAdoptionPrep> {
+		const adapter = this.app.vault.adapter;
+		// On the page's own write chain: the artifacts must not interleave with
+		// a save, and the live file must not be rewritten under the capture.
+		return await this.chain(pageId, async (): Promise<ExternalAdoptionPrep> => {
+			const final = await this.resolvePath(pageId);
+			if (!(await adapter.exists(final))) {
+				return { kind: "unavailable", why: "no live sidecar", reason: "no-live-sidecar" };
+			}
+			// Stat BEFORE the read, for the reason `load` states: a stamp taken
+			// after the bytes can record an mtime that belongs to a revision
+			// this never saw.
+			const st = await adapter.stat(final).catch(() => null);
+			const incomingText = await adapter.read(final);
+			const incomingStamp = contentStamp(incomingText);
+			const parsed = parsePage(incomingText, pageId);
+			if (
+				parsed.damaged ||
+				parsed.futureVersion !== undefined ||
+				parsed.data.surface !== expectedSurface
+			) {
+				// Damage, a newer schema and a legacy canvas page each have an
+				// existing lock that fails closed, and those locks are better
+				// than anything this route could do. Hand it back untouched.
+				return {
+					kind: "unavailable",
+					why: "the incoming revision is not a clean inline page",
+					reason: "incoming-unusable",
+				};
+			}
+			// The artifact carries its own unrounded capture; see
+			// EXACT_OUTGOING_KEY. The dedup key is taken from these bytes, so a
+			// mutation too small for the persisted codec still changes the pair
+			// identity and correctly earns a fresh pair rather than reusing one
+			// that describes a revision the record no longer holds.
+			const outgoingText = serializeExactOutgoing(outgoing);
+			const key = `${contentStamp(outgoingText)}|${incomingStamp}`;
+			const pair =
+				(await this.reuseAdoptionPair(pageId, key, outgoingText, incomingText)) ??
+				(await this.writeAdoptionPair(pageId, final, key, outgoingText, incomingText, outgoing));
+			// REVALIDATE THE CAPTURED GENERATION after the awaited I/O. A third
+			// revision can have landed while the artifacts were being written.
+			// Everything already written STAYS - it is ink, and it is complete -
+			// but the captured generation is not adopted and not acknowledged,
+			// so the newer one is still there for the next poll to find.
+			const after = await adapter.read(final).catch(() => null);
+			if (after === null || contentStamp(after) !== incomingStamp) {
+				return { kind: "stale", why: "a newer external revision arrived during preservation" };
+			}
+			return {
+				kind: "prepared",
+				prepared: {
+					pageId,
+					data: parsed.data,
+					outgoingPath: pair.outgoingPath,
+					incomingPath: pair.incomingPath,
+					reused: pair.reused,
+					// A failed stat proves nothing, and 0 is the safe value: the
+					// next check finds a mismatch, compares the CONTENT stamp,
+					// and settles it. It can cost one extra read; it can never
+					// suppress a real change.
+					mtime: st?.mtime ?? 0,
+					stamp: incomingStamp,
+				},
+			};
+		});
+	}
+
+	/**
+	 * ACKNOWLEDGE a prepared adoption: this exact captured generation becomes
+	 * the baseline the next save is measured against.
+	 *
+	 * Synchronous, and that is the whole point. The caller re-qualifies its
+	 * record immediately before calling, and an await between that check and
+	 * this line is precisely the gap a finished stroke lands in - which is how
+	 * the in-flight-write loss worked.
+	 */
+	acceptExternalAdoption(prepared: PreparedExternalAdoption): void {
+		this.knownMtime.set(prepared.pageId, prepared.mtime);
+		this.knownHash.set(prepared.pageId, prepared.stamp);
+		// The live bytes were composed by ANOTHER device, so no in-process
+		// writer owns them now. A stale writer left here would let
+		// reconcileInProcess skip its read and put a stale page back on disk.
+		this.lastWriter.delete(prepared.pageId);
+	}
+
+	/**
+	 * The pair already written for this exact outgoing/incoming revision pair,
+	 * RE-PROVED against disk, or null.
+	 *
+	 * Repeat attempts are ordinary rather than exceptional: a preparation that
+	 * goes stale, or that the record rejects because a stroke landed, comes
+	 * back on the next poll with both revisions unchanged. Writing a fresh pair
+	 * each time would fill the folder with identical copies. Remembering alone
+	 * is not enough either - an artifact deleted or edited since is no longer
+	 * evidence, and this page then gets a fresh pair rather than a claim about
+	 * a file that is gone.
+	 */
+	private async reuseAdoptionPair(
+		pageId: string,
+		key: string,
+		outgoingText: string,
+		incomingText: string
+	): Promise<{ outgoingPath: string; incomingPath: string; reused: true } | null> {
+		const seen = this.preservedAdoptions.get(pageId);
+		if (!seen || seen.key !== key) return null;
+		const adapter = this.app.vault.adapter;
+		const o = await adapter.read(seen.outgoingPath).catch(() => null);
+		const i = await adapter.read(seen.incomingPath).catch(() => null);
+		if (o !== outgoingText || i !== incomingText) return null;
+		return { outgoingPath: seen.outgoingPath, incomingPath: seen.incomingPath, reused: true };
+	}
+
+	/**
+	 * Write and verify one fresh pair of recovery artifacts beside the live
+	 * file. `.conflict-` keeps both out of `isLiveSidecarName`, so nothing
+	 * treats either as the page.
+	 *
+	 * BOTH names are probed and neither is ever overwritten: a token collision
+	 * is not worth reasoning about, but a leftover artifact from an earlier
+	 * attempt is ordinary and it holds ink. The probe is NOT a cross-process
+	 * reservation and is not claimed to be - two processes can still probe the
+	 * same free name in the same instant. The random token, not the probe, is
+	 * what makes that vanishingly unlikely.
+	 */
+	private async writeAdoptionPair(
+		pageId: string,
+		final: string,
+		key: string,
+		outgoingText: string,
+		incomingText: string,
+		outgoing: PageData
+	): Promise<{ outgoingPath: string; incomingPath: string; reused: false }> {
+		const adapter = this.app.vault.adapter;
+		const base = stripJson(final);
+		let outgoingPath = "";
+		let incomingPath = "";
+		for (let attempt = 0; attempt < 8 && outgoingPath === ""; attempt++) {
+			const token = adoptionToken();
+			const o = `${base}.conflict-external-${token}-outgoing.json`;
+			const i = `${base}.conflict-external-${token}-incoming.json`;
+			if (await adapter.exists(o)) continue;
+			if (await adapter.exists(i)) continue;
+			outgoingPath = o;
+			incomingPath = i;
+		}
+		if (outgoingPath === "") {
+			throw new Error("Handwriting: could not allocate a free pair of recovery copies");
+		}
+		await ensureFolder(adapter, folderOf(final));
+		// Either order leaves, at every instant, a complete copy of at least
+		// one revision plus the untouched live file. A partial attempt's
+		// artifact is kept: this slice adds no cleanup policy, because the
+		// thing being cleaned up would be somebody's ink.
+		await this.writeVerified(pageId, outgoingPath, outgoingText, outgoing);
+		await this.writeVerified(pageId, incomingPath, incomingText);
+		this.preservedAdoptions.set(pageId, { key, outgoingPath, incomingPath });
+		return { outgoingPath, incomingPath, reused: false };
+	}
+
+	/**
+	 * ADAPTER-LEVEL DURABILITY, and exactly no more than that. The write is
+	 * awaited, the bytes are read back and compared exactly, and the result is
+	 * parsed on its own - so an artifact that exists is known to be complete
+	 * and independently recoverable.
+	 *
+	 * It does NOT certify fsync, power loss or real-device durability. No such
+	 * primitive is exposed here, and a stronger claim would be a lie told about
+	 * the one thing a user would rely on.
+	 */
+	private async writeVerified(
+		pageId: string,
+		path: string,
+		text: string,
+		exact?: PageData
+	): Promise<void> {
+		const adapter = this.app.vault.adapter;
+		await adapter.write(path, text);
+		const back = await adapter.read(path);
+		if (back !== text) {
+			throw new Error(`Handwriting: the recovery copy at ${path} did not read back identical`);
+		}
+		const parsed = parsePage(back, pageId);
+		if (parsed.damaged) {
+			throw new Error(`Handwriting: the recovery copy at ${path} does not parse on its own`);
+		}
+		// PARSED SEMANTIC EQUALITY TO THE IMMUTABLE CAPTURE, for the outgoing
+		// leg. Byte-identical readback proves the bytes landed; it says nothing
+		// about whether those bytes still describe what was captured, because
+		// the bytes were already rounded before the comparison began. Reopening
+		// the artifact and comparing the recovered capture is the check that
+		// actually asserts the guarantee this artifact exists to make.
+		if (exact !== undefined) {
+			const recovered = recoverExactPage(parsed.data);
+			if (JSON.stringify(recovered) !== JSON.stringify(exact)) {
+				throw new Error(
+					`Handwriting: the recovery copy at ${path} did not reopen with the ink that was captured`
+				);
+			}
+		}
+	}
+
 	private async writePending(pageId: string): Promise<void> {
 		const data = this.pending.get(pageId);
 		if (!data) return;
 		const writer = this.pendingWriter.get(pageId);
-		this.pending.delete(pageId);
-		this.pendingWriter.delete(pageId);
-		this.clearTimers(pageId); // the batch is consumed, both timers with it
-		// Serialize writes so two saves for the same page can't interleave
-		// their tmp/rename dance.
-		await this.chain(pageId, () => this.writeNow(pageId, data, writer));
+		// Claimed BEFORE the batch is consumed and before any await, so this
+		// page is never observably quiet while its ink is only in memory - not
+		// during the write, and not while this attempt waits its turn in the
+		// page chain. See outstandingWrites.
+		this.beginOutstandingWrite(pageId);
+		try {
+			this.pending.delete(pageId);
+			this.pendingWriter.delete(pageId);
+			this.clearTimers(pageId); // the batch is consumed, both timers with it
+			// Serialize writes so two saves for the same page can't interleave
+			// their tmp/rename dance.
+			await this.chain(pageId, () => this.writeNow(pageId, data, writer));
+		} finally {
+			// Every outcome, including a throw: a leaked claim would block this
+			// page's live reload for the rest of the session. A failed write
+			// has already put the batch back in `pending` by now, so the guard
+			// is continuous across the handover.
+			this.endOutstandingWrite(pageId);
+		}
 	}
 
 	/**

@@ -130,3 +130,81 @@ describe("TailRenderer.drawHead width", () => {
 		expect(h).toBeCloseTo(Math.abs(y2 - y1) + pad * 2, 10);
 	});
 });
+
+/**
+ * `clear()`'s no-box fallback, which is what lets the pen-up sites take the
+ * dirty-rect clear at all.
+ *
+ * Three paths on this class PAINT and then null the dirty box without leaving
+ * one behind - `drawLasso`, `drawSelectionBox` and `drawSpaceDivider`, and the
+ * first says so in its own comment. Against a nulled box the old
+ * `if (!this.dirty) return;` was a total NO-OP: measured in real Chromium over
+ * three tail states x two zooms x two device pixel ratios, it left 920, 1453,
+ * 3356 and 5091 painted pixels - in every case exactly what had been drawn,
+ * nothing erased at all - where `clearAll` erased the canvas in all twelve
+ * (`test/measure/TailClearBox.test.ts`, outside the gate).
+ *
+ * NOTE THE LIMIT OF THE CLAIM. That is a CONDITIONAL: if the box is null then
+ * `clear()` erases nothing. Nobody has shown an ink pen-up can reach that
+ * state - a pen-down dissolves the selection for a bare tip, and a lasso
+ * gesture ends on its own branch - and this fallback is not evidence that it
+ * can. It makes the question moot at no cost, which is why it is here instead
+ * of a reachability hunt.
+ *
+ * This file has no real canvas, so the pixel count lives in the measure suite
+ * above; what is pinned here is the CALL, executed - a nulled box plus a size
+ * issues a whole-canvas clearRect - so the gate notices if the fallback goes.
+ */
+describe("TailRenderer.clear falls back to the whole canvas when it has no box", () => {
+	const W = 320;
+	const H = 240;
+
+	/** Paint, then null the box the way the selection UI does. */
+	function paintAndNull(tail: TailRenderer): void {
+		tail.drawSelectionBox(cam, { x: 110, y: 210, width: 40, height: 25 }, "#1e6ec8");
+	}
+
+	it("clears the whole canvas when the box was nulled by the selection UI", () => {
+		const { canvas, clears } = fakeCanvas();
+		const tail = new TailRenderer(canvas);
+		paintAndNull(tail);
+		// The precondition IS the defect: with no size this is a no-op, which
+		// is exactly the state the measure suite counted pixels in.
+		tail.clear();
+		expect(clears, "a bare clear() erased something, so the fallback is untested").toEqual(
+			[]
+		);
+
+		tail.clear(W, H);
+		expect(clears, "the nulled box did not fall back to the whole canvas").toEqual([
+			[0, 0, W, H],
+		]);
+	});
+
+	it("still prefers the dirty rect when it has one, so the hot path is untouched", () => {
+		// The fallback must not turn every clear into a whole-canvas clear:
+		// the head is erased once per pointer event at 200-250 Hz.
+		const { canvas, clears } = fakeCanvas();
+		const tail = new TailRenderer(canvas);
+		tail.drawHead(cam, style, from, to, 0.9, 4);
+		tail.clear(W, H);
+		expect(clears).toHaveLength(1);
+		const [x, y, w, h] = clears[0]!;
+		expect([x, y, w, h], "a head with a real box took the whole-canvas path").not.toEqual([
+			0, 0, W, H,
+		]);
+		expect(w).toBeLessThan(W);
+		expect(h).toBeLessThan(H);
+	});
+
+	it("is a no-op with no box and no size, which is what the hot path calls", () => {
+		// The size is optional precisely so the per-event callers keep the
+		// early return they have. Changing that would put a whole-canvas
+		// clearRect on the 200-250 Hz path.
+		const { canvas, clears } = fakeCanvas();
+		const tail = new TailRenderer(canvas);
+		paintAndNull(tail);
+		tail.clear();
+		expect(clears).toEqual([]);
+	});
+});

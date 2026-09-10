@@ -42,7 +42,7 @@
 
 import { InkStroke } from "./Stroke";
 import { HIGHLIGHTER_ALPHA } from "./PenStyle";
-import { inkPdfContent, pdfNum } from "./InkPdf";
+import { inkPdfContent, PdfPageAssumption, pdfPageDestination, pdfNum } from "./InkPdf";
 import {
 	PdfPageInfo,
 	asRef,
@@ -144,8 +144,19 @@ interface Placed {
  * Strokes carry the page they belong to (`InkStroke.page`, 1-based, the
  * viewer's own numbering); strokes without one, or with no samples, are not
  * ink on this document and are dropped.
+ *
+ * `assumption` is the settings dropdown, and it DEFAULTS TO `"darken"` so that
+ * every existing caller and every geometry test keeps the shipped behaviour
+ * without naming it. See the destination comment at the content call below for
+ * what each answer costs. Alan ruled the default ("ink readable on white
+ * pages"), then the control ("pdf ink three way dropdown") after finding that
+ * neither position of a boolean helped black ink on a dark page.
  */
-export function appendInkToPdf(original: Uint8Array, strokes: readonly InkStroke[]): AppendResult {
+export function appendInkToPdf(
+	original: Uint8Array,
+	strokes: readonly InkStroke[],
+	assumption: PdfPageAssumption = "darken"
+): AppendResult {
 	const read = readPdf(original);
 	if (!read.ok) return read;
 	const doc = read.value;
@@ -291,7 +302,36 @@ export function appendInkToPdf(original: Uint8Array, strokes: readonly InkStroke
 			resources = placed.resources;
 		}
 		const { cm, flipHeight } = pageMatrix(page);
-		const inner = inkPdfContent(on, flipHeight, gsName);
+		// A DESTINATION THIS MODULE CANNOT SEE, so the user answers it. The
+		// page already exists and we read its dictionary, never its pixels.
+		//
+		// "darken" (the default): assume white and keep light ink readable
+		// there. Right for the overwhelmingly common page, and the complaint
+		// the export slice was built for.
+		//
+		// "lighten": assume a dark page. Without it, black ink on a dark PDF
+		// measured 1.06:1 and NOTHING in the product helped - the rule leaves
+		// it alone because it already passes against white, so the failure was
+		// an omission rather than an over-correction.
+		//
+		// "keep": write the stored colour, exactly as 1.4.12 did. This is the
+		// only correct answer for a MID-TONE page, because both guesses fail
+		// there and they fail symmetrically: adapting for white parks ink near
+		// luminance 0.29 and loses five sampled grey pages, adapting for dark
+		// parks it low and loses six.
+		//
+		// WHY A CHOICE RATHER THAN A CLEVERER RULE. No single colour serves a
+		// white and a black page at once: matching the stored ink on black
+		// needs luminance >= 0.9045, reaching 3.08:1 on white needs <= 0.2909.
+		// That is luminance-only, so it holds for every strategy, and
+		// InkPdfFlattenDestination.test.ts pins it. It does NOT forbid this
+		// dropdown - a declared destination is one page at a time, which is
+		// exactly the "at once" the proof rules out.
+		//
+		// `inkToPdf` is deliberately NOT given this control: it CREATES its
+		// page and paints no background, and a PDF page with none is white in
+		// every reader, so there the destination is a fact, not a guess.
+		const inner = inkPdfContent(on, flipHeight, gsName, pdfPageDestination(assumption));
 		const contentNum = add(streamObject(cm === null ? inner : `q ${cm} cm ${inner} Q`));
 
 		const body = objectBody(doc, page.num);

@@ -13,7 +13,8 @@
 	user-select: none;
 	-webkit-user-select: none;
 	outline: none;
-	background: var(--background-primary);
+	/* The writing canvas is paper, independent of dark app chrome. */
+	background: #ffffff;
 	cursor: crosshair;
 }
 
@@ -96,14 +97,14 @@
 	padding: 2px 4px;
 	border: 1px solid transparent;
 	border-radius: 4px;
-	color: var(--text-normal);
+	color: #1c1f26;
 	font-size: 16px;
 	line-height: 1.5;
 }
 
 .handwriting-box.is-editing {
-	border-color: var(--background-modifier-border);
-	background: var(--background-primary);
+	border-color: rgba(28, 31, 38, 0.2);
+	background: #ffffff;
 }
 
 .handwriting-box-content > :first-child {
@@ -593,7 +594,64 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	left: calc(env(safe-area-inset-left, 0px) + 8px);
 }
 
-/* THE TWO MIDDLES (1.4.12).
+/* THE MIDDLE ROW (1.4.13).
+
+   `top` AND `bottom` provide safe-area-aware bounds, a fit-content height
+   keeps the expanded strip from stretching between them, and auto block
+   margins put its centre on the pane's own centreline. The pill already has
+   a fixed height, so the same margins centre it without a second height.
+
+   NO TRANSFORM. Dragging and the actions-row dodge compose their offsets in
+   one inline transform (MobileTools.ts); CSS centring in that property would
+   disappear the first time either path painted. The Android notification-
+   shade override belongs only to the top row and deliberately does not name
+   any of these selectors. */
+.handwriting-mobile-tools.handwriting-corner-middle-right,
+.handwriting-pen-pill.handwriting-corner-middle-right {
+	top: calc(env(safe-area-inset-top, 0px) + 8px);
+	bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+	right: calc(env(safe-area-inset-right, 0px) + 8px);
+	margin-top: auto;
+	margin-bottom: auto;
+}
+
+.handwriting-mobile-tools.handwriting-corner-middle-left,
+.handwriting-pen-pill.handwriting-corner-middle-left {
+	top: calc(env(safe-area-inset-top, 0px) + 8px);
+	bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+	left: calc(env(safe-area-inset-left, 0px) + 8px);
+	margin-top: auto;
+	margin-bottom: auto;
+}
+
+.handwriting-mobile-tools.handwriting-corner-middle-center,
+.handwriting-pen-pill.handwriting-corner-middle-center {
+	top: calc(env(safe-area-inset-top, 0px) + 8px);
+	bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+	left: 0;
+	right: 0;
+	margin-top: auto;
+	margin-bottom: auto;
+	margin-left: auto;
+	margin-right: auto;
+}
+
+.handwriting-mobile-tools.handwriting-corner-middle-right,
+.handwriting-mobile-tools.handwriting-corner-middle-left {
+	height: fit-content;
+}
+
+.handwriting-mobile-tools.handwriting-corner-middle-center {
+	width: fit-content;
+	height: fit-content;
+}
+
+.handwriting-pen-pill.handwriting-corner-middle-center {
+	width: 34px;
+	height: 34px;
+}
+
+/* THE TOP/BOTTOM CENTRE COLUMN (1.4.12).
 
    CENTRED WITH AUTO MARGINS, NOT WITH A TRANSFORM, and the reason is not
    taste. `applyHeaderClearance` (MobileTools.ts) sets an INLINE transform on
@@ -668,10 +726,10 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
    32px buttons, 15px against mobile's 40px, and the android top clears the
    notification shade by the same concentric margin.
 
-   These rules re-declare `top`/`bottom` outright, so they have to carry the
-   safe-area inset themselves or the phone fix above is lost the moment the
-   strip collapses to the pill. Same unconditional env(): 0px wherever no
-   inset is reported. */
+   Every re-declared anchored axis carries its safe-area inset, or the phone
+   fix above is lost the moment the strip collapses to the pill. The middle
+   row stays vertically centred, so its two additions adjust only left/right.
+   Same unconditional env(): 0px wherever no inset is reported. */
 .handwriting-pen-pill.handwriting-corner-top-right {
 	top: calc(env(safe-area-inset-top, 0px) + 11px);
 	right: calc(env(safe-area-inset-right, 0px) + 11px);
@@ -686,6 +744,12 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 }
 .handwriting-pen-pill.handwriting-corner-bottom-left {
 	bottom: calc(env(safe-area-inset-bottom, 0px) + 11px);
+	left: calc(env(safe-area-inset-left, 0px) + 11px);
+}
+.handwriting-pen-pill.handwriting-corner-middle-right {
+	right: calc(env(safe-area-inset-right, 0px) + 11px);
+}
+.handwriting-pen-pill.handwriting-corner-middle-left {
 	left: calc(env(safe-area-inset-left, 0px) + 11px);
 }
 .is-mobile .handwriting-pen-pill.handwriting-corner-top-right {
@@ -704,7 +768,13 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	bottom: calc(env(safe-area-inset-bottom, 0px) + 15px);
 	left: calc(env(safe-area-inset-left, 0px) + 15px);
 }
-/* The middles need only the VERTICAL half of the concentric adjustment: the
+.is-mobile .handwriting-pen-pill.handwriting-corner-middle-right {
+	right: calc(env(safe-area-inset-right, 0px) + 15px);
+}
+.is-mobile .handwriting-pen-pill.handwriting-corner-middle-left {
+	left: calc(env(safe-area-inset-left, 0px) + 15px);
+}
+/* The top/bottom centre-column anchors need only the VERTICAL half of the
    pill is centred by the base rule above and stays centred whatever its size,
    so there is no horizontal offset to correct. The centring itself is
    deliberately not restated here - one home for it, and these rules override
@@ -718,7 +788,8 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	   inheriting it shrank the circle to the width of the chevron
 	   inside it: a 34px-tall ellipse under the 50% radius (alan,
 	   2026-09-05, on bottom middle: "the icon is all squished").
-	   Only the two middles could show it; the corners set no width. */
+	   Only the top/bottom centre-column anchors could show it; the side
+	   columns set no width. */
 	width: 34px;
 }
 .handwriting-pen-pill.handwriting-corner-bottom-center {
@@ -730,7 +801,8 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	   inheriting it shrank the circle to the width of the chevron
 	   inside it: a 34px-tall ellipse under the 50% radius (alan,
 	   2026-09-05, on bottom middle: "the icon is all squished").
-	   Only the two middles could show it; the corners set no width. */
+	   Only the top/bottom centre-column anchors could show it; the side
+	   columns set no width. */
 	width: 34px;
 }
 .is-mobile .handwriting-pen-pill.handwriting-corner-top-center {
@@ -903,6 +975,36 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 }
 
 /* Desktop trims the chrome; mobile keeps 40px touch targets. */
+/*
+ * AT REST, THE HOST WINS THIS SURFACE - ON PURPOSE. Every tool on the strip
+ * is a `button`, and Obsidian's own `button:not(.clickable-icon)` (0,1,1)
+ * sets `color`, `background-color` and `box-shadow` on every button a
+ * plugin builds. This rule is (0,1,0), so its `background: transparent`,
+ * `box-shadow: none` and `color: var(--text-muted)` LOSE to it, and the
+ * resting strip wears the theme's button face, in the theme's text colour,
+ * with the theme's input shadow. Found by the host stylesheet sweep of
+ * 2026-09-07 - the same sweep as the chip's height and the knob's hover
+ * colour - and shown to the owner, who ruled to KEEP it: "i think the
+ * obsidian rule should work, people will like that they can customize the
+ * toolbar slightly." A theme that restyles buttons restyles this strip,
+ * and that is wanted. The next sweep must not read this row as a defect.
+ *
+ * Only the RESTING state is the host's. `.is-active` (0,2,0), the `:hover`
+ * rule (0,3,0) and the `:active` / `.is-pressed` pair (0,3,0), above and
+ * below, are all more specific than (0,1,1) and paint their own surfaces
+ * with the host's sheet in the cascade or without it.
+ *
+ * The three losing declarations are KEPT, not deleted. They are what paints
+ * a `.handwriting-mobile-tool` that is not a button - the settings preview's
+ * fixed row is `createDiv` (FoldOrderControl.ts), which `button:not()` never
+ * matches - and they are the plugin's own answer wherever no host rule
+ * reaches, which includes every render test that does not load the host's
+ * sheet. Do not "fix" this by raising the specificity or adding
+ * `!important`: that would take the resting surface away from the theme,
+ * against the ruling above. test/render/StripRestSurface.test.ts pins both
+ * halves: the host's surface at rest with its sheet in the cascade, the
+ * plugin's without, and the other three states the plugin's either way.
+ */
 .handwriting-mobile-tool {
 	width: 32px;
 	height: 32px;
@@ -960,6 +1062,39 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	min-width: 18px;
 	min-height: 18px;
 	opacity: 1;
+}
+
+/*
+ * THE PEN, AND ONLY THE PEN, IS THICKER THAN THE HOST DRAWS IT.
+ *
+ * Obsidian draws every lucide glyph as a stroke and its medium default is
+ * --icon-m-stroke-width: 1.75px, which is what an 18px strip glyph gets.
+ * The owner could not read the pen at that weight ("idk it just hard to see
+ * the outline... maybe make the outline thicker"), and guessed the rest
+ * would need it too ("i guess the same problem would happen on light
+ * background, so maybe thicker everything"). We tried exactly that - 2px on
+ * every strip glyph - and HIS EYES DISPROVED HIS OWN GUESS: the pen came
+ * right and the compact glyphs went wrong, "pen gyph is finally thick enough
+ * but now eraser and lasso look ridiculous".
+ *
+ * So the strip inherits the host's weight for everything, as it did before,
+ * and the pen alone is corrected. That is not inconsistency, it is optical:
+ * lucide's pen is almost entirely LONG DIAGONALS, and a diagonal stroke is
+ * spread across more pixels at lower alpha than a horizontal or vertical one
+ * of the same width, so it reads lighter at an identical stroke-width. The
+ * eraser and the lasso are compact closed shapes and have no such loss, so
+ * the same correction applied to them simply made them heavy. Equal declared
+ * width is not equal apparent weight, in either direction.
+ *
+ * Obsidian does the same kind of correction itself, giving its smaller icons
+ * thicker strokes rather than one weight for every size. 2.25px is its own
+ * next step up, not a number invented here. setIcon stamps a lucide-<name>
+ * class on the svg - Obsidian's own stylesheet relies on that too - which is
+ * what makes one glyph targetable without a per-tool class in our markup.
+ */
+.handwriting-mobile-tool .lucide-pen,
+.handwriting-pen-pill .lucide-pen {
+	stroke-width: 2.25px;
 }
 
 .handwriting-mobile-tool.is-active {
@@ -1214,6 +1349,46 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	position: static;
 }
 
+/*
+ * THE KNOB UNDER THE MOUSE. Obsidian repaints every range thumb on hover
+ * and on press: `input[type='range']:not(:disabled)::-webkit-slider-thumb:hover`
+ * and its `:active` twin set `background: var(--slider-thumb-background-hover)`
+ * - white in both of the app's themes - plus a focus border colour and the
+ * host's own shadow. That pair is (0,3,2): one type, one attribute,
+ * `:not(:disabled)`, the state, and the pseudo-element. The rule above is
+ * (0,2,1), so under the mouse the host's white won and the accent disc
+ * flashed white on every desktop. Found by the host stylesheet sweep of
+ * 2026-09-07; the owner, unprompted: "leave the slider knob alone no white
+ * button when clicked that's a little flashy."
+ *
+ * Beaten by SPECIFICITY, not by source order and not by `!important`. The
+ * selector carries the host's own `:not(:disabled)`, so it applies in
+ * exactly the states the host's rule does and no others, and that lifts it
+ * to (0,4,1): two classes, `:not(:disabled)`, the state, one pseudo-element.
+ * Four in the middle column beats the host's three whichever order the two
+ * sheets load in. `:hover` alone would be (0,3,1) and lose; qualifying as
+ * `input.handwriting-eraser-slider` would be (0,3,2) and TIE, which source
+ * order would then settle - and a plugin does not control where its sheet
+ * lands against the app's.
+ *
+ * The values are the resting ones restated. Nothing here reads, copies or
+ * counter-computes `--slider-thumb-background-hover`, so the host changing
+ * that token changes nothing here. Colour only: the host's `:active`
+ * growth and opacity (`--slider-thumb-width-active` and friends, which only
+ * macOS sets away from the base size) are deliberately left to the host -
+ * "mac-only yeah fuckit sure apple users expect flashy ui" (the owner,
+ * 2026-09-07) - and `position: static` above already makes its `top` inert,
+ * so the thumb does not move. The firefox thumb needs no twin: the host's
+ * hover rule is webkit-only. Pinned by test/render/KnobHoverColour.test.ts,
+ * which was watched red at rgb(255, 255, 255) before this rule existed.
+ */
+.handwriting-slider-pop .handwriting-eraser-slider:not(:disabled)::-webkit-slider-thumb:hover,
+.handwriting-slider-pop .handwriting-eraser-slider:not(:disabled)::-webkit-slider-thumb:active {
+	background: var(--interactive-accent);
+	border-color: var(--background-secondary);
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
 .handwriting-slider-pop .handwriting-eraser-slider::-moz-range-thumb {
 	width: 18px;
 	height: 18px;
@@ -1228,12 +1403,44 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	display: flex;
 	gap: 4px;
 	padding: 2px 2px 0;
+	/* Breathing room before the slider. The pop is a flex column with a 6px
+	   gap, which was fine when these chips were 20px tall; at the 30px the
+	   owner asked for they crowd the track - "they are a little close to the
+	   slider button". Spent HERE rather than on the pop s gap so the readout
+	   and the swatch rows below keep the spacing he already approved. */
+	margin-bottom: 4px;
 }
 
 .handwriting-mode-chip {
 	font-size: 10px;
 	line-height: 1.4;
-	padding: 2px 8px;
+	/*
+	 * 30px TALL, FROM ITS OWN PADDING: a 14px line (10px on 1.4) inside 7px
+	 * above and below and a 1px border. The line and the padding were 2px,
+	 * a 20px chip, and the owner judged that too small the moment he saw it
+	 * ("i think the eraser pop chips should be bigger", 2026-09-07). 30 is
+	 * the height these chips had in the app before `height: auto` below took
+	 * them off the host's rule - the size he had been looking at and had not
+	 * objected to - so it is his number restored, not a new one. Padding
+	 * rather than `min-height` so the text is centred in the chip by the
+	 * chip's own box, with or without the host's flex centring on top.
+	 */
+	padding: 7px 8px;
+	/*
+	 * NOT SIZED BY THE HOST. Obsidian's own stylesheet gives every `button`
+	 * `height: var(--input-height)` - 30px on desktop, 44px on a phone -
+	 * and a rule that says nothing about `height` leaves it to the host:
+	 * a chip drawn here as a 10px face on a 1.4 line in 2px of padding
+	 * rendered 30 and 44 tall in the app with every render test reading
+	 * 20 (found by the host stylesheet sweep, 2026-09-07; the same shape
+	 * as the slider thumb's `position: static` below). `auto` hands the
+	 * height back to the padding and the line above, whatever the host's
+	 * number: no counter-offset, because one would be right only until
+	 * that number moved. That the desktop number now happens to equal the
+	 * host's is a coincidence the render suite proves is one, by measuring
+	 * the chip at two host values.
+	 */
+	height: auto;
 	border-radius: 8px;
 	border: 1px solid var(--background-modifier-border);
 	background: transparent;
@@ -1241,6 +1448,32 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	color: var(--text-muted);
 	cursor: pointer;
 }
+/*
+ * THE CHIP KEEPS A TOUCH TARGET ON A FINGER, and this rule is the other half
+ * of the `height: auto` above it.
+ *
+ * Until 1.4.13 these chips declared NO height, so Obsidian's own button rule
+ * sized them - comfortably on a phone, and nowhere near the 20px every render
+ * test believed. `height: auto` fixes that by making the chip size to its own
+ * content: 10px text at 1.4 line-height, 7px padding, 1px border, so 30px.
+ *
+ * On a POINTER THAT IS A FINGER, 30px is a small button. Taking the host's
+ * sizing away without putting a deliberate one back would trade a geometry
+ * bug the tests could see for a tappability bug they cannot - the strip's
+ * phone behaviour is something this plugin's users value specifically, and
+ * it is not the render suite's to spend.
+ *
+ * So the desktop keeps its deliberate 30px and a finger gets a real target.
+ * 40px is the top of Obsidian's own input scale, chosen to match the host
+ * rather than to invent a number. NOT device-verified: nobody has yet tapped
+ * these on a phone with this build.
+ */
+@media (pointer: coarse) {
+	.handwriting-mode-chip {
+		min-height: 40px;
+	}
+}
+
 
 .handwriting-mode-chip.is-current {
 	color: var(--text-on-accent);
@@ -1329,7 +1562,17 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 .handwriting-preset-chip,
 .handwriting-preset-star {
 	/* The swatch's cell, so a chip and a swatch are the same target: 22px
-	   is what the pop's width was measured against. */
+	   is what the pop's width was measured against. NO SLACK: the row above
+	   says it outright - five of these cells and four 4px gaps come to the
+	   pop's 126px content box exactly - and a flex item's `flex-shrink` is 1
+	   by default, not 0, so anything that narrows that box takes it out of
+	   these cells' width while `height: 22px` holds. That is what an oval
+	   is. `.handwriting-pop-colors` learned this first, on a Boox Tab XC
+	   (batendalyn, 2026-09-02), and was fixed with a grid track nothing
+	   could squeeze; this row never got the matching fix, because a flex
+	   row's items need `flex-shrink: 0` for the identical reason a grid
+	   row needed a fixed track. */
+	flex-shrink: 0;
 	width: 22px;
 	height: 22px;
 	padding: 0;
@@ -1384,6 +1627,29 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 	border-radius: 50%;
 	box-shadow: none;
 	cursor: pointer;
+}
+/* THE HOST WINS THIS ONE UNLESS WE TIE IT, and until 2026-09-07 it did.
+   Obsidian ships `.is-tablet button:not(.clickable-icon) { padding:
+   var(--size-4-1) var(--size-4-5) }` (1.13.7 app.css) - 4px vertical, 20px
+   horizontal. That selector is (0,2,1); `padding: 0` on a single class is
+   (0,1,0), so on a tablet the host set the padding and 40px of it plus two
+   border pixels forced these 22px controls to 42px wide while `height: 22px`
+   held. 42 x 22, in BOTH rows - and the colour grid's fixed 22px tracks
+   cannot help, because a track cannot shrink a padding floor. That is the
+   shape the report described: "the ink color selection circles come out as
+   ovals" (jakolson, Boox Note5C, 2026-09-07), reproduced by Architect 2
+   against the installed app across 216 cases, 108 of them failing on tablet
+   classes alone with nothing narrowed.
+
+   These three selectors are (0,2,1) as well, so they TIE the host and win on
+   sheet order, which is the whole mechanism - a plugin sheet loads after the
+   app's. Nothing else moves: same 22px, same grid, same gap, same pop width.
+   The `flex-shrink: 0` above is a different failure and stays; it does not
+   touch this one, and this does not touch it. */
+.handwriting-slider-pop button.handwriting-color-swatch,
+.handwriting-slider-pop button.handwriting-preset-chip,
+.handwriting-slider-pop button.handwriting-preset-star {
+	padding: 0;
 }
 
 .handwriting-color-swatch.is-current {
@@ -1870,6 +2136,32 @@ body.handwriting-paper-dots .markdown-source-view .cm-scroller {
 .cm-scroller.handwriting-touch-guard * {
 	touch-action: none !important;
 }
+
+/*
+ * Third surface: Obsidian's core Slides presentation (SlidesInkSurface).
+ *
+ * IT HAS NO RULE HERE ANY MORE, AND THAT IS THE POINT. The deck used to carry
+ * `touch-action: none` plus a universal-selector rule forcing it on every
+ * descendant, armed on every presentation and conditional on nothing - so
+ * pinch, swipe and section scrolling were gone for every user, including one
+ * who has never owned a stylus. Alan, 2026-09-08: "oh hell nah that's not ok"
+ * and "it must work seamlessly".
+ *
+ * The surface decides AT CONTACT instead. `pointerdown` fires before the same
+ * contact's `touchstart` and carries `pointerType`, so a non-passive
+ * `touchstart` listener can preventDefault a pen and leave a finger entirely
+ * alone. The deck rests at `touch-action: auto`.
+ *
+ * The subtree rule existed because Blink ORs pan-x/pan-y back into any
+ * descendant that is its own scroll container, which every overflowing slide
+ * is. That is a `touch-action` problem and this route does not use
+ * `touch-action`: preventDefault cancels the touch sequence outright, measured
+ * 0px inside a nested overflow:auto scroller. The hole has nothing to act on,
+ * so the rule is deleted rather than weakened.
+ *
+ * The `.cm-scroller` and pdf rules above are untouched - those surfaces still
+ * take the touch-action route and still need their subtree halves.
+ */
 
 /*
  * Both surfaces, but not the same value. The rule above was written for the

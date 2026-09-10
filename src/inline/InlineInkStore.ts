@@ -1,5 +1,7 @@
 import { InkStroke } from "../ink/Stroke";
-import { PageData, ParseResult, emptyPage, newPageId } from "../model/PageData";
+import { PageData, ParseResult, emptyPage, newPageId, parsePage, serializePage } from "../model/PageData";
+import type { ExternalAdoptionPrep, PreparedExternalAdoption } from "../persistence/PageStore";
+import { forkFromAdoption, recordFork } from "../persistence/ForkResolution";
 import { translateStroke } from "../objects/Selection";
 import { runDetached } from "../util/Detached";
 import { notifyInkChanged } from "./InkEvents";
@@ -50,7 +52,240 @@ export interface InlineInkHost {
 	 * Optional: a host without it falls back to scheduleSidecar.
 	 */
 	scheduleSidecarNow?(pageId: string, page: PageData): Promise<void>;
+	/**
+	 * Make both revisions independently recoverable before an external
+	 * adoption, and acknowledge the captured one afterwards. See
+	 * `adoptExternal`, and PageStore for what each step does and does not
+	 * promise.
+	 *
+	 * OPTIONAL, as a pair: a host with neither keeps today's behaviour exactly,
+	 * which is what the headless suites and the poll harnesses rely on. A host
+	 * with only one of them is treated as having neither - half of this route
+	 * is the loss it exists to prevent.
+	 */
+	prepareExternalAdoption?(pageId: string, outgoing: PageData): Promise<ExternalAdoptionPrep>;
+	acceptExternalAdoption?(prepared: PreparedExternalAdoption): void;
 	notify(message: string): void;
+}
+
+/**
+ * What `adoptExternal` did.
+ *
+ *  - `adopted`     both revisions are recoverable and the incoming one is now
+ *                  the visible page. `changed` says whether the ink differs,
+ *                  so an identical revision does not repaint on every poll.
+ *  - `held`        nothing was adopted and nothing acknowledged: current ink,
+ *                  base, history and save safety are exactly as they were, and
+ *                  `reason` records why the external revision remains for a
+ *                  later poll or guarded local save.
+ *  - `unavailable` there is no existing record for this adoption operation.
+ *                  Initial loading remains ensureLoaded/loadRecord's job.
+ */
+export type ExternalAdoptionHeldReason =
+	| "missing-capability"
+	| "unsettled"
+	| "existing-lock"
+	| "no-snapshot"
+	| "preservation-unavailable"
+	| "stale"
+	| "io-failure";
+
+export type ExternalAdoptionResult =
+	| {
+			readonly outcome: "adopted";
+			readonly changed: boolean;
+			readonly reason?: never;
+			readonly outgoingPath: string;
+			readonly incomingPath: string;
+	  }
+	| {
+			readonly outcome: "held";
+			readonly changed: false;
+			readonly reason: ExternalAdoptionHeldReason;
+			readonly outgoingPath?: never;
+			readonly incomingPath?: never;
+	  }
+	| {
+			readonly outcome: "unavailable";
+			readonly changed: false;
+			readonly reason?: never;
+			readonly outgoingPath?: never;
+			readonly incomingPath?: never;
+	  };
+
+const ADOPTION_UNAVAILABLE: ExternalAdoptionResult = { outcome: "unavailable", changed: false };
+
+function adoptionHeld(reason: ExternalAdoptionHeldReason): ExternalAdoptionResult {
+	return { outcome: "held", changed: false, reason };
+}
+
+/**
+ * How long adoption may keep failing before the user hears about it.
+ *
+ * The poll retries every second, and the overwhelmingly common failure is a
+ * sync client holding the file mid-transfer - gone by the next tick. Speaking
+ * then is alarming for nothing: the note is untouched, both revisions are on
+ * disk, and the retry is automatic. So the notice waits long enough for a
+ * transfer to finish and only speaks if the condition is still there, which is
+ * the case that genuinely means "this note has stopped receiving your other
+ * device's ink".
+ *
+ * EIGHT seconds (ruling, alan, 1.4.13). It was thirty, then ten, and he cut it
+ * twice. The person who sees this is, by construction, someone whose other
+ * device's ink is NOT arriving - when it arrives it simply appears and nobody
+ * needed telling. So the window is not protecting them from noise; it is
+ * protecting them from a message about something already fixed. His words for
+ * the moment it should land: "just at the point where theyre like uhhhhhh
+ * itnot working??" - which is seconds, not half a minute. Eight sits past a
+ * sync client's mid-write blip and inside the span where the message still
+ * connects to what they just did. One constant, retunable in one place.
+ */
+export const ADOPTION_QUIET_MS = 8_000;
+
+/**
+ * ALAN'S WORDING, VERBATIM (1.4.13), including the lower case and the trailing
+ * ellipsis, which is doing work: it says the thing is ongoing, which is what
+ * stops someone restarting Obsidian or hunting through settings. It retries
+ * every second, so "still trying" is true and not a hedge.
+ *
+ * It appears on the RECEIVING device - the one where the ink is not showing up,
+ * not the one that drew - so "from your other device" is right from the
+ * reader's side. And it deliberately promises no action: the recovery copies
+ * live in a folder Obsidian will not show them, so there is nothing for them
+ * to go and do.
+ *
+ * "your ink is safe" rather than "nothing is lost": the smaller claim is the
+ * one they can check on their own screen, and someone whose sync is genuinely
+ * broken will not believe the larger one.
+ *
+ * The blank line is a block break. `InlineInkHost.notify` takes a string, and
+ * a newline in a Notice does NOT become a line break without a white-space
+ * rule we do not own - so the host splits blank-line-separated blocks into
+ * divs. See `blockNotice` in main.ts.
+ */
+export const ADOPTION_STILL_FAILING =
+	"ink not appearing on this device?\n\nyour ink is safe. still trying to load from your other device...";
+
+/**
+ * An immutable copy of a page, for preservation across an await.
+ *
+ * The record's strokes are LIVE objects - `moveStrokes` translates them in
+ * place - so handing the record's own arrays to an awaited write would preserve
+ * whatever the ink BECAME while that write ran, filed under the name of the
+ * revision it started as. A deep copy is not a codec step: this is the same
+ * plain JSON payload that goes to disk, with no quantisation and no schema
+ * migration, so nothing is lost by making it.
+ */
+function freezePage(page: PageData): PageData {
+	const clone = (globalThis as { structuredClone?: <T>(value: T) => T }).structuredClone;
+	return clone ? clone(page) : (JSON.parse(JSON.stringify(page)) as PageData);
+}
+
+/** `freezePage`'s copy, for anything that is not a whole page. */
+function deepCopy<T>(value: T): T {
+	const clone = (globalThis as { structuredClone?: <X>(x: X) => X }).structuredClone;
+	return clone ? clone(value) : (JSON.parse(JSON.stringify(value)) as T);
+}
+
+/**
+ * Whether a note's ink may be deleted, and on what terms. Four states because
+ * they are four different actions; see `InlineInkStore.deleteAllReadiness`.
+ */
+export type InlineDeleteReadiness =
+	| { readonly kind: "ready" }
+	| { readonly kind: "damaged" }
+	| { readonly kind: "blocked"; readonly lock: "future" | "duplicate" | "legacy" }
+	/** Loading, claiming or reloading: what this record holds is not yet settled. */
+	| { readonly kind: "unsettled" }
+	| { readonly kind: "unknown" };
+
+/** One stroke a delete-all would destroy, with the page keys that ride beside it. */
+export interface InlineDeleteTarget {
+	readonly stroke: InkStroke;
+	readonly unknown: Record<string, unknown> | null;
+}
+
+/** An immutable, ordered record of exactly what a delete-all would destroy. */
+export interface InlineDeleteCapture {
+	readonly path: string;
+	readonly pageId: string;
+	readonly identity: symbol;
+	/**
+	 * The record's mutation counter when the capture was taken.
+	 *
+	 * THIS IS THE ABA GUARD, and no content comparison can stand in for it:
+	 * ink removed and re-added during the await compares IDENTICAL, because it
+	 * is identical. What changed is that the destructive operation the user
+	 * confirmed no longer describes the same act - the strokes on screen are a
+	 * different generation of the same drawing, and the history the wipe would
+	 * bury is not the history it was authorized against.
+	 */
+	readonly generation: number;
+	readonly targets: readonly InlineDeleteTarget[];
+}
+
+/**
+ * Stroke fields `parsePage` INVENTS when the file omits them, rather than
+ * reading them.
+ *
+ * Today that is `createdAt` alone: `PageData.ts:813` is
+ * `createdAt: num(s.createdAt) ?? Date.now()`, so two parses of identical
+ * bytes at different moments disagree about it. A field like that cannot be
+ * compared between memory and an artifact, because neither value came from the
+ * user's data.
+ *
+ * THIS LIST IS THE STALE-PRONE PART AND IT IS POLICED BY A TEST, not by care.
+ * `InlineDeleteAllRouting.test.ts` parses one sidecar under two clocks and
+ * requires the set of fields that differ to be exactly this set - so a second
+ * clock-defaulted field added to the parser fails that case and names itself,
+ * instead of quietly reopening the refuse-forever bug this closes. It cannot
+ * catch a default that is non-deterministic in some other way; nothing here
+ * pretends otherwise.
+ */
+export const PARSER_INVENTED_STROKE_FIELDS: Readonly<
+	Record<string, (raw: unknown) => boolean>
+> = {
+	// KEYED ON WHAT THE PARSER WOULD INVENT, NOT ON WHETHER THE KEY IS THERE.
+	// The first version of this asked `!(f in stroke)`, which is a different
+	// question and a narrower one: `PageData.ts` invents whenever `num()`
+	// cannot READ the value, so `createdAt: null`, `"1700000000000"` or NaN is
+	// stamped with `Date.now()` exactly like an absent one. Keying on absence
+	// left those refusing forever - the same refuse-forever bug this exists to
+	// close, one condition away.
+	createdAt: (raw) => typeof raw !== "number" || !Number.isFinite(raw),
+};
+
+/**
+ * Per stroke id, which fields the parser would have INVENTED for this artifact.
+ *
+ * `null` when there is no artifact JSON to ask - the caller then compares
+ * everything, which is the safe direction.
+ */
+function inventedFieldsIn(raw: unknown): Map<string, Set<string>> | null {
+	const strokes = (raw as { strokes?: unknown } | null | undefined)?.strokes;
+	if (!Array.isArray(strokes)) return null;
+	const out = new Map<string, Set<string>>();
+	for (const s of strokes) {
+		if (!s || typeof s !== "object") continue;
+		const rec = s as Record<string, unknown>;
+		const id = rec.id;
+		if (typeof id !== "string") continue;
+		const invented = new Set<string>();
+		for (const [field, wouldInvent] of Object.entries(PARSER_INVENTED_STROKE_FIELDS)) {
+			if (wouldInvent(rec[field])) invented.add(field);
+		}
+		out.set(id, invented);
+	}
+	return out;
+}
+
+/** One compared stroke with `drop`'s fields removed from it. */
+function withoutFields(entry: unknown, drop: Set<string> | undefined): unknown {
+	if (!drop || drop.size === 0) return entry;
+	const { stroke, unknown } = entry as { stroke: InkStroke; unknown: unknown };
+	const kept = { ...(stroke as unknown as Record<string, unknown>) };
+	for (const field of drop) delete kept[field];
+	return { stroke: kept, unknown };
 }
 
 const EMPTY: readonly InkStroke[] = [];
@@ -70,9 +305,16 @@ type LoadState = "no" | "loading" | "yes";
 export type InkPresence = "ink" | "none" | "unknown";
 
 interface NoteRecord {
+	/** Session identity follows this record, including before its durable claim. */
+	readonly historyIdentity: symbol;
 	strokes: InkStroke[];
+	/** IDs changed through session operations since the last clean reread began.
+	 * An absent changed ID is a local deletion, not missing cached ink. */
+	localStrokeIds: Set<string>;
 	pageId: string | null;
 	load: LoadState;
+	/** A joining viewer must await adoption before painting cached reload ink. */
+	reloading: boolean;
 	/** The loaded sidecar, kept as the save basis so unknown fields survive. */
 	basePage: PageData | null;
 	/** A canvas-world sidecar exists under this id: never write, never render it. */
@@ -100,13 +342,30 @@ interface NoteRecord {
 	/** The post-claim first write is armed once per claim, not once per stroke. */
 	claimFollowUpArmed: boolean;
 	noticed: boolean;
+	/**
+	 * COUNTS EVERY LOCAL OPERATION that can change what a save would write.
+	 * `adoptExternal` reads it before its first await and re-reads it before
+	 * adopting: a different value means ink moved while the preservation I/O
+	 * ran, and the prepared adoption is refused rather than allowed to replace
+	 * a page it never saw. Bumped by the primitives every mutation path goes
+	 * through - pen completion, add, remove, move - so history replay counts
+	 * too, since undo and redo reach disk through exactly those.
+	 */
+	mutationGeneration: number;
+	/** The external-adoption failure has been reported once for this record. */
+	adoptionNoticed: boolean;
+	/** When this run of adoption failures began, or null while it is succeeding. */
+	adoptionFailingSince: number | null;
 }
 
 function freshRecord(): NoteRecord {
 	return {
+		historyIdentity: Symbol("inline ink history"),
 		strokes: [],
+		localStrokeIds: new Set(),
 		pageId: null,
 		load: "no",
+		reloading: false,
 		basePage: null,
 		legacyLocked: false,
 		damagedLocked: false,
@@ -116,6 +375,9 @@ function freshRecord(): NoteRecord {
 		loadInFlight: null,
 		claimFollowUpArmed: false,
 		noticed: false,
+		mutationGeneration: 0,
+		adoptionNoticed: false,
+		adoptionFailingSince: null,
 	};
 }
 
@@ -124,14 +386,35 @@ export class InlineInkStore {
 	private host: InlineInkHost | null = null;
 	/** First writes after a claim, still in flight; settle() waits for them. */
 	private firstWrites = new Set<Promise<void>>();
+	/** Save continuations remain tracked until their snapshot has been scheduled. */
+	private pendingPersists = new Set<Promise<void>>();
 
 	/** No host = session-memory mode (headless tests). */
 	attachHost(host: InlineInkHost): void {
 		this.host = host;
 	}
 
+	/**
+	 * Is a host attached at all?
+	 *
+	 * READ-ONLY, and it exists for ONE caller: the delete-all preflight, which
+	 * must not read a `none` from `inkPresence` as evidence of an empty note
+	 * when there is no host to have looked. `inkPresence` itself answers `none`
+	 * without a host by design - session-memory mode genuinely has no sidecar -
+	 * and that behaviour is deliberately untouched here. The distinction the
+	 * preflight needs is "nothing to find" versus "nothing looked", and only
+	 * the caller knows which of those it may act on.
+	 */
+	hasHost(): boolean {
+		return this.host !== null;
+	}
+
 	strokes(path: string): readonly InkStroke[] {
-		return this.byPath.get(path)?.strokes ?? EMPTY;
+		const rec = this.byPath.get(path);
+		if (!rec) return EMPTY;
+		return rec.reloading
+			? rec.strokes.filter((stroke) => rec.localStrokeIds.has(stroke.id))
+			: rec.strokes;
 	}
 
 	hasInk(path: string): boolean {
@@ -240,18 +523,17 @@ export class InlineInkStore {
 	private loadRecord(
 		path: string,
 		rec: NoteRecord,
-		fallback?: Pick<NoteRecord, "strokes" | "basePage">
+		fallback?: Pick<NoteRecord, "basePage">
 	): Promise<boolean> {
 		const finish = (changed: boolean): boolean => {
 			if (fallback && rec.basePage === null) {
 				// A failed reread keeps the prior page and any ink added while
 				// waiting. The same completion releases viewers and pending saves.
-				if (rec.strokes.length === 0) rec.strokes = fallback.strokes;
-				else this.insert(rec, fallback.strokes, fallback.strokes.map((_, i) => i));
 				rec.basePage = fallback.basePage;
 				changed = rec.strokes.length > 0;
 			}
 			rec.load = "yes";
+			rec.reloading = false;
 			return changed;
 		};
 		rec.load = "loading";
@@ -297,16 +579,20 @@ export class InlineInkStore {
 		rec.damagedLocked = false; // adoptSidecar re-arms it if still damaged
 		const id = rec.pageId;
 		const changed = await this.trackLoad(rec, async () => {
+			const before = inkFingerprint(rec.strokes);
 			const c = await this.adoptSidecar(rec, id);
 			rec.load = "yes";
-			return c;
+			// A valid empty repair can remove cached ink. Joining viewers may
+			// already have painted that cache, so deletion must request paint
+			// through the same shared completion as restored non-empty ink.
+			return c || inkFingerprint(rec.strokes) !== before;
 		});
 		if (!rec.damagedLocked && !rec.legacyLocked && !rec.futureLocked) {
 			rec.noticed = false; // a future, different problem may speak again
 			this.host.notify(
 				"Handwriting: this note's ink file is readable again. The saved ink is restored and saving is back on."
 			);
-			if (rec.strokes.length > 0) this.schedule(rec);
+			if (rec.strokes.length > 0 || rec.localStrokeIds.size > 0) this.schedule(rec);
 		}
 		return changed;
 	}
@@ -354,9 +640,40 @@ export class InlineInkStore {
 			if (result.data.strokes.length === 0) return false;
 		}
 		rec.basePage = result.data;
-		if (result.data.strokes.length === 0) return false;
-		rec.strokes = [...result.data.strokes, ...rec.strokes];
-		return true;
+		// The remote page owns saved order and unchanged cached IDs. Only an
+		// actual session operation may override its copy of an ID; a missing
+		// locally changed ID is a deletion. Cached strokes absent remotely do
+		// not resurrect. New local ink follows the remote ink in session order.
+		const local = new Map(rec.strokes.map((stroke) => [stroke.id, stroke]));
+		const merged: InkStroke[] = [];
+		const seen = new Set<string>();
+		for (const saved of result.data.strokes) {
+			if (seen.has(saved.id)) continue;
+			seen.add(saved.id);
+			const stroke = rec.localStrokeIds.has(saved.id) ? local.get(saved.id) : saved;
+			if (stroke) merged.push(stroke);
+		}
+		for (const stroke of rec.strokes) {
+			if (!seen.has(stroke.id) && rec.localStrokeIds.has(stroke.id)) {
+				merged.push(stroke);
+				seen.add(stroke.id);
+			}
+		}
+		rec.strokes = merged;
+		return result.data.strokes.length > 0;
+	}
+
+	/** Capture only an in-memory identity; this never claims or loads a note. */
+	captureHistoryIdentity(path: string): symbol {
+		return this.record(path).historyIdentity;
+	}
+
+	/** A removed record cannot resolve, even if its path or durable id is reused. */
+	pathForHistoryIdentity(identity: symbol): string | null {
+		for (const [path, rec] of this.byPath) {
+			if (rec.historyIdentity === identity) return path;
+		}
+		return null;
 	}
 
 	/** The page id the session knows for this note (post-load/claim), if any. */
@@ -385,6 +702,217 @@ export class InlineInkStore {
 	}
 
 	/**
+	 * Whether this note's ink may be deleted, and on what terms.
+	 *
+	 * A DISCRIMINATOR, not a boolean, because the four states are four
+	 * different actions and a caller that rounds them together produces the
+	 * defect this exists to fix: a note whose save lock silently drops every
+	 * write, told that a copy was kept.
+	 *
+	 * - `ready`    the ordinary writable note.
+	 * - `damaged`  the EXISTING intentional session-only branch. The file on
+	 *              disk is the artifact being protected, the wipe writes
+	 *              nothing there, and only session strokes clear. Kept
+	 *              distinct rather than folded into `blocked`.
+	 * - `blocked`  a lock under which `snapshot()` refuses, so nothing this
+	 *              command does can reach disk.
+	 * - `unknown`  no record, no host, or no page id: nothing to say.
+	 *
+	 * FUTURE AND DUPLICATE TAKE PRECEDENCE OVER DAMAGED, deliberately: a note
+	 * can carry both, and the session-only branch is only correct when the
+	 * damage is the ONLY reason the write would not land.
+	 *
+	 * `legacy` is reported as blocked alongside them. Astra's 17:22 ruling
+	 * names future and duplicate explicitly and does not name legacy; it is
+	 * included here because `snapshot()` refuses for it identically, so the
+	 * write dies in exactly the same place - and because a legacy note's
+	 * saved ink never reaches memory at all (`adoptSidecar` returns before the
+	 * merge), which makes a "copy is kept" claim about it doubly untrue. Named
+	 * in the handback as an extension beyond the literal ruling rather than
+	 * folded in silently.
+	 */
+	deleteAllReadiness(path: string): InlineDeleteReadiness {
+		const rec = this.byPath.get(path);
+		if (!rec || !this.host) return { kind: "unknown" };
+
+		// KNOWN LOCKS ARE ANSWERED BEFORE MISSING IDENTITY, and the order is
+		// the point rather than a tidy-up. A future-locked or duplicate-locked
+		// record that has no page id yet is a REACHABLE state, and testing the
+		// id first reported it as `unknown` - collapsing a lock this store
+		// already knows about into "we know nothing", and losing the typed
+		// reason a refusal is supposed to be able to name.
+		if (rec.futureLocked) return { kind: "blocked", lock: "future" };
+		if (rec.duplicateLocked) return { kind: "blocked", lock: "duplicate" };
+		if (rec.legacyLocked) return { kind: "blocked", lock: "legacy" };
+
+		if (!rec.pageId) return { kind: "unknown" };
+
+		// SETTLED, OR NOTHING. A record still loading, claiming or reloading
+		// can qualify as ready and then change under the command's own awaits,
+		// and the two ends of this command do not even read the same list:
+		// `captureDeleteAll` certifies RAW `rec.strokes`, while the clear runs
+		// through `strokes(path)`, which filters to local ids while `reloading`.
+		//
+		// The dangerous shape is the EMPTY one. An unsettled record holds no
+		// strokes in memory yet its sidecar can be full of ink, so a capture
+		// taken there is empty - and an empty capture is exactly the case the
+		// command lets past its backup verification, on the reasoning that
+		// there was nothing to preserve. That reasoning is only true once the
+		// record is settled; before that it is "I have not looked", which is
+		// the fail-open shape: could-not-preserve read as nothing-to-preserve.
+		if (
+			rec.load !== "yes" ||
+			rec.loadInFlight !== null ||
+			rec.claimInFlight !== null ||
+			rec.reloading
+		) {
+			return { kind: "unsettled" };
+		}
+
+		if (rec.damagedLocked) return { kind: "damaged" };
+		return { kind: "ready" };
+	}
+
+	/**
+	 * An immutable, ordered record of exactly the ink a delete-all would
+	 * destroy, taken synchronously before any await.
+	 *
+	 * INCLUDES EACH TARGETED STROKE'S `unknownByObject` ENTRY. A stroke's
+	 * forward-compatible keys are content this command is about to destroy
+	 * just as much as its points are, and they are not carried on the stroke
+	 * object - they sit beside it on the page, keyed by id. Comparing only
+	 * `page.strokes` would certify a backup that had dropped them.
+	 *
+	 * Deep-copied through the same helper the adoption route uses, because the
+	 * record's stroke objects are LIVE - `moveStrokes` translates them in
+	 * place - so a shallow capture would silently follow the ink it is
+	 * supposed to be a fixed record of.
+	 */
+	captureDeleteAll(path: string): InlineDeleteCapture | null {
+		const rec = this.byPath.get(path);
+		if (!rec || !rec.pageId) return null;
+		const unknown = rec.basePage?.unknownByObject ?? {};
+		const targets: InlineDeleteTarget[] = rec.strokes.map((s) => ({
+			stroke: deepCopy(s),
+			unknown: unknown[s.id] ? deepCopy(unknown[s.id]!) : null,
+		}));
+		return {
+			path,
+			pageId: rec.pageId,
+			identity: rec.historyIdentity,
+			generation: rec.mutationGeneration,
+			targets,
+		};
+	}
+
+	/**
+	 * Does the note RIGHT NOW hold exactly the ink the capture recorded?
+	 *
+	 * EXACT AND UNROUNDED, on purpose. This is the post-await qualification,
+	 * and its job is to refuse when anything changed while the backup ran -
+	 * including a change too small for the persisted codec to represent. A
+	 * comparison at saved precision would call a sub-codec edit "unchanged"
+	 * and clear ink the backup does not describe.
+	 *
+	 * AND THE GENERATION IS CHECKED ALONGSIDE THE CONTENT, not instead of it.
+	 * The two catch opposite things and neither is redundant: the counter
+	 * catches remove-and-re-add of identical ink, which compares equal because
+	 * it IS equal; the content comparison catches a held stroke reference
+	 * mutated in place, which leaves the counter alone. A guard that kept only
+	 * one of them would pass exactly the case the other exists for.
+	 */
+	currentMatchesCapture(capture: InlineDeleteCapture): boolean {
+		const rec = this.byPath.get(capture.path);
+		if (!rec || rec.pageId !== capture.pageId) return false;
+		if (rec.historyIdentity !== capture.identity) return false;
+		if (rec.mutationGeneration !== capture.generation) return false;
+		const now = this.captureDeleteAll(capture.path);
+		if (!now) return false;
+		return JSON.stringify(now.targets) === JSON.stringify(capture.targets);
+	}
+
+	/**
+	 * Does `page`, read back from the artifact `preserve` actually returned,
+	 * contain the captured ink?
+	 *
+	 * AT PERSISTED PRECISION, and that asymmetry with the check above is the
+	 * point: the trash copy is an ordinary save, so the only honest question
+	 * is whether it holds what an ordinary save of the capture would have
+	 * held. Comparing the raw capture against saved bytes would refuse every
+	 * correct backup for rounding the codec is supposed to do.
+	 *
+	 * Payloads, not ids or counts: the capture is put through the real codec
+	 * and the results compared whole, including each stroke's unknown keys.
+	 *
+	 * `raw` IS THE ARTIFACT'S OWN JSON, and it is what stops this refusing
+	 * correct backups forever. `preserve` copies the sidecar's BYTES, while the
+	 * capture is memory - and memory came from a parser that invents values for
+	 * fields the file omits (`PageData.ts:813` stamps a missing `createdAt`
+	 * with `Date.now()`). Memory therefore holds the value stamped when the
+	 * note opened, the readback holds the value stamped at delete time, and no
+	 * amount of round-tripping brings those together: the difference is WHEN
+	 * each was invented, not how many times it was encoded. Measured, not
+	 * assumed - putting both sides through one more codec pass leaves the case
+	 * failing exactly as it did.
+	 *
+	 * So an INVENTED field the artifact does not carry is not compared. It
+	 * cannot have been lost by a byte copy of a file that never held it, and a
+	 * restore will re-invent it exactly as the open did. Everything else is
+	 * compared in full, and a field the artifact DOES carry is compared even
+	 * when it is one of these.
+	 *
+	 * ONLY `PARSER_INVENTED_STROKE_FIELDS` IS SKIPPED, deliberately, rather
+	 * than every key the file happens to lack. The file and memory do not share
+	 * a vocabulary - a v1 sidecar stores `pts` where this build writes `ptsd`,
+	 * and neither is the in-memory `points` - so "skip what the artifact does
+	 * not name" would drop a stroke's whole geometry on an older file and call
+	 * an empty copy a match.
+	 *
+	 * Omitting `raw` compares everything, which is the correct answer for a
+	 * caller that has no artifact text to speak for.
+	 */
+	backupMatchesCapture(capture: InlineDeleteCapture, page: PageData, raw?: unknown): boolean {
+		if (page.surface !== "inline") return false;
+		if (page.pageId !== capture.pageId) return false;
+		const asSaved = this.throughCodec(capture);
+		if (asSaved === null) return false;
+		const absent = inventedFieldsIn(raw);
+		const got = page.strokes.map((s) => ({
+			stroke: s,
+			unknown: page.unknownByObject?.[s.id] ?? null,
+		}));
+		if (got.length !== asSaved.length) return false;
+		return got.every((entry, i) => {
+			const drop = absent?.get(entry.stroke.id);
+			return (
+				JSON.stringify(withoutFields(entry, drop)) ===
+				JSON.stringify(withoutFields(asSaved[i], drop))
+			);
+		});
+	}
+
+	/** The capture as the ordinary persisted codec would have written it. */
+	private throughCodec(capture: InlineDeleteCapture): unknown[] | null {
+		try {
+			const page = emptyPage(capture.pageId);
+			page.surface = "inline";
+			page.strokes = capture.targets.map((t) => t.stroke);
+			for (const t of capture.targets) {
+				if (t.unknown) page.unknownByObject[t.stroke.id] = t.unknown;
+			}
+			const round = parsePage(serializePage(page), capture.pageId);
+			if (round.damaged) return null;
+			return round.data.strokes.map((s) => ({
+				stroke: s,
+				unknown: round.data.unknownByObject?.[s.id] ?? null,
+			}));
+		} catch (err) {
+			console.error("[handwriting] could not round-trip the delete-all capture", err);
+			return null;
+		}
+	}
+
+	/**
 	 * Is this note a Handwriting page, meaning it carries spatial state? True when the
 	 * session has strokes or an id for it, or the note's frontmatter already
 	 * carries a `handwriting-page-id` (cheap metadata read, no file I/O). Drives
@@ -407,7 +935,13 @@ export class InlineInkStore {
 	commitGesture(path: string, strokes: readonly InkStroke[]): void {
 		if (strokes.length === 0) return;
 		const rec = this.record(path);
-		rec.strokes.push(...strokes);
+		for (const stroke of strokes) {
+			const at = rec.strokes.findIndex((saved) => saved.id === stroke.id);
+			if (at < 0) rec.strokes.push(stroke);
+			else rec.strokes[at] = stroke;
+			rec.localStrokeIds.add(stroke.id);
+		}
+		rec.mutationGeneration++;
 		this.persist(path, rec);
 		// Once per pen gesture: the most common mutation of all was the one
 		// path that never told the embed layers (ultrareview 2026-08-26).
@@ -448,15 +982,33 @@ export class InlineInkStore {
 		indices?: readonly number[]
 	): void {
 		const present = new Set(rec.strokes.map((s) => s.id));
+		const insertions: Array<{ stroke: InkStroke; at: number | undefined }> = [];
 		strokes.forEach((stroke, i) => {
 			if (present.has(stroke.id)) return;
-			const at = indices?.[i];
+			present.add(stroke.id);
+			insertions.push({ stroke, at: indices?.[i] });
+		});
+		// Captured indices share the pre-erase list, regardless of scrub order.
+		// Deduplicate first so sorting cannot replace the first original operand.
+		// Partial or malformed metadata keeps the existing traversal/fallback.
+		// A lone insertion cannot be out of order, and the live eraser hands
+		// over one stroke per sample: the hot path skips the scan and the sort.
+		if (insertions.length > 1 && indices?.length === strokes.length &&
+			strokes.every((_, i) => Number.isInteger(indices[i]) && indices[i]! >= 0)) {
+			insertions.sort((a, b) => a.at! - b.at!);
+		}
+		insertions.forEach(({ stroke, at }) => {
+			rec.localStrokeIds.add(stroke.id);
 			if (at !== undefined && at >= 0 && at <= rec.strokes.length) {
 				rec.strokes.splice(at, 0, stroke);
 			} else {
 				rec.strokes.push(stroke);
 			}
 		});
+		// Only a real insertion counts. The live eraser hands over strokes that
+		// are already present at input rate, and a generation that moved
+		// without the page changing would refuse adoptions for no reason.
+		if (insertions.length > 0) rec.mutationGeneration++;
 	}
 
 	/** Remove strokes by id. Returns what was removed, with original indices. */
@@ -498,8 +1050,10 @@ export class InlineInkStore {
 			const s = rec.strokes[i]!;
 			if (!wanted.has(s.id)) continue;
 			removed.push({ stroke: s, index: i });
+			rec.localStrokeIds.add(s.id);
 			rec.strokes.splice(i, 1);
 		}
+		if (removed.length > 0) rec.mutationGeneration++;
 		removed.reverse(); // ascending original indices
 		return removed;
 	}
@@ -509,9 +1063,18 @@ export class InlineInkStore {
 		if (dx === 0 && dy === 0) return;
 		const rec = this.record(path);
 		const wanted = new Set(ids);
+		let moved = 0;
 		for (const s of rec.strokes) {
-			if (wanted.has(s.id)) translateStroke(s, dx, dy);
+			if (wanted.has(s.id)) {
+				translateStroke(s, dx, dy);
+				rec.localStrokeIds.add(s.id);
+				moved++;
+			}
 		}
+		// This is the mutation that changes a stroke IN PLACE rather than
+		// changing the list, so it is the one a reference-holding snapshot
+		// would miss. See adoptExternal's second qualification.
+		if (moved > 0) rec.mutationGeneration++;
 	}
 
 	/**
@@ -550,9 +1113,23 @@ export class InlineInkStore {
 		// id until the next claim, disabled saving until the note was
 		// reopened - and if the file had gone rather than merely being
 		// unreadable, that session copy was the only ink left.
-		// PdfInkStore.reloadExternal has guarded this since it was written;
-		// this is the same guard, on the same evidence.
-		const kept = rec.strokes;
+		// PdfInkStore.reloadExternal has guarded this since it was written, on
+		// this same evidence - but NOT by the same mechanism, and the two have
+		// diverged. That store still takes the old route: it saves the strokes
+		// aside and empties the record (`const kept = rec.strokes;`,
+		// PdfInkStore.ts:285), then puts them back if the re-read fails. This
+		// one no longer clears at all, so there is no window to restore FROM
+		// and no failure path that can leave the record empty - strictly the
+		// stronger of the two. Do not read the pdf store's clear-and-restore as
+		// the pattern to copy here, and if you are hardening THAT store, this
+		// is the shape to move it toward rather than the other way round.
+		// (Comment corrected 2026-09-07: it claimed the two guards were the
+		// same. The evidence above is unchanged and is why either exists.)
+		// Keep visible strokes available to move/erase operations during I/O.
+		// The caller established a clean record, so only mutations from here
+		// onward can override the freshly read page.
+		rec.localStrokeIds.clear();
+		rec.reloading = true;
 		// The BASE PAGE is kept for the same reason and was not, which cost
 		// more than the strokes would have. It carries the text boxes, the
 		// images and every forward-compatible field this build does not know
@@ -560,12 +1137,205 @@ export class InlineInkStore {
 		// back with `basePage` still null falls to `emptyPage(pageId)` there
 		// and the next save writes `textBoxes: []` over the disk copy.
 		const keptBase = rec.basePage;
-		rec.strokes = [];
 		rec.basePage = null;
-		await this.loadRecord(path, rec, { strokes: kept, basePage: keptBase });
+		await this.loadRecord(path, rec, { basePage: keptBase });
 		// Joining viewers need the restored picture even when existing panes
 		// still show identical ink. Only actual changes notify the poller.
 		return inkFingerprint(this.strokes(path)) !== before;
+	}
+
+	/**
+	 * ADOPT AN EXTERNAL SIDECAR EDIT WITHOUT LOSING THE OUTGOING REVISION.
+	 *
+	 * `reloadExternal` above rebuilds the record from whatever is on disk. That
+	 * is correct when the incoming file is a superset, and it is silent data
+	 * loss when it is not: the outgoing revision leaves the record and the save
+	 * baseline moves to the incoming one, so nothing anywhere still holds what
+	 * this device had. Across devices that were offline for hours, "not a
+	 * superset" is the ordinary case.
+	 *
+	 * This route does not make the two revisions converge - it makes losing
+	 * either one impossible. Both are written as independently recoverable
+	 * siblings FIRST; only then does the record release the outgoing one. What
+	 * the user sees afterwards is still a single revision, and reconciling the
+	 * fork is a separate question that needs per-writer version vectors this
+	 * layer does not have.
+	 *
+	 * TWO PHASES, because the preservation is I/O and a pen does not wait. The
+	 * record is untouched while it runs; everything the adoption is allowed to
+	 * assume is captured before the first await and re-proved after it, in one
+	 * synchronous run with the adoption itself. Any mutation, any lock, any
+	 * newer external generation, any failure: the prepared result is dropped,
+	 * the artifacts already written are kept, and current ink, base, local
+	 * mutation markers and history are exactly as they were.
+	 */
+	async adoptExternal(path: string): Promise<ExternalAdoptionResult> {
+		const rec = this.byPath.get(path);
+		const host = this.host;
+		if (!rec) return ADOPTION_UNAVAILABLE;
+		if (!host) return adoptionHeld("missing-capability");
+		// Both halves or neither: half of this route is the loss it prevents.
+		const prepare = host.prepareExternalAdoption;
+		const accept = host.acceptExternalAdoption;
+		if (!prepare || !accept) return adoptionHeld("missing-capability");
+		// An established record must also be settled and writable before capture.
+		if (rec.load !== "yes" || rec.loadInFlight || rec.claimInFlight) {
+			return adoptionHeld("unsettled");
+		}
+		if (rec.damagedLocked || rec.legacyLocked || rec.futureLocked || rec.duplicateLocked) {
+			return adoptionHeld("existing-lock");
+		}
+		const id = rec.pageId;
+		const outgoing = this.snapshot(rec);
+		if (!id || !outgoing) return adoptionHeld("no-snapshot");
+		// CAPTURED BEFORE THE FIRST AWAIT. The frozen copy is what gets
+		// preserved, so the artifact is the revision this decision was made
+		// about and not whatever the ink became while the write ran.
+		const generation = rec.mutationGeneration;
+		const basePage = rec.basePage;
+		const frozen = freezePage(outgoing);
+		// THE CAPTURE, COMPARED AS CONTENT AND NOT AS PERSISTED BYTES. This was
+		// `serializePage(frozen)`, which put the qualification behind the same
+		// lossy codec the live file uses: a mutation below the codec's
+		// resolution - x by 0.0004, pressure by 0.0004, t by less than a
+		// millisecond - serialized to identical bytes, so the comparison
+		// answered "unchanged" and a stale preparation replaced the mutated
+		// record. There is no "too small to count" mutation here; the record
+		// being replaced is the mutated one either way.
+		//
+		// JSON of the same-shaped snapshot is a sound content comparison: both
+		// sides are built by `snapshot()` in one order, so equal strings mean
+		// equal content, and anything else refuses. It errs toward refusing,
+		// which is the safe direction - a refusal costs one poll tick.
+		const capturedJson = JSON.stringify(frozen);
+		const before = inkFingerprint(rec.strokes);
+		let prep: ExternalAdoptionPrep;
+		try {
+			prep = await prepare.call(host, id, frozen);
+		} catch (err) {
+			// Preservation could not be completed. Nothing was adopted and
+			// nothing acknowledged, so the note is exactly where it was, both
+			// versions are still on disk, and THE NEXT POLL TRIES AGAIN a
+			// second later.
+			//
+			// QUIET WHILE IT IS STILL TRYING, then speak once if it does not
+			// recover (ruling, alan, 1.4.13: "then dont do a toast", "we dont
+			// wanna terrify them for no reason", then "yes the middle option").
+			//
+			// A single failure is usually a sync client mid-transfer, and it
+			// is gone a second later. Telling the user then is alarming for
+			// nothing: their ink is on screen, both versions are on disk, and
+			// the retry is automatic. But a failure that PERSISTS is different
+			// - it means this note has quietly stopped receiving the other
+			// device's ink, which is exactly the silence that reads as sync
+			// being broken. So the notice waits for the difference between
+			// those two to show itself.
+			//
+			// The console line is unconditional, so a real fault is
+			// diagnosable from the first occurrence even while the UI is quiet.
+			console.error("[handwriting] could not preserve both versions of this note's ink", path, err);
+			this.noteAdoptionFailure(rec);
+			return adoptionHeld("io-failure");
+		}
+		if (prep.kind === "unavailable") {
+			// A missing live sidecar can be a sync replacement between unlink and
+			// rename. Hold it like every preservation refusal, but use the typed
+			// diagnostic to start the existing quiet-period/once-only notice. The
+			// prose `why` is deliberately not control flow.
+			if (prep.reason === "no-live-sidecar") this.noteAdoptionFailure(rec);
+			return adoptionHeld("preservation-unavailable");
+		}
+		// Stale is the benign race, not a fault: a newer revision landed while
+		// the copies were being written, every artifact is kept, and the newer
+		// one is still detectable. Saying nothing is the honest answer.
+		if (prep.kind === "stale") return adoptionHeld("stale");
+		// SYNCHRONOUS FROM HERE TO THE ADOPTION. Not one await may separate
+		// these checks from the assignment below.
+		if (
+			this.byPath.get(path) !== rec ||
+			rec.pageId !== id ||
+			rec.basePage !== basePage ||
+			rec.mutationGeneration !== generation ||
+			rec.load !== "yes" ||
+			rec.loadInFlight ||
+			rec.claimInFlight ||
+			rec.damagedLocked ||
+			rec.legacyLocked ||
+			rec.futureLocked ||
+			rec.duplicateLocked
+		) {
+			return adoptionHeld("unsettled");
+		}
+		// SECOND QUALIFICATION, because the counter alone trusts every mutation
+		// to announce itself. `moveStrokes` translates stroke objects the
+		// record still holds by reference, so a snapshot can change content
+		// without the list changing. Comparing the whole serialized page closes
+		// that by construction rather than by an inventory of callers.
+		const current = this.snapshot(rec);
+		if (!current || JSON.stringify(current) !== capturedJson) return adoptionHeld("unsettled");
+		accept.call(host, prep.prepared);
+		// The existing clean-adoption semantics: the incoming revision becomes
+		// the base and the visible ink. No union of missing ids - that is the
+		// deliberate non-solution, and the outgoing ids stay recoverable from
+		// the artifact instead.
+		rec.basePage = prep.prepared.data;
+		rec.strokes = prep.prepared.data.strokes.slice();
+		rec.localStrokeIds.clear();
+		rec.adoptionNoticed = false;
+		rec.adoptionFailingSince = null;
+		// NO NOTICE ON SUCCESS (ruling, alan, 1.4.13: "kill the second message
+		// definitely"). This is the ORDINARY path - it runs every time two
+		// devices touch the same note, which in a synced vault is routine - and
+		// it told the user so, naming two `.handwriting/` filenames they cannot
+		// browse to from Obsidian. Announcing that everything worked, with
+		// paths, on every sync, is noise that teaches people to dismiss our
+		// notices unread; and the next one they dismiss might be the one that
+		// mattered.
+		//
+		// The paths are still returned on the result for the caller and still
+		// logged, so nothing became undiagnosable - only unannounced.
+		const adopted: ExternalAdoptionResult = {
+			outcome: "adopted",
+			changed: inkFingerprint(rec.strokes) !== before,
+			outgoingPath: prep.prepared.outgoingPath,
+			incomingPath: prep.prepared.incomingPath,
+		};
+		// REGISTERED HERE RATHER THAN AT THE POLL, and not for tidiness: the
+		// poll's adoption block is sliced out of main.ts verbatim and executed
+		// by `LiveReloadTestHarness` with a fixed list of injected names, so a
+		// new identifier in that block is undefined in four suites at runtime.
+		// This is the other place that holds the page id, the note path and
+		// both artifact paths at once.
+		//
+		// Recording is a map write and no I/O: whether a fork is worth putting
+		// to the user is decided when the surface is opened, because adoption
+		// preserves a pair on every sync and most of those have nothing to
+		// decide. Nothing here is announced - the success-silence rule
+		// (`d50534a`) is settled and this does not touch it.
+		const fork = forkFromAdoption(id, path, adopted, Date.now());
+		if (fork) recordFork(fork);
+		return adopted;
+	}
+
+	/**
+	 * The external-adoption failure notice, once per record. The poll runs
+	 * every second and a failing disk keeps failing, so an unlatched notice
+	 * would bury the screen. Cleared by a successful adoption, so a later,
+	 * different failure can still speak.
+	 */
+	private noteAdoptionFailure(rec: NoteRecord): void {
+		if (rec.adoptionNoticed) return;
+		const now = Date.now();
+		// The clock starts on the FIRST failure of this run, not on the notice.
+		// Cleared by a successful adoption, so a transfer that settles resets
+		// the patience rather than spending it.
+		if (rec.adoptionFailingSince === null) {
+			rec.adoptionFailingSince = now;
+			return;
+		}
+		if (now - rec.adoptionFailingSince < ADOPTION_QUIET_MS) return;
+		rec.adoptionNoticed = true;
+		this.host?.notify(ADOPTION_STILL_FAILING);
 	}
 
 	/** Diagnostics: what the session cache holds (it never evicts). */
@@ -614,7 +1384,7 @@ export class InlineInkStore {
 			// the session's strokes and, written, replace the persisted ones.
 			// Persist again once the merge has happened; every mutation path
 			// (commit, erase, move, undo) comes through here.
-			runDetached(
+			this.trackPersist(
 				rec.loadInFlight.then(() => this.persist(path, rec)),
 				`persist inline ink after loading ${path}`
 			);
@@ -633,7 +1403,7 @@ export class InlineInkStore {
 			// lands: the quiet period was already spent waiting for the id.
 			if (!rec.claimFollowUpArmed) {
 				rec.claimFollowUpArmed = true;
-				runDetached(
+				this.trackPersist(
 					rec.claimInFlight.then(() => {
 						rec.claimFollowUpArmed = false;
 						this.scheduleFirst(rec);
@@ -644,6 +1414,12 @@ export class InlineInkStore {
 			return;
 		}
 		this.schedule(rec);
+	}
+
+	private trackPersist(work: Promise<void>, label: string): void {
+		const pending = work.finally(() => this.pendingPersists.delete(pending));
+		this.pendingPersists.add(pending);
+		runDetached(pending, label);
 	}
 
 	private async claim(path: string, rec: NoteRecord): Promise<void> {
@@ -727,7 +1503,7 @@ export class InlineInkStore {
 		const timer = window.setTimeout(() => expire(true), maxWaitMs);
 		try {
 			for (let pass = 0; pass < 4; pass++) {
-				const inFlight: Promise<unknown>[] = [...this.firstWrites];
+				const inFlight: Promise<unknown>[] = [...this.firstWrites, ...this.pendingPersists];
 				for (const rec of this.byPath.values()) {
 					if (rec.claimInFlight) inFlight.push(rec.claimInFlight);
 					if (rec.loadInFlight) inFlight.push(rec.loadInFlight);

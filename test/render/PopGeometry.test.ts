@@ -30,7 +30,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Browser } from "playwright";
-import { launch, openStrip } from "./harness";
+import { hostVars, launch, openStrip } from "./harness";
 import type { PopBox } from "./stripPage";
 
 let browser: Browser;
@@ -344,6 +344,226 @@ describe("the pop is opaque", () => {
 			expect(Number(box.opacity)).toBe(1);
 		} finally {
 			await close();
+		}
+	});
+});
+
+/**
+ * "On note5c the ink color selection circles come out as ovals, not sure
+ * why" - a real user, on a Boox Note5C nobody here has. Nobody has
+ * reproduced it, and this describe does not claim to: `.handwriting-pop-colors`
+ * had this exact defect and was fixed at 1.4.6 by giving its swatches a
+ * FIXED grid track (see that rule) rather than an `auto` one, precisely
+ * because an `auto` track's minimum is content-based and can be squeezed.
+ * One row up, `.handwriting-pop-presets` is a flex row whose cells are sized
+ * the same 22x22 but were never given the flex row's equivalent of that
+ * fix - `flex-shrink: 0` - so they carried the default `flex-shrink: 1` and
+ * were exactly as squeezable as the swatch grid was before 1.4.6.
+ *
+ * WHAT NARROWS THE POP on a real device is not established here and this
+ * suite cannot establish it: `.handwriting-slider-pop` declares its own
+ * width (144px), so nothing in a normal layout - no container this repo
+ * builds - narrows it, and `harness.ts` says plainly this facility answers
+ * nothing about a real device's font stack, scaling or pixel ratio. What
+ * CAN be established with a real engine is the one link in the chain that
+ * does not need the device: IF the pop's box ever ends up narrower than the
+ * row needs - for whatever reason - does a 22px chip stay 22px square, or
+ * does its width give while its `height: 22px` holds. That is what an oval
+ * is, and it is what this test forces and measures directly, with an
+ * override layered on top of the real stylesheet standing in for whatever
+ * narrows the box on the reported hardware.
+ */
+describe("the preset chips do not go oval when their row has no room", () => {
+	/**
+	 * Well under the row's 126px natural need (five 22px cells, four 4px
+	 * gaps) once the pop's own padding and border are subtracted - see
+	 * `.handwriting-slider-pop`, whose box-sizing is `border-box` and stays
+	 * that way under this override, since only `width` is named here.
+	 */
+	const SQUEEZED_POP_WIDTH = 90;
+
+	it("holds each chip's measured width equal to its measured height", async () => {
+		const h = await openStrip(browser, {});
+		try {
+			await h.page.addStyleTag({
+				content: `.handwriting-slider-pop { width: ${SQUEEZED_POP_WIDTH}px !important; }`,
+			});
+			const box = await h.pop({ tool: "pen", presets: 4 });
+
+			// THE SQUEEZE ACTUALLY HAPPENED, or everything below is vacuous: the
+			// row is a full five cells, and its own content box is well short of
+			// what those five cells and their gaps need.
+			const row = box.rows["handwriting-pop-presets"]!;
+			expect(row.count).toBe(5);
+			expect(row.width).toBeLessThan(126);
+
+			const chips = await h.page.evaluate(() =>
+				[
+					...document.querySelectorAll(".handwriting-preset-chip, .handwriting-preset-star"),
+				].map((el) => {
+					const r = el.getBoundingClientRect();
+					return { width: +r.width.toFixed(2), height: +r.height.toFixed(2) };
+				})
+			);
+			expect(chips.length).toBe(5);
+			for (const chip of chips) {
+				// Not a collapsed box: a 0x0 chip would pass "width equals height"
+				// and prove nothing.
+				expect(chip.height).toBeGreaterThan(15);
+				expect(
+					Math.abs(chip.width - chip.height),
+					`chip measured ${chip.width} x ${chip.height} - that is an oval`
+				).toBeLessThanOrEqual(0.5);
+			}
+		} finally {
+			await h.close();
+		}
+	});
+});
+
+/**
+ * THE HOST MAKES THESE CONTROLS OVAL, and the plugin loses the cascade.
+ *
+ * The report was "the ink color selection circles come out as ovals" on a
+ * Boox Note5C (jakolson, 2026-09-07). The squeeze pinned above is a real
+ * mechanism but not that one: it needs the pop narrowed, and the pop is a
+ * hardcoded 144px. This is the one Architect 2 reproduced against the
+ * INSTALLED app - 216 cases, real Chromium, real MobileTools - and it needs
+ * nothing narrowed at all.
+ *
+ * Obsidian 1.13.7 ships `.is-tablet button:not(.clickable-icon) { padding:
+ * var(--size-4-1) var(--size-4-5) }`. That selector is (0,2,1). The plugin
+ * said `padding: 0` on a single class, which is (0,1,0), so THE HOST WINS:
+ * 20px of padding on each side plus two border pixels force a declared 22px
+ * control to 42px wide while `height: 22px` holds it at 22. 42 x 22, in BOTH
+ * rows - and the colour grid's fixed 22px tracks cannot help, because a track
+ * cannot shrink a padding floor. That is why the report says COLOUR circles
+ * and why the earlier grid fix did not cover it.
+ *
+ * The fix ties the host's specificity and wins on sheet order. This test is
+ * what proves it, so it must fail on the code as it was: at 42 x 22, both
+ * with and without the `flex-shrink: 0` above.
+ */
+describe("the host's tablet button padding does not turn the pop's circles into ovals", () => {
+	/**
+	 * Obsidian's OWN rule, hand-reduced to the one declaration that moves the
+	 * box, in the style of `test/render/fixtures/`. Source: the CSS bundled in
+	 * the installed app (C:/Program Files/Obsidian/resources/obsidian.asar,
+	 * app.css sha256 f612f1e8f36486fa57f3b8bd45f0c848409d5b168002e757a13c6d286a7b4c41),
+	 * read 2026-09-07 from Obsidian 1.13.7. Layered UNDER the plugin sheet, in
+	 * the order Obsidian loads a plugin's stylesheet - which is the whole point:
+	 * a rule the plugin never overrode is invisible to every other test here.
+	 */
+	const HOST_TABLET_BUTTON_CSS = [
+		".is-tablet button:not(.clickable-icon) {",
+		"\tpadding: var(--size-4-1) var(--size-4-5);",
+		"}",
+	].join("\n");
+
+	/** The app's own values for the two tokens that rule reads. */
+	const HOST_TABLET_VARS = hostVars({ "--size-4-1": "4px", "--size-4-5": "20px" });
+
+	const SIDE = 22;
+	const TOL = 0.5;
+
+	type Rect = { w: number; h: number; left: number; right: number; top: number; bottom: number };
+
+	/** Build the pop with the host rule under us, optionally on a tablet. */
+	const measure = async (tablet: boolean) => {
+		const h = await openStrip(browser, { hostCss: [HOST_TABLET_BUTTON_CSS, HOST_TABLET_VARS] });
+		if (tablet) await h.page.evaluate(() => document.body.classList.add("is-tablet"));
+		const box = await h.pop({ tool: "pen", presets: 4 });
+		const seen = await h.page.evaluate(() => {
+			const rect = (el: Element) => {
+				const r = el.getBoundingClientRect();
+				return {
+					w: +r.width.toFixed(2),
+					h: +r.height.toFixed(2),
+					left: +r.left.toFixed(2),
+					right: +r.right.toFixed(2),
+					top: +r.top.toFixed(2),
+					bottom: +r.bottom.toFixed(2),
+				};
+			};
+			// The harness leaves one pop per tool in the DOM, and only one of
+			// them holds a preset row - so anchor on the row and take the pop
+			// that owns it, never "the first pop".
+			const row = document.querySelector(".handwriting-pop-presets")!;
+			const pop = row.closest(".handwriting-slider-pop")!;
+			return {
+				pop: rect(pop),
+				swatches: [...pop.querySelectorAll(".handwriting-color-swatch")].map(rect),
+				chips: [...pop.querySelectorAll(".handwriting-preset-chip, .handwriting-preset-star")].map(rect),
+			};
+		});
+		return { h, box, seen };
+	};
+
+	/** Square, and not collapsed to nothing - a 0x0 box is square too. */
+	const assertSquare = (what: string, rects: Rect[]) => {
+		for (const r of rects) {
+			expect(r.h, `${what} measured ${r.w} x ${r.h}`).toBeGreaterThan(15);
+			expect(
+				Math.abs(r.w - r.h),
+				`${what} measured ${r.w} x ${r.h} - that is an oval, not a circle`
+			).toBeLessThanOrEqual(TOL);
+			expect(Math.abs(r.w - SIDE), `${what} is ${r.w}px wide, not ${SIDE}px`).toBeLessThanOrEqual(TOL);
+		}
+	};
+
+	/** Neighbours in one row must not sit on top of each other. */
+	const assertNoOverlap = (what: string, rects: Rect[]) => {
+		const rows = new Map<number, Rect[]>();
+		for (const r of rects) {
+			const key = Math.round(r.top);
+			rows.set(key, [...(rows.get(key) ?? []), r]);
+		}
+		for (const [, row] of rows) {
+			const sorted = [...row].sort((a, b) => a.left - b.left);
+			for (let i = 1; i < sorted.length; i++) {
+				expect(
+					sorted[i]!.left,
+					`${what} overlap: one ends at ${sorted[i - 1]!.right}, the next starts at ${sorted[i]!.left}`
+				).toBeGreaterThanOrEqual(sorted[i - 1]!.right - TOL);
+			}
+		}
+	};
+
+	/** And nothing may hang outside the pop that owns it. */
+	const assertInside = (what: string, pop: Rect, rects: Rect[]) => {
+		for (const r of rects) {
+			expect(r.left, `${what} starts at ${r.left}, outside the pop at ${pop.left}`).toBeGreaterThanOrEqual(pop.left - TOL);
+			expect(r.right, `${what} ends at ${r.right}, outside the pop at ${pop.right}`).toBeLessThanOrEqual(pop.right + TOL);
+		}
+	};
+
+	it("keeps both rows square, unoverlapped and inside the pop with the tablet rule loaded", async () => {
+		const { h, box, seen } = await measure(true);
+		try {
+			// Anti-vacuity: the controls this is about actually exist.
+			expect(seen.chips.length).toBe(5);
+			expect(seen.swatches.length).toBeGreaterThanOrEqual(4);
+			expect(box.rows["handwriting-pop-presets"]!.count).toBe(5);
+
+			assertSquare("a colour swatch", seen.swatches);
+			assertSquare("a preset chip", seen.chips);
+			assertNoOverlap("colour swatches", seen.swatches);
+			assertNoOverlap("preset chips", seen.chips);
+			assertInside("a colour swatch", seen.pop, seen.swatches);
+			assertInside("a preset chip", seen.pop, seen.chips);
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("is square on the desktop cascade too, so the fix did not just move the problem", async () => {
+		const { h, seen } = await measure(false);
+		try {
+			expect(seen.chips.length).toBe(5);
+			assertSquare("a colour swatch", seen.swatches);
+			assertSquare("a preset chip", seen.chips);
+		} finally {
+			await h.close();
 		}
 	});
 });

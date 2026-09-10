@@ -27,6 +27,7 @@
 import { InkStroke } from "./Stroke";
 import { HIGHLIGHTER_ALPHA } from "./PenStyle";
 import { normalizeInkColor } from "./InkColor";
+import { exportInkColor } from "./InkTheme";
 import { Disc, Pt, strokeOutline } from "./StrokeOutline";
 
 /** CSS pixels to PDF points: 96 dpi to 72 dpi. */
@@ -53,9 +54,21 @@ export function pdfNum(v: number): string {
 	return s === "-0" ? "0" : s;
 }
 
-/** A colour as PDF's `r g b` in 0..1, from a validated hex. */
-export function pdfColor(tool: InkStroke["tool"], hex: unknown): string {
-	const safe = normalizeInkColor(tool, hex);
+/**
+ * A colour as PDF's `r g b` in 0..1, from a validated hex.
+ *
+ * `destination` is the colour of the page this ink is being written onto -
+ * `#ffffff` for both consumers, since a created page is white and a flattened
+ * one is a document page. Passing it is what makes near-white ink readable in
+ * the file instead of invisible on it. Omit it and the stored colour is used,
+ * which is what every existing caller and every geometry test wants.
+ */
+export function pdfColor(
+	tool: InkStroke["tool"],
+	hex: unknown,
+	destination?: string | null
+): string {
+	const safe = exportInkColor(normalizeInkColor(tool, hex), destination, tool);
 	const n = Number.parseInt(safe.slice(1), 16);
 	return `${pdfNum(((n >> 16) & 0xff) / 255)} ${pdfNum(((n >> 8) & 0xff) / 255)} ${pdfNum((n & 0xff) / 255)}`;
 }
@@ -131,13 +144,18 @@ export function strokePdfOps(stroke: InkStroke): string {
  * `f` is nonzero winding, which is what unions each outline with its discs -
  * see StrokeOutline for why that pairing is the shape.
  */
-function runs(strokes: readonly InkStroke[]): string {
+function runs(strokes: readonly InkStroke[], destination?: string | null): string {
 	let out = "";
 	let i = 0;
 	while (i < strokes.length) {
-		const color = pdfColor(strokes[i]!.tool, strokes[i]!.color);
+		// Grouped on the colour actually WRITTEN, so two stored colours that
+		// adapt to one value share a fill instead of emitting it twice.
+		const color = pdfColor(strokes[i]!.tool, strokes[i]!.color, destination);
 		let ops = "";
-		while (i < strokes.length && pdfColor(strokes[i]!.tool, strokes[i]!.color) === color) {
+		while (
+			i < strokes.length &&
+			pdfColor(strokes[i]!.tool, strokes[i]!.color, destination) === color
+		) {
 			ops += strokePdfOps(strokes[i]!);
 			i++;
 		}
@@ -156,15 +174,16 @@ function runs(strokes: readonly InkStroke[]): string {
 export function inkPdfContent(
 	strokes: readonly InkStroke[],
 	heightPx: number,
-	gsName = "GSa"
+	gsName = "GSa",
+	destination?: string | null
 ): string {
 	const hi = strokes.filter((s) => s.tool === "highlighter");
 	const pen = strokes.filter((s) => s.tool !== "highlighter");
 	// Flip once: PDF counts y upward from the bottom, ink counts it downward
 	// from the top. Everything after this is written in note coordinates.
 	let out = `q 1 0 0 -1 0 ${pdfNum(heightPx)} cm `;
-	if (hi.length > 0) out += `q /${gsName} gs ${runs(hi)}Q `;
-	out += runs(pen);
+	if (hi.length > 0) out += `q /${gsName} gs ${runs(hi, destination)}Q `;
+	out += runs(pen, destination);
 	return out + "Q";
 }
 
@@ -220,10 +239,77 @@ export function pdfDocument(widthPx: number, heightPx: number, content: string):
 	return out;
 }
 
-/** A note's ink as a standalone one-page PDF, sized to the ink. */
-export function inkToPdf(strokes: readonly InkStroke[]): string {
+/**
+ * The colour a PDF page is when nothing paints one.
+ *
+ * This module writes no background - there is no `rg`+`re`+`f` covering the
+ * media box anywhere in it - and a PDF page with no painted background is
+ * white in every reader. So the destination is not a guess here the way it is
+ * for an SVG: it is what the file will look like.
+ */
+export const PDF_PAGE_WHITE = "#ffffff";
+
+/**
+ * The page colour assumed when the user says their PDF pages are DARK.
+ *
+ * `#2d2d2d` and deliberately NOT `#000000`, which is the worst available
+ * choice and was measured before this constant was picked. Contrast is
+ * compressed at the dark end - `(L + 0.05) / 0.05` - so ink lightened just
+ * enough to clear 3:1 against pure black lands at luminance 0.1 and then
+ * FAILS on a `#1a1a1a` page (2.53:1), which is what a dark-mode export
+ * actually looks like. Assuming black served 1 of 6 sampled dark pages;
+ * `#2d2d2d` serves 4, spanning every realistic dark page (#121212, #1a1a1a,
+ * #1e1e1e, #212121, #2d2d2d) and clearing 3:1 at BOTH ends of that range
+ * (4.67:1 on black, 3.06:1 on #2d2d2d itself).
+ *
+ * The principle, and it is the same one that makes white right on the other
+ * side: assume the LIGHTEST page in the range the user just declared dark,
+ * because that is the worst case for a lightening adjustment - exactly as
+ * white is the worst case for a darkening one.
+ */
+export const PDF_PAGE_DARK = "#2d2d2d";
+
+/**
+ * What the user says the pages they write on look like.
+ *
+ * The code cannot see them - `InkPdfAppend` reads a page dictionary, never
+ * pixels - and a boolean could only offer "guess white" or "guess nothing",
+ * neither of which is "the page is dark". Alan asked for the third state
+ * himself after finding black ink invisible on a dark page.
+ */
+export type PdfPageAssumption = "darken" | "lighten" | "keep";
+
+/**
+ * The destination to adapt against for an assumption, or `null` to adapt at
+ * all - `exportInkColor` returns its input unchanged for `null`.
+ *
+ * Anything unrecognised is `"darken"`, which is the shipped default: a value
+ * this does not know is a value from a newer version or a hand-edited config,
+ * and the safe answer is the one almost every page wants.
+ */
+export function pdfPageDestination(assumption: PdfPageAssumption): string | null {
+	if (assumption === "keep") return null;
+	return assumption === "lighten" ? PDF_PAGE_DARK : PDF_PAGE_WHITE;
+}
+
+/** Coerce stored or user input to an assumption; anything unknown is `darken`. */
+export function normalizePdfPageAssumption(raw: unknown): PdfPageAssumption {
+	return raw === "lighten" || raw === "keep" ? raw : "darken";
+}
+
+/**
+ * A note's ink as a standalone one-page PDF, sized to the ink.
+ *
+ * Destination defaults to the page's own white, which is the whole point of
+ * the slice: this is the command the Reddit complaint used, and near-white
+ * ink written on a dark theme arrived invisible on it.
+ */
+export function inkToPdf(
+	strokes: readonly InkStroke[],
+	destination: string | null = PDF_PAGE_WHITE
+): string {
 	const inked = strokes.filter((s) => s.points.length > 0);
 	if (inked.length === 0) return "";
 	const { w, h } = inkPageBox(inked);
-	return pdfDocument(w, h, inkPdfContent(inked, h));
+	return pdfDocument(w, h, inkPdfContent(inked, h, "GSa", destination));
 }

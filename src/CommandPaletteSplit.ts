@@ -33,11 +33,12 @@ export interface PaletteCommand {
 }
 
 /**
- * The fifteen that stay registered whatever the setting says: everything the
+ * The fourteen that stay registered whatever the setting says: everything the
  * pen toolbar cannot do, plus the two nibs and the two input toggles, which
  * are the way BACK when the strip is hidden.
  *
- * FIFTEEN, NOT SIXTEEN, SINCE `Pen on / off` ABSORBED THE OTHER PEN COMMAND.
+ * FOURTEEN: `Pen on / off` absorbed the other pen command, and the toolbar
+ * auto/show/hide command left with its retired settings row.
  * Alan, 2026-09-05: "there are two of these Handwriting: Pen and Handwriting:
  * toggle pen input on/off - i think that's stupid there should only be one" ->
  * "Pen on / off like Mouse on / off". `inline-tool-pen` kept its id, so a
@@ -54,7 +55,6 @@ export const ALWAYS_COMMANDS: readonly PaletteCommand[] = [
 	{ id: "inline-tool-pen", name: "Pen on / off" },
 	{ id: "inline-tool-highlighter", name: "Highlighter" },
 	{ id: "mouse-ink-toggle", name: "Mouse on / off" },
-	{ id: "pen-tools-cycle", name: "Toolbar: auto / show / hide" },
 	{ id: "paper-cycle", name: "Paper: none / lines / grid / dots" },
 	{ id: "export-ink-svg", name: "Export ink as SVG (drawing only)" },
 	{ id: "export-ink-pdf", name: "Export ink as PDF (drawing only)" },
@@ -74,8 +74,8 @@ export const ALWAYS_COMMANDS: readonly PaletteCommand[] = [
  * toolbar, which is why they can leave the palette without leaving the
  * plugin - see `runGatedCommand` for the half of that promise the strip needs.
  *
- * `pen-tools-cycle` is NOT here. It is the toolbar auto/show/hide command
- * the ruling keeps always-registered; only its id ends in "-cycle".
+ * `pen-tools-cycle` is NOT here or in `ALWAYS_COMMANDS`: its palette command
+ * was retired with the toolbar auto/show/hide settings row.
  */
 export const GATED_FIXED_COMMANDS: readonly PaletteCommand[] = [
 	{ id: "inline-tool-eraser", name: "Toggle eraser on / off" },

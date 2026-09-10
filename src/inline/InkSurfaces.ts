@@ -1,7 +1,7 @@
 /**
  * The ink surfaces, named once.
  *
- * There are FIVE places where a pointer becomes a stroke, and this project's
+ * There are SIX places where a pointer becomes a stroke, and this project's
  * most expensive recurring defect - seven times in the 1.4.x cycle - is a
  * ruling that reached one of them and not another. The seventh is the shape of
  * all of them: the router already knew the `pointerType`, already passed it to
@@ -15,6 +15,16 @@
  * ink path and it built strokes all along. It is the fifth. "Four" was not a
  * miscount so much as a scope the sentence never said out loud, which is how
  * every one of the seven divergences started.
+ *
+ * This header then said FIVE until 2026-09-05, and that was wrong from the
+ * moment the slides line landed. `src/slides/SlidesInkSurface.ts` ships in the
+ * plugin, but the presenter it draws on is `div.slides-container` appended to
+ * `<body>` - not a workspace leaf, no workspace event, so every grep that
+ * starts from a view misses it exactly the way the greps that start from the
+ * plugin bundle missed the demo. It is the sixth, and it was caught by the
+ * StrokeBuilder sweep below on the day the two lines were merged, which is the
+ * only reason this sentence is being corrected on the same day rather than in
+ * three releases' time.
  *
  * A document cannot hold this. The surfaces ground-truth section of
  * `1.4.9-design.md` carries the same table as prose, and prose that is not
@@ -67,14 +77,22 @@
  * by nothing that runs in the plugin.
  */
 
-export type InkSurfaceId = "note" | "pdf" | "canvas" | "penlab" | "demo";
+export type InkSurfaceId = "note" | "pdf" | "canvas" | "penlab" | "demo" | "slides";
 
 /**
  * Which pointer router a surface is built on. This is the fault line: `note`
  * and `pdf` share `InlinePenRouter`, which declares TEN callbacks and lets
  * each surface answer them independently, so it is the pair that diverges.
  * `canvas` and `penlab` share `PointerRouter` and own their whole surface;
- * `demo` is on neither and wires its own pointer handlers.
+ * `demo` and `slides` are on neither and wire their own pointer handlers.
+ * Those two are "none" for different reasons: the demo cannot reach a router
+ * because the site bundle does not carry one, and the slides surface will not
+ * reach for `InlinePenRouter` because doing so would drag its whole eighteen-
+ * import input stack into a bundle that today depends on nothing heavier than
+ * `src/ink`, `src/model` and the DOM-free `src/inline` leaves. Its own comment
+ * on `eraserIntent` is where that reasoning lives, and the price it pays for
+ * it - a handful of the routers' predicates restated - is priced in the
+ * `penContactIntent` row of `InkSurfaceRules.test.ts`, not waved through.
  *
  * This said "seven callbacks", then "EIGHT", and was wrong both times - the
  * count went stale the moment an optional member was added and nobody
@@ -111,7 +129,8 @@ export interface InkSurface {
 /**
  * Each `file` is where the stroke is built, and for the four router-bearing
  * surfaces it is also where the router is constructed and the callbacks are
- * wired. `demo` has no router, so for it the stroke is the whole of it.
+ * wired. `demo` and `slides` have no router, so for them the stroke and the
+ * pointer wiring are both the whole of it.
  *
  * The MEMBERSHIP of this array is not a matter of memory or of enumeration by
  * hand: `InkSurfaceRules.test.ts` holds it to the StrokeBuilder construction
@@ -183,6 +202,58 @@ export const INK_SURFACES: readonly InkSurface[] = [
 		userReachable: true,
 		mountsStrip: false,
 		honoursTipMode: false,
+	},
+	{
+		// The SIXTH, and the one the correction at the top of this file is
+		// about. It ships IN the plugin but outside the workspace: the
+		// presenter is `div.slides-container` appended to `<body>`, not a
+		// leaf, so no workspace event fires for it (its own header, S1).
+		//
+		// EVERY COLUMN BELOW WAS READ OUT OF THE FILE, and the evidence is on
+		// the line above it, because the surrounding entries' columns are
+		// claims a reader can check rather than facts the suite guarantees -
+		// only `file` and `mountsStrip` are executed.
+		//
+		// router "none": it constructs NEITHER router - `grep -c "new
+		// InlinePenRouter(" / "new PointerRouter("` is 0 for both, which is
+		// also what this registry's own router-family test asserts for a
+		// "none" surface. It wires six capture-phase pointer handlers on
+		// `.reveal` itself (pointerdown/move/up/cancel plus the two capture
+		// events) and RESTATES a few of the routers' predicates -
+		// `claimsContact`, `isEraserContact`, `eraserIntent` - rather than
+		// importing them. The reason is written down at `eraserIntent`: it
+		// declines the eighteen-import cost of `InlinePenRouter.ts`. That
+		// choice is a cost, not a free pass, and the `penContactIntent` row
+		// of `InkSurfaceRules.test.ts` records the half of it that is real.
+		//
+		// userReachable true: a user presents a note through core Slides and
+		// writes on the deck with the pen. Unlike `penlab`, something in the
+		// UI opens it, so no rule may skip it for being unreachable.
+		//
+		// mountsStrip false: `grep -c MobileTools` is 0. Derived rather than
+		// believed, like every other row - there is no plugin chrome on a
+		// presentation at all, and the nib comes from the host.
+		//
+		// honoursTipMode: THE TRUTH IS PARTIAL, and `true` is the honest half
+		// of the two available. The tip obeys exactly ONE member of TipMode -
+		// `tipMode() === "eraser"`, read once per contact in the pen-down arm
+		// and handed to `eraserIntent` - and no other, because a deck has no
+		// lasso, no pan and no insert-space for the remaining three to mean
+		// anything on. So read `true` as "the tip obeys TipMode wherever
+		// TipMode has something to say here", NEVER as all four: the lasso,
+		// pan and space rows in `InkSurfaceRules.test.ts` exempt this surface
+		// and are right to. `false` would be the worse lie of the two. It is
+		// the value `canvas` carries, and the two exemptions that cite this
+		// column by name read it as "no TipMode at all" - which would hide
+		// the fact that eraser MODE is the only way a pen with no tail end
+		// takes ink back off a slide, and would contradict the "reads the tip
+		// mode" row, which this surface carries with a real call site.
+		id: "slides",
+		file: "/src/slides/SlidesInkSurface.ts",
+		router: "none",
+		userReachable: true,
+		mountsStrip: false,
+		honoursTipMode: true,
 	},
 ];
 

@@ -3,6 +3,7 @@ import { PenSample } from "../input/PointerRouter";
 import { PenStyle, widthForPressure } from "./PenStyle";
 import { Point2 } from "./Smoothing";
 import { fillRibbon } from "./RibbonRenderer";
+import { inkColorFor } from "./InkTheme";
 
 /**
  * How much width the predicted tail gives up by its tip.
@@ -82,10 +83,55 @@ export class TailRenderer {
 		this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 	}
 
-	/** Erase the previous tail (dirty-rect only). */
-	clear(): void {
-		if (!this.dirty) return;
+	/**
+	 * Erase the previous tail: the dirty rect when there is one, and the WHOLE
+	 * canvas when there is not and a size is given.
+	 *
+	 * The fallback is the point, and it is the same one `WetInkRenderer.
+	 * clearStroke` has: no box means clear everything, because leaving ink
+	 * behind is the one outcome an erase must never produce. Without it this
+	 * method was `if (!this.dirty) return;` - a total no-op - and three paths
+	 * on this class paint the canvas and then NULL the box without leaving one
+	 * behind: `drawLasso`, `drawSelectionBox` and `drawSpaceDivider`, one of
+	 * which says so in a comment ("selection UI clears with clearAll, not a
+	 * dirty rect"). Measured in real Chromium with an exhaustive pixel count
+	 * (`test/measure/TailClearBox.test.ts`), a `clear()` over a nulled box
+	 * left 920, 1453, 3356 and 5091 px across the four zoom/dpr configs - in
+	 * every one, EXACTLY what had just been drawn, so nothing was erased at
+	 * all - where `clearAll` erased the canvas in all twelve cases. An
+	 * independent run on another tree saw the same total no-op at its own
+	 * fixture's counts (1027/3170/1191/3784).
+	 *
+	 * That is a CONDITIONAL fact: IF the box is null then the old `clear()`
+	 * erased nothing. Whether an ink pen-up can actually reach that state is
+	 * NOT established - a pen-down dissolves the selection for a bare tip, and
+	 * a lasso gesture ends on its own branch - so this is not the fix for a
+	 * known on-screen defect. The fallback makes the question moot at no cost,
+	 * which is why it is here instead of a reachability hunt.
+	 *
+	 * The size is OPTIONAL so the hot-path callers do not have to change. They
+	 * erase the previous tail once per pointer event at 200-250 Hz, where the
+	 * dirty rect is a few dozen pixels across and a whole-canvas clear is real
+	 * GPU work; they pass nothing and keep exactly the behaviour they have,
+	 * including the early return. The pen-up sites, which run once per stroke
+	 * and must leave the canvas clean for the committed layer, pass the size
+	 * and get the fallback.
+	 */
+	clear(cssWidth?: number, cssHeight?: number): void {
 		const d = this.dirty;
+		if (!d) {
+			// No box. Clear everything if we were told how big everything is,
+			// and otherwise do what this always did.
+			if (
+				cssWidth !== undefined &&
+				cssHeight !== undefined &&
+				cssWidth > 0 &&
+				cssHeight > 0
+			) {
+				this.ctx.clearRect(0, 0, cssWidth, cssHeight);
+			}
+			return;
+		}
 		this.ctx.clearRect(d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0);
 		this.dirty = null;
 	}
@@ -203,7 +249,9 @@ export class TailRenderer {
 				{ x: from.x, y: from.y, hw },
 				{ x: to.x, y: to.y, hw },
 			],
-			style.color
+			// The head continues the wet ribbon; it has to be the same colour the
+			// ribbon under it was painted (InkTheme.ts).
+			inkColorFor(style)
 		);
 		this.growDirty(x1, y1, x2, y2, hw * cam.zoom + 2);
 	}
@@ -247,7 +295,10 @@ export class TailRenderer {
 	): void {
 		if (points.length === 0) return;
 		const ctx = this.ctx;
-		ctx.strokeStyle = color;
+		// `color` here is always the pen's ink (the predicted tail), never
+		// selection chrome - the lasso and the dividers below keep their raw
+		// colour, because they are UI and not ink.
+		ctx.strokeStyle = inkColorFor(color);
 		ctx.lineCap = "round";
 		ctx.lineJoin = "round";
 		const base = Math.max(0.5, lineWidthPx);

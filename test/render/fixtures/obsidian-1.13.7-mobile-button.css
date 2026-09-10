@@ -1,0 +1,27 @@
+/*
+ * Hand reduction of the button rules from Obsidian 1.13.7 app.css, read
+ * 2026-09-09. These are the declarations that size the collapse button while
+ * Handwriting's stylesheet is still pending; everything else is immaterial
+ * to the startup-order regression.
+ */
+button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	font-size: 13px;
+	border: 0;
+	padding: 4px 12px;
+	height: 44px;
+	white-space: nowrap;
+}
+
+/* Obsidian sizes Lucide SVGs; without this, the fixture undercounts the icon
+ * that shares the collapse button with the still-visible accessible label. */
+.svg-icon {
+	width: 18px;
+	height: 18px;
+}
+
+.is-tablet button:not(.clickable-icon) {
+	padding: 4px 20px;
+}

@@ -44,7 +44,7 @@ import { popRightOffset } from "./PopPlacement";
 import { stripClearance } from "./StripClearance";
 import { deviceHasNeverSeenAPen, penHardwareEverSeen, penHardwareSeen } from "./PenToolsMode";
 import { markMousePutDown, markToolPicked, mouseDrawsFromLitTool, toolIsLit } from "./MouseInk";
-import { penInkEnabled } from "./PenInk";
+import { penInkEnabled, setPenInk } from "./PenInk";
 import { DEFAULT_PEN, HIGHLIGHTER_PEN } from "../ink/PenStyle";
 import { type InkPreset, presetChips, starReplaces } from "../ink/InkPresets";
 import { describeEl } from "./PenHitProbe";
@@ -199,6 +199,19 @@ export interface MobileToolsHost {
 	 */
 	penInksHere(): boolean;
 	/**
+	 * Whether this surface supports explicit finger ink. Note-only and
+	 * capability-shaped so Keyboard remains visible while pen input is off.
+	 * Undefined is false; PDF and existing hosts therefore stay native.
+	 */
+	fingerInkAvailable?(): boolean;
+	/**
+	 * Commit the gesture guard before the next finger reaches the note. A
+	 * browser snapshots touch-action before pointerdown, so entering finger
+	 * ink cannot wait for the router's contact handler to close a native-scroll
+	 * window left open by the preceding gesture.
+	 */
+	prepareFingerInk?(): void;
+	/**
 	 * Does this DEVICE have a touchscreen? For whether the Pan button gets
 	 * BUILT (see `ButtonSpec.shownOn`) - a device fact, not a live reading.
 	 *
@@ -282,6 +295,10 @@ const tipInks = (h: MobileToolsHost): boolean =>
  */
 const penDrawsHere = (h: MobileToolsHost): boolean => penHardwareSeen() && h.penInksHere();
 
+/** The selected nib genuinely draws with touch on the note-only iPhone host. */
+const fingerDrawsHere = (h: MobileToolsHost): boolean =>
+	(h.fingerInkAvailable?.() ?? false) && toolIsLit(h.penInksHere());
+
 /**
  * Whether a nib button's LIGHT (and the collapsed pill) should show it lit:
  * the tip must nominally hold this tool AND the tip must actually ink with
@@ -349,7 +366,9 @@ const penDrawsHere = (h: MobileToolsHost): boolean => penHardwareSeen() && h.pen
  * inside this one disjunct rather than around the pair.
  */
 export const nibIsLit = (h: MobileToolsHost, tool: "pen" | "highlighter"): boolean =>
-	tipInks(h) && h.activeTool() === tool && (penDrawsHere(h) || mouseDrawsHere(h));
+	tipInks(h) &&
+	h.activeTool() === tool &&
+	(penDrawsHere(h) || fingerDrawsHere(h) || mouseDrawsHere(h));
 
 /**
  * DOES THE MOUSE ACTUALLY DRAW ON THIS SURFACE RIGHT NOW - either switch?
@@ -693,7 +712,10 @@ const BUTTONS: ButtonSpec[] = [
 		// `shownOn` below rules on the DEVICE, never on the surface, and that
 		// distinction is the whole of why the field is back at all.
 		//
-		// ONLY ONCE A PEN HAS BEEN ON THIS DEVICE. Alan, 2026-09-05, asked
+		// ONCE A PEN HAS BEEN ON THIS DEVICE, OR ON AN ORDINARY-NOTE IPHONE.
+		// The latter needs this as the explicit exit from finger drawing and it
+		// stays present while off so Pen/Highlighter can re-enter. Elsewhere,
+		// Alan's 2026-09-05 device rule remains:
 		// directly: "yeah mouse only users should never see it, i think" - a
 		// machine with no pen has no pen to turn off, and the button is a slot
 		// on a row he had just called too wide for a phone.
@@ -727,7 +749,7 @@ const BUTTONS: ButtonSpec[] = [
 		// pen device opens with the button and a mouse-only device never grows
 		// one - not even one syncing its data.json from a device that has a pen
 		// (see `PEN_HARDWARE_SEEN_KEY` in PenToolsMode.ts).
-		shownOn: () => penHardwareEverSeen(),
+		shownOn: (h) => penHardwareEverSeen() || (h.fingerInkAvailable?.() ?? false),
 		//
 		// LIT WHILE THE PEN IS OFF - the light means "the keyboard has the
 		// note", not "this button is armed to do something". Every other
@@ -1474,7 +1496,7 @@ export class MobileTools {
 		//
 		// HIDDEN FROM ASSISTIVE TECH, deliberately: an aria-label on a bare
 		// div is dropped by most screen readers anyway, and the keyboard route
-		// to placement is the settings dropdown, which names all six anchors. A
+		// to placement is the settings dropdown, which names all nine anchors. A
 		// half-announced handle that cannot be operated is worse than a silent
 		// one.
 		//
@@ -1692,7 +1714,22 @@ export class MobileTools {
 				// mouse draws because a tool is PICKED, with nothing armed, so
 				// the old guard left that user's lit button unable to put
 				// itself down at all.
-				if (nib && spec.isActive?.(this.host) && ptr === "mouse" && mouseDrawsHere(this.host)) {
+				if (
+					nib &&
+					ptr === "touch" &&
+					(this.host.fingerInkAvailable?.() ?? false) &&
+					!(spec.isLit ?? spec.isActive)?.(this.host)
+				) {
+					// On iPhone an apparent/default nib is not a grant. Its first
+					// tap must pick the tool (or re-enter from Keyboard), not open
+					// an options pop for a tool that cannot draw yet.
+					this.host.exec(spec.commandId);
+					setPenInk(true);
+					this.host.prepareFingerInk?.();
+					this.host.setEditorFocus(false);
+					this.openInkSlider = null;
+					this.sliderFromHover = false;
+				} else if (nib && spec.isActive?.(this.host) && ptr === "mouse" && mouseDrawsHere(this.host)) {
 					// Clicking the tool you are drawing with hands the mouse
 					// back to text. Click it again and it draws again.
 					//
@@ -1775,6 +1812,9 @@ export class MobileTools {
 					this.sliderFromHover = false;
 				} else if (nib && spec.isActive?.(this.host) && ptr === "touch") {
 					// Touch has no hover, so the tap is the toggle.
+					// This lit branch executes no command, so explicitly reach the
+					// same eligibility-scoped preparation as a real nib pick.
+					this.host.prepareFingerInk?.();
 					this.openInkSlider = this.openInkSlider === nib ? null : nib;
 					this.sliderFromHover = false;
 				} else if (nib && spec.isActive?.(this.host)) {
@@ -2190,11 +2230,15 @@ export class MobileTools {
 		// catches every later change - rotation, a split pane being dragged,
 		// the sidebar opening, a popout being resized.
 		//
-		// On the PARENT, not on the strip. The strip's own width is an OUTPUT
-		// of this calculation, so observing it would feed the result back in:
-		// folding a button narrows the strip, which fires the observer, which
-		// measures the narrower strip. The parent's width is the input, and it
-		// changes for the reasons the user actually did something about.
+		// Observe the two INPUTS, never the strip. The parent's width is the
+		// available room; the collapse button's width is the grid cell. The
+		// latter matters at startup: Obsidian can construct the plugin before
+		// its stylesheet settles, while the button's screen-reader label is
+		// still in flow and makes the first cell measurement about 175px. The
+		// stylesheet then makes the button 40px without resizing the absolutely
+		// positioned strip's parent. Watching the button repairs that stale
+		// plan; watching the strip would feed this calculation's own output back
+		// into itself whenever folding changed its width.
 		// In the tree and measurable, so it can be re-folded from here on: the
 		// fold order is a setting, and a change to it has to reach the strips
 		// that are already open. Dropped again in `destroy()`.
@@ -2223,6 +2267,7 @@ export class MobileTools {
 					if (!preview) this.applyHeaderClearance();
 				});
 				watch.observe(parent);
+				watch.observe(this.collapseBtn);
 				this.resizeWatch = watch;
 			} catch (err) {
 				console.error("[handwriting] strip overflow observer failed", err);
@@ -2643,12 +2688,12 @@ export class MobileTools {
 				// arithmetic drifted a full button's width in the bottom-left
 				// corner (glass, 2026-08-31). The pop is visible by here, so
 				// its width is real.
-				// The arithmetic is `popRightOffset` (PopPlacement.ts) so the six
+				// The arithmetic is `popRightOffset` (PopPlacement.ts) so the nine
 				// anchors can be pinned without a layout; this is the measuring.
 				// The PANE is measured too now: the old `Math.max(0, right)`
 				// clamped the pop to the strip's own right edge, which is nearly
 				// the pane's edge in a right-hand corner and nowhere near it for
-				// a centred strip - so a middle anchor could hang a wide pop off
+				// a centred strip - so a centre-column anchor could hang a wide pop off
 				// the side of the pane.
 				const right = popRightOffset({
 					strip: this.el.getBoundingClientRect(),
@@ -2937,9 +2982,9 @@ export class MobileTools {
 	}
 
 	/**
-	 * Park the strip and its pill in a corner. Both move together: they are
+	 * Park the strip and its pill at an anchor. Both move together: they are
 	 * one control in two sizes, and the old classes come off first so a
-	 * change cannot leave two corners asserted at once.
+	 * change cannot leave two anchors asserted at once.
 	 */
 	setCorner(corner: ToolbarCorner): void {
 		this.corner = corner;
@@ -2949,7 +2994,7 @@ export class MobileTools {
 			for (const c of stale) el.classList.remove(c);
 			el.classList.add(want);
 		}
-		// The chevron points at the corner the strip collapses INTO; a
+		// The chevron points toward the edge the strip collapses into; a
 		// hardwired chevron-right pointed off-screen from a left corner.
 		// Emptied FIRST: setIcon does not clear the button, and setCorner
 		// runs on every bind, so the chevrons stacked up side by side
@@ -2978,12 +3023,11 @@ export class MobileTools {
 	 * leaf with a real `.view-actions`, runs this, and measures the two
 	 * boxes.
 	 *
-	 * The pane's OWN actions row, found through `this.pane`, which is the
-	 * element the surface handed the strip. That is the whole of why the two
-	 * surfaces need no separate treatment: the pdf's pane is the leaf's
-	 * `containerEl` and contains the header, the note's is inside
-	 * `.view-content` and does not, so the note finds nothing here and is not
-	 * moved. A measurement rather than a surface name.
+	 * The pane's OWN actions row. A pdf hands in the leaf and contains the row;
+	 * a note hands in an element inside `.view-content`, so its row is found
+	 * through the nearest `.workspace-leaf-content`. Never a document-wide
+	 * lookup: two open panes must not dodge one another's controls. A
+	 * measurement rather than a surface name.
 	 */
 	private applyHeaderClearance(): void {
 		// Cleared FIRST, so the strip is measured where the stylesheet puts
@@ -2995,7 +3039,9 @@ export class MobileTools {
 		// `paintTransform` at the foot of this function puts it straight
 		// back, inside the same synchronous task, so nothing paints between.
 		for (const el of [this.el, this.pill]) el.setCssStyles({ transform: "" });
-		const actions = this.pane.querySelector?.(".view-actions") as HTMLElement | null;
+		const actions =
+			this.pane.querySelector?.(".view-actions") ??
+			this.pane.closest?.(".workspace-leaf-content")?.querySelector(".view-actions");
 		if (!actions) {
 			this.dodge = { x: 0, y: 0 };
 			this.paintTransform();
@@ -3050,7 +3096,7 @@ export class MobileTools {
 
 	/**
 	 * DRAG TO ANCHOR (1.4.12). Pick the toolbar up by its handle, put it
-	 * anywhere, and on release it flies to the nearest of the six placements
+	 * anywhere, and on release it flies to the nearest of the nine placements
 	 * and writes that placement to settings.
 	 *
 	 * ONLY THE HANDLES ARE DRAGGABLE, and that is the whole design. Alan's
@@ -3197,12 +3243,12 @@ export class MobileTools {
 			height: drag.box.bottom - drag.box.top,
 		};
 		// IN THE ANCHORS' OWN FRAME, which is the un-dodged one. `drag.box` was
-		// read off the live element and carries the actions-row dodge; the six
+		// read off the live element and carries the actions-row dodge; the nine
 		// resting centres this is about to be compared against are where the
 		// stylesheet would put the strip, dodge or no dodge. Taking the dodge
 		// back out here is what makes the two comparable - and it is taken out
-		// HERE rather than added to all six, because the strip is one box and
-		// the anchors are six predictions of it.
+		// HERE rather than added to all nine, because the strip is one box and
+		// the anchors are nine predictions of it.
 		const centre = {
 			x: (drag.box.left + drag.box.right) / 2 + this.dragOffset.x - drag.dodge.x,
 			y: (drag.box.top + drag.box.bottom) / 2 + this.dragOffset.y - drag.dodge.y,

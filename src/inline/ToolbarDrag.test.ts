@@ -18,7 +18,12 @@ import {
 	dragPassedThreshold,
 	nearestAnchor,
 } from "./ToolbarDrag";
-import { TOOLBAR_CORNERS, toolbarCornerClass } from "./ToolbarCorner";
+import {
+	TOOLBAR_CORNERS,
+	toolbarAnchorColumn,
+	toolbarAnchorRow,
+	toolbarCornerClass,
+} from "./ToolbarCorner";
 import type { ToolbarCorner } from "./ToolbarCorner";
 
 /** A 1000x800 pane, big enough that no two anchors are near each other. */
@@ -82,32 +87,48 @@ describe("dragPassedThreshold: a tap stays a tap", () => {
 	});
 });
 
-describe("anchorRestingCentre: where each of the six puts the strip's middle", () => {
-	it("a corner sits its own half-width in from the edge it names", () => {
-		expect(anchorRestingCentre("top-left", PANE, STRIP, 8)).toEqual({ x: 208, y: 28 });
-		expect(anchorRestingCentre("top-right", PANE, STRIP, 8)).toEqual({ x: 792, y: 28 });
-		expect(anchorRestingCentre("bottom-left", PANE, STRIP, 8)).toEqual({ x: 208, y: 772 });
-		expect(anchorRestingCentre("bottom-right", PANE, STRIP, 8)).toEqual({ x: 792, y: 772 });
+describe("anchorRestingCentre: where the 3x3 grid puts the strip's middle", () => {
+	it("returns all nine distinct expected centres for the expanded strip", () => {
+		const expected: Record<ToolbarCorner, { x: number; y: number }> = {
+			"top-left": { x: 208, y: 28 },
+			"top-center": { x: 500, y: 28 },
+			"top-right": { x: 792, y: 28 },
+			"middle-left": { x: 208, y: 400 },
+			"middle-center": { x: 500, y: 400 },
+			"middle-right": { x: 792, y: 400 },
+			"bottom-left": { x: 208, y: 772 },
+			"bottom-center": { x: 500, y: 772 },
+			"bottom-right": { x: 792, y: 772 },
+		};
+		for (const corner of TOOLBAR_CORNERS) {
+			expect(anchorRestingCentre(corner, PANE, STRIP, 8), corner).toEqual(expected[corner]);
+		}
+		expect(new Set(Object.values(expected).map(({ x, y }) => `${x},${y}`))).toHaveLength(9);
 	});
 
-	it("a middle is the pane's own centre, whatever the strip's width", () => {
-		// The stylesheet centres the middles with auto margins between
-		// `left: 0` and `right: 0`, so there is no horizontal inset to apply
-		// and the width cancels out. A rule that treated a middle like a
-		// corner would move it as the row folded.
-		for (const size of [STRIP, PILL, { width: 984, height: 40 }]) {
-			expect(anchorRestingCentre("top-center", PANE, size, 8).x).toBe(500);
-			expect(anchorRestingCentre("bottom-center", PANE, size, 8).x).toBe(500);
+	it("uses the pane midline for the whole middle row in both toolbar sizes", () => {
+		for (const size of [STRIP, PILL]) {
+			for (const corner of ["middle-left", "middle-center", "middle-right"] as const) {
+				expect(anchorRestingCentre(corner, PANE, size, 8).y, corner).toBe(400);
+			}
 		}
 	});
 
-	it("the vertical is the edge it names, in both sizes", () => {
+	it("keeps the centre column centred as the toolbar width changes", () => {
+		for (const size of [STRIP, PILL, { width: 984, height: 40 }]) {
+			for (const corner of ["top-center", "middle-center", "bottom-center"] as const) {
+				expect(anchorRestingCentre(corner, PANE, size, 8).x, corner).toBe(500);
+			}
+		}
+	});
+
+	it("keeps top and bottom edge centres concentric in the pill size", () => {
 		expect(anchorRestingCentre("top-center", PANE, PILL, 8).y).toBe(25);
 		expect(anchorRestingCentre("bottom-center", PANE, PILL, 8).y).toBe(775);
 	});
 });
 
-describe("nearestAnchor: which of the six a drop landed on", () => {
+describe("nearestAnchor: which cell of the 3x3 grid a drop landed on", () => {
 	it("a drop right on an anchor's resting centre chooses that anchor", () => {
 		for (const corner of TOOLBAR_CORNERS) {
 			const at = anchorRestingCentre(corner, PANE, STRIP, TOOLBAR_ANCHOR_INSET_PX);
@@ -118,11 +139,16 @@ describe("nearestAnchor: which of the six a drop landed on", () => {
 		}
 	});
 
-	it("reads the vertical half of the pane the drop is in", () => {
-		expect(drop(208, 300)).toBe("top-left");
-		expect(drop(208, 500)).toBe("bottom-left");
-		expect(drop(500, 300)).toBe("top-center");
-		expect(drop(500, 500)).toBe("bottom-center");
+	it("retains top and bottom drops and adds all three centre-height drops", () => {
+		expect(drop(208, 100)).toBe("top-left");
+		expect(drop(500, 100)).toBe("top-center");
+		expect(drop(792, 100)).toBe("top-right");
+		expect(drop(208, 400)).toBe("middle-left");
+		expect(drop(500, 400)).toBe("middle-center");
+		expect(drop(792, 400)).toBe("middle-right");
+		expect(drop(208, 700)).toBe("bottom-left");
+		expect(drop(500, 700)).toBe("bottom-center");
+		expect(drop(792, 700)).toBe("bottom-right");
 	});
 
 	/**
@@ -177,8 +203,8 @@ describe("nearestAnchor: which of the six a drop landed on", () => {
 /**
  * The one number this module copies out of the stylesheet, pinned to it.
  *
- * `TOOLBAR_ANCHOR_INSET_PX` is only a tie-breaker - it shifts all six resting
- * centres inward together, and the landing itself is measured rather than
+ * `TOOLBAR_ANCHOR_INSET_PX` is only a tie-breaker - it shifts the outer rows
+ * and columns inward, and the landing itself is measured rather than
  * predicted - but a copied constant with nothing holding it to its original
  * is a copied constant that drifts. This is the same assertion-on-stylesheet-
  * text `CornerSafeArea.test.ts` uses, and for the same reason: the value is
@@ -194,15 +220,22 @@ describe("styles.css - the anchor inset the drop rule assumes is the one the she
 				new RegExp(`(?:^|,|\\})[^{}]*${selector.replace(/\./g, "\\.")}\\s*(?:,[^{}]*)?\\{([^{}]*)\\}`)
 			);
 			expect(rule, `rule missing: ${selector}`).not.toBeNull();
-			const edge = corner.startsWith("top") ? "top" : "bottom";
-			expect(
-				rule![1],
-				`${selector} does not hold the strip ${TOOLBAR_ANCHOR_INSET_PX}px off the ${edge} edge`
-			).toMatch(
-				new RegExp(
-					`${edge}:\\s*calc\\(\\s*env\\([^)]*\\)\\s*\\+\\s*${TOOLBAR_ANCHOR_INSET_PX}px\\s*\\)`
-				)
-			);
+			const vertical =
+				toolbarAnchorRow(corner) === "middle"
+					? (["top", "bottom"] as const)
+					: ([toolbarAnchorRow(corner)] as const);
+			const column = toolbarAnchorColumn(corner);
+			const horizontal = column === "center" ? [] : [column];
+			for (const edge of [...vertical, ...horizontal]) {
+				expect(
+					rule![1],
+					`${selector} does not hold the strip ${TOOLBAR_ANCHOR_INSET_PX}px off the ${edge} bound`
+				).toMatch(
+					new RegExp(
+						`${edge}:\\s*calc\\(\\s*env\\([^)]*\\)\\s*\\+\\s*${TOOLBAR_ANCHOR_INSET_PX}px\\s*\\)`
+					)
+				);
+			}
 		}
 	});
 });

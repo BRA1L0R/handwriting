@@ -14,6 +14,41 @@ interface DeleteKeyEvent {
 	preventDefault(): void;
 }
 
+/**
+ * What a lasso delete actually did, so its caller can tell the two failures
+ * apart.
+ *
+ * One number could not: `deleteSelectedInk` used to answer 0 both when the
+ * user had selected nothing and when a real selection was matched by NOTHING
+ * in the store, and the command site turned both into "lasso some ink first".
+ * The second is a lie - the user HAD lassoed - and it was reported from
+ * public (r/ObsidianMD, Boox, 2026-09-07).
+ */
+export type DeleteSelectionOutcome =
+	/** Strokes were removed. `count` is how many were selected. */
+	| { kind: "deleted"; count: number }
+	/** Nothing was selected, or there is no path to delete from. */
+	| { kind: "empty" }
+	/** A real selection whose ids the store matched none of. */
+	| { kind: "unmatched"; count: number };
+
+/**
+ * The notice a lasso delete owes the user, or `null` when it owes none.
+ *
+ * Pure and exported so both strings are pinned by EXECUTION rather than by
+ * reading `main.ts` as text - the empty-selection string in particular must
+ * stay byte-identical, since it is the one that was always true.
+ */
+export function lassoDeleteNotice(outcome: DeleteSelectionOutcome): string | null {
+	if (outcome.kind === "deleted") return null;
+	if (outcome.kind === "empty") return "Handwriting: lasso some ink first";
+	// Says what happened and what is true NOW. No blame, and no "try again":
+	// re-lassoing the same strokes fails the same way, so telling the user to
+	// retry would waste their time. The selection is deliberately still on
+	// screen, which is the one thing that lets them do anything else with it.
+	return "Handwriting: could not remove the selected ink - the lasso has been kept";
+}
+
 /** Remove exactly the selected strokes and capture enough state for undo. */
 export function removeSelectedInlineStrokes(
 	store: InlineInkStore,

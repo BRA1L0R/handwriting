@@ -20,6 +20,16 @@ import {
 } from "./input/PenDiagnosticsView";
 import { HANDWRITING_PEN_LAB_VIEW_TYPE, PenLabView } from "./view/PenLabView";
 import {
+	SlidesInkHost,
+	onSlidesCssChange,
+	reloadSlidesExternal,
+	scanForSlides,
+	setSlidesInk,
+	settleSlidesInk,
+	slidesInkEnabled,
+	slidesReloadCandidate,
+} from "./slides/SlidesInkSurface";
+import {
 	addStripSurface,
 	applyToolbarPlacement,
 	endLiveStrokesEverywhere,
@@ -28,8 +38,13 @@ import {
 	copyInlineZoomReport,
 	copyPresentationReport,
 	copyRegionCensus,
+	copySelectionNotice,
+	copySelectionNoticeIsRoutine,
+	cutSelectionNotice,
+	cutSelectionNoticeIsRoutine,
 	deleteAllInkOn,
 	getEraserRadiusPx,
+	getEraserWholeStrokes,
 	getInkSizeMult,
 	getInlineEraserMode,
 	getInlineLassoMode,
@@ -41,6 +56,7 @@ import {
 	inlineInk,
 	inlineReloadCandidates,
 	InkOverlayPlugin,
+	overlayForActiveEditor,
 	overlayForPath,
 	refreshPenToolsAll,
 	refreshAllStrips,
@@ -62,6 +78,7 @@ import {
 	setToolbarCorner,
 } from "./inline/InkOverlay";
 import { destroyProbeMarkers } from "./inline/PenProbe";
+import { lassoDeleteNotice } from "./inline/InlineSelectionDelete";
 import { armForegroundRepaint } from "./inline/ForegroundRepaint";
 import { captureInlinePenTrace, clearInlinePenTrace, formatInlinePenTrace } from "./inline/InlinePenRouter";
 import {
@@ -75,11 +92,18 @@ import { surfaceExtents } from "./inline/SurfaceExtent";
 import { claimMarkdown, reassignMarkdown } from "./inline/InlineClaim";
 import { INK_SIZE_STEPS, clampInkSize, nextInkSize } from "./ink/InkSize";
 import { DEFAULT_ERASER_RADIUS_PX, clampEraserRadius, nextEraserSize } from "./ink/EraserSize";
-import { setPressureSensitivity } from "./ink/PenStyle";
+import { DEFAULT_PEN, HIGHLIGHTER_PEN, setPressureSensitivity } from "./ink/PenStyle";
+import {
+	refreshInkTheme,
+	setInkExportReadability,
+	setInkThemeAdaptation,
+} from "./ink/InkTheme";
 import { setInkShaping } from "./ink/InkShape";
 import { InkPreset, normalizeInkPresets, setInkPresets } from "./ink/InkPresets";
 import { installInkPresetActions } from "./ink/InkPresetHost";
 import { registerInkPresetCommands } from "./ink/InkPresetCommands";
+import { consumeHintLagMs, discardHintSamples } from "./ink/LatencyEstimate";
+import { noteLag, resetEinkHintProgress } from "./ink/EinkHint";
 import { ownedNoticeHiders } from "./OwnedNotices";
 import {
 	HIGHLIGHTER_COLORS,
@@ -96,6 +120,7 @@ import {
 	setDiagnosticsChangedListener,
 	setDiagnosticsEnabled,
 } from "./diag/DiagSwitch";
+import { routineNoticesVisible, setRoutineNoticesVisible } from "./diag/RoutineNotices";
 import { traceGuardVerdict } from "./diag/TraceGuard";
 import {
 	armMouseInkQuietly,
@@ -106,9 +131,9 @@ import {
 import { setPrediction, setPredictionEink } from "./inline/StrokePrediction";
 import { PaperStyle, nextPaperStyle, normalizePaperStyle, paperClass } from "./inline/Paper";
 import { inkToSvg } from "./ink/SvgExport";
-import { InkStroke, InkTool } from "./ink/Stroke";
+import { InkTool } from "./ink/Stroke";
 import { appendInkToPdf, flattenedPdfPath } from "./ink/InkPdfAppend";
-import { inkToPdf } from "./ink/InkPdf";
+import { inkToPdf, normalizePdfPageAssumption, PdfPageAssumption } from "./ink/InkPdf";
 import { bytesOf } from "./pdf/PdfSyntax";
 import { createFreshFile } from "./export/CreateFreshFile";
 import { clipboardSize } from "./inline/InkClipboard";
@@ -165,10 +190,13 @@ import {
 } from "./pdf/PdfIdentity";
 import { HeadSource, RangedHandle, readPdfHead } from "./pdf/PdfHead";
 import { applyOp } from "./pdf/PdfInkHistory";
-import { isSafePageId, newPageId } from "./model/PageData";
+import { isSafePageId, newPageId, parsePage } from "./model/PageData";
+import type { InkPresence, InlineDeleteCapture } from "./inline/InlineInkStore";
 import { PageIdIndex, RegisterVerdict } from "./model/PageIdIndex";
 import { newPageMarkdown } from "./model/MarkdownPage";
-import { PageStore } from "./persistence/PageStore";
+import { PageStore, newPageWriter } from "./persistence/PageStore";
+import { FORK_COPY_PLACEHOLDER, ForkHost, refreshForks } from "./persistence/ForkResolution";
+import { ForkResolutionModal } from "./persistence/ForkResolutionModal";
 import { runDetached } from "./util/Detached";
 import { decideWhatsNew, whatsNewDurationMs, whatsNewFragment } from "./update/WhatsNew";
 import {
@@ -225,6 +253,64 @@ const RECYCLE_GRACE_MS = 10_000;
  */
 const DECLAIM_GRACE_MS = 2_000;
 
+/**
+ * The two refusals "Delete all ink" can give a PDF, written once because the
+ * first of them is used from three places and three copies of a sentence are
+ * three things that drift apart.
+ *
+ * TWO NARROW RULINGS, AND THEY ARE BOTH ABOUT PUNCTUATION AND CASING ONLY.
+ *
+ * 1. APPROVED BY ALAN, 2026-09-08: sentence case after the "Handwriting:"
+ *    prefix - a sentence starts lowercase, "Handwriting" keeps its capital
+ *    wherever it appears, and a command keeps its own name, which is why
+ *    "Delete all ink" below is still capitalised.
+ *
+ * 2. APPROVED BY ALAN, 2026-09-09 18:41 CDT, shown both strings as they were
+ *    and as they would be and asked yes or no with no wording touched either
+ *    way. His answer, verbatim: "last period off, ones between sentences
+ *    stay". So the TRAILING period came off both; both internal periods in
+ *    the second string remain. Same rule as `DELETE_ALL_TEMPORARY`.
+ *
+ * 3. AND HE PUT THE TRAILING PERIOD BACK THE SAME DAY, 2026-09-09 17:14 CDT,
+ *    which is the state below. Verbatim: "ehhhhhhhhhhhhhhhh we hsould be
+ *    consistent, put a period back at end".
+ *
+ *    WHY, because the reason bounds it: a seat found that OTHER messages on
+ *    this same command always carried trailing periods and had never been
+ *    shown to him - "open the note in editing view to delete its ink.",
+ *    "removed N strokes. Undo restores them.", the disk-error line. Shown
+ *    both readings, he chose consistency in the direction of RESTORING
+ *    periods rather than stripping more. The unruled sentences therefore
+ *    need nothing.
+ *
+ *    THE INTERNAL PERIODS ARE UNTOUCHED BY THIS - his 17:18 "yes that's fine
+ *    good call" still binds - and no wording changed. One character each.
+ *
+ *    DO NOT STRIP THESE AGAIN ON THE STRENGTH OF THE 18:41 ENTRY. It is still
+ *    on the record and still says the opposite; this paragraph is why. The
+ *    authority is the 2026-09-09 17:14 CDT entry in `queue.md` /
+ *    `lead-engineer.md` / `astra.md`, not this comment.
+ *
+ *    ONE SENTENCE IS RULED THE OTHER WAY and is not in this file: the
+ *    ink-trash restore line stays BARE, because it ends in a file path where
+ *    a period reads as part of the path. That asymmetry is deliberate.
+ *
+ * HE HAS NEVER SEEN THE WORDING OF EITHER SENTENCE, and neither ruling above
+ * says anything about it. They are a casing convention and a trailing
+ * character. DO NOT READ THIS BLOCK AS APPROVAL OF THE SENTENCES - two narrow
+ * rulings stacked under one heading is exactly how an unapproved string comes
+ * to look approved, and the shortest route to that is a third one added
+ * without this paragraph.
+ *
+ * Still open with him and NOT to be pre-empted here: the delete-all refusal
+ * reason `changed-during-backup` maps onto the second string below, on the
+ * note surface it has an approved sentence, and whether that sentence should
+ * be extended to this surface is his to rule.
+ */
+const PDF_INK_NOT_READY = "Handwriting: this PDF's ink storage is not ready. nothing was deleted.";
+const PDF_INK_CHANGED_DURING_BACKUP =
+	"Handwriting: the ink changed while its backup was being made. nothing was deleted. run Delete all ink again if you still want to remove it.";
+
 interface HandwritingSettings {
 	/** Per-page camera, kept out of the synced note on purpose (§22). */
 	cameras: Record<string, CameraState>;
@@ -240,6 +326,42 @@ interface HandwritingSettings {
 	pressureSensitivity: boolean;
 	/** Shaped ribbon: velocity thinning and the start/end taper. */
 	inkSmoothing: boolean;
+	/**
+	 * Draw near-black ink light on the DARK theme. Default on.
+	 *
+	 * One direction only: the light theme is left exactly as stored. Render
+	 * time either way - the stroke keeps the colour it was written or
+	 * imported with, and turning this off paints it again. It exists because
+	 * OneNote exports its ink as #000000 and Obsidian's dark theme paints the
+	 * page near-black, so an imported page reads as blank (alan, 2026-09-04).
+	 */
+	inkAdaptsToTheme: boolean;
+	/**
+	 * Guarantee exported ink is readable where it lands. Default ON.
+	 *
+	 * The opposite default to `inkAdaptsToTheme` above, and deliberately so
+	 * (alan, 2026-09-08: "export toggle should default on"). On screen you are
+	 * looking at your own canvas and the expected behaviour is the colour you
+	 * picked; in an export you are producing something for elsewhere and the
+	 * expected behaviour is that you can read it. Same principle, opposite
+	 * answers - which is why the settings copy has to say so.
+	 *
+	 * Render time only, like the other one: nothing rewrites a stored colour.
+	 */
+	inkReadableInExports: boolean;
+	/**
+	 * Whether flattening ink into an existing PDF may assume that PDF's pages
+	 * are white. Default true.
+	 *
+	 * Separate from the setting above because the two know different things.
+	 * An export or a snip is a page Handwriting makes, so its colour is a fact;
+	 * a flatten writes onto pages somebody else made, read as a dictionary and
+	 * never as pixels, so white is a guess. It is the right guess for almost
+	 * every document and the wrong one for grey or dark stock, where it makes
+	 * light ink LESS readable than leaving it alone would. Render time only:
+	 * nothing rewrites a stored colour.
+	 */
+	inkPdfColorMode: PdfPageAssumption;
 	/** Vault folder holding the ink sidecars. Default `.handwriting`. */
 	inkFolder: string;
 	/** Which corner the floating pen toolbar parks in. Default top-right. */
@@ -271,6 +393,18 @@ interface HandwritingSettings {
 	mouseInk: boolean;
 	strokePrediction: boolean;
 	booxMode: boolean;
+	/**
+	 * Latch: has this vault already been told once that its ink is arriving
+	 * late and Boox mode might help? Not a settings-UI row - it exists only
+	 * so the hint (see EinkHint.ts) fires at most once per install rather
+	 * than once per session.
+	 */
+	einkHintOffered: boolean;
+	/**
+	 * Latch: has this vault already seen the iPad Scribble warning? Internal
+	 * persistence only, never a settings-UI row.
+	 */
+	scribbleHintOffered: boolean;
 	/** Ruled paper background (v0.13.16): none, lines, grid or dots. Per device. */
 	paperStyle: PaperStyle;
 	/** Pen tools strip (v0.13.16): auto (pen summons it), show, or hide. */
@@ -283,6 +417,15 @@ interface HandwritingSettings {
 	shapeSnap: boolean;
 	/** Shows the developer diagnostics commands in the palette. */
 	devDiagnostics: boolean;
+	/**
+	 * Pen ink on the core Slides presentation (src/slides/SlidesInkSurface.ts).
+	 *
+	 * On by default: a reader who presents a note and draws on it expects the
+	 * ink to be there next time, and the whole cost to a reader who never
+	 * presents is one MutationObserver on `body` - which is not even installed
+	 * while this is off.
+	 */
+	slidesInk: boolean;
 	/** One command per colour and per nib size, for hotkeys. */
 	colorSizeCommands: boolean;
 	/**
@@ -305,6 +448,43 @@ const DEFAULT_SETTINGS: HandwritingSettings = {
 	inkSizes: { pen: 1, highlighter: 1 },
 	pressureSensitivity: true,
 	inkSmoothing: true,
+	/*
+	 * OFF BY DEFAULT, on the owner's ruling: "leave it off default, because
+	 * expected behaviour should be default and then the option if they need
+	 * it". Black ink drawn black is what a reader expects; drawing it light
+	 * on a dark theme is the surprising thing, however useful it is for an
+	 * imported page that would otherwise read as blank.
+	 *
+	 * This arrived ON by default with the slides port, which would have
+	 * changed how every dark-theme user's existing ink looked the moment
+	 * they updated, with nothing in the release notes to warn them. The
+	 * LOAD COERCION below has to agree with this line or the default here
+	 * is decorative - a vault with no stored value is decided there, not
+	 * here, and that is every existing user.
+	 */
+	inkAdaptsToTheme: false,
+	/**
+	 * ON by default, on Alan's ruling ("export toggle should default on") -
+	 * the opposite answer to the line above, for the reason recorded on the
+	 * interface field.
+	 *
+	 * THE SAME TRAP APPLIES HERE AND IT POINTS THE OTHER WAY. Two places
+	 * decide a default and only the LOAD COERCION decides for a vault that
+	 * has never stored the key, which is every existing user. For default-ON
+	 * the coercion must read `!== false` (absence counts as on); `=== true`
+	 * would leave this line decorative and ship the fix switched off for
+	 * everyone who already has a vault - exactly how `inkAdaptsToTheme` went
+	 * wrong once, with the signs reversed.
+	 */
+	inkReadableInExports: true,
+	/**
+	 * ON, on Alan's ruling of 2026-09-08 ("ink readable on white pages" then
+	 * "with a toggle in the setings"): the common page is white, so the
+	 * guarantee holds by default and the toggle is there for the pages where
+	 * assuming white costs more than it pays. Its load coercion is `!== false`
+	 * for the reason spelled out beside `inkReadableInExports`.
+	 */
+	inkPdfColorMode: "darken",
 	inkColors: { pen: PEN_COLORS[0]!.hex, highlighter: HIGHLIGHTER_COLORS[0]!.hex },
 	pageOwners: {},
 	eraserRadiusPx: DEFAULT_ERASER_RADIUS_PX,
@@ -314,12 +494,15 @@ const DEFAULT_SETTINGS: HandwritingSettings = {
 	// everyone else.
 	strokePrediction: true,
 	booxMode: false,
+	einkHintOffered: false,
+	scribbleHintOffered: false,
 	paperStyle: "none",
 	penTools: "auto",
 	eraserMode: "stroke",
 	penReticle: true,
 	shapeSnap: true,
 	devDiagnostics: false,
+	slidesInk: true,
 	colorSizeCommands: false,
 	penPresets: [],
 	lastSeenVersion: null,
@@ -563,6 +746,380 @@ const penInkCommandHost: PenCommandHost = {
 		if (!on) hidePenCursorsEverywhere();
 	},
 };
+
+/**
+ * A Notice whose blank-line-separated blocks actually render as blocks.
+ *
+ * `Notice` sets TEXT, and a newline in text does not become a line break
+ * without a `white-space` rule we do not own - so a message written in blocks
+ * arrives as one run-on line. Alan wants the breaks and the reason is
+ * legibility: "i want the line break it helps with visibility" (1.4.13), for
+ * this notice and for the boox and ipad hints.
+ *
+ * One block is still a plain string Notice, so nothing pays for a fragment it
+ * does not use. Splits on a blank line only - a single newline inside a block
+ * stays inside it, because wrapping is the theme's business and not ours.
+ */
+/**
+ * The blocks a notice message is written in, blank-line separated.
+ *
+ * Exported and pure so the property Alan actually asked for - that the message
+ * ARRIVES as more than one line - is pinned by a test rather than by reading
+ * Obsidian's stylesheet. Someone collapsing the string to one line, or a
+ * refactor losing the escape, fails `NoticeBlocks.test.ts` instead of shipping
+ * a run-on toast nobody notices until a user reports it.
+ */
+export function noticeBlocks(message: string): string[] {
+	return message.split(/\n\s*\n/).filter((s) => s.length > 0);
+}
+
+function blockNotice(message: string, durationMs?: number): Notice {
+	const blocks = noticeBlocks(message);
+	if (blocks.length < 2) return new Notice(message, durationMs);
+	return new Notice(
+		createFragment((f) => {
+			for (const block of blocks) f.createDiv({ text: block });
+		}),
+		durationMs
+	);
+}
+
+/**
+ * Read the artifact `preserve` actually returned and check it holds the
+ * captured ink, at the ordinary persisted precision a trash copy is
+ * written with. A copy of a damaged or newer-schema file is not a copy we
+ * may claim, and neither is one whose ink differs from what is on screen.
+ */
+async function backupHoldsCapture(
+capture: InlineDeleteCapture,
+at: string,
+read: (path: string) => Promise<string>
+): Promise<boolean> {
+	try {
+	const text = await read(at);
+		const raw: unknown = JSON.parse(text);
+		// THE ARTIFACT MUST DECLARE THE CAPTURED PAGE ITSELF, checked on the
+		// RAW bytes and before the parse. `parsePage`'s third argument is a
+		// fallback id, and `PageData.ts:646` substitutes it whenever the file
+		// omits `pageId` or carries an unsafe one - so the parsed page would
+		// come back wearing the very id it is about to be compared against, and
+		// bytes that never named this page could pass as its backup.
+		if ((raw as { pageId?: unknown } | null)?.pageId !== capture.pageId) return false;
+		const parsed = parsePage(text, capture.pageId);
+		if (parsed.damaged || parsed.futureVersion !== undefined) return false;
+		// The artifact's own JSON goes on to the comparison too, so it can tell
+		// a field the FILE never carried from one the copy lost. Without it a
+		// sidecar written without `createdAt` is refused on every press,
+		// forever, and each refusal leaves another trash generation behind.
+		return inlineInk.backupMatchesCapture(capture, parsed.data, raw);
+	} catch (err) {
+		console.error("[handwriting] could not read back the delete-all backup", at, err);
+		return false;
+	}
+}
+
+/**
+ * The note a delete-all was invoked on: the object AND the path it was
+ * invoked under, captured together before any await.
+ *
+ * BOTH HALVES, because either alone lies after a rename. The path alone stops
+ * naming this note; the object alone survives a rename and would follow the
+ * note to its new name, deleting ink the user never confirmed. `null` means
+ * the command started on something that is not a file in the vault.
+ */
+type DeleteAllTarget = Readonly<{ file: TFile; path: string }> | null;
+
+/**
+ * Why an inline delete-all refused. One reason per refusal return in
+ * `deleteAllInk`, so a refusal can be reported without being inferred.
+ */
+export type DeleteAllRefusal =
+	| "locked-future"
+	| "locked-duplicate"
+	| "locked-legacy"
+	/** No identity, and no ink in the record either: a note never drawn on. */
+	| "unknown-readiness"
+	/** No identity, but the record DOES hold ink - drawn before the claim landed. */
+	| "unknown-holds-ink"
+	/**
+	 * The note was renamed, deleted or replaced while the backup ran.
+	 *
+	 * SEPARATE FROM `readiness-lost` BECAUSE THE SENTENCE DIFFERS. Readiness
+	 * can be lost for reasons that really do clear - a lock arriving, a load
+	 * starting - and Alan ruled those temporary. This one is not temporary in
+	 * any sense: the note is gone, or the path now holds a different note, and
+	 * telling that user to try again in a moment is false.
+	 */
+	| "target-lost"
+	| "unsettled-record"
+	| "no-capture"
+	| "backup-missing"
+	| "backup-unverified"
+	| "readiness-lost"
+	| "changed-during-backup";
+
+/**
+ * APPROVED BY ALAN, 2026-09-08, shown the ten refusal reasons and asked for a
+ * line each - "okay delete-all just sy something like, your ink cannot be
+ * deleted". Put back to him as the exact sentence below and not amended.
+ *
+ * SOURCE: `queue.md` / `lead-engineer.md`, entry stamped 2026-09-09 09:12 CDT,
+ * which also carries the second string below. An earlier revision of this
+ * marker said the words had only been relayed and were not on the record; they
+ * are now, and this line points at them instead.
+ *
+ * ONE SENTENCE AT NEARLY EVERY CALL SITE, and the sameness is the ruling
+ * rather than an economy. The part that makes it safe: it claims NOTHING about
+ * a copy in either direction. Some of these fire before anything has been
+ * written and must not imply one exists; three fire after a trash generation
+ * was kept and must not imply one does not.
+ *
+ * DO NOT VARY IT per reason, per surface, or because it reads oddly somewhere.
+ * If a call site makes it read wrong, that is Alan's to rule on: name the call
+ * site and leave the string alone. That is exactly how the second string below
+ * came to exist.
+ *
+ * THE TRAILING PERIOD IS HIS, AND SO WAS ITS ABSENCE. The whole arc, because
+ * half of it invites the next reader to undo the other half:
+ *
+ *   The period was OURS - added when the constants were formed, never typed by
+ *   him. Shown that, he ruled it off all three on 2026-09-09 17:09: "get the
+ *   periods OUT", then "GET EM OUT".
+ *
+ *   He then RESTORED it the same day, 17:14/17:21: "ehhhhhhhhhhhhhhhh we
+ *   hsould be consistent, put a period back at end". The reason bounds it -
+ *   other sentences on this same command still carry trailing periods because
+ *   he was never shown them ("open the note in editing view to delete its
+ *   ink.", "removed N strokes. Undo restores them.", the disk-error notice).
+ *   Offered per-string or per-command, he chose consistency, restoring rather
+ *   than stripping.
+ *
+ * Both entries are at source in queue.md / lead-engineer.md / astra.md, and
+ * the earlier one still says the opposite - so read the date before acting on
+ * either. A test asserts the BARE form appears in no shipped file.
+ *
+ * NOT EVERY APPROVED STRING ENDS IN A PERIOD. The trash-restore line is ruled
+ * bare - "leave that last one bare" - because it ends in a file path where a
+ * period reads as part of the path. It is another owner's, and nothing here
+ * may assert a rule that would force it to match these three.
+ */
+export const DELETE_ALL_REFUSED = "Handwriting: your ink cannot be deleted.";
+
+/**
+ * APPROVED BY ALAN, 2026-09-09 09:12 CDT, and SCOPED TO ONE REASON.
+ *
+ * An attack found the sentence above is FALSE in one place: at
+ * `unknown-readiness` on a note that has never been inked and is open in
+ * editing view, there is no ink, so nothing "cannot be deleted" - the old code
+ * said "removed 0 strokes" there. His ruling, verbatim: "okay, on a note
+ * you've never inked you can say 'no ink on this note'", then "yes, correct
+ * you got it" on this exact form.
+ *
+ * `unknown-readiness` ONLY. Every other refusal keeps the sentence above, and
+ * the four cases where it reads as permanent when the truth is "not right now"
+ * - `unsettled-record`, `readiness-lost`, `changed-during-backup`,
+ * `backup-unverified` - are NOT ruled and must not borrow this one. It would
+ * be false at all four: those notes DO have ink.
+ *
+ * THE PERIOD CAME OFF AND WENT BACK ON, both on his word. The history matters
+ * more than the final form here, which is why it is recorded rather than
+ * quietly shown - and it has now reversed twice:
+ *
+ *   His words this morning had no period: "you can say 'no ink on this note'".
+ *   WE added one when the string was formed, and his "yes, correct you got it"
+ *   was given to the form he was shown, not to punctuation he chose. Shown it
+ *   later beside the bare version already live on the ordinary path, he ruled
+ *   "no period" (2026-09-09 16:58).
+ *
+ *   Then, told that other sentences on this same command still carry trailing
+ *   periods because he was never shown them, he restored it for consistency
+ *   (17:14/17:21): "ehhhhhhhhhhhhhhhh we hsould be consistent, put a period
+ *   back at end".
+ *
+ * All entries are at source in queue.md / lead-engineer.md / astra.md, and the
+ * middle one still says the opposite - read the date before acting on either.
+ * A test asserts the BARE form appears in no shipped file.
+ */
+export const DELETE_ALL_NO_INK = "Handwriting: no ink on this note.";
+
+/**
+ * APPROVED BY ALAN, 2026-09-09 12:34 CDT, and SCOPED TO FOUR REASONS.
+ *
+ * SOURCE: the 12:34 entry, posted in `queue.md`, `lead-engineer.md`,
+ * `1.4.10.md` and `astra.md` before the dispatch. The sentence below IS his
+ * answer - he was shown all eleven reasons rendered as the notices a user
+ * actually sees, plus three candidate sentences, and typed this one back
+ * himself rather than directing anyone to write it.
+ *
+ * THE LOWERCASE `try` IS HIS AND IS NOT A TYPO. It matches his other lowercase
+ * rulings the same night. No capital T, no em dash, no "please", no rewording.
+ *
+ * WHAT IT FIXES: at these four the general sentence reads as PERMANENT when
+ * the truth is "not right now" - the note is still settling, it stopped being
+ * ready mid-delete, or its ink moved while the copy was being made. Trying
+ * again works, and the old wording told the user it would not.
+ *
+ * AND HE WAS OFFERED THE COPY-KEPT VARIANT AND DID NOT TAKE IT. One candidate
+ * named the trash generation that three of these four keep. He passed over it
+ * and chose the temporary-only sentence, so NOTHING here mentions a copy - not
+ * in any form, however true it is of those three. That is recorded because it
+ * is the clause a later reader is most likely to "improve" back in.
+ *
+ * The rule that produced three strings instead of one, kept verbatim because
+ * following it twice is what got the wording right: if a call site makes an
+ * approved string read wrong, NAME THE CALL SITE AND LEAVE THE STRING ALONE.
+ *
+ * TWO PERIODS, AND THE INTERNAL ONE NEVER MOVED. He ruled the trailing periods
+ * off all three sentences on 2026-09-09 17:09 - "get the periods OUT", then
+ * "GET EM OUT" - and RESTORED them the same day at 17:14/17:21 for consistency
+ * with the sentences on this command he had never been shown:
+ * "ehhhhhhhhhhhhhhhh we hsould be consistent, put a period back at end".
+ *
+ * Through both reversals the INTERNAL period after "right now" stayed. It
+ * separates two sentences: removing it gives "cannot be deleted right now try
+ * again in a moment", which is not a punctuation change but a different and
+ * worse sentence, and a re-write is his to type rather than ours to attempt.
+ * That reading was recorded in the 17:09 entry for him to veto and he did not.
+ *
+ * The lowercase `try` is his and did not move either.
+ */
+export const DELETE_ALL_TEMPORARY =
+	"Handwriting: your ink cannot be deleted right now. try again in a moment.";
+
+/**
+ * WHAT EACH REFUSAL SAYS TO THE USER.
+ *
+ * Every reason maps to the one approved sentence. The table stays a table
+ * rather than collapsing into a single constant at the call site, because it
+ * is what makes a NEW reason a build error instead of a silent refusal: the
+ * `Record<DeleteAllRefusal, ...>` type will not compile without an entry, and
+ * the test beside it asserts every entry carries the approved string. Whoever
+ * adds the eleventh reason has to decide, in the open, what it says.
+ *
+ * WHY THE STRING MATTERED MORE THAN "the user is confused". Refusals at the
+ * verification steps happen AFTER `preserve` has written a trash generation,
+ * which is kept on purpose, and `freeTrashPath` has no cap - so a button that
+ * silently did nothing cost one more file on every press. Nothing downstream
+ * mistook that silence for success (`runDetached` is clean), so it was an
+ * unbounded-file-growth problem rather than a correctness one.
+ */
+const DELETE_ALL_REFUSAL_TEXT: Record<DeleteAllRefusal, string | null> = {
+	"locked-future": DELETE_ALL_REFUSED,
+	"locked-duplicate": DELETE_ALL_REFUSED,
+	"locked-legacy": DELETE_ALL_REFUSED,
+	// THE ONE THAT DIFFERS, and it differs because the other sentence was FALSE
+	// here rather than merely awkward: this note has no ink at all.
+	"unknown-readiness": DELETE_ALL_NO_INK,
+	// The same readiness, but this note HAS ink - so the never-inked sentence
+	// would be false here and it keeps the general one.
+	"unknown-holds-ink": DELETE_ALL_REFUSED,
+	// THE FOUR HE RULED TEMPORARY, and only these four. At each of them trying
+	// again works, which the general sentence denied. Three of them keep a
+	// trash generation and say nothing about it: he was shown that variant and
+	// passed over it.
+	"unsettled-record": DELETE_ALL_TEMPORARY,
+	"readiness-lost": DELETE_ALL_TEMPORARY,
+	"changed-during-backup": DELETE_ALL_TEMPORARY,
+	"backup-unverified": DELETE_ALL_TEMPORARY,
+	// NOT temporary, deliberately: `no-capture` and `backup-missing` are not
+	// states that clear by waiting, and he was not shown them for this ruling.
+	"no-capture": DELETE_ALL_REFUSED,
+	"backup-missing": DELETE_ALL_REFUSED,
+	// Nor this one, and it is the reason this key exists apart from
+	// `readiness-lost`: a renamed, deleted or replaced note does not come back
+	// in a moment, so the temporary sentence would be false about it.
+	"target-lost": DELETE_ALL_REFUSED,
+};
+
+/**
+ * Report a refused delete-all. THE ONLY THING IT DOES IS SPEAK.
+ *
+ * It reads no state that could change one, and it clears, persists, snapshots
+ * and resets nothing - the old warning that reached the user as a side effect
+ * of the wipe attempting to persist is not a reporting path, it was a symptom,
+ * and it stopped firing the moment the command started refusing before it
+ * touched the store.
+ */
+function reportDeleteAllRefusal(reason: DeleteAllRefusal): void {
+	const text = DELETE_ALL_REFUSAL_TEXT[reason];
+	if (text !== null) new Notice(text);
+}
+
+/** Every reason, for coverage that the table and the union stay in step. */
+export const DELETE_ALL_REFUSALS = Object.keys(DELETE_ALL_REFUSAL_TEXT) as DeleteAllRefusal[];
+
+/** The approved text for a refusal, or null while none has been approved. */
+export function deleteAllRefusalText(reason: DeleteAllRefusal): string | null {
+	return DELETE_ALL_REFUSAL_TEXT[reason];
+}
+
+/** The clear, the history entry and the notice: the only side effects. */
+function finishDeleteAllInk(path: string, kept: string | null): void {
+	const n = deleteAllInkOn(path);
+	if (n === null) {
+		new Notice("Handwriting: open the note in editing view to delete its ink.");
+		return;
+	}
+	const what = n === 1 ? "1 stroke" : `${n} strokes`;
+	new Notice(
+		kept
+			? `Handwriting: removed ${what}. Undo restores them; a copy is kept in ${kept}.`
+			: `Handwriting: removed ${what}. Undo restores them.`
+	);
+}
+
+/**
+ * The store's two RECOVERY notices, which are two different events.
+ *
+ * `onRecovered` is the corrupt-file promotion: the main file could not be read,
+ * its own complete interrupted save was promoted, and the corrupt bytes are
+ * quarantined under a new name. Its sentence is accurate for that and unchanged.
+ *
+ * `onInkTrashRestored` is an ink-trash restore: no live sidecar existed, a
+ * readable generation was found in the trash and renamed back into place.
+ * `restoredTo` is that live file - the restore is a rename, so there is no kept
+ * copy to name. Its sentence is Alan's, approved 2026-09-09; the authority is
+ * the mailbox entry stamped 2026-09-09 18:26 CDT in `queue.md`, not this
+ * comment. Lowercase `the`, curly quotes around the note, internal period kept,
+ * no final period.
+ *
+ * EXTRACTED FROM `onload` ONLY so a test can execute the REAL callbacks rather
+ * than a copy of them: built inline they were unreachable, and a test that
+ * re-implements a notice proves nothing about the one that ships. It is called
+ * from `onload` and nowhere else; there is no test-only formatter.
+ */
+export function bindRecoveryNotices(
+	store: PageStore,
+	noteNameFor: (pageId: string) => string
+): void {
+	store.onRecovered = (pageId, keptAs) => {
+		new Notice(
+			`Handwriting recovered the ink on "${noteNameFor(pageId)}" from an interrupted save. The unreadable file is kept as ${keptAs}.`,
+			15000
+		);
+	};
+	// NO TRAILING PERIOD, AND THAT IS RULED - not drafted, not an oversight.
+	//
+	// Alan restored the trailing period on six other approved strings the same
+	// day ("put a period back at end", 2026-09-09 17:14 CDT) and was then asked
+	// about this one specifically. His answer: "leave that last one bare"
+	// (17:21 CDT). THE REASON IS THE PATH: this sentence ends in a file path,
+	// and a period there reads as part of the path.
+	//
+	// SO THE ASYMMETRY IS DELIBERATE. Six punctuated, this one bare. Anyone
+	// checking consistency will find this string the odd one and be tempted to
+	// "fix" it - that is what this comment is for. The authority is the 17:21
+	// entry in `queue.md` / `lead-engineer.md` / `astra.md`, not this comment,
+	// and `RecoveredAnnouncesTrashRestore.test.ts` reds if a period appears.
+	//
+	// The INTERNAL period after "trash" stays, as it always has.
+	store.onInkTrashRestored = (pageId, restoredTo) => {
+		new Notice(
+			`Handwriting restored the ink on “${noteNameFor(pageId)}” from trash. the file is at ${restoredTo}`,
+			15000
+		);
+	};
+}
 
 export default class HandwritingPlugin extends Plugin implements HandwritingHost {
 	store!: PageStore;
@@ -896,6 +1453,34 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	}
 
 	/**
+	 * The whole of a PDF's ink as one comparable value, or null if it cannot
+	 * be taken.
+	 *
+	 * Text, not a copy of the objects, because both mutation shapes defeat a
+	 * copy: `commit` pushes into the live array in place, and
+	 * `replaceAllLive` swaps the array for another. A reference compares
+	 * equal to itself after the first, and a shallow copy shares the stroke
+	 * objects with both. Serializing captures every point's coordinates,
+	 * pressure and time along with style, page and anything else a stroke
+	 * carries - which is the point, since the change this guards against can
+	 * be one interior coordinate that the on-disk rounding would hide.
+	 *
+	 * Nothing here touches the live objects: no freeze, no sort, no mutation.
+	 *
+	 * Null when the ink cannot be serialized at all, and the caller then
+	 * refuses the clear. "Cannot compare" must not read as "did not change" -
+	 * that is the direction that loses ink.
+	 */
+	private pdfInkSnapshot(id: string): string | null {
+		try {
+			return JSON.stringify(this.pdfStore.strokes(id));
+		} catch (err) {
+			console.error("[handwriting] delete-all-pdf-ink could not read current ink", err);
+			return null;
+		}
+	}
+
+	/**
 	 * The confirmed pdf wipe. Same permanence invariant as the note wipe: the
 	 * trash copy is made FIRST and a failed copy aborts everything -
 	 * Handwriting never deletes ink it could not preserve. `preserve` also
@@ -906,16 +1491,65 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	 * against strokes that no longer exist: an undo replayed across the wipe
 	 * would restore a fragment and call it the past. The trash copy is the
 	 * recovery path, and the dialog said so.
+	 *
+	 * "Made FIRST" was doing more work than it could carry. The copy is made
+	 * first in TIME, but `preserve` is awaited, and the wipe used to read the
+	 * document again on the other side of that await - so ink drawn during the
+	 * copy was cleared from the live file and absent from the copy, while the
+	 * notice named the copy as the recovery path. The two guards below close
+	 * that: the store must be able to write at all, and the ink must be the
+	 * same ink, both immediately before anything is cleared.
 	 */
 	private async deleteAllPdfInk(id: string): Promise<void> {
+		// The trash copy is only a safety net if the store can actually write.
+		// In session-memory mode, mid-read, or under either lock, `persist`
+		// drops every scheduled write: this session's ink has never reached
+		// the disk and never will, so `preserve` copies a file that does not
+		// contain it - or finds no file at all and returns null - and the
+		// clear below destroys the only remaining copy while the notice says
+		// one was kept. A locked document has already been told its ink is not
+		// being saved; being told a copy was kept immediately after is the
+		// same lie twice. Refuse before making the claim, not after.
+		if (!this.pdfStore.canPersist(id)) {
+			new Notice(PDF_INK_NOT_READY);
+			return;
+		}
+		// What is on screen RIGHT NOW, frozen before the await. Everything
+		// below reads the stroke array again once `preserve` has resolved, and
+		// a stroke finished inside that gap is in neither copy: the backup was
+		// taken before it existed, and the clear removes it from the live
+		// document. Only a full-content value sees that. A count, an id set or
+		// a bounding box all miss a stroke that replaced another, and
+		// `inkFingerprint` is lossy by construction.
+		const before = this.pdfInkSnapshot(id);
+		if (before === null) {
+			new Notice(PDF_INK_NOT_READY);
+			return;
+		}
 		let kept: string | null = null;
 		try {
 			kept = await this.store.preserve(id);
 		} catch (err) {
 			console.error("[handwriting] delete-all-pdf-ink backup failed", err);
 			new Notice(
-				"Handwriting: could not copy this PDF's ink to the trash (disk error). Nothing was deleted."
+				"Handwriting: could not copy this PDF's ink to the trash (disk error). nothing was deleted."
 			);
+			return;
+		}
+		// Both guards again, and NOTHING may await between here and the clear.
+		// Readiness is rechecked because the wait is long enough to lose it: a
+		// poll that finds the sidecar half-written by a sync client locks the
+		// record while the backup is in flight, and a copy taken before that
+		// lock is not a copy of what is on screen now.
+		if (!this.pdfStore.canPersist(id)) {
+			new Notice(PDF_INK_NOT_READY);
+			return;
+		}
+		// The copy that did complete is left where it is - it is a real
+		// generation of real ink and deleting it would be its own small loss -
+		// but nothing here claims it holds the strokes drawn since.
+		if (this.pdfInkSnapshot(id) !== before) {
+			new Notice(PDF_INK_CHANGED_DURING_BACKUP);
 			return;
 		}
 		const n = this.pdfStore.strokes(id).length;
@@ -1004,7 +1638,23 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			}
 			return null;
 		}
-		const overlay = overlayForPath(file.path);
+		// The pane the user is IN, not the first pane that mounted this path.
+		// The PDF branch above has asked which pane is active since 1.4.6
+		// (AD2); this branch asked `overlayForPath(file.path)`, which answers
+		// the first mounted overlay - so with two editors open on one note the
+		// palette and the hotkeys deleted the other pane's ink, copied the
+		// other pane's ink, and put the undo step in the other pane, where the
+		// user's own Undo could not reach it.
+		//
+		// Identity on both halves, and null rather than a fallback: a path is
+		// shared by every pane on the note, and a refused command is
+		// recoverable where a delete in the wrong pane is not. This is also
+		// what Paste follows - it is the fourth caller here, and it lands ink
+		// in the active pane for the same reason the other three take from it.
+		const active = this.app.workspace.activeEditor;
+		const editor = active?.editor;
+		if (!active || !editor || active.file !== file) return null;
+		const overlay = overlayForActiveEditor(editor, file);
 		return overlay ? { kind: "inline", overlay } : null;
 	}
 
@@ -1039,19 +1689,42 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			return;
 		}
 		const base = file.path.replace(/\.md$/, "");
-		const out = await this.firstFreePath((n) => `${base}.snip-${n}.png`);
-		const name = out.split("/").pop() ?? out;
-		const taken = this.app.metadataCache.getFirstLinkpathDest(name, file.path) !== null;
-		const md = `![[${taken ? out : name}]]
+		// The bytes are already rendered and belong to THIS invocation; the turn
+		// below only decides when they are written, never what they are.
+		//
+		// `copied` starts false rather than true: a chooser that rejects never
+		// reaches the clipboard at all, and the failure notice must not then
+		// claim an embed is sitting there waiting.
+		let copied = false;
+		try {
+			const { path: out } = await createFreshFile(
+				() => this.firstFreePath((n) => `${base}.snip-${n}.png`),
+				async (path) => {
+					// Built for the destination this turn was actually given. A name
+					// predicted before queueing is a name another caller may take.
+					const name = path.split("/").pop() ?? path;
+					const taken = this.app.metadataCache.getFirstLinkpathDest(name, file.path) !== null;
+					const md = `![[${taken ? path : name}]]
 [[${file.basename}]]`;
-		let copied = true;
-		try {
-			await navigator.clipboard.writeText(md);
-		} catch {
-			copied = false;
-		}
-		try {
-			await this.app.vault.createBinary(out, snip.bytes.buffer as ArrayBuffer);
+					try {
+						await navigator.clipboard.writeText(md);
+						copied = true;
+					} catch {
+						copied = false;
+					}
+					return this.app.vault.createBinary(path, snip.bytes.buffer as ArrayBuffer);
+				},
+				// One attempt, as this caller always made. The helper's default of
+				// eight is for callers with no side effect to repeat; retrying here
+				// would ask the clipboard again on every round.
+				1
+			);
+			const name = out.split("/").pop() ?? out;
+			new Notice(
+				copied
+					? `Handwriting: snipped to ${name}; the embed is on your clipboard`
+					: `Handwriting: snipped to ${name}; the clipboard refused the embed`
+			);
 		} catch (e) {
 			console.error("[handwriting] snip the selection", e);
 			new Notice(
@@ -1059,13 +1732,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 					? "Handwriting: the snip could not be written; the embed on your clipboard has nowhere to point"
 					: "Handwriting: the snip could not be written"
 			);
-			return;
 		}
-		new Notice(
-			copied
-				? `Handwriting: snipped to ${name}; the embed is on your clipboard`
-				: `Handwriting: snipped to ${name}; the clipboard refused the embed`
-		);
 	}
 
 	/**
@@ -1097,19 +1764,33 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			return;
 		}
 		const base = file.path.replace(/\.pdf$/i, "");
-		const out = await this.firstFreePath((n) => `${base}.snip-${n}.png`);
-		const name = out.split("/").pop() ?? out;
-		const taken = this.app.metadataCache.getFirstLinkpathDest(name, file.path) !== null;
-		const md = `![[${taken ? out : name}]]
+		// The page number and the bytes belong to THIS invocation and are read
+		// before the turn, so a snip that waits still describes what it captured.
+		let copied = false;
+		try {
+			const { path: out } = await createFreshFile(
+				() => this.firstFreePath((n) => `${base}.snip-${n}.png`),
+				async (path) => {
+					const name = path.split("/").pop() ?? path;
+					const taken = this.app.metadataCache.getFirstLinkpathDest(name, file.path) !== null;
+					const md = `![[${taken ? path : name}]]
 [[${file.name}#page=${snip.pageNumber}|${file.basename} p.${snip.pageNumber}]]`;
-		let copied = true;
-		try {
-			await navigator.clipboard.writeText(md);
-		} catch {
-			copied = false;
-		}
-		try {
-			await this.app.vault.createBinary(out, snip.bytes.buffer as ArrayBuffer);
+					try {
+						await navigator.clipboard.writeText(md);
+						copied = true;
+					} catch {
+						copied = false;
+					}
+					return this.app.vault.createBinary(path, snip.bytes.buffer as ArrayBuffer);
+				},
+				1
+			);
+			const name = out.split("/").pop() ?? out;
+			new Notice(
+				copied
+					? `Handwriting: snipped to ${name}; the embed is on your clipboard`
+					: `Handwriting: snipped to ${name}; the clipboard refused the embed`
+			);
 		} catch (e) {
 			console.error("[handwriting] snip the selection", e);
 			new Notice(
@@ -1117,13 +1798,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 					? "Handwriting: the snip could not be written; the embed on your clipboard has nowhere to point"
 					: "Handwriting: the snip could not be written"
 			);
-			return;
 		}
-		new Notice(
-			copied
-				? `Handwriting: snipped to ${name}; the embed is on your clipboard`
-				: `Handwriting: snipped to ${name}; the clipboard refused the embed`
-		);
 	}
 
 	/**
@@ -1148,7 +1823,11 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	 */
 	private async flattenPdf(file: TFile, id: string): Promise<void> {
 		const bytes = new Uint8Array(await this.app.vault.readBinary(file));
-		const result = appendInkToPdf(bytes, this.pdfStore.strokes(id));
+		const result = appendInkToPdf(
+			bytes,
+			this.pdfStore.strokes(id),
+			this.settings.inkPdfColorMode
+		);
 		if (!result.ok) {
 			new Notice(`Handwriting: this PDF cannot be flattened - ${result.reason}`);
 			return;
@@ -1273,14 +1952,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				15000
 			);
 		};
-		// The corrupt-file recovery (persistence gate): the interrupted save
-		// was complete and is now the main file; the corrupt bytes were kept.
-		this.store.onRecovered = (pageId, keptAs) => {
-			new Notice(
-				`Handwriting recovered the ink on "${this.noteNameFor(pageId)}" from an interrupted save. The unreadable file is kept as ${keptAs}.`,
-				15000
-			);
-		};
+		bindRecoveryNotices(this.store, (pageId) => this.noteNameFor(pageId));
 		await this.loadSettings();
 
 		this.registerView(HANDWRITING_PAGE_VIEW_TYPE, (leaf) => new HandwritingPageView(leaf, this));
@@ -1304,44 +1976,19 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// the identity rules: the awaited page-id write precedes any sidecar,
 		// and an untouched note costs one metadata lookup and zero writes.
 		inlineInk.attachHost({
-			readPageId: (path) => {
-				const file = this.app.vault.getFileByPath(path);
-				if (!file) return null;
-				const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
-				const id = fm?.["handwriting-page-id"] as unknown;
-				// Frontmatter is text a person or a sync peer typed, and this
-				// id goes straight into a sidecar path. Anything outside
-				// isSafePageId is not "a page with an odd name": the note
-				// counts as unclaimed, so the next stroke mints a fresh id
-				// and the ink lands in the ink folder like everyone else's.
-				if (typeof id === "string" && id.length > 0 && !isSafePageId(id)) {
-					this.warnUnusablePageId(path);
-					return null;
-				}
-				return isSafePageId(id) ? id : null;
-			},
-			claimId: async (path, proposedId) => {
-				const file = this.app.vault.getFileByPath(path);
-				if (!file) throw new Error(`Handwriting: no file at ${path}`);
-				let out: { pageId: string; futureVersion?: number } = { pageId: proposedId };
-				await this.app.vault.process(file, (data) => {
-					const r = claimMarkdown(data, proposedId);
-					out = { pageId: r.pageId, futureVersion: r.futureVersion };
-					return r.content;
-				});
-				// A claim is a first sighting for the ownership ledger. The note
-				// that mints an id owns it (duplicate detection, v0.13.6).
-				if (out.futureVersion === undefined) {
-					if (this.pageIds.register(path, out.pageId).kind === "registered") {
-						this.persistOwners();
-					}
-				}
-				return out;
-			},
+			readPageId: (path) => this.notePageId(path),
+			claimId: (path, proposedId) => this.claimNotePageId(path, proposedId),
 			loadSidecar: (pageId) => this.store.load(pageId),
 			scheduleSidecar: (pageId, page) => this.store.schedule(pageId, page),
 			scheduleSidecarNow: (pageId, page) => this.store.saveNow(pageId, page),
-			notify: (message) => new Notice(message),
+			// Adopting another device's ink is destructive to this device's
+			// unless both revisions are made recoverable first. The store does
+			// the preserving and the acknowledging; the record decides whether
+			// the adoption is still safe between them. See adoptExternal.
+			prepareExternalAdoption: (pageId, outgoing) =>
+				this.store.prepareExternalAdoption(pageId, outgoing),
+			acceptExternalAdoption: (prepared) => this.store.acceptExternalAdoption(prepared),
+			notify: (message) => blockNotice(message),
 		});
 
 		this.registerEditorExtension(inkOverlayExtension());
@@ -1428,6 +2075,17 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				this.applyPaperTo(win.document, this.settings.paperStyle);
 			})
 		);
+		// Discovery for Boox mode: a slow present lag is the signal, checked
+		// on a plain interval rather than off the ink path so a machine that
+		// never writes still gets a periodic look. See checkEinkHint.
+		//
+		// Registered HERE, above the live-reload poll, on purpose: that poll's
+		// registration block is sliced out of this file's source and EXECUTED by
+		// src/LiveReloadTestHarness.ts, which pins it to exactly one
+		// `this.registerInterval(` and one `window.setInterval(`. An interval
+		// added between `let reloadTickBusy` and the pen command lands inside
+		// that window and fails those suites closed. Keep this outside it.
+		this.registerInterval(window.setInterval(() => this.checkEinkHint(), 10_000));
 		// Live reload: ink synced in from another device appears without a
 		// restart. One stat per open, quiet editor per check; the store
 		// adopts a changed sidecar only when nothing local is unsaved and no
@@ -1435,6 +2093,33 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// last word. Dot-folders are invisible to vault events (sidecars
 		// are not vault-indexed files), which is why this polls.
 		let reloadTickBusy = false;
+		// A sidecar belongs to a document, but each live pane owns its repaint.
+		// Keep exact bindings so a deferred repaint cannot reach a replacement.
+		const pendingPdfRefreshes = new Map<HTMLElement, { id: string; controller: PdfInkController }>();
+		const currentPdfPanes = (id: string) => [...this.pdfInk].filter(
+			([root]) => root.isConnected && this.pdfIds.get(root) === id
+		);
+		const refreshPendingPdfPanes = (failed: Map<PdfInkController, "eligibility" | "refresh">) => {
+			for (const [root, binding] of pendingPdfRefreshes) {
+				const { id, controller } = binding;
+				let phase: "eligibility" | "refresh" = "eligibility";
+				try {
+					if (!root.isConnected || this.pdfInk.get(root) !== controller || this.pdfIds.get(root) !== id) {
+						pendingPdfRefreshes.delete(root);
+						continue;
+					}
+					if (failed.has(controller) || !controller.idle) continue;
+					phase = "refresh";
+					controller.refresh();
+					pendingPdfRefreshes.delete(root);
+				} catch (err) {
+					// Retry on the next visible tick, even without another mtime.
+					// A fresh adoption later this tick must not retry the failure.
+					failed.set(controller, phase);
+					console.error(`[handwriting] live-reload poll failed for PDF ${id}`, err);
+				}
+			}
+		};
 		// Idle backoff. This exists to notice another device's write, and every
 		// tick that finds nothing still costs a stat per open document -
 		// forever, on battery, whether or not a second device exists. Quiet
@@ -1457,6 +2142,9 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 					wasHidden = false;
 					quietTicks = 0;
 				}
+				// Display debt is independent of the stat cadence and never resets it.
+				const failedPdfRefreshes = new Map<PdfInkController, "eligibility" | "refresh">();
+				refreshPendingPdfPanes(failedPdfRefreshes);
 				ticks++;
 				if (ticks % reloadStride(quietTicks) !== 0) {
 					this.pollStats.spaced++;
@@ -1472,26 +2160,54 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 						// reason - another device wrote them - so they need the
 						// same poll rather than a second one keeping its own
 						// time.
-						for (const [root, controller] of [...this.pdfInk]) {
-							const id = this.pdfIds.get(root);
-							if (!id || !controller.idle) continue;
-							if (!(await this.store.externallyChanged(id))) continue;
-							// The check above is a tick old and the stat was
-							// awaited; a pen can have landed since. Re-asking
-							// costs nothing and a swap mid-stroke costs the
-							// stroke.
-							if (!controller.idle) continue;
-							// And a stroke that LANDED in that gap has queued a
-							// write holding a pre-reload snapshot. Reloading
-							// now refreshes the known mtime, which disarms the
-							// write-path conflict guard, and that stale
-							// snapshot then goes over the other device's ink
-							// with no conflict copy. Skip the tick instead: the
-							// write lands, and the next poll reloads cleanly.
-							if (this.store.hasQueuedWrite(id)) continue;
-							if (await this.pdfStore.reloadExternal(id)) {
-								controller.refresh();
-								changed = true;
+						const pdfIds = new Set([...this.pdfInk.keys()].map(root => this.pdfIds.get(root)));
+						for (const id of pdfIds) {
+							if (!id) continue;
+							try {
+								let panes = currentPdfPanes(id);
+								if (!panes.length || panes.some(([, controller]) =>
+									failedPdfRefreshes.get(controller) === "eligibility" || !controller.idle
+								)) continue;
+								if (!(await this.store.externallyChanged(id))) continue;
+								// Stat awaited: panes may have joined, switched or started
+								// a gesture. Check every current binding before reloading
+								// the record they all share.
+								panes = currentPdfPanes(id);
+								if (!panes.length || panes.some(([, controller]) =>
+									failedPdfRefreshes.get(controller) === "eligibility" || !controller.idle
+								)) continue;
+								// A stroke completed during stat may have queued a stale
+								// snapshot. Preserve the write-path conflict guard until
+								// that write lands, then reload on a later poll.
+								if (this.store.hasQueuedWrite(id)) continue;
+								// Only a completed preserving adoption may replace an
+								// established PDF record. Missing capability, unavailable
+								// input, locks, preservation failures and stale qualification
+								// all retain the record and baseline for a later poll/save.
+								const expectedPanes = panes;
+								const adoption = await this.pdfStore.adoptExternal?.(id, () => {
+									const current = currentPdfPanes(id);
+									if (current.length !== expectedPanes.length) return false;
+									if (current.some(([, controller]) => !controller.idle)) return false;
+									if (this.store.hasQueuedWrite(id)) return false;
+									return expectedPanes.every(([root, controller], i) => {
+										const binding = current[i];
+										return binding?.[0] === root && binding[1] === controller;
+									});
+								});
+								if (adoption?.outcome !== "adopted") continue;
+								if (adoption.changed) {
+									changed = true;
+									// Loading still awaits file I/O; this bookkeeping does
+									// not make shared-cache adoption atomic with gestures.
+									// Include current panes and defer any that became busy.
+									for (const [root, controller] of currentPdfPanes(id)) {
+										pendingPdfRefreshes.set(root, { id, controller });
+									}
+									refreshPendingPdfPanes(failedPdfRefreshes);
+								}
+							} catch (err) {
+								console.error(`[handwriting] live-reload poll failed for PDF ${id}`, err);
 							}
 						}
 						for (const path of inlineReloadCandidates()) {
@@ -1504,7 +2220,16 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 							// another device simply never arriving.
 							try {
 								const id = inlineInk.pageIdOf(path);
-								if (!id || !(await this.store.externallyChanged(id))) continue;
+								if (!id) continue;
+								// Inline needs one fact the shared boolean intentionally
+								// collapses: positively observed absence starts the existing
+								// held-adoption notice. PDF and Slides keep boolean false for
+								// absence, and stat/read errors remain ordinary unchanged.
+								const sidecarChanged = await this.store.externallyChanged(id);
+								const observation = sidecarChanged
+									? "changed"
+									: (this.store.externalChangeObservation?.(id) ?? "unchanged");
+								if (observation === "unchanged") continue;
 								// The quiet check above is a tick old and the stat
 								// awaited: a pen can have landed meanwhile. This
 								// recheck runs in the same microtask as the
@@ -1518,7 +2243,24 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 								// anything. Let the write land; the next poll
 								// reloads against a mtime that matches it.
 								if (this.store.hasQueuedWrite(id)) continue;
-								if (await inlineInk.reloadExternal(path)) {
+								// PRESERVE BOTH REVISIONS BEFORE ADOPTING ONE.
+								// A sync replacement is not necessarily a
+								// superset of what this device holds, and the
+								// an unpreserved reload moves the save baseline to
+								// the incoming file - after which nothing holds
+								// the outgoing ink at all. The adopting route
+								// writes both as independently recoverable
+								// siblings first and only then swaps.
+								//
+								// Only a completed preserving adoption may replace
+								// an established record. Missing capability,
+								// unavailable preparation, locks and races all hold
+								// the current base for a later poll/save. The method
+								// stays optional for reduced test stand-ins; absence
+								// is also a hold, never reload authority.
+								const adoption = await inlineInk.adoptExternal?.(path);
+								if (adoption?.outcome !== "adopted") continue;
+								if (adoption.changed) {
 									inkExternallyReloaded(path);
 									notifyInkChanged(path);
 									// The release line owns this line, not the cherry-pick:
@@ -1529,6 +2271,30 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 							} catch (err) {
 								console.error(`[handwriting] live-reload poll failed for ${path}`, err);
 							}
+						}
+						// A live presentation, on the same tick and for the same
+						// reason: its `<pageId>.slides` sidecar sits in the same
+						// unindexed folder and another device writes it while the
+						// deck is open. Without this leg a deck kept its stale
+						// copy for the whole presentation and then overwrote the
+						// newer file at teardown. Its own try/catch, for the
+						// starvation reason the inline loop states.
+						try {
+							const slidesId = slidesReloadCandidate();
+							if (slidesId && (await this.store.externallyChanged(slidesId))) {
+								// Re-asked in the same microtask as the adopt: the
+								// answer above is a tick old and a pen can have
+								// landed on the deck since.
+								if (
+									slidesReloadCandidate() === slidesId &&
+									!this.store.hasQueuedWrite(slidesId) &&
+									(await reloadSlidesExternal(slidesId))
+								) {
+									changed = true;
+								}
+							}
+						} catch (err) {
+							console.error("[handwriting] live-reload poll failed for the presentation", err);
 						}
 						quietTicks = changed ? 0 : quietTicks + 1;
 					})().finally(() => {
@@ -1555,7 +2321,10 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			id: "inline-tool-pen",
 			name: "Pen on / off",
 			callback: () => {
-				showPenToggleNotice(penToggleNoticeText(penOnOff(penInkCommandHost)));
+				// The toggle itself is NOT gated - `penOnOff` is what flips the
+				// pen and it returns the new state. Only the toast is routine.
+				const on = penOnOff(penInkCommandHost);
+				if (routineNoticesVisible()) showPenToggleNotice(penToggleNoticeText(on));
 			},
 		});
 		// The eraser used to need a pen with an eraser end. Plenty of pens do
@@ -1629,19 +2398,52 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				showMouseInkToggleNotice(on ? "Handwriting: ink" : "Handwriting: cursor");
 			},
 		});
+		// THE ONLY WAY A PERSON CAN REACH A PRESERVED FORK. Adoption keeps both
+		// revisions and says nothing on success (`d50534a`, settled), and both
+		// artifacts live in the ink folder - `.handwriting` by default, which
+		// Obsidian will not browse. Nothing else in the plugin enumerates them:
+		// every folder sweep skips `.conflict-` names on purpose. Registered
+		// outside the live-reload block above because `LiveReloadTestHarness`
+		// slices that block out of this file and executes it with a fixed list
+		// of injected names.
 		this.addCommand({
-			id: "pen-tools-cycle",
-			name: "Toolbar: auto / show / hide",
+			id: "resolve-ink-fork",
+			name: FORK_COPY_PLACEHOLDER.commandName,
 			callback: () => {
-				const next = nextPenToolsMode(getPenToolsMode());
-				setPenToolsMode(next);
-				this.settings.penTools = next;
-				runDetached(this.persistSettings(), "save the pen tools mode");
-				refreshPenToolsAll();
-				new Notice(`Handwriting: pen tools ${next}`);
+				const host: ForkHost = {
+					read: (p) => this.app.vault.adapter.read(p),
+					stat: async (p) => {
+						const s = await this.app.vault.adapter.stat(p);
+						return s ? { mtime: s.mtime } : null;
+					},
+					saveNow: (pageId, data) => this.store.saveNow(pageId, data),
+					list: async (folder) => (await this.app.vault.adapter.list(folder)).files,
+				};
+				runDetached(
+					refreshForks(host, this.store.inkFolder()).then(() => {
+						new ForkResolutionModal(this.app, host).open();
+					}),
+					"open the fork resolution list"
+				);
 			},
 		});
 		this.addCommand({
+			id: "slides-ink-toggle",
+			name: "Toggle slides ink",
+			callback: () => {
+				const on = !slidesInkEnabled();
+				this.settings.slidesInk = on;
+				runDetached(this.persistSettings(), "save the slides ink setting");
+				if (on) this.startSlidesInk();
+				else setSlidesInk(false);
+				new Notice(
+					on
+						? "Handwriting: slides ink on (start a presentation, then draw)"
+						: "Handwriting: slides ink off"
+				);
+			},
+		});
+				this.addCommand({
 			id: "paper-cycle",
 			name: "Paper: none / lines / grid / dots",
 			callback: () => {
@@ -1649,7 +2451,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				this.settings.paperStyle = next;
 				this.applyPaper(next);
 				runDetached(this.persistSettings(), "save the paper style");
-				new Notice(`Handwriting: paper ${next}`);
+				if (routineNoticesVisible()) new Notice(`Handwriting: paper ${next}`);
 			},
 		});
 		// THE SPLIT (1.4.12). "Extra commands for hotkeys" gates REGISTRATION -
@@ -1685,7 +2487,9 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// taken out of their hand - so this is `togglePenInput`, not the
 		// command's `penOnOff`. One flag either way, so the two never disagree.
 		setRetiredCommandAction(PEN_INK_TOGGLE, () => {
-			showPenToggleNotice(penToggleNoticeText(togglePenInput(penInkCommandHost)));
+			// As above: `togglePenInput` performs the toggle. Gate the toast only.
+			const on = togglePenInput(penInkCommandHost);
+			if (routineNoticesVisible()) showPenToggleNotice(penToggleNoticeText(on));
 		});
 		const addGatedCommand = (cmd: Command): void => {
 			// Copied, and copied BEFORE registration. `addCommand` hands the
@@ -2049,7 +2853,11 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				if (!surface) return false;
 				if (!checking) {
 					if (surface.kind === "inline") {
-						if (surface.overlay.deleteSelectedInk() === 0) new Notice("Handwriting: lasso some ink first");
+						// Two different failures, two different sentences; see
+						// `lassoDeleteNotice`, which owns both strings so they are
+						// pinned by execution rather than by reading this file.
+						const said = lassoDeleteNotice(surface.overlay.deleteSelectedInk());
+						if (said) new Notice(said);
 					} else {
 						// Notifies itself: an unidentified PDF and an empty
 						// lasso both stop a delete, and only the controller
@@ -2068,8 +2876,13 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				if (!surface) return false;
 				if (!checking) {
 					if (surface.kind === "inline") {
-						const n = surface.overlay.copySelectedInk();
-						new Notice(n > 0 ? `Handwriting: copied ${n} stroke(s)` : "Handwriting: lasso some ink first");
+						// One owner for both sentences; see `copySelectionNotice`.
+						// The strings are unchanged - this moved where they live so
+						// the strip button cannot drift from the command.
+						// The copy itself runs either way; only the success sentence is routine.
+						const copied = surface.overlay.copySelectedInk();
+						if (routineNoticesVisible() || !copySelectionNoticeIsRoutine(copied))
+							new Notice(copySelectionNotice(copied));
 					} else {
 						// Notifies itself, all three outcomes.
 						surface.controller.copySelection();
@@ -2086,8 +2899,12 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				if (!surface) return false;
 				if (!checking) {
 					if (surface.kind === "inline") {
-						const n = surface.overlay.cutSelectedInk();
-						new Notice(n > 0 ? `Handwriting: cut ${n} stroke(s)` : "Handwriting: lasso some ink first");
+						// Three outcomes, not two; see `cutSelectionNotice`,
+						// which owns all three sentences so they are pinned by
+						// execution rather than by reading this file.
+						const outcome = surface.overlay.cutSelectedInk();
+						if (routineNoticesVisible() || !cutSelectionNoticeIsRoutine(outcome))
+							new Notice(cutSelectionNotice(outcome));
 					} else {
 						// Notifies itself, for the same reason delete does.
 						surface.controller.cutSelectionCommand();
@@ -2115,7 +2932,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 						new Notice("Handwriting: the ink clipboard is empty, copy selected ink first");
 					} else if (surface.kind === "inline") {
 						const n = surface.overlay.pasteInkHere();
-						new Notice(`Handwriting: pasted ${n} stroke(s)`);
+						if (routineNoticesVisible()) new Notice(`Handwriting: pasted ${n} stroke(s)`);
 					} else {
 						// Notifies itself (success, or the note-ink-on-a-pdf refusal).
 						surface.controller.pasteFromClipboard();
@@ -2639,6 +3456,26 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			);
 		};
 		this.registerEvent(this.app.workspace.on("active-leaf-change", updateStatusBarClass));
+		// A theme switch arrives as `css-change` and nothing else. The ink
+		// adaptation is decided at draw time from the body class, so the
+		// cached flag is re-read and every surface repainted - otherwise
+		// the page keeps whatever it was painted under the old theme until
+		// an unrelated repaint happens by.
+		this.registerEvent(
+			this.app.workspace.on("css-change", () => {
+				refreshInkTheme(document);
+				repaintAllInkOverlays();
+				// The strip previews ink - the tinted palette button and the
+				// swatch pop - and a preview that disagrees with the stroke
+				// beside it is a swatch lying about which pen it is.
+				refreshAllStrips();
+				// A live deck's ink theme is measured off `.reveal`'s own
+				// paint, not read from this event, so a theme or snippet
+				// switch mid-presentation has to re-arm that measurement
+				// itself (GAP 16) - a no-op when no deck is live.
+				onSlidesCssChange();
+			})
+		);
 		// PDF ink controllers follow the open PDF views. Keyed by root element
 		// rather than by leaf: a leaf can be reused for a different file, and
 		// the element is what the overlays actually live inside.
@@ -2650,6 +3487,17 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			this.pdfInk.clear();
 		});
 		syncPdfInk();
+		// Slides ink. These two hooks are a courtesy re-scan and nothing more:
+		// the core Slides presentation is a div on `<body>`, not a leaf, so
+		// neither event ever fires for one opening or closing
+		// (SlidesInkSurface S1). Its own MutationObserver is the real signal.
+		// `scanForSlides` returns immediately while the feature is off, so this
+		// costs nothing to a vault that has turned it off.
+		this.registerEvent(this.app.workspace.on("layout-change", () => scanForSlides()));
+		this.registerEvent(this.app.workspace.on("active-leaf-change", () => scanForSlides()));
+		if (this.settings.slidesInk) this.startSlidesInk();
+		// Disposes the live deck, which flushes its save.
+		this.register(() => setSlidesInk(false));
 		// Every way the recording switch flips, not just the command: showing
 		// a report also ends the capture, and that path left "recording pen"
 		// in the status bar with nothing recording.
@@ -2725,6 +3573,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		this.app.workspace.onLayoutReady(() => {
 			if (this.unloaded) return;
 			this.showWhatsNewIfDue();
+			this.showScribbleHintIfDue();
 		});
 
 		// ---- background/freeze flush ------------------------------------------
@@ -3087,7 +3936,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		this.settings.inkColors[tool] = setInkColorHex(tool, hex);
 		refreshAllStrips();
 		await this.persistSettings();
-		new Notice(`Handwriting: ${tool} ${name}`);
+		if (routineNoticesVisible()) new Notice(`Handwriting: ${tool} ${name}`);
 	}
 
 	private async setInkSize(mult: number, name: string): Promise<void> {
@@ -3095,14 +3944,14 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		setInkSizeMult(tool, mult);
 		this.settings.inkSizes[tool] = clampInkSize(mult);
 		await this.persistSettings();
-		new Notice(`Handwriting: ${tool} size ${name}`);
+		if (routineNoticesVisible()) new Notice(`Handwriting: ${tool} size ${name}`);
 	}
 
 	private async setEraserSize(radiusPx: number, name: string): Promise<void> {
 		setEraserRadiusPx(radiusPx);
 		this.settings.eraserRadiusPx = clampEraserRadius(radiusPx);
 		await this.persistSettings();
-		new Notice(`Handwriting: eraser ${name}`);
+		if (routineNoticesVisible()) new Notice(`Handwriting: eraser ${name}`);
 	}
 
 	/**
@@ -3125,29 +3974,163 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	 * the fix is to stop lying in the refusal, not to hide the command.
 	 */
 	private deleteAllInkOrSaySo(path: string): void {
-		if (inlineInk.inkPresence(path) === "unknown") {
+		// THE TARGET, captured before any await, as an object AND the path it
+		// was invoked under. A string does not follow a rename, so every later
+		// step compares against this pair rather than trusting the name.
+		const target = this.captureDeleteAllTarget(path);
+		if (this.qualifiedDeleteAllPresence(target) === "unknown") {
 			runDetached(
-				inlineInk.ensureLoaded(path).then(() => this.deleteAllInkNow(path)),
+				// ONE attempt, and it requalifies the SAME capture afterwards.
+				// An unresolved load must not become no-ink, and must not loop.
+				inlineInk.ensureLoaded(path).then(() => this.deleteAllInkNow(target)),
 				`read ink before deleting all of it on ${path}`
 			);
 			return;
 		}
-		this.deleteAllInkNow(path);
+		this.deleteAllInkNow(target);
 	}
 
-	/** The decision itself, on information already in hand. */
-	private deleteAllInkNow(path: string): void {
-		if (inlineInk.hasInk(path)) this.confirmDeleteAllInk(path);
-		else new Notice("Handwriting: no ink on this note");
+	/**
+	 * The note this command was invoked on, as an object and a path together.
+	 *
+	 * `null` when the command started on something that is not a Markdown file
+	 * in the vault, which is not a note we may delete ink from either.
+	 */
+	private captureDeleteAllTarget(path: string): DeleteAllTarget {
+		const file = this.app.vault.getFileByPath(path);
+		return file === null ? null : { file, path };
 	}
 
-	/** "Delete all ink": confirm first. The count in the dialog is live. */
-	private confirmDeleteAllInk(path: string): void {
-		const count = inlineInk.strokes(path).length;
+	/**
+	 * Is the captured target STILL the current one, synchronously, right now?
+	 *
+	 * Four clauses, and each is load-bearing (Astra, 2026-09-09T07:31:28):
+	 *
+	 *  - `!this.unloaded` - the plugin itself is still live. Acting after
+	 *    unload writes through a store nobody is maintaining.
+	 *  - `extension === "md"` - it is still a note.
+	 *  - `file.path === target.path` - NOT RENAMED. Obsidian moves the same
+	 *    `TFile` object and updates its `path`, so the object surviving is not
+	 *    evidence the name did.
+	 *  - the vault entry AT that path IS that object - NOT REPLACED. Path
+	 *    equality alone is insufficient: delete-then-recreate at the same path
+	 *    produces a different `TFile` wearing the same name, and following the
+	 *    string there would retarget the deletion at somebody else's ink.
+	 *
+	 * `getActiveFile()` is deliberately not consulted. The target is the note
+	 * the command was invoked on, never whatever happens to be focused when the
+	 * user finally clicks.
+	 */
+	private sameDeleteAllTarget(target: DeleteAllTarget): boolean {
+		if (target === null) return false;
+		return (
+			!this.unloaded &&
+			target.file.extension === "md" &&
+			target.file.path === target.path &&
+			this.app.vault.getAbstractFileByPath(target.path) === target.file
+		);
+	}
+
+	/**
+	 * Presence, but only when it is evidence about THIS note.
+	 *
+	 * `inkPresence` answers a question about a path; this answers a question
+	 * about a target, and the difference is the whole seam. Three ways a bare
+	 * `none` is not evidence of an empty note:
+	 *
+	 *  - THE TARGET IS GONE OR IS SOMEBODY ELSE. A note renamed away leaves no
+	 *    record and no metadata under its old path, which is precisely the
+	 *    shape `InlineInkStore.ts:453` answers `none` for. Identity first.
+	 *  - NO HOST. Session-memory mode has nothing to look in, so `none` there
+	 *    means "nothing looked", not "nothing to find".
+	 *  - NO METADATA. A missing file cache cannot testify that the note has no
+	 *    ink id; absent metadata is the absence of evidence. Metadata that IS
+	 *    available and carries no ink id is real evidence and may be `none`.
+	 *
+	 * Returns `"invalid-target"` rather than throwing, so the caller decides
+	 * what to say - and the caller says the generic refusal, never no-ink.
+	 */
+	private qualifiedDeleteAllPresence(target: DeleteAllTarget): InkPresence | "invalid-target" {
+		if (!this.sameDeleteAllTarget(target)) return "invalid-target";
+		if (!inlineInk.hasHost()) return "unknown";
+		const presence = inlineInk.inkPresence(target!.path);
+		if (presence !== "none") return presence;
+		const cache = this.app.metadataCache.getFileCache(target!.file);
+		return cache === null || cache === undefined ? "unknown" : "none";
+	}
+
+	/**
+	 * The decision itself, on information already in hand.
+	 *
+	 * THE ORDINARY PATH USES ALAN'S SENTENCE TOO, on his ruling of 2026-09-09
+	 * 16:49 - "yeah both use mine". This site and the `unknown-readiness`
+	 * refusal were one character apart, and the difference was never a
+	 * decision: the constant simply had not been carried here. He was told the
+	 * two do not differ beyond the period, and that HIS sentence was on the
+	 * rare path while the older wording was on the common one - so the ruling
+	 * is about REACH, not wording.
+	 *
+	 * It stops at the note surface. The PDF sentence is still open with him.
+	 *
+	 * AND NO-INK IS NOW TWO CONDITIONS, NOT ONE. Alan's sentence says something
+	 * about a specific note, so it may only be said when this is still that
+	 * note AND its presence is a qualified `none`.
+	 *
+	 * `inkPresence` ALONE CANNOT CARRY IT, which is the trap in this seam and
+	 * is why the identity check is not belt-and-braces. `InlineInkStore.ts:453`
+	 * answers `none` when there is no record and the note carries no page id -
+	 * and a note that has been renamed away has exactly that shape: no record
+	 * under the old string, no metadata under it either. So `none` means both
+	 * "a real empty note" and "no longer there", and only the captured object
+	 * tells them apart. Swapping `hasInk` for `inkPresence` would have looked
+	 * like the fix and left the seam open.
+	 *
+	 * `unknown` does not reach the sentence either: an unread record with an
+	 * empty cache is not evidence of emptiness, it is the absence of evidence.
+	 */
+	private deleteAllInkNow(target: DeleteAllTarget): void {
+		const presence = this.qualifiedDeleteAllPresence(target);
+		if (presence === "ink") this.confirmDeleteAllInk(target);
+		else if (presence === "none") new Notice(DELETE_ALL_NO_INK);
+		else new Notice(DELETE_ALL_REFUSED);
+	}
+
+	/**
+	 * "Delete all ink": confirm first. The count in the dialog is live.
+	 *
+	 * THE MODAL IS THE LONGEST AWAIT IN THIS COMMAND - it is however long the
+	 * user takes - so the identity is checked again inside the callback,
+	 * immediately before the wipe is dispatched. Checking only at the start
+	 * would authorise a deletion against a note and then perform it against
+	 * whatever holds that path by the time they click.
+	 */
+	private confirmDeleteAllInk(target: DeleteAllTarget): void {
+		if (target === null) return;
+		const count = inlineInk.strokes(target.path).length;
 		if (count === 0) return;
-		new ConfirmDeleteInkModal(this.app, count, "note", () => {
-			runDetached(this.deleteAllInk(path), `delete all ink on ${path}`);
-		}).open();
+		new ConfirmDeleteInkModal(this.app, count, "note", () =>
+			this.confirmedDeleteAllInk(target)
+		).open();
+	}
+
+	/**
+	 * What the confirmation button actually does.
+	 *
+	 * A NAMED METHOD RATHER THAN AN INLINE CLOSURE, so the re-check has a
+	 * caller a test can reach: `ConfirmDeleteInkModal` is not exported and
+	 * nothing in the suite drives it, so a check living inside its callback
+	 * could only ever be pinned by reading the source. This is the same
+	 * decision, one indirection out, and it is executed instead.
+	 */
+	private confirmedDeleteAllInk(target: DeleteAllTarget): void {
+		// A CONFIRMED CALL WITHOUT ITS ORIGINAL CAPTURE IS INVALID, and that is
+		// not permission to reacquire one by path: the whole point of the
+		// capture is that the path may no longer mean what it meant.
+		if (!this.sameDeleteAllTarget(target)) {
+			new Notice(DELETE_ALL_REFUSED);
+			return;
+		}
+		runDetached(this.deleteAllInk(target!), `delete all ink on ${target!.path}`);
 	}
 
 	/**
@@ -3158,32 +4141,179 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	 * file on disk is already the artifact being protected, the wipe writes
 	 * nothing there (fail-closed lock), and only session strokes are cleared.
 	 */
-	private async deleteAllInk(path: string): Promise<void> {
+	private async deleteAllInk(target: DeleteAllTarget): Promise<void> {
+		// (0) THE TARGET, BEFORE THE READINESS. A confirmed call arriving
+		// without its original capture is invalid, and reacquiring one from the
+		// path would defeat the capture's whole purpose.
+		if (!this.sameDeleteAllTarget(target)) {
+			reportDeleteAllRefusal("target-lost");
+			return;
+		}
+		const path = target!.path;
+
+		// (1) READINESS BEFORE ANYTHING. A blocked note gets NO side effects at
+		// all: no preservation, no trash write, no session change, no live
+		// bytes, no history entry and no success notice. Not a quieter
+		// success - nothing. Under these locks `snapshot()` refuses, so every
+		// write this command would make dies silently, and a note that has
+		// already been told its ink is not being saved must not then be told a
+		// copy was kept.
+		//
+		// NO NOTICE IS RAISED HERE, deliberately. The store's own lock
+		// reporting is the approved wording and it has already spoken; no new
+		// copy is authorized for this path, and inventing one - or borrowing
+		// the pdf route's - is out of scope. Named in the handback as the one
+		// thing this repair leaves owed.
+		const readiness = inlineInk.deleteAllReadiness(path);
+		if (readiness.kind === "blocked") {
+			reportDeleteAllRefusal(`locked-${readiness.lock}` as DeleteAllRefusal);
+			return;
+		}
+
+		// `unknown` REFUSES, on Astra's 18:21 ruling, and this reverses what an
+		// earlier revision of this command did. The measurement that revision
+		// rested on still stands - an unclaimed record's ink has no sidecar and
+		// cannot compose one, so there is nothing on disk to lose - but the
+		// ruling is about what an UNPROVEN state may be permitted to do, which
+		// is a different question: unknown does not prove eligibility, a valid
+		// capture, an empty target or an adequate backup, so it may not reach a
+		// destructive clear, a history entry or a success notice.
+		//
+		// NO EMPTINESS PROBE HERE, deliberately: discovering the target was
+		// empty by calling the registry IS invoking the wipe. The
+		// non-destructive no-op for an empty note already exists upstream in
+		// `confirmDeleteAllInk`, which returns before the modal when the count
+		// is zero, and it is untouched.
+		if (readiness.kind === "unknown") {
+			// TWO DIFFERENT NOTES REACH THIS ONE READINESS, and Alan's second
+			// string is true of only one of them. He ruled on "a note you've
+			// never inked"; `unknown` also covers a note that HAS been drawn on
+			// but whose identity claim has not landed yet - a state measured in
+			// this file's `unknown` cases, holding real strokes. Telling that
+			// user "no ink on this note" would be a second false sentence of
+			// exactly the kind the first one was corrected for, so the reason is
+			// split here rather than the string being stretched to cover it.
+			//
+			// QUALIFIED PRESENCE, NOT A STROKE COUNT. An empty `strokes(path)`
+			// is the same shape for "a note never drawn on" and for "a note
+			// that is no longer there", and only the first of those may be
+			// told there is no ink on it. So ONLY a qualified `none` takes the
+			// no-ink arm; `ink`, `unknown` and an invalid target all take the
+			// generic refusal.
+			//
+			// It remains a pure lookup: it inspects, and it does not invoke the
+			// wipe to discover whether the target was empty.
+			const presence = this.qualifiedDeleteAllPresence(target);
+			reportDeleteAllRefusal(presence === "none" ? "unknown-readiness" : "unknown-holds-ink");
+			return;
+		}
+
+		// AN UNSETTLED RECORD REFUSES FOR THE SAME REASON, and it is the arm
+		// that matters most: mid-load its memory is empty while the sidecar can
+		// be full, so the capture is empty, and an empty capture is the one the
+		// backup verification below does not run. Letting it through would read
+		// "I have not looked yet" as "there is nothing to preserve".
+		if (readiness.kind === "unsettled") {
+			reportDeleteAllRefusal("unsettled-record");
+			return;
+		}
+
+		// `damaged` remains the EXISTING intentional session-only branch, kept
+		// as a distinct explicit exception: the file on disk is already the
+		// artifact being protected and the wipe writes nothing there.
+		if (readiness.kind !== "ready") {
+			finishDeleteAllInk(path, null);
+			return;
+		}
+
+		// (2) THE CAPTURE, at the same boundary as the readiness check and
+		// before any await: ordered, deep, immutable, and carrying each
+		// targeted stroke's `unknownByObject` entry.
+		//
+		// A null capture REFUSES rather than clearing. `ready` already implies
+		// a record with a page id so this is not reachable through readiness,
+		// but "no valid capture" and "safe to destroy" must not be the same
+		// branch: the ruling names a valid capture as one of the things an
+		// unproven state does not establish.
+		const capture = inlineInk.captureDeleteAll(path);
+		if (capture === null) {
+			reportDeleteAllRefusal("no-capture");
+			return;
+		}
+
 		let kept: string | null = null;
-		const pageId = inlineInk.pageIdOf(path);
-		if (pageId && !inlineInk.isDamagedLocked(path)) {
-			try {
-				kept = await this.store.preserve(pageId);
-			} catch (err) {
-				console.error("[handwriting] delete-all-ink backup failed", err);
-				new Notice(
-					"Handwriting: could not copy this note's ink to the trash (disk error). Nothing was deleted."
-				);
+		try {
+			kept = await this.store.preserve(capture.pageId);
+		} catch (err) {
+			console.error("[handwriting] delete-all-ink backup failed", err);
+			new Notice(
+				"Handwriting: could not copy this note's ink to the trash (disk error). nothing was deleted."
+			);
+			return;
+		}
+
+		// (3) THE BACKUP THAT CAME BACK HAS TO HOLD THE INK. `preserve` copies
+		// whatever is at the live path and returns where it put it; its return
+		// value does not certify that the file equals what is on screen. A
+		// non-empty target therefore requires a real returned path AND a
+		// readback that matches the capture at ordinary saved precision.
+		// The empty-target case skips the verification below because there was
+		// nothing to preserve - and that is only true because readiness has
+		// already refused every unsettled record. An empty capture on a record
+		// that has not finished loading means "not looked at yet", not "empty".
+		if (capture.targets.length > 0) {
+			// A REAL PATH, not merely a non-null one. `preserve` answering with
+			// an empty or blank string is not a location a copy can be at, and
+			// treating it as one would let "I could not preserve this" pass for
+			// "preserved, carry on".
+			if (kept === null || kept.trim() === "") {
+				reportDeleteAllRefusal("backup-missing");
+				return;
+			}
+			if (!(await backupHoldsCapture(capture, kept, (p) => this.app.vault.adapter.read(p)))) {
+				reportDeleteAllRefusal("backup-unverified");
 				return;
 			}
 		}
-		const n = deleteAllInkOn(path);
-		if (n === null) {
-			new Notice("Handwriting: open the note in editing view to delete its ink.");
+
+		// (4) AND NOTHING MAY AWAIT FROM HERE TO THE CLEAR. Readiness can be
+		// lost during the copy, and content can change under it - including by
+		// less than the persisted codec can represent, which is why the
+		// current-content check is exact and unrounded while the backup check
+		// above is not.
+		//
+		// On any refusal here the backup STAYS. It is a real generation of
+		// real ink; deleting it to tidy up would be its own small loss, and
+		// "no trash copy" stops being a truthful postcondition the moment
+		// preservation has run.
+		// THE SAME TARGET, RECHECKED HERE AND NOT EARLIER. Preservation is an
+		// await, and a rename, delete or replacement during it leaves the path
+		// naming a different note - or none. This is the last synchronous
+		// moment before the mutation, so it is the only place the check is
+		// worth anything.
+		//
+		// The backup already produced STAYS, and is neither retargeted nor
+		// removed: it is a real generation of this note's real ink, and the
+		// note having moved does not make it less so.
+		if (!this.sameDeleteAllTarget(target)) {
+			// `target-lost`, NOT `readiness-lost`. Both refuse and both keep the
+			// backup, but they say different things, and only one of them is
+			// true here: the note is not coming back in a moment.
+			reportDeleteAllRefusal("target-lost");
 			return;
 		}
-		const what = n === 1 ? "1 stroke" : `${n} strokes`;
-		new Notice(
-			kept
-				? `Handwriting: removed ${what}. Undo restores them; a copy is kept in ${kept}.`
-				: `Handwriting: removed ${what}. Undo restores them.`
-		);
+		if (inlineInk.deleteAllReadiness(path).kind !== "ready") {
+			reportDeleteAllRefusal("readiness-lost");
+			return;
+		}
+		if (!inlineInk.currentMatchesCapture(capture)) {
+			reportDeleteAllRefusal("changed-during-backup");
+			return;
+		}
+
+		finishDeleteAllInk(path, kept);
 	}
+
 
 	/**
 	 * The note a page id belongs to, for user-facing messages (RC4).
@@ -3497,6 +4627,15 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			console.error("[handwriting] settle on unload failed", err);
 		}
 		try {
+			// The presentation keeps its own claim and load promises, which
+			// `inlineInk.settle()` cannot see: a deck torn down inside the
+			// ~100-300 ms a first-stroke claim takes has a write parked behind
+			// it, and flushing the store before that lands writes nothing.
+			await settleSlidesInk();
+		} catch (err) {
+			console.error("[handwriting] slides settle on unload failed", err);
+		}
+		try {
 			await this.store.flush();
 		} catch (err) {
 			console.error("[handwriting] flush on unload failed", err);
@@ -3531,10 +4670,16 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	private async newPage(): Promise<void> {
 		const folder = this.app.workspace.getActiveFile()?.parent?.path ?? "";
 		const base = "Handwriting page";
-		const path = await this.firstFreePath((n) => this.pathFor(folder, n === 1 ? base : `${base} ${n}`));
 		const pageId = newPageId();
 		try {
-			const file = await this.app.vault.create(path, newPageMarkdown(pageId));
+			// One attempt, matching what this caller always did: it made exactly
+			// one create attempt, and routing it through the shared turn must not
+			// quietly turn that into `createFreshFile`'s default of eight.
+			const { result: file } = await createFreshFile(
+				() => this.firstFreePath((n) => this.pathFor(folder, n === 1 ? base : `${base} ${n}`)),
+				(path) => this.app.vault.create(path, newPageMarkdown(pageId)),
+				1
+			);
 			const leaf = this.app.workspace.getLeaf(true);
 			await leaf.setViewState({
 				type: HANDWRITING_PAGE_VIEW_TYPE,
@@ -3795,6 +4940,116 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		);
 	}
 
+	/**
+	 * Read a note's claimed page id out of frontmatter, or null.
+	 *
+	 * Lifted out of the inline host's own closure when the slides surface
+	 * arrived, so the two surfaces read the id through ONE function: a note
+	 * presented as slides and a note written on directly must agree about
+	 * what its id is, and two copies of this predicate would be the shape of
+	 * the divergence InkSurfaces.ts is about.
+	 */
+	private notePageId(path: string): string | null {
+		const file = this.app.vault.getFileByPath(path);
+		if (!file) return null;
+		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+		const id = fm?.["handwriting-page-id"] as unknown;
+		// Frontmatter is text a person or a sync peer typed, and this
+		// id goes straight into a sidecar path. Anything outside
+		// isSafePageId is not "a page with an odd name": the note
+		// counts as unclaimed, so the next stroke mints a fresh id
+		// and the ink lands in the ink folder like everyone else's.
+		if (typeof id === "string" && id.length > 0 && !isSafePageId(id)) {
+			this.warnUnusablePageId(path);
+			return null;
+		}
+		return isSafePageId(id) ? id : null;
+	}
+
+	/**
+	 * Atomically stamp (or discover) a note's page id. The ONE Markdown write
+	 * the ink model makes, and the only one - shared by the inline surface and
+	 * the slides surface so a note claimed by drawing on a slide is claimed
+	 * exactly the way a note claimed by writing on it is.
+	 */
+	private async claimNotePageId(
+		path: string,
+		proposedId: string
+	): Promise<{ pageId: string; futureVersion?: number }> {
+		const file = this.app.vault.getFileByPath(path);
+		if (!file) throw new Error(`Handwriting: no file at ${path}`);
+		let out: { pageId: string; futureVersion?: number } = { pageId: proposedId };
+		await this.app.vault.process(file, (data) => {
+			const r = claimMarkdown(data, proposedId);
+			out = { pageId: r.pageId, futureVersion: r.futureVersion };
+			return r.content;
+		});
+		// A claim is a first sighting for the ownership ledger. The note
+		// that mints an id owns it (duplicate detection, v0.13.6).
+		if (out.futureVersion === undefined) {
+			if (this.pageIds.register(path, out.pageId).kind === "registered") {
+				this.persistOwners();
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * Start slides ink, handing it everything it needs to know about Obsidian.
+	 *
+	 * The surface reads the nib through this host rather than importing the
+	 * inline module's getters, so `src/slides` depends on `src/ink` and
+	 * `src/model` and on no CodeMirror and no Obsidian API at all. Same nib the
+	 * inline surface binds per stroke: a pen of its own would be a second set
+	 * of colours and widths to keep in step for no reason.
+	 *
+	 * The sidecar goes through the SAME PageStore as every other surface, under
+	 * a writer identity of its own: a presentation is a second in-process
+	 * writer, and the store cannot tell two writers apart by anything else.
+	 * Note that it never writes the note's own page id - always
+	 * `<pageId>.slides` - so the note surface and this one can be live on the
+	 * same file at once without either overwriting the other.
+	 */
+	private startSlidesInk(): void {
+		const writer = newPageWriter("slides");
+		const host: SlidesInkHost = {
+			activeFilePath: () => this.app.workspace.getActiveFile()?.path ?? null,
+			readSource: async (path) => {
+				const file = this.app.vault.getFileByPath(path);
+				if (!file) return null;
+				// cachedRead: this is a read for hashing, not for editing, and
+				// the presentation is already showing the rendered version.
+				return this.app.vault.cachedRead(file);
+			},
+			readPageId: (path) => this.notePageId(path),
+			claimId: (path, proposedId) => this.claimNotePageId(path, proposedId),
+			newPageId: () => newPageId(),
+			loadSidecar: (sidecarId) => this.store.load(sidecarId),
+			scheduleSidecar: (sidecarId, page) => this.store.schedule(sidecarId, page, writer),
+			saveSidecarNow: (sidecarId, page) => this.store.saveNow(sidecarId, page, writer),
+			nib: () => {
+				const tool = getInlineTool();
+				const base = tool === "highlighter" ? HIGHLIGHTER_PEN : DEFAULT_PEN;
+				return {
+					tool,
+					color: getInkColorHex(tool),
+					width: base.baseWidth * getInkSizeMult(tool),
+				};
+			},
+			// The same live setting the inline eraser reads and `Next eraser
+			// size` steps through - so the size picked there is the size that
+			// erases here too, rather than a second, silently-ignored one.
+			eraserRadiusPx: () => getEraserRadiusPx(),
+			// And the same whole-vs-partial rule, from the same place: the
+			// eraser mode setting (`eraserMode === "stroke"`) drives both
+			// surfaces, so a slide erases the way that reader's notes do.
+			eraseWholeStrokes: () => getEraserWholeStrokes(),
+			notify: (message) => blockNotice(message),
+			buildId: this.manifest.version,
+		};
+		setSlidesInk(true, host);
+	}
+
 	// ---- settings -----------------------------------------------------------
 
 	/** One ruled style at a time: clear both classes, then set the one asked for. */
@@ -3937,14 +5192,31 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			// renamed into, and reading it here would make one old choice
 			// silently set two different things.
 			inkSmoothing: raw?.inkSmoothing !== false,
+			// `=== true`, NOT `!== false`: a vault with no stored value must come
+			// back OFF to match the default above. `!== false` reads absence as
+			// ON, which is how this shipped on by default.
+			inkAdaptsToTheme: raw?.inkAdaptsToTheme === true,
+			// `!== false`, NOT `=== true`: this one ships ON, so a vault with no
+			// stored value must come back ON to match its default. The line above
+			// is the same decision with the opposite sign, and the pair is why
+			// both spellings appear in this object rather than one house style.
+			inkReadableInExports: raw?.inkReadableInExports !== false,
+			// An ENUM, so the boolean trap above becomes a different one: the
+			// check is "anything I do not recognise is the default", which
+			// covers the absent key AND a value from a newer version or a
+			// hand-edited config. `normalizePdfPageAssumption` owns that
+			// single answer so it cannot drift from the type.
+			inkPdfColorMode: normalizePdfPageAssumption(raw?.inkPdfColorMode),
 			pageOwners:
 				raw?.pageOwners && typeof raw.pageOwners === "object" ? raw.pageOwners : {},
 			eraserRadiusPx: clampEraserRadius(raw?.eraserRadiusPx ?? DEFAULT_ERASER_RADIUS_PX),
 			mouseInk: raw?.mouseInk === true,
 			strokePrediction: raw?.strokePrediction !== false,
 			booxMode: raw?.booxMode === true,
+			einkHintOffered: raw?.einkHintOffered === true,
+			scribbleHintOffered: raw?.scribbleHintOffered === true,
 			paperStyle: normalizePaperStyle(raw?.paperStyle),
-			penTools: normalizePenToolsMode(raw?.penTools),
+			penTools: "auto",
 			// A fresh key on purpose: the old boolean keys carried the OLD
 			// default in every data.json (full-object saves), so reading
 			// them pinned the whole fleet to reticle and the stroke default
@@ -3953,6 +5225,12 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			penReticle: raw?.penReticle !== false,
 			shapeSnap: raw?.shapeSnap !== false,
 			devDiagnostics: raw?.devDiagnostics === true,
+			// `!== false`, so a vault that has never heard of slides ink - and
+			// every vault written by a build without it - gets the feature.
+			// The old `slidesInkProbe` key is deliberately not read: it carried
+			// the PROTOTYPE's off-by-default, and inheriting it would leave
+			// slides ink dark on every machine that ever ran the probe.
+			slidesInk: raw?.slidesInk !== false,
 			colorSizeCommands: raw?.colorSizeCommands === true,
 			// Not trusted a byte: `normalizeInkPresets` drops entries it
 			// cannot read, clamps the two fields that have real fallbacks,
@@ -4094,6 +5372,9 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			load: (id) => this.store.load(id),
 			schedule: (id, data) => this.store.schedule(id, data),
 			notice: (message) => void new Notice(message),
+			prepareExternalAdoption: (id, outgoing) =>
+				this.store.prepareExternalAdoption(id, outgoing, "pdf"),
+			acceptExternalAdoption: (prepared) => this.store.acceptExternalAdoption(prepared),
 		});
 		setMouseInk(this.settings.mouseInk);
 		// applyPaper's iterateAllLeaves walks the workspace's restored layout;
@@ -4124,7 +5405,18 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				runDetached(this.persistSettings(), "save the ink presets");
 			},
 		});
+		// Pushed in ONCE, here, and deliberately not again from the settings
+		// toggle: the `devDiagnostics` row promises "Takes effect after the
+		// plugin reloads", so a live read would break its own promise. See
+		// RoutineNotices.ts.
+		setRoutineNoticesVisible(this.settings.devDiagnostics);
 		setPressureSensitivity(this.settings.pressureSensitivity);
+		setInkThemeAdaptation(this.settings.inkAdaptsToTheme);
+		setInkExportReadability(this.settings.inkReadableInExports);
+		// The theme flag is cached (InkTheme.ts: a DOM read per stroke per frame
+		// is a repaint-loop cost), so it has to be primed once here as well as
+		// refreshed on `css-change`.
+		refreshInkTheme(document);
 		this.applyBooxMode();
 		setInkColorHex("pen", this.settings.inkColors.pen);
 		setInkColorHex("highlighter", this.settings.inkColors.highlighter);
@@ -4132,6 +5424,15 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		setEraserWholeStrokes(this.settings.eraserMode === "stroke");
 		setShapeSnap(this.settings.shapeSnap);
 	}
+
+	/**
+	 * The mode `applyBooxMode` last actually applied, so a real transition can
+	 * be told from a reapplication. Undefined until the first call - field
+	 * initialisers do not run for the `Object.create` instances the tests use -
+	 * and that first call counts as a change, so a session starts with no
+	 * pending hint evidence.
+	 */
+	private booxModeApplied: boolean | undefined;
 
 	/**
 	 * Boox mode: the slice of e-ink latency the plugin owns. E-ink pays per
@@ -4143,6 +5444,19 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	 */
 	applyBooxMode(): void {
 		const on = this.settings.booxMode;
+		// A mode CHANGE invalidates hint evidence in both directions, and it is
+		// cleared HERE rather than at the next tick because a user can toggle on
+		// and off entirely between two ten-second checks: samples taken while
+		// e-ink mode was on describe a different render path, and a partial run
+		// from before the change describes a machine since reconfigured.
+		// Reapplying the SAME mode - which the settings tab does for the toggles
+		// next to this one - changes nothing and must not throw away a valid run.
+		// The offer latch is never cleared here: told once is once.
+		if (this.booxModeApplied !== on) {
+			this.booxModeApplied = on;
+			discardHintSamples();
+			resetEinkHintProgress();
+		}
 		document.body.classList.toggle("handwriting-boox", on);
 		// Prediction is EXTENDED on e-ink, not paused: the first NoteAir
 		// trace (2026-09-01) measured the webview delivering pen events
@@ -4256,6 +5570,118 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		}
 		for (const id of plan.toUnmirror) clearGatedCommandAction(id);
 		for (const id of plan.toRemove) this.removeGatedCommand(id);
+	}
+
+	/**
+	 * Apple Scribble can claim Pencil input over an ordinary editable note.
+	 * There is no web-side fix for that platform feature, so this is a one-time
+	 * warning, not a claim that Handwriting changed Scribble's behaviour.
+	 *
+	 * Obsidian's host flags are the gate: iOS AND tablet means its iPad app.
+	 * The conjunction excludes iPhone, Android/e-ink tablets, and desktop
+	 * hosts without guessing from a user agent.
+	 */
+	private showScribbleHintIfDue(): void {
+		if (!Platform.isIosApp || !Platform.isTablet || this.settings.scribbleHintOffered) {
+			return;
+		}
+		blockNotice(
+			`IPAD USERS ONLY
+
+if you are seeing black ink 'lift' up off the page and ink is disappearing
+
+turn off scribble > iPad settings > Apple pencil > scribble toggle off
+
+- alan :)`,
+			0
+		);
+		// Burn the once-per-vault latch only after Notice construction returns.
+		// If the toast never appeared, this session has not spent its one chance.
+		this.settings.scribbleHintOffered = true;
+		this.saveSettingsNow();
+	}
+
+	/**
+	 * Discovery for a setting that already exists: `booxMode` is tuned
+	 * against a real e-ink device, but nothing ever told a writer on a slow
+	 * machine it was there. Polled rather than driven off the ink path
+	 * itself, because the ink path is exactly what must not gain a single
+	 * branch for this - see EinkHint.ts for the state machine and
+	 * Prediction.ts:96-101 for why the caps themselves stay put.
+	 *
+	 * Two early-outs before the state machine is even asked: Boox mode
+	 * already on means there is nothing to discover, and the latch already
+	 * true means this vault has already been told.
+	 *
+	 * rAF sample age is a symptom, not a diagnosis: it cannot tell an e-ink
+	 * panel from a slow machine, a background tab or a one-off stall that
+	 * outlasted the freshness window. That is why the notice below leads
+	 * with a CONDITION the reader checks for themselves rather than with a
+	 * claim about their hardware: anyone it does not apply to stops at the
+	 * first line. The wording, the block layout and the sticky duration are
+	 * Alan's - see the comment at the Notice itself before changing any of
+	 * them.
+	 */
+	private checkEinkHint(): void {
+		// Every tick SPENDS the pending batch, whatever else happens to it.
+		// Evidence left behind would age into the next interval and stop that
+		// batch being disjoint, which is the defect this replaced: a check's
+		// reading has to be about the interval that just ended and nothing else.
+		if (this.settings.booxMode) {
+			discardHintSamples();
+			resetEinkHintProgress();
+			return;
+		}
+		if (this.settings.einkHintOffered) {
+			discardHintSamples();
+			return;
+		}
+		if (!noteLag(consumeHintLagMs())) return;
+		// STAYS UNTIL DISMISSED (ruling, alan, 1.4.13: "sticky toast it is").
+		// This is a ONE-LAUNCH TOAST and the flag below burns it for the life
+		// of the vault, so a timed toast missed once is gone forever - and the
+		// whole point is telling someone who has never heard of Boox mode that
+		// it exists. 15 s of a writer's attention while their pen is down is
+		// not a fair bet against never saying it again. Sticky also survives
+		// being stacked under the what's-new toast, which is the other
+		// one-launch toast this plugin shows.
+		//
+		// Sticky and not a modal, which is what this looked like it would be:
+		// the audience is BY CONSTRUCTION on slow-refreshing e-ink hardware -
+		// that is what `noteLag` just measured - so a modal would force the
+		// largest possible repaint on the one display whose repaint latency
+		// prompted the message, and interrupt a stroke to do it. A toast
+		// never blocks the hand and costs a fraction of that.
+		// ALAN'S WORDING, VERBATIM (1.4.13), and the layout is his too - three
+		// blocks, the condition first. That order is load-bearing rather than
+		// styling: the gate below is measured SLOWNESS, not e-ink hardware
+		// (there is no device detection anywhere in this path), so a fast-
+		// enough machine having a bad run reaches this too. Leading with "IF
+		// YOU ARE ON BOOX" lets everyone it does not apply to dismiss it
+		// without reading further.
+		//
+		// A fragment rather than a "\n"-joined string: `Notice` sets text, and
+		// newlines in text do not become line breaks without a white-space
+		// rule we do not own. Three `div`s render the three blocks whatever
+		// the theme does. Same `createFragment` idiom as `renderSupport`.
+		new Notice(
+			createFragment((f) => {
+				f.createDiv({ text: "IF YOU ARE ON BOOX" });
+				f.createDiv({ text: "try the boox toggle in handwriting settings" });
+				f.createDiv({ text: "-alan :)" });
+			}),
+			0
+		);
+		// BURNED ONLY ONCE THE TOAST EXISTS, not before. This is the trap the
+		// plugin already met once - "showWhatsNewIfDue would have spent the
+		// one-launch toast on a session nobody saw" (see `unloaded`,
+		// 1.4.6-design.md 5k/AD6). Writing and persisting the flag first meant
+		// a `Notice` that threw, or a teardown between the two, spent the one
+		// chance on a toast that never rendered. Nothing between the
+		// construction above and this line can fail, so ordering it after is
+		// free.
+		this.settings.einkHintOffered = true;
+		this.saveSettingsNow();
 	}
 
 	/** Settings-tab writes: persist now, quietly. */
@@ -4572,70 +5998,7 @@ class HandwritingSettingTab extends PluginSettingTab {
 	getSettingDefinitions(): SettingDefinitionItem<SettingKey>[] {
 		return [
 			{
-				type: "group",
-				heading: "Pen",
-				items: [
-					{
-						name: "Pressure sensitivity",
-						desc:
-							"Line width follows how hard you press. Off gives an even line; " +
-							"strokes still thin with speed and taper at the ends. Default on.",
-						// The command palette used to carry two separate commands for
-						// this row - "Pressure sensitivity: toggle" and "Pen pressure:
-						// recalibrate" - and Alan ruled both out of the palette
-						// (2026-09-05: "pressure sensitivity... those are all
-						// settings"). The toggle keeps going through `control`'s own
-						// path (`getControlValue`/`setControlValue`, same as every
-						// other row); `render` only adds the button beside it, the
-						// same escape hatch `renderSyncButton` below uses.
-						render: (setting) => this.renderPressureSensitivity(setting),
-					},
-					{
-						name: "Ink prediction",
-						// The e-ink flicker advice came out with 1.3.9: that flicker was the
-						// wet canvas asking for the low-latency path, not prediction, so
-						// sending people here to fix it cost a boox user a pointless toggle
-						// and told us nothing. Flicking past sharp corners is a real
-						// prediction artefact and stays.
-						desc:
-							"Draws a little ahead of the pen to hide latency. " +
-							"Turn it off if the line runs ahead of the nib or flicks past sharp corners. " +
-							"Default on.",
-						control: {
-							type: "toggle",
-							key: "strokePrediction",
-							disabled: () => this.plugin.settings.booxMode,
-						},
-					},
-					{
-						// The smoothing users can actually feel. setInkShaping has been
-						// honoured by the renderers all along but nothing ever called it: the
-						// toggle that drove it was renamed into "pressure sensitivity" and the
-						// shaping half lost its wiring, so the line has been permanently
-						// shaped with no way to say otherwise. Two people asked for exactly
-						// this on the same day (boox thread, 2026-08-30) and were told to turn
-						// prediction off, which is a different feature and did nothing.
-						name: "Ink smoothing",
-						desc:
-							"Shapes the line: thinner when you move fast, tapered at each end. " +
-							"Off draws an unshaped stroke that follows the pen more literally. Default on.",
-						control: {
-							type: "toggle",
-							key: "inkSmoothing",
-							disabled: () => this.plugin.settings.booxMode,
-						},
-					},
-					{
-						name: "Shape snap",
-						desc: "Hold the pen still at the end of a stroke to snap your drawing into a shape. Default on.",
-						control: { type: "toggle", key: "shapeSnap" },
-					},
-					{
-						name: "Mouse ink",
-						desc: "Left click draws. Default off.",
-						control: { type: "toggle", key: "mouseInk" },
-					},
-				],
+				name: `Version ${this.plugin.manifest.version}`,
 			},
 			{
 				type: "group",
@@ -4650,27 +6013,12 @@ class HandwritingSettingTab extends PluginSettingTab {
 							options: { none: "None", lines: "Lines", grid: "Grid", dots: "Dots" },
 						},
 					},
-					{
-						name: "Pen toolbar",
-						// What this setting decides is whether the toolbar is
-						// THERE, which "auto-hides when the pen is away" did not
-						// say: auto shows it once a pen has been used this
-						// session and then keeps it, rather than hiding and
-						// showing as the pen comes and goes.
-						//
-						// The behaviour that wording described is real but is
-						// not this setting: the strip steps aside on pen contact
-						// and returns on pen-up, in EVERY mode, Show included
-						// (setInking, InkOverlay.ts:1912/2001/2262). Two
-						// behaviours, one of them configurable, and the
-						// description was quietly claiming the wrong one.
-						desc: "Shows the toolbar once you use a pen. Always on mobile. Default auto.",
-						control: {
-							type: "dropdown",
-							key: "penTools",
-							options: { auto: "Auto", show: "Show", hide: "Hide" },
-						},
-					},
+				],
+			},
+			{
+				type: "group",
+				heading: "Toolbar",
+				items: [
 					{
 						name: "Toolbar placement",
 						desc: "Where the pen toolbar and its pill sit. Default top right.",
@@ -4701,23 +6049,98 @@ class HandwritingSettingTab extends PluginSettingTab {
 						// written this way.
 						render: (setting) => this.renderFoldOrder(setting),
 					},
-					{
-						name: "Pen reticle",
-						desc: "Shows a dot where the pen is. Default on.",
-						control: {
-							type: "toggle",
-							key: "penReticle",
-							disabled: () => this.plugin.settings.booxMode,
-						},
-					},
-					// movableTextBoxes lands here on 1.5.0: it is about how the
-					// note lays out rather than how the pen draws.
 				],
 			},
 			{
 				type: "group",
-				heading: "E-ink",
+				heading: "PDFs",
 				items: [
+					{
+						// APPROVED BY ALAN AS WRITTEN, 2026-09-08 - "that
+						// works", then "color btw american" / "not british".
+						// AMERICAN SPELLING HERE ONLY: he ruled on this row,
+						// not on the five other strings that still say
+						// "colour", including the row directly above. Two
+						// adjacent rows therefore disagree, deliberately, and
+						// tidying them is a separate copy question that has
+						// not been asked.
+						//
+						// FIVE earlier drafts died, and the first four failed
+						// the same way: they explained. Two were named "Keep
+						// flattened ink readable" - "wtf is this copy", then
+						// "not clear, why is flattened ink unreadable,
+						// question makes more questions then it answers". The
+						// NAME was the fault, not the length: it asked the
+						// reader a question it never answered, and "flattened"
+						// is our word, not theirs.
+						//
+						// This one is shaped on the "Paper background" row
+						// rather than invented - topic name, then a
+						// description that lists the options and names the
+						// default. Do not lengthen it; the option labels carry
+						// the rest, and the mechanism lives in InkPdfAppend.ts
+						// where it belongs.
+						name: "Ink color when flattening PDFs",
+						desc: "Darken, lighten, or leave it alone. Default darken.",
+						control: {
+							type: "dropdown",
+							key: "inkPdfColorMode",
+							options: {
+								darken: "Darken it for light pages",
+								lighten: "Lighten it for dark pages",
+								keep: "Leave it as I drew it",
+							},
+						},
+					},
+				],
+			},
+			{
+				type: "group",
+				heading: "Export",
+				items: [
+					{
+						// DIRECTLY BELOW the theme row on purpose, and the copy has
+						// to earn that position. Two adjacent toggles that look like
+						// the same idea with opposite defaults read as a bug unless
+						// the text says why, so this one names the difference: your
+						// own canvas versus a file you are making for somewhere else.
+						// That sentence is an acceptance condition of the slice, not
+						// decoration.
+						name: "Keep exported ink readable",
+						desc:
+							// Alan's words, 2026-09-09, verbatim. This row and its ~90-word
+							// description were flagged UNAPPROVED on 2026-09-08 and rode the
+							// build for a day. This is the approval. Do not restore the old
+							// text, which explained the reasoning at length and named the
+							// neighbouring setting that has since been deleted.
+							"Darkens or lightens pen ink that would disappear when you export, print, or " +
+							"snip. Ink on screen and its saved color stay unchanged. Highlighter is left " +
+							"alone. Default on.",
+						control: { type: "toggle", key: "inkReadableInExports" },
+					},
+				],
+			},
+			{
+				type: "group",
+				heading: "Latency",
+				items: [
+					{
+						name: "Ink prediction",
+						// The e-ink flicker advice came out with 1.3.9: that flicker was the
+						// wet canvas asking for the low-latency path, not prediction, so
+						// sending people here to fix it cost a boox user a pointless toggle
+						// and told us nothing. Flicking past sharp corners is a real
+						// prediction artefact and stays.
+						desc:
+							"Draws a little ahead of the pen to hide latency. " +
+							"Turn it off if the line runs ahead of the nib or flicks past sharp corners. " +
+							"Default on.",
+						control: {
+							type: "toggle",
+							key: "strokePrediction",
+							disabled: () => this.plugin.settings.booxMode,
+						},
+					},
 					{
 						name: "Boox mode",
 						desc:
@@ -4729,12 +6152,65 @@ class HandwritingSettingTab extends PluginSettingTab {
 			},
 			{
 				type: "group",
-				heading: "Storage",
+				heading: "Pen",
 				items: [
 					{
-						name: "Compatibility with Obsidian Sync, iCloud and Dropbox",
-						aliases: ["ink folder", "hidden folder", "sync", "obsidian sync", "icloud", "dropbox"],
-						render: (setting) => this.renderSyncButton(setting),
+						name: "Pressure sensitivity",
+						desc:
+							"Line width follows how hard you press. Off gives an even line; " +
+							"strokes still thin with speed and taper at the ends. Default on.",
+						// The command palette used to carry two separate commands for
+						// this row - "Pressure sensitivity: toggle" and "Pen pressure:
+						// recalibrate" - and Alan ruled both out of the palette
+						// (2026-09-05: "pressure sensitivity... those are all
+						// settings"). The toggle keeps going through `control`'s own
+						// path (`getControlValue`/`setControlValue`, same as every
+						// other row); `render` only adds the button beside it, the
+						// same escape hatch `renderSyncButton` below uses.
+						render: (setting) => this.renderPressureSensitivity(setting),
+					},
+					{
+						// The smoothing users can actually feel. setInkShaping has been
+						// honoured by the renderers all along but nothing ever called it: the
+						// toggle that drove it was renamed into "pressure sensitivity" and the
+						// shaping half lost its wiring, so the line has been permanently
+						// shaped with no way to say otherwise. Two people asked for exactly
+						// this on the same day (boox thread, 2026-08-30) and were told to turn
+						// prediction off, which is a different feature and did nothing.
+						name: "Ink smoothing",
+						desc:
+							"Shapes the line: thinner when you move fast, tapered at each end. " +
+							"Off draws an unshaped stroke that follows the pen more literally. Default on.",
+						control: {
+							type: "toggle",
+							key: "inkSmoothing",
+							disabled: () => this.plugin.settings.booxMode,
+						},
+					},
+				],
+			},
+			{
+				type: "group",
+				heading: "Mouse",
+				items: [
+					{
+						name: "Mouse ink",
+						desc: "Left click draws. Default off.",
+						control: { type: "toggle", key: "mouseInk" },
+					},
+					{
+						name: "Pen reticle",
+						desc: "Shows a dot where the pen is. Default on.",
+						control: {
+							type: "toggle",
+							key: "penReticle",
+							disabled: () => this.plugin.settings.booxMode,
+						},
+					},
+					{
+						name: "Shape snap",
+						desc: "Hold the pen still at the end of a stroke to snap your drawing into a shape. Default on.",
+						control: { type: "toggle", key: "shapeSnap" },
 					},
 				],
 			},
@@ -4759,11 +6235,12 @@ class HandwritingSettingTab extends PluginSettingTab {
 							"Hotkeys for colors and sizes",
 						],
 						desc:
-							"Adds the tool toggles (eraser, lasso, insert space, pan), the color and size " +
-							"cycles, a separate command per ink color and nib size, and a pair per quick-pen " +
-							"slot (wear it, or save the pen in hand into it), so each can take its own " +
-							"hotkey. Off by default - the pen toolbar reaches all of them, and they " +
-							"crowded out the export and flatten commands." +
+							// Alan's words, 2026-09-09, verbatim. He sent it twice: the first
+							// read "For mouse or pen hotkey users" and he trimmed it to "For
+							// hotkey users." Do not restore the inventory this replaced - the
+							// old text listed every command in parentheses and ran to 84 words.
+							"For hotkey users. Adds tool toggles, color and size controls, and quick pens " +
+							"to the command palette. Each can take its own hotkey. Default off." +
 							// The switch is live (setControlValue -> the plugin's
 							// applyGatedCommandRegistration), so the reload sentence it
 							// carried since 1.4.6 would now be a lie - except on an
@@ -4806,10 +6283,17 @@ class HandwritingSettingTab extends PluginSettingTab {
 					},
 				],
 			},
-			// Last, because these are for reporting a bug or reading a trace
-			// rather than for writing: someone who wants them goes looking, and
-			// someone who does not meets them only after every setting they
-			// came for.
+			{
+				type: "group",
+				heading: "Storage",
+				items: [
+					{
+						name: "Compatibility with Obsidian Sync, iCloud and Dropbox",
+						aliases: ["ink folder", "hidden folder", "sync", "obsidian sync", "icloud", "dropbox"],
+						render: (setting) => this.renderSyncButton(setting),
+					},
+				],
+			},
 			{
 				type: "group",
 				heading: "Developer",
@@ -4820,25 +6304,6 @@ class HandwritingSettingTab extends PluginSettingTab {
 							"Shows the developer diagnostics commands in the palette. " +
 							"Takes effect after the plugin reloads.",
 						control: { type: "toggle", key: "devDiagnostics" },
-					},
-					// INSIDE this group deliberately, and it is the last row of
-					// the last one, so it is still the final thing on the page -
-					// which is the whole point of it: someone who has been using
-					// the thing ends up here, not someone deciding whether to
-					// install it.
-					//
-					// Trailing the array instead put it in this section anyway on
-					// 1.12, where `paint()` has no way to close a group - a
-					// heading opens a run that only the next heading ends - while
-					// 1.13's own renderer floated it outside. Same file, two
-					// answers. Placing it here makes both renderers agree, and
-					// makes the placement a decision rather than a side effect
-					// (alan, 2026-09-02: "kofi support row can be in developer
-					// that's fine").
-					{
-						name: SUPPORT_LINE,
-						searchable: false,
-						render: (setting) => this.renderSupport(setting),
 					},
 				],
 			},
@@ -4944,6 +6409,31 @@ class HandwritingSettingTab extends PluginSettingTab {
 				// again - and a Boox user flipping this would otherwise watch
 				// two toggles keep insisting they were on.
 				this.rerender();
+				break;
+			case "inkAdaptsToTheme":
+				s.inkAdaptsToTheme = on;
+				setInkThemeAdaptation(on);
+				// The theme may have moved since the last `css-change` this window
+				// saw (a settings tab opened in a second window, say), and the flag
+				// is what the repaint below will read.
+				refreshInkTheme(document);
+				repaintAllInkOverlays();
+				refreshAllStrips();
+				break;
+			case "inkPdfColorMode":
+				// Read at flatten time from `this.settings`, so there is no
+				// renderer to notify and nothing to repaint: the next flatten
+				// asks and gets the new answer. Normalised on the way in as
+				// well as on load, so a control that somehow yields an unknown
+				// string cannot store one.
+				s.inkPdfColorMode = normalizePdfPageAssumption(str);
+				break;
+			case "inkReadableInExports":
+				s.inkReadableInExports = on;
+				setInkExportReadability(on);
+				// No repaint: this setting cannot change a pixel on screen. It is
+				// read only inside an export, a print swap or a snip, and every
+				// one of those paints from scratch when it runs.
 				break;
 			case "shapeSnap":
 				s.shapeSnap = on;

@@ -23,8 +23,15 @@
  *   - anything about Obsidian. There is no Obsidian here. The theme
  *     variables below are INJECTED by this file, and an injected value is a
  *     parameter, not a measurement: a real theme sets different ones.
- *   - anything about iOS or Android. This is desktop Chromium; Playwright's
- *     WebKit is a patched build and its font stack is not iOS Safari's.
+ *     The host's OWN RULES are not here either unless a test brings them:
+ *     `hostCss` layers a hand-reduced fixture of them UNDER the plugin's
+ *     sheet, in the order Obsidian loads a plugin's stylesheet, which is
+ *     the only way this harness can see a host declaration the plugin
+ *     forgot to override (the slider thumb's `top`, 2026-09-06, reached two
+ *     users with every file here green).
+ *   - anything about iOS or Android. Chromium is the default; the startup
+ *     regression also runs in Playwright's desktop WebKit, but that is a
+ *     patched build and its font stack is not iOS Safari's.
  *   - whether a pop is PLACED correctly. It measures the pop's own box;
  *     `hangUnder`'s re-centring and `popRightOffset`'s clamping are pinned
  *     separately, against rects rather than a render.
@@ -34,11 +41,13 @@
  */
 
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import { build } from "esbuild";
-import { chromium, type Browser, type Page } from "playwright";
+import { chromium, webkit, type Browser, type Page } from "playwright";
 import type {
 	ClearanceProbe,
 	DragProbe,
+	MobileChromeProbe,
 	MoreRowProbe,
 	PopBox,
 	ReadoutProbe,
@@ -62,6 +71,25 @@ const here = (rel: string): string => fileURLToPath(new URL(rel, import.meta.url
  * hand-written copy of the rules measures the copy.
  */
 export const stylesCss = (): string => rawStyles;
+
+/**
+ * One of the host's stylesheets, as this suite keeps them: a HAND REDUCTION
+ * in `test/render/fixtures/`, naming its source, its values and the date it
+ * was read, never a dump of the app's CSS. Read from disk at call time so a
+ * fixture edited to match a new app build is what the next run injects.
+ */
+export const hostFixture = (name: string): string =>
+	readFileSync(here(`./fixtures/${name}`), "utf8");
+
+/**
+ * A `:root` block setting host tokens, for the value a fixture leaves as a
+ * parameter - the app ships `--slider-thumb-y` twice, and the test that
+ * loads the range fixture runs at both. Goes in `hostCss` beside the fixture.
+ */
+export const hostVars = (vars: Readonly<Record<string, string>>): string =>
+	`:root {\n${Object.entries(vars)
+		.map(([k, v]) => `\t${k}: ${v};`)
+		.join("\n")}\n}`;
 
 /**
  * EVERY value this harness supplies that Obsidian would have supplied.
@@ -183,6 +211,16 @@ export interface OpenOptions {
 	/** Overrides the on-disk stylesheet. Only the teeth demonstrations use it. */
 	css?: string;
 	/**
+	 * Host stylesheets to lay UNDER the plugin's, each in its own `<style>`,
+	 * in the order given, all before `styles.css` - the order Obsidian loads
+	 * a plugin's sheet after its own. Specificity decides the conflicts
+	 * either way; the order is kept so the page is the real cascade. Use
+	 * `hostFixture` for the sheet and `hostVars` for its parameters rather
+	 * than concatenating strings into `css`, which REPLACES the plugin's
+	 * sheet and so measures whatever the caller pasted.
+	 */
+	hostCss?: string | readonly string[];
+	/**
 	 * The page's device pixel ratio. Left unset it is 1, which is every
 	 * measurement here before `KnobAndDots.test.ts` - and which is exactly
 	 * the machine on which the two defects that file covers are invisible.
@@ -195,18 +233,26 @@ export interface OpenOptions {
 	deviceScaleFactor?: number;
 }
 
-/** Opens a page holding the real strip under the real stylesheet. */
-export async function openStrip(browser: Browser, opts: OpenOptions = {}): Promise<Harness> {
-	const page = await browser.newPage({
-		viewport: { width: 1400, height: 900 },
-		...(opts.deviceScaleFactor === undefined
-			? {}
-			: { deviceScaleFactor: opts.deviceScaleFactor }),
-	});
+/**
+ * Every sheet a harness page carries, in cascade order: the reset and the
+ * injected tokens, then any host sheets, then the plugin's. One function so
+ * the three page openers below cannot drift apart on what "under the plugin's
+ * stylesheet" means.
+ */
+async function injectSheets(
+	page: Page,
+	title: string,
+	opts: {
+		interfaceFont?: string;
+		css?: string;
+		hostCss?: string | readonly string[];
+		skipPluginCss?: boolean;
+	}
+): Promise<void> {
 	const vars = Object.entries({ ...INJECTED.loadBearing, ...INJECTED.cosmetic })
 		.map(([k, v]) => `${k}: ${v};`)
 		.join("\n\t");
-	await page.setContent("<!doctype html><meta charset=utf-8><title>chip geometry</title>");
+	await page.setContent(`<!doctype html><meta charset=utf-8><title>${title}</title>`);
 	await page.addStyleTag({
 		content: [
 			BOX_SIZING_RESET,
@@ -219,7 +265,27 @@ export async function openStrip(browser: Browser, opts: OpenOptions = {}): Promi
 			}; }`,
 		].join("\n"),
 	});
-	await page.addStyleTag({ content: opts.css ?? stylesCss() });
+	const host =
+		opts.hostCss === undefined
+			? []
+			: typeof opts.hostCss === "string"
+				? [opts.hostCss]
+				: opts.hostCss;
+	for (const sheet of host) await page.addStyleTag({ content: sheet });
+	if (!opts.skipPluginCss) {
+		await page.addStyleTag({ content: opts.css ?? stylesCss() });
+	}
+}
+
+/** Opens a page holding the real strip under the real stylesheet. */
+export async function openStrip(browser: Browser, opts: OpenOptions = {}): Promise<Harness> {
+	const page = await browser.newPage({
+		viewport: { width: 1400, height: 900 },
+		...(opts.deviceScaleFactor === undefined
+			? {}
+			: { deviceScaleFactor: opts.deviceScaleFactor }),
+	});
+	await injectSheets(page, "chip geometry", opts);
 	await page.addScriptTag({ content: await stripBundle() });
 	await page.evaluate(() => {
 		(window as unknown as { __pane: HTMLElement }).__pane = window.__hw.buildStrip();
@@ -235,8 +301,10 @@ export async function openStrip(browser: Browser, opts: OpenOptions = {}): Promi
 	};
 }
 
-export async function launch(): Promise<Browser> {
-	return chromium.launch();
+export type BrowserEngine = "chromium" | "webkit";
+
+export async function launch(engine: BrowserEngine = "chromium"): Promise<Browser> {
+	return (engine === "webkit" ? webkit : chromium).launch();
 }
 
 export type { Browser };
@@ -266,28 +334,24 @@ export interface LeafHarness {
 export interface LeafOptions {
 	/** True mounts on the leaf (the pdf's arrangement); false, in the content. */
 	header: boolean;
+	/** Let the host header float over note content, as Obsidian mobile chrome can. */
+	overlayHeader?: boolean;
+	/** Apply the host's mobile platform classes to the leaf fixture. */
+	platform?: "android" | "ios";
 	corner: ToolbarCorner;
 	collapsed: boolean;
 	/** The pane's width. A phone and a desktop take different branches. */
 	width: number;
+	/** Host sheets under the plugin's; see `OpenOptions.hostCss`. */
+	hostCss?: string | readonly string[];
 }
 
 export async function openLeaf(browser: Browser, opts: LeafOptions): Promise<LeafHarness> {
 	const page = await browser.newPage({
 		viewport: { width: Math.max(opts.width + 60, 480), height: 800 },
+		...(opts.platform ? { deviceScaleFactor: 3 } : {}),
 	});
-	const vars = Object.entries({ ...INJECTED.loadBearing, ...INJECTED.cosmetic })
-		.map(([k, v]) => `${k}: ${v};`)
-		.join("\n\t");
-	await page.setContent("<!doctype html><meta charset=utf-8><title>header clearance</title>");
-	await page.addStyleTag({
-		content: [
-			BOX_SIZING_RESET,
-			`:root {\n\t${vars}\n}`,
-			"body { margin: 0; font-size: 16px; font-family: Arial, sans-serif; }",
-		].join("\n"),
-	});
-	await page.addStyleTag({ content: stylesCss() });
+	await injectSheets(page, "header clearance", { hostCss: opts.hostCss });
 	await page.addScriptTag({ content: await stripBundle() });
 	await page.evaluate((o) => {
 		(window as unknown as { __pane: HTMLElement }).__pane = window.__hw.buildLeaf(o);
@@ -309,6 +373,131 @@ export async function openLeaf(browser: Browser, opts: LeafOptions): Promise<Lea
 		// business knowing the name of.
 		reapply: async () => {
 			await page.evaluate((c) => window.__hw.reapplyCorner(c), opts.corner);
+		},
+	};
+}
+
+/** The exact viewport/device-scale fixture for issue #10's mobile report. */
+export interface MobileChromeHarness {
+	page: Page;
+	close(): Promise<void>;
+	probe(corner: ToolbarCorner, collapsed?: boolean): Promise<MobileChromeProbe>;
+	/** Read startup geometry without calling a setter that itself re-plans it. */
+	probeCurrent(collapsed?: boolean): Promise<MobileChromeProbe>;
+}
+
+export async function openMobileChrome(
+	browser: Browser,
+	opts: {
+		hostCss?: string | readonly string[];
+		platform?: "android" | "ios";
+		width?: number;
+		height?: number;
+		latePluginCss?: boolean;
+	} = {}
+): Promise<MobileChromeHarness> {
+	const page = await browser.newPage({
+		viewport: { width: opts.width ?? 360, height: opts.height ?? 780 },
+		deviceScaleFactor: 3,
+	});
+	await injectSheets(page, "mobile toolbar placement", {
+		hostCss: opts.hostCss,
+		skipPluginCss: opts.latePluginCss,
+	});
+	await page.addScriptTag({ content: await stripBundle() });
+	if (opts.latePluginCss) {
+		// Wait for the observer's FIRST delivery explicitly. Two animation
+		// frames are not a portable substitute: WebKit is allowed to deliver a
+		// newly observed box after the rAF callback in that rendering update.
+		await page.evaluate(() => {
+			const NativeObserver = window.ResizeObserver;
+			let delivered!: () => void;
+			const firstDelivery = new Promise<void>((resolve) => {
+				delivered = resolve;
+			});
+			let pending = true;
+			class DeliveryTrackedObserver extends NativeObserver {
+				constructor(callback: ResizeObserverCallback) {
+					super((entries, observer) => {
+						callback(entries, observer);
+						if (pending) {
+							pending = false;
+							delivered();
+						}
+					});
+				}
+			}
+			Object.defineProperty(window, "ResizeObserver", {
+				configurable: true,
+				value: DeliveryTrackedObserver,
+			});
+			(
+				window as unknown as { __hwFirstResizeDelivery: Promise<void> }
+			).__hwFirstResizeDelivery = firstDelivery;
+		});
+	}
+	await page.evaluate((platform) => {
+		(window as unknown as { __pane: HTMLElement }).__pane =
+			window.__hw.buildMobileChrome(platform);
+	}, opts.platform ?? "android");
+	if (opts.latePluginCss) {
+		// Let the constructor's parent ResizeObserver deliver while only host
+		// CSS exists, then record the poisoned measurement as a positive control.
+		await page.evaluate(async () => {
+			await (
+				window as unknown as { __hwFirstResizeDelivery: Promise<void> }
+			).__hwFirstResizeDelivery;
+			const strip = document.querySelector<HTMLElement>(".handwriting-mobile-tools");
+			const button = document.querySelector<HTMLElement>(".handwriting-tools-collapse");
+			if (!strip || !button) throw new Error("mobile toolbar startup fixture is incomplete");
+			const style = getComputedStyle(strip);
+			strip.dataset.startupColumns = style.getPropertyValue("--hw-strip-cols").trim();
+			strip.dataset.startupCell = style.getPropertyValue("--hw-strip-cell").trim();
+			strip.dataset.startupButtonWidth = String(button.getBoundingClientRect().width);
+		});
+		await page.addStyleTag({ content: stylesCss() });
+		// A child ResizeObserver should now see the collapse button settle from
+		// its host-sized label box to the plugin's square button and re-plan.
+		await page.evaluate(
+			() =>
+				new Promise<void>((resolve) =>
+					requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+				)
+		);
+	}
+	return {
+		page,
+		close: () => page.close(),
+		probeCurrent: (collapsed = false) =>
+			page.evaluate(
+				(folded) =>
+					window.__hw.mobileChromeProbe(
+						(window as unknown as { __pane: HTMLElement }).__pane,
+						folded
+					),
+				collapsed
+			),
+		probe: async (corner, collapsed = false) => {
+			// Public placement path first, then two frames for ResizeObserver and
+			// the strip's overflow pass to settle before geometry is read.
+			await page.evaluate(
+				({ placement, folded }) => window.__hw.setMobileChromeState(placement, folded),
+				{ placement: corner, folded: collapsed }
+			);
+			await page.evaluate(
+				() =>
+					new Promise<void>((resolve) =>
+						requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+					)
+			);
+			return page.evaluate(
+				(folded) =>
+					window.__hw.mobileChromeProbe(
+						(window as unknown as { __pane: HTMLElement }).__pane,
+						folded
+					),
+				collapsed
+			);
 		},
 	};
 }
@@ -346,23 +535,12 @@ export interface FoldHarness {
 
 export async function openFoldOrder(
 	browser: Browser,
-	opts: FoldOrderOptions & { viewport: number }
+	opts: FoldOrderOptions & { viewport: number; hostCss?: string | readonly string[] }
 ): Promise<FoldHarness> {
 	const page = await browser.newPage({ viewport: { width: opts.viewport, height: 900 } });
-	const vars = Object.entries({ ...INJECTED.loadBearing, ...INJECTED.cosmetic })
-		.map(([k, v]) => `${k}: ${v};`)
-		.join("\n\t");
-	await page.setContent("<!doctype html><meta charset=utf-8><title>fold order</title>");
-	await page.addStyleTag({
-		content: [
-			BOX_SIZING_RESET,
-			`:root {\n\t${vars}\n}`,
-			"body { margin: 0; font-size: 16px; font-family: Arial, sans-serif; }",
-		].join("\n"),
-	});
-	await page.addStyleTag({ content: stylesCss() });
+	await injectSheets(page, "fold order", { hostCss: opts.hostCss });
 	await page.addScriptTag({ content: await pageBundle("./foldOrderPage.ts") });
-	const { viewport: _viewport, ...build } = opts;
+	const { viewport: _viewport, hostCss: _hostCss, ...build } = opts;
 	// Armed BEFORE the control is built: it patches the ResizeObserver
 	// constructor, and an observer already created is already native.
 	await page.evaluate(() => window.__fold.armReflowCounter());

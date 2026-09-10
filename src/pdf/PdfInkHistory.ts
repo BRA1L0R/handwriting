@@ -44,10 +44,24 @@ export function applyOp(strokes: readonly InkStroke[], op: InkOp): InkStroke[] {
 		case "add": {
 			// Indices restore z-order: a stroke that was third stays third, or
 			// undoing an erase would bring ink back on top of what covered it.
-			if (!op.indices) return [...out, ...op.strokes];
+			// Another pane may already have restored this ID. Its current
+			// object is authoritative, even when the history snapshot differs.
+			const seen = new Set(out.map((s) => s.id));
+			if (!op.indices) {
+				for (const s of op.strokes) {
+					if (seen.has(s.id)) continue;
+					out.push(s);
+					seen.add(s.id);
+				}
+				return out;
+			}
 			const pairs = op.strokes.map((s, i) => ({ s, at: op.indices![i] ?? out.length }));
 			pairs.sort((a, b) => a.at - b.at);
-			for (const { s, at } of pairs) out.splice(Math.min(at, out.length), 0, s);
+			for (const { s, at } of pairs) {
+				if (seen.has(s.id)) continue;
+				out.splice(Math.min(at, out.length), 0, s);
+				seen.add(s.id);
+			}
 			return out;
 		}
 		case "remove": {
@@ -69,9 +83,15 @@ export function applyOp(strokes: readonly InkStroke[], op: InkOp): InkStroke[] {
 		case "replace": {
 			const gone = new Set(op.removed.map((s) => s.id));
 			const kept = out.filter((s) => !gone.has(s.id));
+			// Seed after removal so an explicit same-ID replacement still wins.
+			const seen = new Set(kept.map((s) => s.id));
 			const pairs = op.inserted.map((s, i) => ({ s, at: op.insertedAt[i] ?? kept.length }));
 			pairs.sort((a, b) => a.at - b.at);
-			for (const { s, at } of pairs) kept.splice(Math.min(at, kept.length), 0, s);
+			for (const { s, at } of pairs) {
+				if (seen.has(s.id)) continue;
+				kept.splice(Math.min(at, kept.length), 0, s);
+				seen.add(s.id);
+			}
 			return kept;
 		}
 	}

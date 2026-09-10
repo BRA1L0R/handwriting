@@ -25,7 +25,14 @@ import { drawStroke, resetRibbonCacheStats, ribbonCacheStats } from "./StrokeRen
  * noticed.
  */
 
-const STYLE: PenStyle = { color: "#000000", baseWidth: 3, minWidthFactor: 0.35, gamma: 0.75 };
+const STYLE: PenStyle = {
+	color: "#000000",
+	baseWidth: 3,
+	minWidthFactor: 0.35,
+	gamma: 0.75,
+	maxWidthFactor: 1,
+	pressureOffWidthFactor: 0.7364923123758843,
+};
 const CAM: CameraState = { x: 0, y: 0, zoom: 1 };
 
 /** A right-angle corner: the shape the report was about. */
@@ -57,15 +64,15 @@ const SMOOTH_FIXTURE: number[][] = [
 	[10, 10, 1.104738],
 ];
 
-/** The same stroke through the shaped path, also pre-change. */
+/** The same centerline through the accepted pressure-aware endpoint taper. */
 const SHAPED_FIXTURE: number[][] = [
-	[0, 0, 0.121848],
+	[0, 0, 1.007385],
 	[5, 0, 1.023476],
 	[7.1875, 0.3125, 1.021835],
 	[8.75, 1.25, 1.020193],
 	[9.6875, 2.8125, 1.018551],
 	[10, 5, 1.016909],
-	[10, 10, 0.120272],
+	[10, 10, 0.981491],
 ];
 
 function fakeCtx(): CanvasRenderingContext2D {

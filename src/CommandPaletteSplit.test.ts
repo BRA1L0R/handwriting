@@ -129,16 +129,13 @@ describe("the gated set: table and registration agree", () => {
 		expect(MAIN).toContain("const names = inkColorNames();");
 	});
 
-	it("does not gate the toolbar command", () => {
-		// `pen-tools-cycle` is the toolbar auto/show/hide command; only its id
-		// ends in "-cycle". The design doc's §9 lists it in both sets, and the
-		// always-side is the one its own count of sixteen agrees with.
+	it("retires the toolbar command with its settings row", () => {
 		expect(GATED_FIXED_COMMANDS.map((c) => c.id)).not.toContain("pen-tools-cycle");
-		expect(ALWAYS_COMMANDS.map((c) => c.id)).toContain("pen-tools-cycle");
-		// Fifteen since 1.4.12 folded `pen-ink-toggle` into `Pen on / off`
-		// (alan: "there should only be one"). PenCommandIsOne.test.ts pins the
-		// removal itself; this count is what stops one creeping back in.
-		expect(ALWAYS_COMMANDS).toHaveLength(15);
+		expect(ALWAYS_COMMANDS.map((c) => c.id)).not.toContain("pen-tools-cycle");
+		expect(MAIN).not.toContain('id: "pen-tools-cycle"');
+		// Fourteen after `pen-ink-toggle` and `pen-tools-cycle` both left the
+		// palette. The exact count stops either retired command creeping back in.
+		expect(ALWAYS_COMMANDS).toHaveLength(14);
 	});
 });
 

@@ -22,9 +22,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { InkOverlayPlugin } from "./InkOverlay";
+import { InkOverlayPlugin, setInlineTool } from "./InkOverlay";
 import { SelectionModel } from "../objects/SelectionModel";
 import { resetTipModeForTest, setTipMode } from "./TipMode";
+import { DEFAULT_PEN } from "../ink/PenStyle";
 
 /** The selection's world bounds; the contact below lands in the middle. */
 const BOUNDS = { x: 0, y: 0, width: 100, height: 100 };
@@ -32,13 +33,18 @@ const INSIDE = { x: 50, y: 50 };
 
 interface Rig {
 	/** A pen contact at `at`, through the real `penDown`. */
-	penDown(at: { x: number; y: number }): void;
+	penDown(at: { x: number; y: number }, pointerType?: string): void;
 	/** The gesture `penDown` chose. */
 	mode(): string;
 	/** Whether the selection-grab claimed the contact. */
 	grabbed: ReturnType<typeof vi.fn>;
 	/** Whether the eraser gesture opened. */
 	erased: ReturnType<typeof vi.fn>;
+	/** The actual wet/head contact written by an ink down, including a dot. */
+	wetDown: ReturnType<typeof vi.fn>;
+	headDown: ReturnType<typeof vi.fn>;
+	/** Per-stroke pressure state that gates persisted hardware calibration. */
+	pressureState(): { gain: number; observesPen: boolean };
 }
 
 function makeRig(): Rig {
@@ -55,6 +61,20 @@ function makeRig(): Rig {
 	view.router = null;
 	// stripPenDown takes a nullable strip and no-ops on null.
 	view.mobileTools = null;
+	view.penStyle = { ...DEFAULT_PEN };
+	view.highlighterStyle = { ...DEFAULT_PEN };
+	const wetDown = vi.fn();
+	const headDown = vi.fn();
+	const wet = {
+		shape: true,
+		beginStroke: wetDown,
+		contactHalfWidth: () => 1,
+	};
+	view.wet = wet;
+	view.highlightWet = wet;
+	view.predReal = [];
+	view.predLastTail = [];
+	view.tail = { clear: () => undefined, drawHead: headDown };
 	// focusClaimedPenEditor's whole contract: already focused, nothing to do.
 	view.view = { hasFocus: true, focus: () => undefined };
 	view.frame = { locked: false, begin: () => undefined, end: () => undefined, cancel: () => undefined };
@@ -78,6 +98,8 @@ function makeRig(): Rig {
 	view.lassoDown = grabbed;
 	view.filePath = () => "note.md";
 	view.startFrameTicker = () => undefined;
+	view.ensurePenTools = () => undefined;
+	view.probeSample = () => undefined;
 	view.showEraserCursor = () => undefined;
 	view.eraseAt = erased;
 
@@ -85,15 +107,21 @@ function makeRig(): Rig {
 		penDown(this: unknown, sample: unknown, ev: unknown): void;
 	};
 	return {
-		penDown(at) {
+		penDown(at, pointerType = "pen") {
 			const sample = { ...at, pressure: 0.5, timestamp: 0, tiltX: 0, tiltY: 0 };
 			// A plain tip: no eraser end (bit 32), no side button (bit 2).
-			const ev = { buttons: 1, button: 0, clientX: at.x, clientY: at.y };
+			const ev = { buttons: 1, button: 0, clientX: at.x, clientY: at.y, pointerType };
 			proto.penDown.call(view, sample, ev);
 		},
 		mode: () => view.mode as string,
 		grabbed,
 		erased,
+		wetDown,
+		headDown,
+		pressureState: () => ({
+			gain: view.strokeGain as number,
+			observesPen: view.strokePenGesture as boolean,
+		}),
 	};
 }
 
@@ -122,5 +150,19 @@ describe("a pen landing inside a live selection", () => {
 
 		expect(rig.mode()).toBe("lasso");
 		expect(rig.grabbed).toHaveBeenCalledTimes(1);
+	});
+
+	it("clears a stale selection and inks when the eligible contact is a finger", () => {
+		setTipMode("nib");
+		setInlineTool("pen");
+		const rig = makeRig();
+
+		rig.penDown(INSIDE, "touch");
+
+		expect(rig.mode()).toBe("ink");
+		expect(rig.grabbed).not.toHaveBeenCalled();
+		expect(rig.wetDown).toHaveBeenCalledTimes(1);
+		expect(rig.headDown).toHaveBeenCalledTimes(1);
+		expect(rig.pressureState()).toEqual({ gain: 1, observesPen: false });
 	});
 });

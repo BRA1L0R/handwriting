@@ -22,6 +22,7 @@ import { mouseActsAsPen, mouseInkEnabled, toolIsLit } from "./MouseInk";
 import { MouseTrail } from "../input/MouseTrail";
 import { deviceHasNeverSeenAPen, penSeenThisSession } from "./PenToolsMode";
 import { setPenInk } from "./PenInk";
+import { FINGER_INK_PRESSURE } from "./FingerInk";
 
 /**
  * Pen capture for the inline overlay.
@@ -31,7 +32,7 @@ import { setPenInk } from "./PenInk";
  * Handwriting owns the whole surface, so touch pans the camera and mouse navigates.
  * On an ordinary note the EDITOR owns the surface. Touch must scroll and
  * place carets natively, the mouse must select text natively, and Handwriting may
- * claim exactly one thing: the pen.
+ * claim the pen plus the note-only iPhone finger opt-in declared below.
  *
  * Rules:
  *   Pen tip      -> ink. Claimed in the CAPTURE phase on the editor's
@@ -40,11 +41,10 @@ import { setPenInk } from "./PenInk";
  *   Pen side    -> claimed: held at contact it lassos and moves ink.
  *   Pen eraser   -> claimed and swallowed (no ink, and no accidental
  *                   right-click storm from the eraser end).
- *   Touch        -> passed through untouched, UNLESS the palm gate says a pen
- *                   is active or hovering, in which case the contact is
- *                   swallowed before the editor can scroll or place a caret
- *                   under the writer's palm. This is the only touch handling,
- *                   and it is not on the pen hot path.
+ *   Touch        -> passed through/native-assisted navigation unless the palm
+ *                   gate owns it, or the note host explicitly grants the first
+ *                   iPhone finger to the selected nib. A second finger drops
+ *                   that provisional ink and rejoins the existing pinch path.
  *   Mouse        -> never touched.
  *
  * The pen hot path is byte-for-byte the frozen pipeline's shape: sync work
@@ -182,6 +182,13 @@ export interface InlinePenCallbacks {
 	 */
 	onStrokeAbandoned?(): void;
 	/**
+	 * Note-only opt-in for drawing with the first finger. Undefined means
+	 * native touch, which keeps PDF and every existing caller unchanged.
+	 */
+	fingerInk?(): boolean;
+	/** Drop the provisional finger stroke before handing two contacts to pinch. */
+	onFingerInkCancelled?(): void;
+	/**
 	 * A HAND JUST LANDED ON THE GLASS with none there a moment ago: whatever
 	 * hover reticle a MOUSE is holding up is not wanted while it writes.
 	 *
@@ -213,7 +220,7 @@ export interface InlinePenCallbacks {
 	 * mouse that draws still draws, and its own in-gesture ring is the only
 	 * one it loses.
 	 *
-	 * Optional, and NOT in `INLINE_PEN_CALLBACKS` (InkSurfaces.ts): note-only
+		 * Optional, and NOT in `INLINE_PEN_CALLBACKS` (InkSurfaces.ts): note-only
 	 * today, like `claimBandContact?` and `describeChrome?`. An undefined
 	 * member reads as "this surface has no reticle to stand down", which is
 	 * the harnesses' answer and the pdf's until somebody rules on it there.
@@ -461,6 +468,52 @@ const liveChromeDescribers = new Set<(target: Element | null) => string>();
  * these and the sets stay empty for the loop to walk in nothing flat.
  */
 const liveSuppressedTypes = new Set<Set<string>>();
+
+/**
+ * Every live router, registered/unregistered exactly where the three sets
+ * above are (constructor/dispose). What it is for: "is a hand on the glass
+ * ANYWHERE", which the reticle rule needs and one router cannot answer.
+ *
+ * NOT A STORED BIT, and that is the whole design. A cross-surface flag that
+ * failed to clear would be a mouse reticle that never comes back - a worse
+ * defect than the stale ring this fixes. Membership is the only state kept
+ * here; the ANSWER is re-derived from each member on every ask, out of the
+ * same self-healing terms `handOnGlass` already documents. If every router
+ * forgot everything, `anyHandOnGlass()` goes false on its own, with no
+ * cleanup call from anybody: an empty set returns on the first line, and a
+ * live router with cleared touch sets, a null `activePenId` and an expired
+ * hover stamp returns false from `handOnGlass()` unchanged.
+ *
+ * The router rather than the surface, deliberately: `PdfInkController` builds
+ * its stroke handling on THIS class rather than a second router (see
+ * `mouseActsAsPen`'s note), so one set here spans notes and pdfs with no
+ * second registry, no `addStripSurface` plumbing, and no import back from
+ * this module into `InkOverlay` - which would close a real cycle.
+ */
+const liveRouters = new Set<InlinePenRouter>();
+
+/**
+ * Is a hand on the glass on ANY open ink surface?
+ *
+ * The 1.4.12 ruling ("hide the mouse reticle when a finger or pen is active")
+ * read one surface's router, because the router is per-surface: with two panes
+ * side by side, a finger writing in pane A left the mouse's ring lit in pane
+ * B - the same marker-for-a-pointer-nobody-is-using the ruling was about.
+ * There is one user with two hands, so a hand on pane A means the mouse over
+ * pane B is parked by definition.
+ *
+ * COST, and it is the reason this is a plain loop over a Set. One iteration
+ * per open ink surface (1 in the common case, 2-3 for a split), short-circuit
+ * on the first true, each iteration being today's `handOnGlass()`: two set
+ * sizes, two field reads, and the clock only when the first four say no. Paid
+ * on MOUSE hover samples only - both read sites gate on the sample being a
+ * mouse's, so pen and touch samples never evaluate this at all. No layout
+ * read, no timer, no polling, no allocation.
+ */
+export function anyHandOnGlass(): boolean {
+	for (const r of liveRouters) if (r.handOnGlass()) return true;
+	return false;
+}
 
 function armWindowMirror(scrollers: () => HTMLElement[]): void {
 	mirrorRefs++;
@@ -763,6 +816,10 @@ export class InlinePenRouter {
 	 * silence this too without knowing it exists.
 	 */
 	private activeIsPen = false;
+	/** True only while the claimed pointer is the note-only iPhone finger. */
+	private activeIsFinger = false;
+	/** After finger ink yields to pinch, no contact in that gesture may re-arm it. */
+	private fingerInkBlockedUntilAllLift = false;
 	/** Palm contacts we swallowed at pointerdown; their later events die too. */
 	private swallowedTouches = new Set<number>();
 	// Palm parole (v0.13.3): the latest swallowed contact is watched. If it
@@ -781,6 +838,8 @@ export class InlinePenRouter {
 	private manip = new ManipulationGuard();
 	private guardApplied = false;
 	private rearmTimer: number | null = null;
+	/** A toolbar/command entry waiting for every current note touch to finish. */
+	private fingerInkPreparationPending = false;
 	private savedTouchAction = "";
 	private savedTouchActionKnown = false;
 	/** Non-palm touches currently counted by the guard's touch window. */
@@ -892,6 +951,7 @@ export class InlinePenRouter {
 		this.scaleProvider = scaleProvider;
 		this.rect = rectEl.getBoundingClientRect();
 		liveScrollers.add(scrollEl);
+		liveRouters.add(this);
 		liveSuppressedTypes.add(this.suppressedTraced);
 		if (cb.describeChrome) {
 			this.describeChromeFn = (target) => cb.describeChrome!(target);
@@ -923,7 +983,9 @@ export class InlinePenRouter {
 			if (e.pointerType === "pen") tr("gotpointercapture", e);
 		});
 		on("lostpointercapture", (e) => {
-			if (e.pointerType !== "pen" && !this.mouseActsAsPen(e)) return;
+			const ownedFinger =
+				e.pointerType === "touch" && this.activeIsFinger && e.pointerId === this.activePenId;
+			if (!ownedFinger && e.pointerType !== "pen" && !this.mouseActsAsPen(e)) return;
 			tr("lostpointercapture", e, this.activePenId !== null ? "DURING STROKE" : "");
 			this.endPenStroke(e, false);
 		});
@@ -1088,6 +1150,7 @@ export class InlinePenRouter {
 						const id = te.changedTouches[i]?.identifier;
 						if (typeof id === "number") this.liveTouchIds.delete(id);
 					}
+					this.finishFingerInkPreparation();
 				}
 				// PEN OFF: nothing below this line may eat a touch. The three
 				// rules under it exist to keep the pen's SECOND event stream
@@ -1106,6 +1169,14 @@ export class InlinePenRouter {
 				// went down while the pen was off and lifted after it came
 				// back on would otherwise leave a stale id in the set forever.
 				if (this.penOff()) return;
+				// The native touch stream is the same owned finger gesture. Keep
+				// it away from CodeMirror while the pointer stream feeds ink; this
+				// does not use the pen palm gate or stylus touch classification.
+				if (this.activeIsFinger || this.fingerInkBlockedUntilAllLift) {
+					te.preventDefault();
+					te.stopPropagation();
+					return;
+				}
 				if (stylusOnlyTouches(te.changedTouches)) {
 					te.preventDefault();
 					te.stopPropagation();
@@ -1445,6 +1516,7 @@ export class InlinePenRouter {
 	 */
 	finishActiveStroke(): boolean {
 		if (this.activePenId === null) return false;
+		const wasFinger = this.activeIsFinger;
 		// Null FIRST, then release. `releasePointerCapture` is what raises
 		// `lostpointercapture`, whose handler calls `endPenStroke(e, false)` -
 		// a second full commit, `cb.onPenUp` included - and the only thing
@@ -1455,6 +1527,7 @@ export class InlinePenRouter {
 		// moment this path started calling `onPenUp`.
 		const penId = this.activePenId;
 		this.activePenId = null;
+		this.activeIsFinger = false;
 		try {
 			this.scrollEl.releasePointerCapture(penId);
 		} catch {
@@ -1464,7 +1537,7 @@ export class InlinePenRouter {
 		telemetry.bump("inline.penUp");
 		this.disarmEndBackstop();
 		this.inkFeed.strokeEnd();
-		this.gate.penStrokeEnded(performance.now());
+		if (!wasFinger) this.gate.penStrokeEnded(performance.now());
 		this.touchesAtStrokeStart.clear();
 		// The contacts the blur orphans alongside the pen - see the header.
 		// liveTouchIds is NOT among them: unlike touchPos/guardTouches (OUR
@@ -1479,6 +1552,8 @@ export class InlinePenRouter {
 		// were a fresh mid-stroke touch.
 		this.touchPos.clear();
 		this.guardTouches.clear();
+		this.fingerInkBlockedUntilAllLift = false;
+		if (wasFinger) this.applyGuard(this.manip.penSignal(), "finger-blur");
 		this.gesturePanned = false;
 		this.cancelFling();
 		// Standing guard: no release. Armed IS the resting state.
@@ -1487,8 +1562,9 @@ export class InlinePenRouter {
 		// hand it straight back (a dismissed dialog, the on-screen keyboard
 		// closing) and the trailing click lands here, so the tail is armed the
 		// same way `endPenStroke` arms it.
-		this.scheduleOwnershipDisarm();
+		if (!wasFinger) this.scheduleOwnershipDisarm();
 		this.cb.onPenUp();
+		this.finishFingerInkPreparation();
 		return true;
 	}
 
@@ -1609,6 +1685,7 @@ export class InlinePenRouter {
 			this.guardTouches.size > 0;
 		if (!hasLiveGesture) return false;
 		const hadStroke = this.activePenId !== null;
+		const abandonedFinger = hadStroke && this.activeIsFinger;
 		// Read BEFORE the teardown below zeroes the terms it is made of.
 		const tearingDownPenGesture =
 			hadStroke ||
@@ -1623,6 +1700,7 @@ export class InlinePenRouter {
 			// thing its contract promises it never does.
 			const penId = this.activePenId;
 			this.activePenId = null;
+			this.activeIsFinger = false;
 			try {
 				this.scrollEl.releasePointerCapture(penId);
 			} catch {
@@ -1630,7 +1708,7 @@ export class InlinePenRouter {
 			}
 			this.disarmEndBackstop();
 			this.inkFeed.strokeEnd();
-			this.gate.penStrokeEnded(performance.now());
+			if (!abandonedFinger) this.gate.penStrokeEnded(performance.now());
 			hideProbeMarkers();
 		}
 		// These four touch-map clears run ONLY when `hadStroke` - a claimed
@@ -1661,6 +1739,8 @@ export class InlinePenRouter {
 			this.touchPos.clear();
 			this.liveTouchIds.clear();
 			this.guardTouches.clear();
+			this.fingerInkBlockedUntilAllLift = false;
+			if (abandonedFinger) this.manip.penSignal();
 		}
 		this.gesturePanned = false;
 		this.cancelFling();
@@ -1684,6 +1764,14 @@ export class InlinePenRouter {
 		this.touchPos.clear();
 		this.pinchLive = false;
 		liveScrollers.delete(this.scrollEl);
+		// OUT OF THE SET IS THE WHOLE TEARDOWN, and it is why a pane closed
+		// mid-gesture cannot strand the other panes' rings. This method does
+		// not clear `guardTouches`/`swallowedTouches` (it never did), so a
+		// router disposed with a finger still down keeps saying true for good
+		// - but nothing asks it any more, so `anyHandOnGlass()` stops
+		// counting it on the very next mouse sample. No cleanup call, and
+		// nothing to get wrong at the call sites.
+		liveRouters.delete(this);
 		liveSuppressedTypes.delete(this.suppressedTraced);
 		if (this.describeChromeFn) {
 			liveChromeDescribers.delete(this.describeChromeFn);
@@ -1699,6 +1787,7 @@ export class InlinePenRouter {
 			this.ownershipDisarmTimer = null;
 		}
 		this.activePenId = null;
+		this.activeIsFinger = false;
 		this.disarmOwnership();
 	}
 
@@ -1820,6 +1909,51 @@ export class InlinePenRouter {
 		this.pinchLive = false;
 		this.cb.onPinch("end", 1, centroid ?? this.pinchCentroid());
 		tr("guard", e, "pinch released");
+	}
+
+	/**
+	 * Close a native-touch window when the toolbar explicitly enters iPhone
+	 * finger ink. The compositor decides whether the next contact may pan from
+	 * touch-action before it dispatches pointerdown, so the ordinary claim path
+	 * is necessarily too late to make this transition itself.
+	 */
+	prepareFingerInk(): void {
+		if (!(this.cb.fingerInk?.() ?? false)) {
+			this.fingerInkPreparationPending = false;
+			return;
+		}
+		// Do not rewrite the guard underneath another contact. Remember the
+		// entry instead; pointer and native-touch streams retire independently.
+		if (this.fingerInkContactActive()) {
+			this.fingerInkPreparationPending = true;
+			return;
+		}
+		this.fingerInkPreparationPending = false;
+		this.cancelFling();
+		this.gesturePanned = false;
+		this.applyGuard(this.manip.penSignal(), "finger-ink-selected");
+	}
+
+	private fingerInkContactActive(): boolean {
+		return (
+			this.activePenId !== null ||
+			this.guardTouches.size > 0 ||
+			this.swallowedTouches.size > 0 ||
+			this.liveTouchIds.size > 0
+		);
+	}
+
+	/** Apply a deferred entry only after both browser input streams are quiet. */
+	private finishFingerInkPreparation(): void {
+		if (!this.fingerInkPreparationPending || this.fingerInkContactActive()) return;
+		if (!(this.cb.fingerInk?.() ?? false)) {
+			this.fingerInkPreparationPending = false;
+			return;
+		}
+		this.fingerInkPreparationPending = false;
+		this.cancelFling();
+		this.gesturePanned = false;
+		this.applyGuard(this.manip.penSignal(), "finger-ink-selected-after-touch");
 	}
 
 	private beginAssist(e: PointerEvent): void {
@@ -2076,7 +2210,14 @@ export class InlinePenRouter {
 		return {
 			x: visualToNote(e.clientX - this.rect.left, scale),
 			y: visualToNote(e.clientY - this.rect.top, scale),
-			pressure: e.pressure > 0 ? e.pressure : e.pointerType === "pen" ? 0 : 0.5,
+			pressure:
+				e.pointerType === "touch"
+					? FINGER_INK_PRESSURE
+					: e.pressure > 0
+					? e.pressure
+					: e.pointerType === "pen"
+						? 0
+						: 0.5,
 			timestamp: e.timeStamp,
 			tiltX: e.tiltX,
 			tiltY: e.tiltY,
@@ -2099,7 +2240,61 @@ export class InlinePenRouter {
 			// ABOVE EVERY BRANCH BELOW, palm gate included: a contact this
 			// router is about to swallow is still a hand on the glass, and the
 			// mouse's ring is as unwanted under it as under any other.
-			if (!this.handOnGlass()) this.cb.onHandOnGlass?.();
+			//
+			// THE QUESTION IS THIS ROUTER'S; THE ANSWER GOES TO EVERY PANE.
+			// The ask stays `this.handOnGlass()` so the edge-not-level
+			// property above survives exactly as written - a palm settling
+			// beside a working pen sees a hand already on ITS OWN glass and
+			// says nothing, and the pen's ring never blinks. What changes is
+			// who hears it: a parked mouse in ANOTHER pane sends no further
+			// event of any kind, so the `anyHandOnGlass()` gate at the reticle
+			// sites - which only ever runs on a mouse SAMPLE - can never take
+			// down a ring that is already lit over there. This edge is the
+			// only thing that can, and it has to reach every live router.
+			//
+			// Fanned out here rather than by the surfaces' callback bodies
+			// (which stay each surface's own stand-down, unchanged) because
+			// this module must not import `InkOverlay` to reach
+			// `hidePenCursorsEverywhere` - that closes a real cycle, the one
+			// `stripSurfaces` exists to avoid. `liveRouters` already holds
+			// every surface of both kinds, and each router's `onHandOnGlass`
+			// is that surface's own hide, so the set is the fan-out.
+			//
+			// Includes THIS router, which is the 1.4.12 behaviour unchanged:
+			// with one pane open the loop runs once and calls exactly the
+			// callback the old line called.
+			if (!this.handOnGlass()) for (const r of liveRouters) r.cb.onHandOnGlass?.();
+
+			// Finger ink is a deliberately tiny opt-in: first contact only, on
+			// the ordinary-note host that supplied the predicate. Record it in
+			// the normal touch maps before claiming it so a second contact can
+			// atomically turn this same gesture into the existing pinch path.
+			if (
+				!this.fingerInkBlockedUntilAllLift &&
+				this.activePenId === null &&
+				this.touchPos.size === 0 &&
+				(this.cb.fingerInk?.() ?? false)
+			) {
+				this.guardTouches.add(e.pointerId);
+				this.touchPos.set(e.pointerId, { x: e.clientX, y: e.clientY });
+				this.applyGuard(this.manip.touchStart(), "finger-ink");
+				this.claimFingerInk(e);
+				return;
+			}
+
+			// A second finger revokes the provisional stroke before pinch sees
+			// either move. Keep both touch-map entries: pinch, third fingers and
+			// replacement contacts all depend on that bookkeeping staying whole.
+			if (this.activeIsFinger && this.activePenId !== null) {
+				this.guardTouches.add(e.pointerId);
+				this.touchPos.set(e.pointerId, { x: e.clientX, y: e.clientY });
+				this.manip.touchStart();
+				this.cancelFingerInkForPinch();
+				if (this.touchPos.size === 2) this.beginPinch(e);
+				e.preventDefault();
+				e.stopPropagation();
+				return;
+			}
 			// The one piece of touch arbitration Handwriting owns: a palm planted
 			// while the pen is writing or hovering must not scroll the note or
 			// move the caret. Everything else about touch is the editor's.
@@ -2147,6 +2342,11 @@ export class InlinePenRouter {
 				return;
 			}
 			this.applyGuard(d, "touch");
+			if (this.fingerInkBlockedUntilAllLift) {
+				e.preventDefault();
+				e.stopPropagation();
+				return;
+			}
 			if (d.assistThisGesture && guardEnabled) {
 				this.beginAssist(e);
 				tr("pointerdown", e, "touch (guard held; assist will carry this gesture)");
@@ -2158,6 +2358,14 @@ export class InlinePenRouter {
 				);
 			}
 			return;
+		}
+		// A real pen is the more specific instrument. If it lands while the
+		// iPhone finger stroke is live, finish the received finger ink exactly
+		// once before the pen walks the unchanged claim path below. This is not
+		// a pinch, so the user's mark is retained; the resting finger stays in
+		// the touch maps and is reclassified by the existing pen/palm rules.
+		if (e.pointerType === "pen" && this.activeIsFinger) {
+			this.commitFingerInkForPenPreemption();
 		}
 		// ADDENDUM 3 ("button should become the truth", alan, 2026-09-05,
 		// ~16:4x, verbatim): "what if we're on mouse cursor and then they
@@ -2344,6 +2552,71 @@ export class InlinePenRouter {
 		this.cb.onPenDown(this.sampleFrom(e), e);
 	}
 
+	/** Claim one eligible touch without impersonating pen hardware or its palm gate. */
+	private claimFingerInk(e: PointerEvent): void {
+		this.strokeDownAt = performance.now();
+		this.firstRawTraced = false;
+		this.inkFeed.strokeStart(e.timeStamp);
+		e.preventDefault();
+		e.stopPropagation();
+		this.refreshRect();
+		this.activePenId = e.pointerId;
+		this.activeIsPen = false;
+		this.activeIsFinger = true;
+		this.penDowns++;
+		telemetry.bump("inline.fingerDown");
+		this.armEndBackstop();
+		try {
+			this.scrollEl.setPointerCapture(e.pointerId);
+		} catch {
+			/* best-effort; the window backstop covers a failed capture */
+		}
+		this.mouseStrokeTrail = null;
+		this.cb.onPenDown(this.sampleFrom(e), e);
+	}
+
+	/** Cancel, never commit, the one-finger preview before pinch owns the gesture. */
+	private cancelFingerInkForPinch(): void {
+		if (this.activePenId === null || !this.activeIsFinger) return;
+		const pointerId = this.activePenId;
+		this.activePenId = null;
+		this.activeIsFinger = false;
+		this.fingerInkBlockedUntilAllLift = true;
+		try {
+			this.scrollEl.releasePointerCapture(pointerId);
+		} catch {
+			/* best-effort; the gesture is already unowned */
+		}
+		this.disarmEndBackstop();
+		this.inkFeed.strokeEnd();
+		this.mouseStrokeTrail = null;
+		this.cb.onFingerInkCancelled?.();
+	}
+
+	/** Commit a non-pinch finger stroke before a real pen takes ownership. */
+	private commitFingerInkForPenPreemption(): void {
+		if (this.activePenId === null || !this.activeIsFinger) return;
+		const pointerId = this.activePenId;
+		// Null before release: lostpointercapture must not finish this twice.
+		this.activePenId = null;
+		this.activeIsFinger = false;
+		try {
+			this.scrollEl.releasePointerCapture(pointerId);
+		} catch {
+			/* best-effort; the incoming pen is about to own capture */
+		}
+		this.penUps++;
+		telemetry.bump("inline.fingerUp.penPreempted");
+		this.disarmEndBackstop();
+		this.inkFeed.strokeEnd();
+		this.mouseStrokeTrail = null;
+		this.touchesAtStrokeStart.clear();
+		hideProbeMarkers();
+		// No event: the incoming pen event is not the finger's lift and must
+		// not be mistaken for one by the surface's reticle restoration.
+		this.cb.onPenUp();
+	}
+
 	/**
 	 * Hover with no active stroke, throttled: one line per 150 ms OR whenever
 	 * `buttons` changes. `buttons !== 0` while hovering means the digitizer
@@ -2369,6 +2642,11 @@ export class InlinePenRouter {
 	// ---- pointermove / pointerrawupdate -------------------------------------
 
 	private pointerMove(e: PointerEvent): void {
+		const ownedFinger =
+			e.pointerType === "touch" && this.activeIsFinger && e.pointerId === this.activePenId;
+		if (ownedFinger && this.touchPos.has(e.pointerId)) {
+			this.touchPos.set(e.pointerId, { x: e.clientX, y: e.clientY });
+		}
 		// A real mouse entering while the pen remains nearby gets the ordinary
 		// editor cursor. The same-point compatibility move Windows emits right
 		// after pen hover is still the pen and must not flash the I-beam.
@@ -2386,7 +2664,7 @@ export class InlinePenRouter {
 		) {
 			this.cb.onPenLeave();
 		}
-		if (e.pointerType === "touch") {
+		if (e.pointerType === "touch" && !ownedFinger) {
 			this.lastTouchAt = performance.now();
 			scrollProbeTouch();
 			if (this.swallowedTouches.has(e.pointerId)) {
@@ -2449,6 +2727,11 @@ export class InlinePenRouter {
 					return;
 				}
 			}
+			if (this.fingerInkBlockedUntilAllLift && this.guardTouches.has(e.pointerId)) {
+				e.preventDefault();
+				e.stopPropagation();
+				return;
+			}
 			// A guard-tracked touch during a claimed stroke is a palm (its
 			// assist, if any, was cancelled at claim): keep it off the editor.
 			if (this.activePenId !== null && this.guardTouches.has(e.pointerId)) {
@@ -2464,7 +2747,7 @@ export class InlinePenRouter {
 			}
 			return;
 		}
-		if (e.pointerType !== "pen" && !this.mouseActsAsPen(e)) return;
+		if (!ownedFinger && e.pointerType !== "pen" && !this.mouseActsAsPen(e)) return;
 		if (this.activePenId === null) {
 			// PEN OFF: a hovering pen is not our pen. Everything below this
 			// line is preparation for a claim that is never coming - the palm
@@ -2487,8 +2770,19 @@ export class InlinePenRouter {
 			if (e.pointerType === "pen") this.penHoverAt = this.lastPenHoverAt;
 			this.lastPenHoverX = e.clientX;
 			this.lastPenHoverY = e.clientY;
-			this.gate.penHoverSeen(performance.now());
-			this.applyGuard(this.manip.penSignal(), "pen-hover");
+			// A PEN warms the palm gate, and not the armed mouse this branch
+			// also accepts: `blocksNewTouch` reads this stamp before it
+			// swallows the next finger, and a mouse moving on a desk with no
+			// pen in the room must not turn that finger into a palm. Same test
+			// as the `penHoverAt` stamp above, for the same reason.
+			if (e.pointerType === "pen") this.gate.penHoverSeen(performance.now());
+			// A PEN re-arms the standing guard, and not the armed mouse either.
+			// The guard's touch-action: none exists so a cold pen contact meets
+			// a committed opt-out and inks instead of panning; a mouse is not
+			// subject to touch-action at all, so signalling from its hover
+			// bought the mouse nothing and shut the touch window a finger pan
+			// had just opened. Same test as the two stamps above.
+			if (e.pointerType === "pen") this.applyGuard(this.manip.penSignal(), "pen-hover");
 			this.traceHover(e);
 			if (isHitProbeEnabled()) hitProbeHover(e);
 			this.cb.onPenHover(this.sampleFrom(e), e.pointerType);
@@ -2513,7 +2807,11 @@ export class InlinePenRouter {
 		// and on Chromium that has happened before any stroke exists. Same
 		// downstream contract as the raw path: onPenRaw feeds StrokeBuilder,
 		// the tools, the wet layer, all of it.
-		if (this.inkFeed.moveFeedsInk()) {
+		// Finger ink is intentionally move-capable even if a real pen proved
+		// this browser's raw channel earlier in the session. WebKit may expose
+		// raw for Pencil but only moves for a direct touch; the arbiter's
+		// timestamp floor still deduplicates a raw/move overlap when both arrive.
+		if (ownedFinger || this.inkFeed.moveFeedsInk()) {
 			markRawPointer(e.clientX, e.clientY);
 			telemetry.bump("inline.moveFedInk");
 			const coalesced =
@@ -2573,10 +2871,14 @@ export class InlinePenRouter {
 	}
 
 	private pointerRawUpdate(e: PointerEvent): void {
-		if (e.pointerType !== "pen" && !this.mouseActsAsPen(e)) return;
-		// Any pen raw, hover included, proves the channel exists for the
-		// session and keeps the move handler out of the ink business.
-		this.inkFeed.noteRawChannel();
+		const ownedFinger =
+			e.pointerType === "touch" && this.activeIsFinger && e.pointerId === this.activePenId;
+		if (!ownedFinger && e.pointerType !== "pen" && !this.mouseActsAsPen(e)) return;
+		// Any PEN/MOUSE raw, hover included, proves the channel exists for that
+		// pipeline and keeps its move handler out of the ink business. A direct
+		// touch does not impersonate that hardware capability: finger strokes
+		// remain move-capable even when their engine also emits raw events.
+		if (!ownedFinger) this.inkFeed.noteRawChannel();
 		if (this.activePenId === null) {
 			// PEN OFF, the raw stream's half of the hover gate above and for
 			// the same three reasons. `noteRawChannel()` stays ABOVE it: that
@@ -2589,8 +2891,12 @@ export class InlinePenRouter {
 			// The raw stream's half of the pen-only stamp; same rule, same
 			// reason (see the move handler above and `handOnGlass`).
 			if (e.pointerType === "pen") this.penHoverAt = this.lastPenHoverAt;
-			this.gate.penHoverSeen(performance.now());
-			this.applyGuard(this.manip.penSignal(), "pen-hover");
+			// The raw stream's half of the pen-only gate warm; same rule, same
+			// reason (see the move handler above).
+			if (e.pointerType === "pen") this.gate.penHoverSeen(performance.now());
+			// The raw stream's half of the pen-only guard signal; same rule,
+			// same reason (see the move handler above).
+			if (e.pointerType === "pen") this.applyGuard(this.manip.penSignal(), "pen-hover");
 			this.traceHover(e);
 			return;
 		}
@@ -2653,6 +2959,9 @@ export class InlinePenRouter {
 
 	private pointerUpOrCancel(e: PointerEvent): void {
 		if (e.pointerType === "touch") {
+			const blockedFingerGesture = this.fingerInkBlockedUntilAllLift;
+			const ownedFinger = this.activeIsFinger && e.pointerId === this.activePenId;
+			if (ownedFinger) this.endPenStroke(e, false);
 			if (this.swallowedTouches.delete(e.pointerId)) {
 				if (this.paroleId === e.pointerId) {
 					this.paroleId = null;
@@ -2660,6 +2969,7 @@ export class InlinePenRouter {
 				}
 				e.preventDefault();
 				e.stopPropagation();
+				this.finishFingerInkPreparation();
 				return;
 			}
 			if (this.touchPos.has(e.pointerId)) {
@@ -2672,15 +2982,20 @@ export class InlinePenRouter {
 				this.endPinch(e, centroid);
 			}
 			const wasAssistPan = this.endAssist(e);
-			const duringStroke = this.activePenId !== null && this.guardTouches.has(e.pointerId);
+			const duringStroke =
+				ownedFinger || (this.activePenId !== null && this.guardTouches.has(e.pointerId));
 			if (this.guardTouches.delete(e.pointerId)) {
 				// `panned` = this gesture really scrolled (assist engaged at any
 				// point). Only then does the native touch window open on the
 				// last lift; taps and resting palms leave the guard armed.
 				this.applyGuard(this.manip.touchEnd(this.gesturePanned || wasAssistPan), "touch-end");
-				if (this.guardTouches.size === 0) this.gesturePanned = false;
+				if (this.guardTouches.size === 0) {
+					this.gesturePanned = false;
+					this.fingerInkBlockedUntilAllLift = false;
+				}
 			}
-			if (wasAssistPan || duringStroke) {
+			this.finishFingerInkPreparation();
+			if (wasAssistPan || duringStroke || blockedFingerGesture) {
 				// The pan already happened (or a palm is lifting mid-stroke);
 				// keep the trailing tap machinery off the editor, matching a
 				// native pan's cancel semantics.
@@ -2702,7 +3017,9 @@ export class InlinePenRouter {
 	/** Idempotent single funnel, same as the canvas router. */
 	private endPenStroke(e: PointerEvent, viaFallback: boolean): void {
 		if (this.activePenId === null || e.pointerId !== this.activePenId) return;
+		const wasFinger = this.activeIsFinger;
 		this.activePenId = null;
+		this.activeIsFinger = false;
 		this.penUps++;
 		telemetry.bump("inline.penUp");
 		if (viaFallback) {
@@ -2712,14 +3029,31 @@ export class InlinePenRouter {
 		}
 		this.disarmEndBackstop();
 		this.inkFeed.strokeEnd();
-		this.gate.penStrokeEnded(performance.now());
+		if (!wasFinger) this.gate.penStrokeEnded(performance.now());
 		this.touchesAtStrokeStart.clear();
+		if (wasFinger) this.retireEndedFingerContact(e.pointerId);
 		// Standing guard: no release. Armed IS the resting state.
 		hideProbeMarkers();
 		// Trailing click/auxclick/contextmenu from this contact land AFTER
 		// pointerup, so the ownership guard stays up through the tail.
-		this.scheduleOwnershipDisarm();
+		if (!wasFinger) this.scheduleOwnershipDisarm();
 		this.cb.onPenUp(e);
+		this.finishFingerInkPreparation();
+	}
+
+	/**
+	 * Balance the touch maps when capture/window ends a finger without the
+	 * scroller's normal touch-up tail. Normal pointer-up reaches this same
+	 * helper first and therefore cannot double-decrement the guard afterward.
+	 */
+	private retireEndedFingerContact(pointerId: number): void {
+		this.touchPos.delete(pointerId);
+		if (!this.guardTouches.delete(pointerId)) return;
+		this.applyGuard(this.manip.touchEnd(this.gesturePanned), "finger-ink-end");
+		if (this.guardTouches.size === 0) {
+			this.gesturePanned = false;
+			this.fingerInkBlockedUntilAllLift = false;
+		}
 	}
 
 	/** Armed only while a stroke is active, not a standing document listener. */
@@ -2728,11 +3062,23 @@ export class InlinePenRouter {
 		const fn = (ev: Event) => {
 			const pe = ev as PointerEvent;
 			const path = typeof pe.composedPath === "function" ? pe.composedPath() : [];
-			if (!backstopMayEnd({ pointerType: pe.pointerType, scrollerInPath: path.includes(this.scrollEl) })) {
+			const fingerMayEnd =
+				this.activeIsFinger &&
+				pe.pointerType === "touch" &&
+				pe.pointerId === this.activePenId &&
+				!path.includes(this.scrollEl);
+			if (
+				!fingerMayEnd &&
+				!backstopMayEnd({ pointerType: pe.pointerType, scrollerInPath: path.includes(this.scrollEl) })
+			) {
 				if (pe.pointerType === "pen" && this.activePenId !== null) {
 					tr(`window-${pe.type}`, pe, "backstop stood down: scroller in path, normal handler ends it");
 				}
 				return;
+			}
+			if (fingerMayEnd) {
+				pe.preventDefault();
+				pe.stopPropagation();
 			}
 			this.endPenStroke(pe, true);
 		};

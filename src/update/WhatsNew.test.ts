@@ -306,6 +306,32 @@ describe("collapsing groups older than the two most recent", () => {
 		expect(collapsedDivs(frag)).toHaveLength(0);
 	});
 
+	it("renders the thirteen 1.4.13 release-note lines verbatim and in order", () => {
+		const d = decideWhatsNew("1.4.13", "1.4.12", false);
+		expect(d.show).toBe(true);
+		if (!d.show) throw new Error("unreachable, asserted above");
+		const frag = whatsNewFragment(d.version, d.notes, d.groups) as unknown as FakeEl;
+		// VERBATIM MATTERS MOST ON THE THIRD LINE. It is Alan's own signed
+		// message, and its lowercase, its missing trailing period and the
+		// spacing of `-alan` are all his. This assertion is what stops a later
+		// tidy-up "correcting" any of them.
+		expect(listItems(frag).map((item) => item.text)).toEqual([
+			"slides added!!",
+			"data safety 2.0",
+			"ink pressure changes (let me know how it feels -alan)",
+			"pdf ink color setting added",
+			"cursor fixes",
+			"lasso fixes",
+			"undo fix",
+			"toolbar fixes",
+			"new toolbar anchors (drag toolbar to new locations!)",
+			"notification spam fix",
+			"dev mode",
+			"boox/ipad hints",
+			"bug fixes",
+		]);
+	});
+
 	it("from 1.4.10 to 1.4.12 (two groups): no collapsed line, both groups render in full", () => {
 		const d = decideWhatsNew("1.4.12", "1.4.10", false);
 		expect(d.show).toBe(true);

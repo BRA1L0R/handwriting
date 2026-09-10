@@ -65,7 +65,7 @@ import {
 	armMouseInkQuietlyEverywhere,
 	releaseMouseInkQuietlyEverywhere,
 } from "../inline/InkOverlay";
-import { InlinePenRouter, traceSurface } from "../inline/InlinePenRouter";
+import { InlinePenRouter, anyHandOnGlass, traceSurface } from "../inline/InlinePenRouter";
 import { describeEl } from "../inline/PenHitProbe";
 import { PenSample } from "../input/PointerRouter";
 import { InkOp } from "../inline/InkHistory";
@@ -81,6 +81,7 @@ import {
 	getInlinePanMode,
 	getInlineSpaceMode,
 	getToolbarCorner,
+	persistEraserModeNow,
 	setEraserRadiusPx,
 	setEraserWholeStrokes,
 	setInkSizeMult,
@@ -157,7 +158,14 @@ const OWN_CLASSES = [OVERLAY_CLASS, INK_OVER_CLASS, "handwriting-pdf-cursor"];
  * the return value when it was `void`, and still does; this is read back
  * only by the trace sites below.
  */
-type ReticleOutcome = "wrote" | "off" | "no-probe" | "no-scale" | "no-cursor-el" | "pan-drag";
+type ReticleOutcome =
+	| "wrote"
+	| "off"
+	| "no-probe"
+	| "no-scale"
+	| "no-cursor-el"
+	| "pan-drag"
+	| "hand-on-glass";
 
 /**
  * A `penRaw` batch is traced once for the first 5 of a gesture, then every
@@ -350,6 +358,55 @@ const PROBE_MAX_AGE_MS = 250;
 
 /** Floor between mutation-driven syncs. See scheduleThrottled. */
 const SYNC_MIN_GAP_MS = 120;
+
+/**
+ * EVERY element currently wearing a cursor class, across every controller and
+ * every window - the reference that makes a stuck class findable again.
+ *
+ * `showCursor` paints `handwriting-pdf-hover` on whatever `probe()` returned
+ * AT THE TIME. pdf.js rebuilds its viewer routinely, so that element is often
+ * not `boundScroller`, and it is only ever recorded in ONE field
+ * (`cursorScroller`) that the next paint overwrites and the teardown nulls.
+ * Whatever was painted and then lost went on wearing `cursor: none` - which
+ * styles.css puts on the container AND EVERY DESCENDANT - with no reference
+ * left anywhere that could take it off. In a popout window holding one PDF
+ * leaf that viewer is most of the window, which is how it reads as "the whole
+ * window has no cursor".
+ *
+ * A MODULE-LEVEL set and not a per-controller one, deliberately: a popout is a
+ * second window with its own controller instance, and the instance that
+ * hides is not always the instance that painted. Per-instance bookkeeping
+ * cannot answer for an element another instance stranded, which is the case
+ * `PdfCursorStrandAcrossWindows.test.ts` executes.
+ *
+ * This does NOT change how the class is applied - `showCursor` still paints
+ * exactly what it painted before, on the same element, under the same gates.
+ * It only makes the painting recoverable.
+ *
+ * It cannot grow without bound: every sweep clears it, and a sweep runs on
+ * every hide and every teardown. An element that dies with its window is held
+ * only until the next hide, which any pointer movement anywhere causes.
+ */
+const cursorPaintedEls = new Set<HTMLElement>();
+
+/** Record that `el` has been given a cursor class, so a hide can find it. */
+function noteCursorPainted(el: HTMLElement): void {
+	cursorPaintedEls.add(el);
+}
+
+/**
+ * Take BOTH cursor classes off every element that was given one, wherever it
+ * lives. Removing a class an element does not carry is a no-op, so this costs
+ * one call per painted element and changes nothing in the common case where
+ * the only entry is the one the caller was about to clean anyway.
+ */
+function releasePaintedCursorEls(): void {
+	for (const el of cursorPaintedEls) {
+		el.classList.remove("handwriting-pdf-hover");
+		el.classList.remove("handwriting-pdf-pan-drag");
+	}
+	cursorPaintedEls.clear();
+}
 
 /** Where a page's strokes come from. Page numbers are 1-based. */
 export type StrokeSource = (pageNumber: number) => readonly InkStroke[];
@@ -675,6 +732,25 @@ export class PdfInkController {
 	 * Kept so the swap can be noticed. See bindTo.
 	 */
 	private boundScroller: HTMLElement | null = null;
+	/**
+	 * The scroller the cursor classes were last put ON.
+	 *
+	 * `showCursor` adds them to whatever `probe()` returned AT THE TIME, and
+	 * after pdf.js rebuilds its viewer that is not the element a fresh probe
+	 * returns. Recording the owner is what lets `hideCursor` take them off
+	 * again while calling no `probe()` at all, and that matters because the
+	 * hide path runs on EVERY ResizeObserver delivery: `probe()` there is a
+	 * full `probeViewer` scan - `clientWidth`, `clientHeight`, `offsetTop`,
+	 * `offsetLeft` and a rect off every page div pdf.js keeps alive - taken
+	 * synchronously inside the callback, on a long document hundreds of
+	 * forced layout reads, and a forced read also flushes pending layout.
+	 * Dragging a split divider fires resize continuously.
+	 *
+	 * Not a substitute for `boundScroller`, which is cleared alongside it:
+	 * the two are different elements after a viewer rebuild, and removing a
+	 * class an element does not carry is a no-op, so clearing both is safe.
+	 */
+	private cursorScroller: HTMLElement | null = null;
 	private ro: ResizeObserver | null = null;
 	/**
 	 * Each page's size in points, learned once per page.
@@ -943,7 +1019,13 @@ export class PdfInkController {
 			setPlacement: (corner) => applyToolbarPlacement(corner),
 			eraserOn: () => getInlineEraserMode(),
 			eraserWholeStroke: () => getEraserWholeStrokes(),
-			setEraserWholeStroke: (on) => setEraserWholeStrokes(on),
+			// Same pairing the note host makes inline (InkOverlay.ts:1888-1891);
+			// this host builds its spec in a different file and reaches the
+			// module-private persist hook through `persistEraserModeNow`.
+			setEraserWholeStroke: (on) => {
+				setEraserWholeStrokes(on);
+				persistEraserModeNow(on);
+			},
 			lassoOn: () => getInlineLassoMode(),
 			spaceOn: () => getInlineSpaceMode(),
 			panOn: () => getInlinePanMode(),
@@ -1380,8 +1462,52 @@ export class PdfInkController {
 		else this.pinchBridge.dispose();
 		// Zoom changes the page boxes, which changes what every overlay must be
 		// sized and scaled for.
+		//
+		// TWO DIFFERENT CACHES, BOTH STALE ON A RESIZE, NEITHER COVERED BY THE
+		// OTHER. `invalidateProbe` only clears THIS controller's view of the
+		// scroller (page boxes, scale) - it says nothing to `this.router`,
+		// which keeps its own `this.rect` (an `InlinePenRouter` field, refreshed
+		// only on that router's own pointerdown) for turning a raw
+		// `e.clientX/Y` into a sample. This fires on RESIZE: a split opening or
+		// closing beside this pane changes ITS WIDTH, which is what the
+		// observer below actually sees. A ResizeObserver sees size, not
+		// position (the note surface's own lesson, `InkOverlay.ts:1143`), so a
+		// pane move at CONSTANT size is NOT covered by this fix - nobody has a
+		// repro for that shape; it is owed work, not fixed here. Within what
+		// IS covered: the router's own `rect` goes stale, and nothing refreshes
+		// it without a pointerdown - which leaves the router mapping every
+		// HOVER against the OLD origin: the reticle painted far outside its own
+		// pane.
+		// The working explanation for the vanished ARROW, not yet confirmed on
+		// device: the same paint adds `handwriting-pdf-hover` (below, in
+		// `showCursor`), whose `cursor: none` on the whole viewer would hide
+		// the native pointer too. The one probe taken during the symptom found
+		// that class absent on both viewers; the device re-pass has to settle
+		// it. `refreshRect()` exists
+		// precisely for a host to call when geometry changes; this is that
+		// call, ported from the note surface. What that surface actually does,
+		// measured rather than remembered: `refreshRect()` is the host-callable
+		// hook, and `InkOverlay.ts` calls it from six places - `mount` (:1658),
+		// `handleResize` (:2420, :2471), `penDown` (:2891),
+		// `restoreReticleAfterPan` (:4574) and `syncBand` (:5564). TWO of those
+		// six ARE inside a ResizeObserver: `handleResize` is that surface's
+		// observer callback (`new ResizeObserver(() => this.handleResize())`,
+		// :1593). So the precedent this line cites is real for those two and
+		// not for the other four. Do NOT delete this as redundant with
+		// `invalidateProbe()` above - they cache different things, one this
+		// controller's and one the router's, and only the router's feeds
+		// `e.clientX - this.rect.left`.
 		this.ro = new ResizeObserver(() => {
 			this.invalidateProbe();
+			this.router?.refreshRect();
+			// A reticle already painted at a pre-resize content position is
+			// stranded there until the next hover repaints it; hiding it now
+			// also takes `handwriting-pdf-hover` off the scroller immediately.
+			// Whether that is what restores the native arrow is the working
+			// explanation recorded above and NOT a settled fact - the one probe
+			// taken during the symptom found the class absent on both viewers,
+			// and the device re-pass has to settle it.
+			this.hideCursor();
 			this.schedule();
 		});
 		this.ro.observe(scroller);
@@ -1419,6 +1545,22 @@ export class PdfInkController {
 				// expensive defect shape rebuilt at small scale.
 				onPenMove: (_ev, count) => this.metrics.recordEvent("move", count, 0, false),
 				onPenUp: (ev) => this.penUp(ev),
+				// A HAND IS LANDING WITH NOTHING ELSE ON THE GLASS (ruling, alan,
+				// 1.4.12: "hide the mouse reticle when a finger or pen is
+				// active"). `InlinePenRouter.onHandOnGlass` fires only on that
+				// edge - a stale mouse ring left over from before the finger or
+				// pen arrived - so `hideCursor` is safe here even mid pen-stroke:
+				// the router asks only when `handOnGlass()` was false a moment
+				// ago, which a claimed pen already made true. Byte-for-byte the
+				// note surface's reasoning (InkOverlay.ts, `onHandOnGlass:
+				// () => this.hidePenCursor()`); this surface had no reticle to
+				// stand down until now, so it was left `undefined` (an optional,
+				// note-only member) rather than sharing the rule - the gap this
+				// brief closes. `hideCursor` and not a narrower hide: it is the
+				// one teardown every abandon path already goes through, and it
+				// takes `handwriting-pdf-hover`'s `cursor: none` off with the
+				// ring, leaving the native cursor rather than no pointer at all.
+				onHandOnGlass: () => this.hideCursor(),
 				// PEN OFF (PenInk.ts, design §5): byte-for-byte the note
 				// overlay's line, because it is byte-for-byte the same rule.
 				// This surface passed NOTHING for two days - the state was
@@ -1483,6 +1625,7 @@ export class PdfInkController {
 		this.tools = null;
 		this.dropOverlays();
 		this.boundScroller = null;
+		this.cursorScroller = null;
 		this.band = null;
 	}
 
@@ -1679,13 +1822,11 @@ export class PdfInkController {
 		const pair = this.wetOn(page);
 		const box = this.frameBox(page);
 		if (pair && box) {
-			if (predictionEinkOn()) {
-				pair.wet.clearStroke(box.widthPx, box.heightPx);
-				pair.tail.clear();
-			} else {
-				pair.wet.clear(box.widthPx, box.heightPx);
-				pair.tail.clearAll(box.widthPx, box.heightPx);
-			}
+			// Every device clears the stroke's own box, and the tail its dirty
+			// rect. Same reasoning as `penUp`'s commit branch below - see the
+			// comment there, which is where it is written out.
+			pair.wet.clearStroke(box.widthPx, box.heightPx);
+			pair.tail.clear(box.widthPx, box.heightPx);
 		}
 		this.undressWet(this.overlays.get(page));
 	}
@@ -2004,6 +2145,39 @@ export class PdfInkController {
 		// is believed; the field only speaks where nothing else does.
 		const mousePointer =
 			pointerType === "mouse" || (pointerType === undefined && this.mouseStroke);
+		// A HAND IS ON THE GLASS: THE MOUSE PAINTS NOTHING. The ruling,
+		// alan, 1.4.12: "hide the mouse reticle when a finger or pen is
+		// active". With mouse ink armed a parked mouse is still HOVERING,
+		// so without this its ring sits wherever the pointer was last left
+		// the whole time a finger flings the page or the pen writes.
+		//
+		// `InlinePenRouter.handOnGlass()` is the question, reused rather
+		// than a second notion of "a hand is on the glass" - it is derived,
+		// not stored, off state the router already keeps and already
+		// recovers (guardTouches/swallowedTouches, activePenId +
+		// activeIsPen, penHoverAt). Byte-for-byte the note surface's own
+		// gate (InkOverlay.ts's `showPenCursor`), which reached this
+		// ruling first (1.4.12) through the same router - this surface
+		// shares it (`this.router = new InlinePenRouter(...)` above)
+		// rather than a second router, so nothing here needed a second
+		// mechanism, only this read.
+		//
+		// ONE BOOLEAN READ, on a path that already runs: the router has
+		// already recorded every term `handOnGlass` inspects by the time
+		// any hover reaches this method, so this adds no new listener and
+		// no new layout read.
+		//
+		// `router` is null before `bindTo` and in this file's own unit
+		// rigs that construct the controller without mounting one - both
+		// read as "nothing is on the glass", which is what a mouse hover
+		// behaved as before this rule existed.
+		// EVERY OPEN SURFACE, not just this one (1.4.13) - byte-for-byte the
+		// note surface's change and its reasoning (InkOverlay.ts): a hand on a
+		// note pane's glass must take this pdf's parked mouse ring down too,
+		// and `anyHandOnGlass` (InlinePenRouter.ts) is the same derived answer
+		// ORed over every live router. Still under `mousePointer`, so the pen
+		// and touch paths pay nothing.
+		if (mousePointer && anyHandOnGlass()) return "hand-on-glass";
 		const probed = this.probe();
 		if (!probed) return "no-probe";
 		if (probed.scaleFactor === null) return "no-scale";
@@ -2042,6 +2216,14 @@ export class PdfInkController {
 					this.cursorEl = null;
 					this.boundScroller?.classList.remove("handwriting-pdf-hover");
 					this.boundScroller?.classList.remove("handwriting-pdf-pan-drag");
+					// BEFORE the field is nulled, and reaching wider than it:
+					// this disposer used to clean `boundScroller` and then drop
+					// the only reference to whatever else had been painted. A
+					// pane torn down after a viewer rebuild - which is what a
+					// move to a popout window does - left that element wearing
+					// `cursor: none` with nothing able to find it again.
+					releasePaintedCursorEls();
+					this.cursorScroller = null;
 				});
 			}
 		}
@@ -2156,6 +2338,13 @@ export class PdfInkController {
 		// one being wrong. The note surface hides it the same way while a pen
 		// is near; the class comes off when the pen leaves, not at contact.
 		probed.scroller.classList.add("handwriting-pdf-hover");
+		// WHICH element got it, so the hide path can take it off without a
+		// probe of its own. See `cursorScroller`.
+		this.cursorScroller = probed.scroller;
+		// AND in the module-level set, which is what survives this field being
+		// overwritten by the next paint or nulled by the teardown. See
+		// `cursorPaintedEls`.
+		noteCursorPainted(probed.scroller);
 		// A pen that leaves hover range without sending pointerleave would
 		// otherwise strand the reticle on screen; see the note surface, which
 		// learned this the same way.
@@ -2184,8 +2373,13 @@ export class PdfInkController {
 			this.cursorTimer = null;
 		}
 		this.cursorEl?.setCssStyles({ display: "none" });
-		const probed = this.probe();
-		probed?.scroller.classList.remove("handwriting-pdf-hover");
+		// NO `probe()` HERE, and that is the point of this method's shape.
+		// The ResizeObserver callback calls `invalidateProbe()` and then this,
+		// so a `probe()` on this path could never be served from cache: every
+		// delivery ran `probeViewer` in full, synchronously, even with no
+		// cursor on screen. The elements carrying the classes are known
+		// without asking the layout for them - see `cursorScroller`.
+		this.cursorScroller?.classList.remove("handwriting-pdf-hover");
 		// AND the scroller the class was actually put on. `showCursor` adds it
 		// to whatever the probe returned at the time; this used to take it off
 		// whatever the probe returns now, and those are not the same element
@@ -2210,8 +2404,15 @@ export class PdfInkController {
 		// and the bound scroller are not the same element after pdf.js
 		// rebuilds its viewer, and the class was added to whichever one
 		// pen-down held.
-		probed?.scroller.classList.remove("handwriting-pdf-pan-drag");
+		this.cursorScroller?.classList.remove("handwriting-pdf-pan-drag");
 		this.boundScroller?.classList.remove("handwriting-pdf-pan-drag");
+		// AND every element anyone painted, which is the only line here that
+		// can reach one this instance never recorded - a viewer rebuilt under
+		// a previous paint, or a pane that now lives in another window with
+		// its own controller. The two pairs above stay because they are this
+		// method's documented contract and cost nothing when they agree; this
+		// is what makes the set of them complete. See `cursorPaintedEls`.
+		releasePaintedCursorEls();
 		// One boolean write, always: arms the next showCursor's `pdf-hover`
 		// "resumed" transition line. See `cursorTraceHidden`.
 		this.cursorTraceHidden = true;
@@ -2325,6 +2526,17 @@ export class PdfInkController {
 	private beginPanDragCursor(scroller: HTMLElement): void {
 		this.hideCursor();
 		scroller.classList.add("handwriting-pdf-pan-drag");
+		// Recorded for the same reason `showCursor` records it: this is a
+		// cursor class too, and `hideCursor` now takes both off the recorded
+		// owner rather than off a fresh probe. `hideCursor` ran one line above,
+		// so the field would otherwise still name the element the HOVER class
+		// was last on, and a pen-down that lands after a viewer rebuild would
+		// leave the grabbing hand on with no gesture behind it.
+		this.cursorScroller = scroller;
+		// And in the module-level set for the same reason the hover paint is:
+		// `hideCursor` ran one line above and CLEARED that set, so without
+		// this the grabbing hand would be the one class nothing could find.
+		noteCursorPainted(scroller);
 	}
 
 	/**
@@ -3844,13 +4056,32 @@ export class PdfInkController {
 		if (pair && this.wetHighlighter) pair.wetCanvas.setCssProps({ opacity: "0" });
 		this.sync();
 		if (pair && box) {
-			if (predictionEinkOn()) {
-				pair.wet.clearStroke(box.widthPx, box.heightPx);
-				pair.tail.clear();
-			} else {
-				pair.wet.clear(box.widthPx, box.heightPx);
-				pair.tail.clearAll(box.widthPx, box.heightPx);
-			}
+			// The wet layer clears the stroke's OWN BOX on every device.
+			//
+			// This used to be Boox-only, "until an e-ink user has confirmed the
+			// box on hardware" - a confirmation nobody on this project has the
+			// device to give, so the whole-canvas clearRect stayed on the
+			// default path, damaging the entire canvas once per pen-up. A pixel
+			// proof replaced it: all four `appendPoint` branches x four path
+			// shapes x both zooms x both device pixel ratios x both pens' width
+			// laws, 128 cases, drawn in real Chromium and read back
+			// EXHAUSTIVELY - every pixel, no stride - leave nothing, each
+			// against a paired control that does leave a rim
+			// (`test/measure/WetClearBox.test.ts`). `clearStroke` still falls
+			// back to a whole-canvas clear when it has no box or a NaN one, so
+			// the failure mode is the old behaviour rather than stale ink.
+			//
+			// The TAIL takes its dirty rect here too. Leaving it on `clearAll`
+			// would have kept a whole-canvas damage per pen-up on the layer
+			// above, defeating most of the change below it. Its own proof is
+			// `test/measure/TailClearBox.test.ts`: the head and the
+			// head-plus-prediction states are erased completely by the dirty
+			// rect at both zooms and both device pixel ratios - CONDITIONAL on
+			// the fallback, because `clear()` used to return outright on a
+			// null box and three paths on that class paint and then null it.
+			// The size handed in is what selects the fallback.
+			pair.wet.clearStroke(box.widthPx, box.heightPx);
+			pair.tail.clear(box.widthPx, box.heightPx);
 		}
 		this.undressWet(attached);
 	}

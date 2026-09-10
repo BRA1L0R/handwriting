@@ -176,6 +176,11 @@ const RULES: readonly SurfaceRule[] = [
 			penlab:
 				"has no eraser at all - its own header: \"No file, no persistence, no text, no eraser\". It is a probe for the stroke pipeline",
 			demo: "ships on the website, not in the plugin. One tool, no modes and no eraser, so there is nothing to show the reach of",
+			// NOT the shape of the exemptions above it, and written long so it
+			// cannot be skimmed as one. This surface is not outside the rule -
+			// it is inside it and not carrying it.
+			slides:
+				"MISSING, not inapplicable. This surface really does erase: `eraserIntent` claims the contact, `slideEraseCircle` builds a real ring in deck-logical units from the host's own `eraserRadiusPx()`, and `eraseAt` cuts whole strokes or parts with it. It draws NOTHING under the nib to show where that ring is (grep: zero hits for showEraserCursor, eraserEl or any cursor class in SlidesInkSurface.ts), which is erasing blind - the exact defect this row was written for on the pdf. Left open deliberately: this slice enrols the surface and does not add behaviour to it",
 		},
 	},
 	{
@@ -227,6 +232,8 @@ const RULES: readonly SurfaceRule[] = [
 			penlab:
 				"no lasso and no selection of any kind - its own header: \"No file, no persistence, no text, no eraser\". It is a probe for the stroke pipeline",
 			demo: "no TipMode on the site - one tool, chosen by its own buttons, and no eraser, lasso, pan or space",
+			slides:
+				"no lasso on a deck at all - `eraserIntent`'s own comment says so out loud (\"slides ink has no lasso yet\"), and a held barrel button falls through to the tip here rather than selecting. There is no selection model, no clipboard path and no marquee for a reticle to precede. Note that this surface DOES honour TipMode's eraser member, so its exemption here is about the missing gesture and not about the mode system",
 		},
 	},
 	{
@@ -280,6 +287,8 @@ const RULES: readonly SurfaceRule[] = [
 				"no pan MODE at all to hold a reticle for - panning here is a transient gesture (two-finger drag), not a tip state, and `type Tool` has no pan member. The row above's canvas reason (no general reticle) would also apply, but this is the more specific one: there is no mode to show in the first place",
 			penlab: "no tip mode; the lab draws with a fixed nib on purpose",
 			demo: "no TipMode on the site - one tool, chosen by its own buttons, and no eraser, lasso, pan or space",
+			slides:
+				"no pan MODE, and nothing to pan. `.slides` is laid out at the logical deck size and then scaled to fit the viewport (S3, its own header), so the whole slide is on screen by construction and there is no off-screen region a tip could drag into view. TipMode's `pan` member reaches this surface's pen-down arm as no branch at all",
 		},
 	},
 	{
@@ -295,6 +304,8 @@ const RULES: readonly SurfaceRule[] = [
 				"no insert-space mode - a canvas page is fixed size and nothing here moves rows to make room for ink, and `type Tool` has no space member",
 			penlab: "no tip mode; the lab draws with a fixed nib on purpose",
 			demo: "no TipMode on the site - one tool, chosen by its own buttons, and no eraser, lasso, pan or space",
+			slides:
+				"no insert-space on a deck. A section is a fixed-size page created up front and never re-created (S2, its own header); nothing here moves rows to make room for ink, and TipMode's `space` member reaches this surface's pen-down arm as no branch at all",
 		},
 	},
 	{
@@ -324,17 +335,33 @@ const RULES: readonly SurfaceRule[] = [
 			penlab:
 				"draws no reticle of any kind - its own header: \"No file, no persistence, no text, no eraser\". It is a probe for the stroke pipeline, and a probe with a fixed nib has no ring to strand",
 			demo: "no reticle on the site: one tool chosen by its own buttons, no hover mark under the pointer, and so no timer that could take one away",
+			slides:
+				"no reticle, and no hover path for a watchdog to guard even if there were one. `onPointerMoveBody` returns unless the event's pointerId is the one the stroke session already owns, so a hovering pen or mouse is dropped before anything could be painted under it - nothing on this surface is ever left on screen by a hover sample that stopped arriving. The eraser ring it lacks is the row four above, and it is filed there as MISSING rather than borrowed into this one",
 		},
 	},
 	{
 		rule: "pen-contact arbitration is shared, not re-implemented",
 		markers: ["penContactIntent("],
-		on: ["note", "pdf"],
+		on: ["note", "pdf", "slides"],
 		exempt: {
 			canvas:
 				"no tip mode at all - its own `type Tool` has no `pan` member and it pans by transient gesture, so there is nothing here to arbitrate",
 			penlab: "not user-reachable, and no tip mode; it is a probe for the stroke pipeline",
 			demo: "ships on the website, not in the plugin. One tool, no modes and no eraser, so there is no contact to arbitrate",
+			// FIXED. This row used to carry the only exemption in the file
+			// that contradicted a reason written in the surface's own source:
+			// slides was filed MISSING for the PEN arm, because
+			// `eraserIntent`'s pen branch restated `isEraserContact(buttons,
+			// button) || eraserMode` - `penContactIntent`'s erase arm one
+			// wrapper apart - while justifying the restatement with the
+			// eighteen-import cost of `InlinePenRouter`, which is true of
+			// `bandEraserIntent` and was never true of this one. The pen arm
+			// now calls `penContactIntent` (TipMode.ts, the DOM-free leaf the
+			// file already imported for `tipMode()`), so slides has moved from
+			// `exempt` to `on` and the marker is asserted rather than excused.
+			// The mouse arm (`eraserMode && mouseInk && (buttons & 1) !== 0`)
+			// is still restated and still has no shared function to call; that
+			// half was never part of this row.
 		},
 	},
 	{
@@ -345,6 +372,8 @@ const RULES: readonly SurfaceRule[] = [
 			canvas: "constructs no MobileTools strip",
 			penlab: "constructs no MobileTools strip",
 			demo: "constructs no MobileTools strip - the site has no plugin chrome at all",
+			slides:
+				"constructs no MobileTools strip - a presentation carries no plugin chrome of any kind, and the three canvases this surface does mount over `.reveal` are `pointer-events: none` by design, so there is nothing here for a pen contact to have to step around",
 		},
 	},
 	{
@@ -355,6 +384,8 @@ const RULES: readonly SurfaceRule[] = [
 			canvas: "constructs no MobileTools strip",
 			penlab: "constructs no MobileTools strip",
 			demo: "constructs no MobileTools strip - the site has no plugin chrome at all",
+			slides:
+				"constructs no MobileTools strip, so nothing stood aside at contact and nothing has to come back at lift - the other half of the row above, exempt for the same single reason",
 		},
 	},
 	{
@@ -385,6 +416,11 @@ const RULES: readonly SurfaceRule[] = [
 			penlab:
 				"not user-reachable and shows no document, so there is no in-place file switch to strand a contact across",
 			demo: "ships on the website with no router and one document; nothing swaps out from under a stroke",
+			// Filed MISSING even though the MARKER could never apply here, so
+			// that "no router" does not get read as "no exposure". The two
+			// are different claims and only the first is true.
+			slides:
+				"MISSING in substance, though not through this marker: there is no router here to call `abandonActiveStroke(` on. The exposure is real and open - `slidechanged` runs `remount()`, which advances `layers.index` and stands nothing down, while `onPointerEnd` commits the finished stroke into `this.strokes.get(l.index)`. So a slide changed mid-stroke files that stroke on the slide the deck has just moved TO. Reveal's arrows and its swipe cannot reach this (the navigation guard swallows their click and touch events for the whole life of a pen contact); the KEYBOARD can, and it is deliberately left alive by S4. Not fixed in this slice",
 		},
 	},
 	{
@@ -396,6 +432,8 @@ const RULES: readonly SurfaceRule[] = [
 				"its router does not preventDefault the mousedown that focuses a pane, so nothing has to be given back",
 			penlab: "not user-reachable; no keys are bound to it",
 			demo: "no editor and no pane focus to claim; the site is a canvas on a static page",
+			slides:
+				"answers this rule's QUESTION through its own mechanism rather than failing to answer it, the way penlab answers the move-events row below. There is no editor and no workspace pane here to give focus back to; what a claimed pen must not cost this surface is REVEAL's keyboard, and two rules protect it - S4 (`preventDefault` at pen-down and never `stopPropagation`, so the contact still bubbles and Reveal's focus plugin keeps the deck) and `ensureDeckFocused()`, run in the capture phase on every contact, which focuses `.reveal` first and blurs a contenteditable still holding focus outside it when the focus will not take",
 		},
 	},
 	{
@@ -411,6 +449,8 @@ const RULES: readonly SurfaceRule[] = [
 			canvas: "the strip is not mounted here, so there is no visibility question to answer",
 			penlab: "the strip is not mounted here, and nothing opens it",
 			demo: "no strip to reveal, and no session-scoped pen state on the site",
+			slides:
+				"the strip is not mounted here, so there is no visibility question to answer - the canvas's reason exactly, and for the same structural cause. Worth a reader knowing rather than acting on: the claim is process-global (PenToolsMode.ts), so a pen used only ever on a deck teaches the note surface nothing about itself",
 		},
 	},
 	{
@@ -429,6 +469,8 @@ const RULES: readonly SurfaceRule[] = [
 			penlab:
 				"mounts no strip and nothing opens it; its fixed nib is the instrument, not a tool the user picks",
 			demo: "no strip lights to drive; nothing on the site changes when a pen is present",
+			slides:
+				"mounts no strip, so it builds no nib button and has no light for a hardware answer to feed - the canvas's reason. The nib on a deck is read out of the host at each pen-down (`this.host.nib()`) rather than lit on a toolbar of its own",
 		},
 	},
 	{
@@ -439,6 +481,13 @@ const RULES: readonly SurfaceRule[] = [
 			canvas: "marks no pen seen - see the row above",
 			penlab: "marks no pen seen - see the row above",
 			demo: "reads `e.pointerType` at pen-down for the mouse device mark, but has no pen-seen claim to gate",
+			// The one surface where this row's marker is PRESENT and the
+			// ruling is still exempt. `claimsContact` and `eraserIntent` both
+			// contain the literal `pointerType === "pen"`. Carrying the row on
+			// that would be the vacuous pass this file exists to refuse: the
+			// text is there for a different question.
+			slides:
+				"reads `pointerType` throughout `claimsContact` and `eraserIntent`, including the literal this row matches on, but has no pen-seen claim of any kind for a gate to be about - see the two rows above. The gate it does carry decides whether the contact is CLAIMED, which is not the claim this rule is named for",
 		},
 	},
 	{
@@ -460,6 +509,8 @@ const RULES: readonly SurfaceRule[] = [
 			// Read out of DemoInk.ts rather than assumed from "it's the demo",
 			// which is a category and not a mechanism.
 			demo: "MECHANICAL, twice over. It has no hover path to gate: it binds pointerdown/move/up/cancel and nothing else, and `move()` returns on its first line unless the pointer is the captured, actively-drawing one - so a hovering pen or mouse is dropped before its type is ever read. And the predicate cannot reach here: `pointerRaisesPenTools` lives in PenToolsMode.ts, which is not in the site bundle - build-site.mjs bundles src/site/DemoInk.ts as the sole entry point and that import graph is camera/coordinates plus src/ink only. Importing it would drag PenToolsMode's module-level mode and penSeen, and MouseInk behind them, into a static page with no settings layer to source either from",
+			slides:
+				"MECHANICAL, twice over, like the demo. There is no MobileTools strip over a deck for a hovering pointer to raise, and there is no hover path to gate in any case: `onPointerMoveBody` returns unless the event's pointerId is the one the stroke session already owns, so a hovering pen or mouse is dropped before its type is ever read",
 		},
 	},
 	{
@@ -494,12 +545,24 @@ const RULES: readonly SurfaceRule[] = [
 			// markup in docs/index.html, found by `boot()` through
 			// `[data-tool]` and never shown or hidden by anything.
 			demo: "there is no Pen-toolbar mode on the site to hear a change to. The only things that announce one are `setPenToolsMode` and `markPenSeen` (PenToolsMode.ts), both plugin-settings paths, and the site has neither a settings layer nor a plugin instance. The subscription would also be unhonourable here: it returns an unsubscribe a surface MUST call at teardown, and the demo has no teardown at all - `boot()` runs once per page load, adds its listeners and removes none, and InkDemo lives until the page unloads",
+			slides:
+				"mounts no MobileTools strip, so a Pen-toolbar change has nothing on this surface to create or destroy. The only pen chrome a deck has is the host's nib, which this surface re-reads at every pen-down (`this.host.nib()`) rather than holding across a change and needing to hear about one",
 		},
 	},
 	{
+		// CARRIED BY SLIDES, and the only row of the four TipMode rows that
+		// is. `tipMode()` occurs once in SlidesInkSurface.ts outside its
+		// import - `tipMode() === "eraser"`, read once per contact in the
+		// pen-down arm and handed to `eraserIntent` - so the marker is a real
+		// call and not a signature: this file's own `import { tipMode }`
+		// carries no parentheses, and there is no local wrapper to match the
+		// way `tipModeHeld()` matches one on the note (see the Escape row
+		// below). What it reads is the ERASER member alone; the lasso, pan and
+		// space rows exempt it, and INK_SURFACES' entry spells that partial
+		// truth out rather than letting `honoursTipMode: true` imply four.
 		rule: "reads the tip mode",
 		markers: ["tipMode()"],
-		on: ["note", "pdf"],
+		on: ["note", "pdf", "slides"],
 		exempt: {
 			canvas: "no tip mode - `type Tool` has no `pan` member; it pans by transient gesture",
 			penlab: "no tip mode; the lab draws with a fixed nib on purpose",
@@ -507,9 +570,17 @@ const RULES: readonly SurfaceRule[] = [
 		},
 	},
 	{
+		// CARRIED BY SLIDES, and it is a fix rather than an inheritance:
+		// "slides dont work with mouse ink" (Alan, Paladin, mouse-only,
+		// 2026-09-05). The surface was pen-only, so the setting had no effect
+		// on a deck while the editor already honoured it - the one-surface
+		// divergence this whole file is about, on the surface that had not
+		// been enrolled yet. Two real call sites now, both outside the import:
+		// `claimsContact(ev.pointerType, ev.isPrimary, ev.buttons,
+		// mouseInkEnabled())` at contact, and the mouse arm of `eraserIntent`.
 		rule: "honours the mouse-ink setting",
 		markers: ["mouseInkEnabled("],
-		on: ["note", "pdf"],
+		on: ["note", "pdf", "slides"],
 		exempt: {
 			canvas:
 				"Handwriting owns this whole surface, so a mouse draws here unconditionally and there is no setting to honour",
@@ -569,12 +640,25 @@ const RULES: readonly SurfaceRule[] = [
 				// site to go quietly wrong the way the pdf's did, because
 				// there is no move-rate figure at all.
 				demo: "no metrics system of any kind to fall silent in - DemoInk.ts imports no StrokeMetrics and builds none, and its own pointerdown/pointermove/pointerup/pointercancel handlers carry no diagnostics whatsoever",
+				// Read out of SlidesInkSurface.ts, and the penlab shape
+				// exactly: a real instrument, a different one.
+				slides:
+					"already counts its stroke's move events, just not through this call - it constructs no StrokeMetrics at all (grep: zero hits for StrokeMetrics in this file), so there is no instance here for `recordEvent(\"move\"` to be called on. Its own `SlidesMoveTrace` is the instrument: `markHandlerStart`/`endHandler` wrap every pointermove, `countSamples` counts each coalesced batch and `countLayoutRead` counts the forced layouts, and the line it prints at stroke end is the move-rate figure this surface actually has",
 			},
 		},
 	{
+		// CARRIED BY SLIDES. One real call site, `l.wet.contactHalfWidth(
+		// this.activeStyle, ev.pressure)` in the pen-down arm, feeding the one
+		// head draw on this surface that is not gated on `head()` - so for a
+		// tap on a deck it is the entire visible mark, which is precisely the
+		// thin-speck case the floor exists for. Its own comment says the floor
+		// lives in the wet layer and is not recomputed here, which is the rule
+		// this row is named for. The two prose mentions above the call are
+		// blanked by `codeOnly` before the match, so the row is not carried by
+		// the narration.
 		rule: "the tap floor lives at the nib, not at the caller",
 		markers: ["contactHalfWidth("],
-		on: ["note", "pdf", "canvas"],
+		on: ["note", "pdf", "canvas", "slides"],
 		exempt: {
 			penlab:
 				"the lab exists so its head and its ribbon CAN disagree - that disagreement is what it is for, and holding it to the shared floor would remove the instrument",
@@ -625,6 +709,11 @@ const RULES: readonly SurfaceRule[] = [
 			penlab:
 				"no tip mode; the lab draws with a fixed nib on purpose, and it wires no keydown listener of any kind (grep: zero hits for keydown/KeyDown/Escape in PenLabView.ts)",
 			demo: "no TipMode on the site - one tool, chosen by its own buttons, and no eraser, lasso, pan or space - and it wires no keydown listener of any kind (grep: zero hits for keydown/KeyDown/Escape in DemoInk.ts)",
+			// NOT the demo's reason, despite the same last clause: this
+			// surface DOES honour a TipMode member. The exemption is about
+			// which member, and about whose key Escape is.
+			slides:
+				"none of the three modes this row names reaches a deck - no pan, no lasso, no insert-space - so there is no held mode of that kind to hand back, and this surface wires no keydown listener at all (grep: zero hits for keydown across SlidesInkSurface.ts's addEventListener calls; the three mentions are prose about REVEAL's handler). Deliberate rather than forgotten: Escape is Reveal's own close-the-presentation key and intercepting it would cost the reader the way out. The one held mode that does reach here is eraser, and it survives the deck rather than stranding anyone - the note surface's own Escape branch releases it the moment the presentation closes, since `tipMode` is process-global",
 		},
 	},
 	{
@@ -661,6 +750,8 @@ const RULES: readonly SurfaceRule[] = [
 			penlab:
 				'no lasso and no selection of any kind - its own header: "No file, no persistence, no text, no eraser" - and it wires no keydown listener at all (grep: zero hits for keydown/KeyDown/ctrlKey in PenLabView.ts)',
 			demo: "no TipMode and no lasso on the site - one tool, chosen by its own buttons - and it wires no keydown listener at all (grep: zero hits for keydown/KeyDown/ctrlKey in DemoInk.ts)",
+			slides:
+				"no lasso and no selection of any kind on a deck to copy or cut - `eraserIntent`'s own comment says so out loud, and a held barrel button falls through to the tip here rather than selecting - and this surface wires no keydown listener at all, so there is no key branch to divide by selection type in the first place",
 		},
 	},
 ];

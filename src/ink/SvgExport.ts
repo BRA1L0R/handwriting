@@ -15,6 +15,15 @@
  * the single-pass translucency rule from styles.css (painting each stroke
  * translucent would double-blend every overlap into a dark seam).
  *
+ * DESTINATION. An SVG this module writes has NO background of its own: it
+ * emits fills and nothing else, so the file is transparent and what shows
+ * through is whatever it is dropped onto. That is why a destination is a
+ * PARAMETER here rather than the constant it is for the PDF and the snip -
+ * this module genuinely cannot know it, and a caller that does (a print
+ * sheet, a page of known colour) passes it so the ink is guaranteed readable
+ * there. Omit it and the stored colours are emitted exactly as before, which
+ * is what the live rendered layer wants.
+ *
  * Pure string building over pure geometry: no DOM, loads under vitest.
  */
 
@@ -22,6 +31,7 @@ import { ribbonSides, jointIndices, RibbonPt } from "./Ribbon";
 import { HIGHLIGHTER_ALPHA } from "./PenStyle";
 import { InkStroke } from "./Stroke";
 import { normalizeInkColor } from "./InkColor";
+import { exportInkColor } from "./InkTheme";
 import { ribbonOf } from "./StrokeOutline";
 
 const MARGIN_WORLD = 12;
@@ -64,13 +74,20 @@ export function strokePathData(stroke: InkStroke): string {
 }
 
 /** One stroke's ribbon outline plus its cap/joint discs, as SVG elements. */
-export function strokeToSvg(stroke: InkStroke): string {
+export function strokeToSvg(stroke: InkStroke, destination?: string | null): string {
 	// Sanitized, not trusted. A stroke's colour is whatever the sidecar JSON
 	// said, and this string is interpolated into markup - written to a file
 	// that a browser will open, and (since the rendered layer became vector)
 	// inserted into the live DOM. `normalizeInkColor` answers with a hex from
 	// the palette or a hex that matched the pattern, and nothing else.
-	const color = normalizeInkColor(stroke.tool, stroke.color);
+	//
+	// The readability rule runs AFTER that, on the sanitized value, so what it
+	// adjusts is already known to be a hex and what it returns still is.
+	const color = exportInkColor(
+		normalizeInkColor(stroke.tool, stroke.color),
+		destination,
+		stroke.tool
+	);
 	const ribbon = ribbonOf(stroke);
 	if (ribbon.length === 0) return "";
 	const circle = (p: RibbonPt) =>
@@ -102,9 +119,13 @@ export function strokeToSvg(stroke: InkStroke): string {
  * Coordinates are note space, untranslated, so a viewBox anchored at the
  * origin puts the ink exactly where the note put it.
  */
-export function inkSvgBody(strokes: readonly InkStroke[]): string {
-	const hi = runMarkup(inkSvgRuns(strokes.filter((s) => s.tool === "highlighter")));
-	const pen = runMarkup(inkSvgRuns(strokes.filter((s) => s.tool !== "highlighter")));
+export function inkSvgBody(strokes: readonly InkStroke[], destination?: string | null): string {
+	const hi = runMarkup(
+		inkSvgRuns(strokes.filter((s) => s.tool === "highlighter"), destination)
+	);
+	const pen = runMarkup(
+		inkSvgRuns(strokes.filter((s) => s.tool !== "highlighter"), destination)
+	);
 	return (hi ? `<g opacity="${HIGHLIGHTER_ALPHA}">${hi}</g>` : "") + pen;
 }
 
@@ -123,13 +144,16 @@ export interface InkSvgRun {
  * sight, safe content or not - so the string form stays for the .svg file
  * export, where it is a file write.
  */
-export function inkSvgLayers(strokes: readonly InkStroke[]): {
+export function inkSvgLayers(
+	strokes: readonly InkStroke[],
+	destination?: string | null
+): {
 	highlighter: InkSvgRun[];
 	pen: InkSvgRun[];
 } {
 	return {
-		highlighter: inkSvgRuns(strokes.filter((s) => s.tool === "highlighter")),
-		pen: inkSvgRuns(strokes.filter((s) => s.tool !== "highlighter")),
+		highlighter: inkSvgRuns(strokes.filter((s) => s.tool === "highlighter"), destination),
+		pen: inkSvgRuns(strokes.filter((s) => s.tool !== "highlighter"), destination),
 	};
 }
 
@@ -157,13 +181,19 @@ function runMarkup(runs: readonly InkSvgRun[]): string {
  * run merge instead of cancelling. That is also what the highlighter layer
  * wants: one flat wash rather than a dark seam at every crossing.
  */
-function inkSvgRuns(strokes: readonly InkStroke[]): InkSvgRun[] {
+function inkSvgRuns(strokes: readonly InkStroke[], destination?: string | null): InkSvgRun[] {
+	// Runs group on the colour actually EMITTED rather than the stored one.
+	// Two stored colours that adapt to the same value belong in one path, and
+	// a run that broke on the stored colour would emit two identical fills
+	// back to back. Still CONSECUTIVE, so z-order is untouched either way.
+	const emitted = (s: InkStroke): string =>
+		exportInkColor(normalizeInkColor(s.tool, s.color), destination, s.tool);
 	const out: InkSvgRun[] = [];
 	let i = 0;
 	while (i < strokes.length) {
-		const color = normalizeInkColor(strokes[i]!.tool, strokes[i]!.color);
+		const color = emitted(strokes[i]!);
 		let d = "";
-		while (i < strokes.length && normalizeInkColor(strokes[i]!.tool, strokes[i]!.color) === color) {
+		while (i < strokes.length && emitted(strokes[i]!) === color) {
 			d += strokePathData(strokes[i]!);
 			i++;
 		}
@@ -177,7 +207,7 @@ function inkSvgRuns(strokes: readonly InkStroke[]): InkSvgRun[] {
  * painted FIRST (under the pen, matching the layer order) inside one group
  * carrying the layer opacity.
  */
-export function inkToSvg(strokes: readonly InkStroke[]): string {
+export function inkToSvg(strokes: readonly InkStroke[], destination?: string | null): string {
 	const inked = strokes.filter((s) => s.points.length > 0);
 	if (inked.length === 0) return "";
 	let x0 = Infinity;
@@ -194,7 +224,7 @@ export function inkToSvg(strokes: readonly InkStroke[]): string {
 	y0 -= MARGIN_WORLD;
 	x1 += MARGIN_WORLD;
 	y1 += MARGIN_WORLD;
-	const body = inkSvgBody(inked);
+	const body = inkSvgBody(inked, destination);
 	const w = num(x1 - x0);
 	const h = num(y1 - y0);
 	return (

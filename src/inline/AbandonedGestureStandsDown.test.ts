@@ -37,6 +37,7 @@ import { StrokeFrame } from "./StrokeFrame";
 
 interface Proto {
 	strokeAbandoned(this: unknown): void;
+	cancelFingerInkForPinch(this: unknown): void;
 }
 
 interface Layer {
@@ -95,6 +96,8 @@ function makeRig() {
 	inst.spaceTotalDy = 9;
 	inst.panLast = { x: 5, y: 5 };
 	inst.hoverWatchdog = null;
+	inst.frameTicking = true;
+	inst.strokePenGesture = true;
 	inst.selectionDeleteKeys = { reset: noop };
 
 	// The frame lock a live stroke holds. Left held, it freezes the NEXT
@@ -208,5 +211,20 @@ describe("the note surface stands its own gesture down when a stroke is abandone
 		rig.proto.strokeAbandoned.call(rig.inst);
 
 		expect(rig.cursorStyle.display).toBe("none");
+	});
+
+	it("uses the same full provisional cleanup when a second finger starts pinch", () => {
+		const rig = makeRig();
+
+		rig.proto.cancelFingerInkForPinch.call(rig.inst);
+
+		expect(rig.inking).toEqual([false]);
+		expect(rig.inst.builder).toBe(null);
+		expect((rig.inst.frame as StrokeFrame).locked).toBe(false);
+		expect(rig.wet.cleared).toBe(1);
+		expect(rig.highlightWet.cleared).toBe(1);
+		expect(rig.tail.cleared).toBe(1);
+		expect(rig.inst.frameTicking).toBe(false);
+		expect(rig.inst.strokePenGesture).toBe(false);
 	});
 });

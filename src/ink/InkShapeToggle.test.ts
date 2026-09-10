@@ -35,6 +35,8 @@ function screenRibbon(stroke: InkStroke): RibbonPt[] {
 		baseWidth: stroke.width,
 		minWidthFactor: flat ? 0.9 : 0.35,
 		gamma: flat ? 1 : 0.75,
+		maxWidthFactor: 1,
+		pressureOffWidthFactor: flat ? 0.95 : 0.7364923123758843,
 	};
 	// Both of drawStroke's decisions, not one. The unshaped branch used to be
 	// reached with `flattenStroke`'s smooth default, which pairs the raw width

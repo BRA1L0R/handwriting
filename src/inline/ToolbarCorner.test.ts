@@ -7,7 +7,7 @@
  * sentence naming `.handwriting-corner-bottom-left` proved the corner was
  * styled just as well as the rule that styles it did.
  *
- * Demonstrated on this branch rather than argued: all six real occurrences of
+ * Demonstrated on the original six-anchor branch rather than argued: every real occurrence of
  * `handwriting-corner-bottom-left` were renamed to a typo - a rename that
  * missed the stylesheet, which is the ordinary way this arrives - and one
  * comment listing the four corner classes was added. All five tests here
@@ -34,39 +34,83 @@ import {
 	TOOLBAR_CORNER_LABELS,
 	collapseChevronGlyph,
 	collapseChevronIcon,
+	isCenterColumnAnchor,
 	isMiddleAnchor,
 	allToolbarCornerClasses,
 	normalizeToolbarCorner,
+	toolbarAnchorColumn,
+	toolbarAnchorRow,
 	toolbarCornerClass,
 } from "./ToolbarCorner";
 import css from "../../styles.css?raw";
 
 describe("ToolbarCorner", () => {
-	it("offers six placements and defaults to the one that shipped", () => {
-		expect(TOOLBAR_CORNERS).toHaveLength(6);
+	const NINE = [
+		"top-right",
+		"top-left",
+		"top-center",
+		"middle-right",
+		"middle-left",
+		"middle-center",
+		"bottom-right",
+		"bottom-left",
+		"bottom-center",
+	] as const;
+
+	it("offers the exact 3x3 grid and keeps the shipped default", () => {
+		expect(TOOLBAR_CORNERS).toEqual(NINE);
 		expect(DEFAULT_TOOLBAR_CORNER).toBe("top-right");
 	});
 
-	// THE FOUR ORIGINAL VALUES ARE LOAD-BEARING: they are in every existing
+	// THE SIX SHIPPED VALUES ARE LOAD-BEARING: they are in existing
 	// data.json. Adding the middles must not rename one of them, or every
 	// user's toolbar moves on upgrade and the normalise hands them the
 	// default instead of what they chose.
-	it("keeps the four original values exactly as they were persisted", () => {
-		for (const corner of ["top-right", "top-left", "bottom-right", "bottom-left"] as const) {
+	it("keeps all six prior values exactly as they were persisted", () => {
+		for (const corner of [
+			"top-right",
+			"top-left",
+			"top-center",
+			"bottom-right",
+			"bottom-left",
+			"bottom-center",
+		] as const) {
 			expect(TOOLBAR_CORNERS).toContain(corner);
 			expect(normalizeToolbarCorner(corner)).toBe(corner);
 		}
 	});
 
-	it("accepts the two middles, and labels them as middles", () => {
-		expect(normalizeToolbarCorner("top-center")).toBe("top-center");
-		expect(normalizeToolbarCorner("bottom-center")).toBe("bottom-center");
-		const labels = new Map(TOOLBAR_CORNER_LABELS.map((r) => [r.value, r.label]));
-		expect(labels.get("top-center")).toBe("Top middle");
-		expect(labels.get("bottom-center")).toBe("Bottom middle");
+	it("accepts the three new middle-row values", () => {
+		for (const corner of ["middle-right", "middle-left", "middle-center"] as const) {
+			expect(normalizeToolbarCorner(corner)).toBe(corner);
+		}
+	});
+
+	it("gives the nine values their exact labels", () => {
+		expect(TOOLBAR_CORNER_LABELS).toEqual([
+			{ value: "top-right", label: "Top right" },
+			{ value: "top-left", label: "Top left" },
+			{ value: "top-center", label: "Top middle" },
+			{ value: "middle-right", label: "Middle right" },
+			{ value: "middle-left", label: "Middle left" },
+			{ value: "middle-center", label: "Middle center" },
+			{ value: "bottom-right", label: "Bottom right" },
+			{ value: "bottom-left", label: "Bottom left" },
+			{ value: "bottom-center", label: "Bottom middle" },
+		]);
+	});
+
+	it("keeps row and column explicit, including both meanings of middle", () => {
+		expect(toolbarAnchorRow("middle-right")).toBe("middle");
+		expect(toolbarAnchorColumn("middle-right")).toBe("right");
+		expect(toolbarAnchorRow("top-center")).toBe("top");
+		expect(toolbarAnchorColumn("top-center")).toBe("center");
+		expect(isCenterColumnAnchor("middle-center")).toBe(true);
+		expect(isCenterColumnAnchor("middle-right")).toBe(false);
+		// Compatibility helper still means centre COLUMN, not middle row.
 		expect(isMiddleAnchor("top-center")).toBe(true);
-		expect(isMiddleAnchor("bottom-center")).toBe(true);
-		expect(isMiddleAnchor("top-right")).toBe(false);
+		expect(isMiddleAnchor("middle-center")).toBe(true);
+		expect(isMiddleAnchor("middle-right")).toBe(false);
 	});
 
 	// The dropdown is built from the labels, so a placement with no label is
@@ -93,6 +137,7 @@ describe("ToolbarCorner", () => {
 
 	it("gives each corner its own class, and can list them all to clear", () => {
 		const classes = allToolbarCornerClasses();
+		expect(classes).toEqual(NINE.map((corner) => `handwriting-corner-${corner}`));
 		expect(new Set(classes).size).toBe(TOOLBAR_CORNERS.length);
 		for (const c of TOOLBAR_CORNERS) expect(classes).toContain(toolbarCornerClass(c));
 	});
@@ -154,9 +199,15 @@ describe("collapseChevronIcon: the arrow names the edge the strip goes to", () =
 		expect(collapseChevronIcon("bottom-left")).toBe("chevron-left");
 	});
 
-	it("points at the edge for the two middles", () => {
+	it("points at the edge for the top and bottom centre-column anchors", () => {
 		expect(collapseChevronIcon("top-center")).toBe("chevron-up");
 		expect(collapseChevronIcon("bottom-center")).toBe("chevron-down");
+	});
+
+	it("uses each side for the middle row and a neutral centre", () => {
+		expect(collapseChevronIcon("middle-left")).toBe("chevron-left");
+		expect(collapseChevronIcon("middle-right")).toBe("chevron-right");
+		expect(collapseChevronIcon("middle-center")).toBe("minus");
 	});
 
 	it("has a glyph fallback for every placement, matching the icon", () => {
@@ -164,6 +215,9 @@ describe("collapseChevronIcon: the arrow names the edge the strip goes to", () =
 			"top-right": ">",
 			"top-left": "<",
 			"top-center": "^",
+			"middle-right": ">",
+			"middle-left": "<",
+			"middle-center": "−",
 			"bottom-right": ">",
 			"bottom-left": "<",
 			"bottom-center": "v",

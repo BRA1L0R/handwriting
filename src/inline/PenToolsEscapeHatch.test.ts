@@ -94,6 +94,7 @@ import {
 	setPenToolsMode,
 } from "./PenToolsMode";
 import { PdfInkController } from "../pdf/PdfInkController";
+import HandwritingPlugin from "../main";
 
 /** The gesture path rebinds, which constructs observers Node does not have. */
 class NoopObserver {
@@ -104,6 +105,50 @@ class NoopObserver {
 const g = globalThis as unknown as Record<string, unknown>;
 g.ResizeObserver ??= NoopObserver;
 g.MutationObserver ??= NoopObserver;
+g.document ??= {
+	body: {
+		classList: {
+			add: (): void => {},
+			toggle: (): void => {},
+			contains: (): boolean => false,
+		},
+	},
+};
+
+const settingsProto = HandwritingPlugin.prototype as unknown as {
+	loadSettings(this: unknown): Promise<void>;
+	persistSettings(this: unknown): Promise<void>;
+};
+
+interface LoadedPenTools {
+	settings: Record<string, unknown>;
+	saved: Record<string, unknown> | null;
+}
+
+async function loadSavedPenTools(raw: "auto" | "show" | "hide"): Promise<LoadedPenTools> {
+	const plugin = Object.create(HandwritingPlugin.prototype) as Record<string, unknown>;
+	plugin.loadData = (): Promise<unknown> => Promise.resolve({ penTools: raw });
+	plugin.saved = null;
+	plugin.saveData = (data: Record<string, unknown>): Promise<void> => {
+		plugin.saved = data;
+		return Promise.resolve();
+	};
+	plugin.settingsTimer = null;
+	plugin.settingsDirty = false;
+	plugin.settingsWriting = null;
+	plugin.settingsWriteAgain = false;
+	plugin.store = { useInkFolder: () => {}, load: () => null, schedule: () => {} };
+	plugin.pdfStore = { attachHost: () => {} };
+	plugin.app = { workspace: { onLayoutReady: () => {} } };
+	plugin.applyPaperTo = (): void => {};
+	plugin.applyBooxMode = (): void => {};
+	await settingsProto.loadSettings.call(plugin);
+	await settingsProto.persistSettings.call(plugin);
+	return {
+		settings: plugin.settings as Record<string, unknown>,
+		saved: plugin.saved as Record<string, unknown> | null,
+	};
+}
 
 // ---- the two hatches, as main.ts spells them --------------------------------
 
@@ -283,6 +328,26 @@ describe("a mouse-only user reaches the pen toolbar, and only through the two ru
 		expect(penSeenThisSession()).toBe(false);
 		expect(strips.live).toBe(0);
 	});
+
+	it.each([
+		{ saved: "hide", mobile: true, afterNote: 1, afterPdf: 2 },
+		{ saved: "show", mobile: false, afterNote: 0, afterPdf: 0 },
+		{ saved: "auto", mobile: true, afterNote: 1, afterPdf: 2 },
+	] as const)(
+		"upgrades saved $saved to auto before note and PDF toolbars mount",
+		async ({ saved, mobile, afterNote, afterPdf }) => {
+			platform.isMobileApp = mobile;
+			const loaded = await loadSavedPenTools(saved);
+
+			expect(loaded.settings.penTools).toBe("auto");
+			expect(loaded.saved?.penTools).toBe("auto");
+			expect(getPenToolsMode()).toBe("auto");
+			openNote();
+			expect(strips.live).toBe(afterNote);
+			openPdf();
+			expect(strips.live).toBe(afterPdf);
+		}
+	);
 
 	it("one press of the toolbar command puts a strip on a note", () => {
 		openNote();

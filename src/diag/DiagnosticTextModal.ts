@@ -1,5 +1,6 @@
 import { App, Modal, Notice, Platform } from "obsidian";
 import { endRecordingForReport } from "./DiagSwitch";
+import { createFreshFile } from "../export/CreateFreshFile";
 
 /**
  * How long an upload may hang before the button is handed back.
@@ -257,21 +258,36 @@ export class DiagnosticTextModal extends Modal {
 	 * survives the modal being closed by accident.
 	 */
 	private async saveToVault(): Promise<void> {
+		// Both taken before the turn below: two reports saved inside one second
+		// share a base name, so the scan has to run inside the turn - but the
+		// second it stamps, and the text it saves, are this invocation's own.
 		const base = `handwriting-diagnostics-${stamp()}`;
+		const text = this.text;
 		try {
-			let path = `${base}.md`;
-			let n = 2;
-			// getFileByPath answers null for a FOLDER at this path, not just a
-			// free one - commit 56e981b's swap made this loop call a folder
-			// free and hand it to vault.create, which then throws (1.4.6-
-			// design.md 5m/AF3). This is a plain existence test, not "is
-			// there a file to read", so it needs the abstract getter, which
-			// answers non-null for either kind.
-			while (this.app.vault.getAbstractFileByPath(path)) {
-				path = `${base}-${n++}.md`;
-			}
-			await this.app.vault.create(path, this.text);
-			new Notice(`Handwriting: saved to ${path}`, 8000);
+			const { path: saved } = await createFreshFile(
+				async () => {
+					// The whole scan, inside the turn. Choosing outside it is what
+					// let two saves in one second pick the same name and the second
+					// replace the first, both of them reporting delivery.
+					let path = `${base}.md`;
+					let n = 2;
+					// getFileByPath answers null for a FOLDER at this path, not just a
+					// free one - commit 56e981b's swap made this loop call a folder
+					// free and hand it to vault.create, which then throws (1.4.6-
+					// design.md 5m/AF3). This is a plain existence test, not "is
+					// there a file to read", so it needs the abstract getter, which
+					// answers non-null for either kind.
+					while (this.app.vault.getAbstractFileByPath(path)) {
+						path = `${base}-${n++}.md`;
+					}
+					return path;
+				},
+				(path) => this.app.vault.create(path, text),
+				// One attempt, as this caller always made: a save that fails still
+				// fails once and says so, rather than quietly trying eight names.
+				1
+			);
+			new Notice(`Handwriting: saved to ${saved}`, 8000);
 			this.delivered();
 		} catch (err) {
 			new Notice(`Handwriting: could not save the report: ${String(err)}`, 10000);
