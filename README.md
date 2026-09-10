@@ -180,13 +180,13 @@ this is a section dedicated to anyone curious about the mechanisms
 
 ### writing
 
-when you put pen to screen, then switch to keyboard and back, it should feel seamless. This is because of three layers interacting -
+when you put pen to screen, then switch to keyboard and back, it should feel seamless. This is because of three layers interacting
 
-you are writing on an overlay canvas drawn over the Obsidian text editor - this overlay is drawn in codemirror 6 and accepts+records pen inputs. codemirror 6 is a program component that Obsidian uses to handles things like typing, cursor movement, text selection, etc
+first, you are writing on an overlay canvas drawn to match the Obsidian text editor. this overlay is made in codemirror 6 and accepts+records pen inputs. codemirror 6 is a program component that Obsidian uses to handles things like typing, cursor movement, text selection, etc
 
-second layer made of logic. the input guard lives here. He gets to decide which events belong to Handwriting and which fall through to Obsidian
+second layer is made of logic. the input guard lives here. He gets to decide which events belong to Handwriting and which fall through to Obsidian
 
-Obsidian or its live editor, sits directly underneath - this is the base where all inputs go unless otherwise claimed
+Obsidian or its live editor, sits underneath - this is the base where all inputs go unless otherwise claimed
 
 to sum up: Obsidian's live editor handles the Markdown. transparent canvas layer above it draws the ink. then logic layer decides whether or not the thing poking it is a pen, a finger, or a palm
 
@@ -202,9 +202,27 @@ in this case, the sidecar stores your ink as coordinates - your note is linked t
 
 what this means practically is that no matter what happens to the ink, the text in your note will be safe, as the note itself is not modified (besides its frontmatter).
 
+### why the ink looks good
+
+a typical pen reports ~200-250 dots/events a second. what other handwriting apps probably do (almost certainly) is draw straight lines between each dot - this is what causes the jaggedness or spikiness on boox or other e-ink devices, also because the pen trembles a bit naturally
+
+what i did is smooth the curve by adding the previous dot into the calculation. this causes bad perceived lag, so i had to replace the last stretch of the curve to the pen tip with a straight line in real time
+
+### how does it stay still
+
+ink coordinates are stored in the sidecar. origin is at the top-left of the text column, absolute y down the document.
+
+any transformation of the viewport, Handwriting calculates where that part of the note is on your screen and redraws the ink. then, Handwriting matches the overlay to the live editor pane.
+
+this sounds pretty straightforward. 
+
+however if you resize Obsidian, resize a window pane, change the font size, pinch the screen, zoom with ctrl+, ctrl-, or ctrl & scroll, use a theme that moves the text column, use a theme that moves the live editor, change the readable line length setting, or simply pan, the coordinates must transform to match
+
 ### palm rejection
 
-the base of all palm rejection tech starts with blocking hand input when pen begins input. On notes, Handwriting's block persists 350 ms after pen lifts, in case you brush the screen as you are lifting off.
+most palm rejection tech starts with blocking hand input when pen begins input. Handwriting does this too.
+
+On notes, Handwriting's block persists 350 ms after pen lifts in case you brush the screen as you are lifting off.
 
 but this creates a problem: writers who hold their pen close to screen while scrolling with other hand
 
@@ -216,50 +234,35 @@ therefore the input guard is given a short memory bank -  remembers whether a pe
 
 a finger scrolling the page and a palm resting on it can look similar to bad logic, so Handwriting counts things like time in ms between hand contact to next pen input, whether contact stops moving after, size of the contact, speed of the contact, angle, etc
 
-on pdfs, a touch contact too large to be a fingertip is thrown away. the heel of a hand produces a larger contact area, which is different from normal touch input.
-
-### why the ink looks good
-
-a typical pen reports ~200-250 dots/events a second. what other handwriting apps probably do (almost certainly) is draw straight lines between each dot - this is what causes the jaggedness or spikiness on boox or other e-ink devices, also because the pen trembles a bit naturally
-
-what i did is smooth the curve by adding the previous dot into the calculation. this causes bad perceived lag, so i had to replace the last stretch of the curve to the pen tip with a straight line in real time
-
-### how does it stay still
-
-ink coordinates are stored in the sidecar. origin is at the top-left of the text column, absolute y down the document.
-
-when you ink: those saved coordinates are saved. any transformation of the viewport, Handwriting calculates where that part of the note is on your screen and draws the ink there again. then, Handwriting matches the overlay to the live editor.
-
-this sounds pretty straightforward, until you realize that if you resize a pane, change the font size, pinch to zoom, zoom with ctrl+ or ctrl-, zoom with ctrl and scroll, use a theme that moves the text column, change the readable line length setting, or simply scroll.. the coordinates must transform...
+this goes for pdfs too.
 
 ### undo/redo
 
-if you draw, type, then erase, ctrl+z should undo those things in the order you did them. it should feel and be seamless.
+if you draw, type, then erase, ctrl+z should undo those things in the order you did them
 
 this meant Obsidian, not just Handwriting, needed to know what an ink action is and in what order
 
-so each ink action had to be translated and recorded in obsidian's undo history. adding a stroke. moving a lasso selection. which strokes moved and by how much. erasing. what was removed and how much of it
+each ink action had to be translated to be able to be recorded in obsidian's undo history. adding a stroke. moving a lasso selection. which strokes moved and by how much. erasing. what was removed and how much of it
 
-teaching these operations to participate in the editor's history alongside text gives seamless undo text and ink in the exact order you did them
+teaching these operations to participate in the editor's history alongside text gives seamless undo/redo for text and ink
 
 ### saving and recovery
 
-I spent a lot of time trying to guarantee that you wouldn't lose your ink no matter how hard you tried. i didnt want you guys mad at me :sob:
+I worked hard trying to guarantee that you wouldn't lose your ink no matter how hard you tried. i still didn't make it impossible so so be careful. :sob:
 
 some things i did included:
-every stroke is stored in memory first, then saved to your drive with periodic saves when doing extended writing
 
 before replacing the saved sidecar, Handwriting writes a complete temporary copy. if a save get corrupted or interrupted, recovery is possible
 
-if an ink file is corrupted, damaged, or can't be understood, Handwriting will refuse to overwrite it. this is a safety feature that will stop you from loading a broken file and accidentally immediately overwriting all the information
+if an ink file is corrupted, damaged, or can't be understood, Handwriting will refuse to overwrite it. this will stop you from loading a broken file and accidentally immediately overwriting all the information
 
-`Delete all ink` command immediately makes a recovery copy before clearing the page. if that copy can't be saved to drive, the command will refuse to delete ink
+`Delete all ink` command always makes and saves a recovery copy before clearing the page. if that copy can't be saved, the command will refuse to delete ink
 
-there is still a short gap between drawing into memory and saving to disk so if you draw a stroke and then shut down your pc immediately, you might lose that stroke.
+every stroke is stored in memory first then saved to your drive with periodic saves when doing any writing. however there is still a short gap between drawing into memory and saving to disk so if you draw a stroke and then shut down your pc immediately, you might lose that stroke!
 
 also added an export to svg or pdf option so you can save your ink to use in other programs
 
-finally: deleting the entire handwriting folder takes its recovery copies with it so be careful. and back up your vault!!
+finally: deleting the entire handwriting folder will take all its recovery copies with it so be careful. and back up your vault!!
 
 if you have any questions i will try to answer as best i can
 
