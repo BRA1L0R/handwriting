@@ -14,13 +14,13 @@ one line is written to the invisible frontmatter of a note when you first write 
 
 a note you never inked on is never modified.
 
+---
+
 > **ipad**
 >
 > turn off Scribble or ios will draw its own black ink over your strokes, and its scratch-out gesture may delete ink.
 >
 > **iPad Settings → Apple Pencil → Scribble → Off**
->
-> ios may discard a canvas’s pixels while Obsidian is in the background or memory is limited. this is more likely on long notes containing images or a pdf. the stroke data remains saved and the ink is repainted when you return to Obsidian.
 
 ## what it does
 
