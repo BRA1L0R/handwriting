@@ -36,9 +36,7 @@ Here's a demonstration of some of the features: https://youtu.be/TUeniA9BZcc
 * insert space tool
 * undo/redo ink + text
 * draw + pan with the mouse if you want
-* write on pdfs
-* flatten ink for pdf export
-* snip pdfs
+* pdfs: annotate, export, snip
 
 ### features
 
@@ -52,13 +50,17 @@ Here's a demonstration of some of the features: https://youtu.be/TUeniA9BZcc
 * ink prediction + smoothing
 * lined, grid, and dotted paper background
 * export ink as svg or pdf
-* infinite canvas
-* ink embeds
-* handwriting to shape
+* true infinite canvas
+* ink works in embeds
+* handwriting to shape snap
 
 ### works on
 
 windows · macos · linux · ipad · boox · android
+
+### doesn't really work on
+
+iphone
 
 ## installing
 
@@ -110,7 +112,7 @@ the keyboard button disables pen input so a tap can place the caret and open the
 
 this also applies to pdfs. with the pen disabled, taps pass through to the pdf viewer.
 
-#### mouse input
+### mouse input
 
 to use the toolbar with a mouse, run `Handwriting: Mouse on / off`.
 
@@ -127,11 +129,11 @@ tap the eraser button to select a mode. stroke is the default.
 
 the eraser button also toggles the eraser on and off. with **Extra commands for hotkeys** enabled, `Toggle eraser on / off` and `Eraser size: next` are available in the command palette.
 
-### colors and quick pens
+### colors and favorites
 
-tap the pen button to open its size slider, quick pens and 8 pen colors. tap the highlighter button to open the same controls with its 5 highlighter colors.
+tap the pen button to open its size slider, favorites and 8 pen colors. tap the highlighter button to open its size slider, also with favorites and 5 highlighter colors.
 
-selecting a color applies it to the corresponding nib and returns to inking from eraser, lasso, insert space or pan.
+selecting a color applies it to the corresponding nib.
 
 ### extra commands for hotkeys
 
@@ -150,11 +152,7 @@ each command can be assigned its own hotkey.
 
 the commands are hidden by default because their number makes other Handwriting commands harder to find. disabling the setting removes them from the palette but preserves their hotkey assignments.
 
-### palm rejection
 
-on pdfs, a touch contact too large to be a fingertip is discarded. the heel of a hand produces a larger contact area, which allows it to be distinguished from normal touch input.
-
-notes use a separate, timing-based method.
 
 ### pinch zoom
 
@@ -172,17 +170,51 @@ with a mouse, pause at the end of a stroke and select **Snap**.
 
 if you use one of these services, enable **Compatibility with Obsidian Sync, iCloud and Dropbox** in Handwriting settings.
 
+**compatibility: sync between devices**
+
+this option switches where Handwriting stores ink- by default, ink is stored in the hidden .handwriting sidecar (which like half of services don't look at hidden folders by default, so won't sync with these services). Hitting this button creates a handwriting sidecar (no period in front), then points itself at it
+
 ## how it works
 
 this is a section dedicated to anyone curious about the mechanisms
 
 ### writing
 
-when you put pen to screen, you are writing on an overlay drawn over the Obsidian text editor - this overlay is drawn in codemirror 6
+when you put pen to screen, then switch to keyboard and back, it should feel seamless. This is because of three layers interacting -
 
-the overlay claims pen input only, by default - touch, typing, selection and caret placement fall through to Obsidian untouched, and so does mouse unless mouse ink is turned on
+the first layer:
 
-in terms of risk, the only thing ever written directly by Handwriting is one line - `handwriting-page-id`, added to the invisible frontmatter of your note on the first detected stroke.
+you are writing on an overlay canvas drawn over the Obsidian text editor - this overlay is drawn in codemirror 6 and accepts+records pen inputs. codemirror 6 is a program component that Obsidian uses to handles things like typing, cursor movement, text selection, etc
+
+the invisible second layer:
+
+made of logic. the input guard lives here.
+
+He gets to decide which events belong to Handwriting and which fall through to Obsidian
+
+the third layer:
+
+Obsidian or its live editor, sits directly underneath - this is the base where all inputs go unless otherwise claimed
+
+to sum up:
+
+Obsidian's live editor handles the Markdown. transparent canvas layer above it draws the ink. then logic layer decides whether or not the thing poking it is a pen, a finger or a palm.
+
+**touch**
+
+the base of all palm rejection tech starts with simply blocking hand input when pen begins input. On notes, Handwriting's block persists up to 350 ms after pen lifts, just in case you brush the screen as you are lifting off.
+
+but this creates a problem: writers who hold their pen close to screen while scrolling with other hand
+
+because of this, pen-input blocked finger swipe gets one chance to prove it really is a finger swiping. if it moves far enough, fast enough, and isn't reporting a palm-sized contact, it is allowed to fall through and become a pan. this is fairly reliable.
+
+however, palms can slide too, especially while you're erasing. if movement were the only test, lifting the eraser could suddenly let your resting hand drag the page. so movement isn't enough.
+
+therefore the input guard is given a short memory bank -  remembers whether a pen stroke happened at any point while a finger/palm touch was down. if it did, that contact stays blocked until you lift it
+
+bad palm rejection often comes from bad logic. detection is detection. a finger scrolling the page and a palm resting on it can look exactly similar to bad logic, so Handwriting counts things like time in ms between hand contact and very next pen input, whether the contact stops moving after, size of the contact, speed of the contact, angle, etc
+
+on pdfs, a touch contact too large to be a fingertip is discarded. the heel of a hand produces a larger contact area, which allows it to be distinguished from normal touch input.
 
 ### why the ink looks good
 
@@ -202,31 +234,47 @@ in this case, the sidecar stores your ink as coordinates - your note is linked t
 
 what this means practically is that no matter what happens to the ink, the text in your note will be safe, as the note itself is not modified (besides its frontmatter).
 
-### where does ink go when deleted
+### keeping it on the page
 
-you can use undo (ctrl+z) to get ink back if you accidentally erase/delete it
+ink coordinates are stored in the sidecar. the origin is at the top-left of the text column, absolute y down the document.
 
-undo/redo history is bulletproof - should undo/redo actions, erase, strokes, text, in the exact order you did them (this took quite a bit of effort actually).
+when you ink: those saved coordinates are saved. any transformation of the viewport, Handwriting calculates where that part of the note is on your screen and draws the ink there again. then, Handwriting matches the overlay to the live editor.
 
-`Delete all ink` copies the note's ink to `.handwriting/trash/` before it wipes anything, every time. so even the big red button is recoverable.
+this sounds pretty straightforward, until you realize that if you resize a pane, change the font size, pinch to zoom, zoom with ctrl+ or ctrl-, zoom with ctrl and scroll, use a theme that moves the text column, change the readable line length setting, or simply scroll.. the coordinates must transform...
 
-in one case your ink will be permanently gone - if you delete the `.handwriting` folder itself.
+this design is also why handwriting stays in place while text can move 'underneath' it. the text and the ink do not interact - the ink stroke knows its position on the page; but not relative to the text since that belongs on another layer. this silo'd design persists through the code, for now. there's one exception to this and that is the Insert Space tool
 
-if that was an accident (fat-fingered it, cat walked across the keyboard) check your OS recycle bin or trash first.
+### undo/redo
 
-that being said, it's just good rule of thumb to always back up your vault!!
+if you draw a word, type a sentence, then erase part of the word, ctrl+z should undo those things in the order you did them. it should feel and be seamless.
 
-you can export your ink as svg or pdf first if you want to load it into other programs.
+that meant Obsidian, not just Handwriting, needed to know what an ink action is and how to reverse it
 
-### how is the ink stored
+so each ink action had to be translated and recorded in obsidian's undo history. adding a stroke. moving a lasso selection. which strokes moved and by how much. erasing. what was removed and how much of it
 
-ink is stored in note-surface JSON coordinates. origin at the top-left of the text column, y absolute down the document. markdown reflows wherever it wants. your ink stays where you put it. editing text will never move ink except in the case of the insert space tool, by design
+teaching these operations to participate in the editor's history alongside text gives seamless undo text and ink in the exact order you did them
 
-### how is the ink placed
+### saving and recovery
 
-ink flows or drawing happens on raw pointer events. the line behind the nib is smoothed with math; the last stub to the pen tip is raw so the ink will always reach the tip of the pen
+I spent a lot of time trying to guarantee that you wouldn't lose your ink no matter how hard you tried. i didnt want you guys mad at me :sob:
 
-if you have any more questions i'd be glad to answer in the comments
+some of the things i did:
+
+every stroke is stored in memory first, then saved to the drive with periodic saves occurring during extended writing
+
+before replacing the saved sidecar, Handwriting writes a complete temporary copy just in case. if a save get corrupted or interrupted, recovery is possible
+
+if an ink file is corrupted, damaged or can't be understood, Handwriting will refuse to overwrite it. this is a safety feature that will stop you from loading a broken file and accidentally immediately overwriting the information on it
+
+`Delete all ink` command immediately makes a recovery copy before clearing the page. if that copy can't be saved, the command will refuse to delete ink
+
+I also added an export to svg or pdf option so you can save your ink to use in other programs
+
+finally: there is still a short gap between drawing into memory and saving to disk so if you draw a stroke and then lightning immediately claps your breaker's cheeks and your PC shuts down, you might lose that stroke.
+
+and one more thing: deleting the entire handwriting folder takes its recovery copies with it, so be careful. and back up your vault!!
+
+if you have any questions i will try to answer as best i can
 
 ## reporting problems
 
@@ -240,28 +288,27 @@ reproduce the bug.
 
 run `Bug report: send`.
 
-press Upload and the report comes straight to me 🙂 paste the id it gives you into your issue or the reddit thread.
+press `Upload` and the report comes straight to me 🙂 paste the id it gives you into your issue or the reddit thread so I know where it came from.
 
-for those of you nervous about bug reports: specifically what the report records are pen coordinates, timing, and what kind of device+pen the report is coming from- nothing else. furthermore, nothing leaves your device unless you press Upload. Copy and Save to Vault are offline ways to do bug reports
+for those of you nervous about sending bug reports: specifically what the report sends are pen coordinates and timings- nothing else. 
+
+and i guarantee nothing will leave your device unless you press `Upload` button. still uncomfortable with telemetry? `Copy` and `Save to Vault` buttons are offline ways to do bug reports
 
 ## coming soon
 
 * audio alongside ink
 * ruler + compass on screen
 * laser pointer
-* ocr / handwriting to text
-* searchable handwriting
-* handwriting to math/latex
-* text boxes
+* ocr / handwriting to text ( very soon )
+* searchable handwriting ( very soon )
+* handwriting to math/latex ( very soon )
+* text boxes ;)
 * canvas mode
-* custom toolbar with favorites
 * more custom colors
-
-there's still a long way to go before obsidian has real parity with onenote. i'm not going anywhere.
 
 ## money
 
-Handwriting is free. i'm still working on it almost every night. if you want to buy me a coffee:
+Handwriting is free. i still work on it almost every night. if you want to buy me a coffee:
 https://ko-fi.com/ellimistafk
 
 thank you for using my plugin.
@@ -274,11 +321,11 @@ disclaimer: ai assistance was used in this project.
 
 ## why i built this
 
-back in uni i remember taking biochem notes on my new surface pro 4 with stars in my eyes. drawing structures and typing labels on the same OneNote page felt like literal magic. i can still remember how good it felt, how proud i was showing my notes to friends and professors
+back in uni i remember taking biochem notes on a Surface Pro 4 with stars in my eyes. drawing structures and typing labels on the same OneNote page felt like literal magic. ten years later, now for work, I'm still using onenote - and i consider it a prison. 
 
-ten years later, now for work, I'm still using onenote - and i consider it a prison. things change.
-
-Obsidian has almost reached feature-parity but there's one last integration that keeps me coming back into the hands of Microsoft.
+things change.
+ 
+Obsidian has almost reached feature-parity for me but there's one last integration that keeps me falling back into the hands of Microsoft.
 
 **Handwriting is OneNote's last bastion.**
 
