@@ -3442,7 +3442,7 @@ export class PdfInkController {
 			// shaped-width decisions are made here, per stroke, from the
 			// TOOL - never from the layer, which is one pair for both tools.
 			this.wetBegun = true;
-			pair.wet.beginStroke(point, this.strokeStyle, this.wetFlat);
+			pair.wet.beginStroke(point, this.strokeStyle, this.wetFlat, this.builder!.resolvedPressureProfile);
 			// The contact draw, not the moving one. One shared call site meant
 			// this surface asked for the bare live width on the FIRST sample
 			// too, so a tap came out at the shaper's tip floor; swapping that

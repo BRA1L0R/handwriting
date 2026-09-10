@@ -282,7 +282,7 @@ const KNOWN_TOP = new Set([
 const KNOWN_BOX = new Set(["id", "x", "y", "width", "z"]);
 const KNOWN_IMAGE = new Set(["id", "x", "y", "width", "height", "z"]);
 const KNOWN_STROKE = new Set(["id", "tool", "color", "width", "createdAt", "device", "widthMode", "pts",
-	"ptsd", "points", "page"]);
+	"ptsd", "points", "page", "pressureProfile"]);
 
 /** Everything in `raw` that is not a key we claim to own. */
 function unknownKeys(raw: Record<string, unknown>, known: Set<string>): Record<string, unknown> {
@@ -512,6 +512,7 @@ export function serializePage(page: PageData, version: number = SCHEMA_VERSION):
 							createdAt: s.createdAt,
 							...(s.device === "mouse" ? { device: s.device } : {}),
 							...(s.widthMode === "uniform" ? { widthMode: s.widthMode } : {}),
+							...(s.pressureProfile === "exp7" ? { pressureProfile: s.pressureProfile } : {}),
 							...(typeof s.page === "number" ? { page: s.page } : {}),
 							...(version >= 2
 								? { ptsd: packPointsV2(s.points) }
@@ -832,6 +833,7 @@ export function migratePageData(
 				createdAt: num(s.createdAt) ?? Date.now(),
 				...(s.device === "mouse" ? { device: "mouse" as const } : {}),
 				...(s.widthMode === "uniform" ? { widthMode: "uniform" as const } : {}),
+				...(s.pressureProfile === "exp7" ? { pressureProfile: "exp7" as const } : {}),
 				// Page numbers are 1-based; anything else is not a page and is
 				// dropped rather than stored as a number that indexes nowhere.
 				...(Number.isInteger(s.page) && (s.page as number) >= 1
@@ -839,6 +841,11 @@ export function migratePageData(
 					: {}),
 			});
 			const extra = unknownKeys(s, KNOWN_STROKE);
+			// The discriminator is known only for the one generation this build
+			// understands. Preserve future values through the opaque field map.
+			if (s.pressureProfile !== undefined && s.pressureProfile !== "exp7") {
+				extra.pressureProfile = s.pressureProfile;
+			}
 			if (Object.keys(extra).length > 0) page.unknownByObject[id] = extra;
 		}
 	}

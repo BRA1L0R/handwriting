@@ -920,7 +920,7 @@ export class HandwritingPageView extends TextFileView {
 		// the shaped width law and from the raw centerline, and the wet layer
 		// cannot work that out for itself.
 		if (point) {
-			this.wet().beginStroke(point, style, tool === "highlighter");
+			this.wet().beginStroke(point, style, tool === "highlighter", this.builder.resolvedPressureProfile);
 			this.drawContact(point, style);
 		}
 		this.startTicker();

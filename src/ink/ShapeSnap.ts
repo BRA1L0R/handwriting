@@ -536,5 +536,6 @@ export function snapStroke(stroke: InkStroke, dwellConfirmed = false): InkStroke
 		createdAt: stroke.createdAt,
 		...(stroke.device === "mouse" ? { device: stroke.device } : {}),
 		...(stroke.widthMode === "uniform" ? { widthMode: stroke.widthMode } : {}),
+		...(stroke.pressureProfile === "exp7" ? { pressureProfile: stroke.pressureProfile } : {}),
 	};
 }

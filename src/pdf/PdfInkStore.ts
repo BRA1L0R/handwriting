@@ -52,8 +52,7 @@ function inkFingerprint(strokes: readonly InkStroke[]): string {
 
 /** A detached lossless copy captured before preservation begins awaiting I/O. */
 function freezePage(page: PageData): PageData | null {
-	const clone = (globalThis as { structuredClone?: <T>(value: T) => T }).structuredClone;
-	return clone ? clone(page) : null;
+	return typeof structuredClone === "function" ? structuredClone(page) : null;
 }
 
 function adoptionHeld(reason: ExternalAdoptionHeldReason): ExternalAdoptionResult {
@@ -376,8 +375,8 @@ export class PdfInkStore {
 		if (!rec) return ADOPTION_UNAVAILABLE;
 		const host = this.host;
 		if (!host) return adoptionHeld("missing-capability");
-		const prepare = host.prepareExternalAdoption;
-		const accept = host.acceptExternalAdoption;
+		const prepare = host.prepareExternalAdoption?.bind(host);
+		const accept = host.acceptExternalAdoption?.bind(host);
 		if (!prepare || !accept || !stillEligible) return adoptionHeld("missing-capability");
 		if (rec.load !== "yes" || rec.loadInFlight) return adoptionHeld("unsettled");
 		if (rec.unreadableLocked || rec.futureLocked) return adoptionHeld("existing-lock");
@@ -393,7 +392,7 @@ export class PdfInkStore {
 
 		let prep: ExternalAdoptionPrep;
 		try {
-			prep = await prepare.call(host, id, frozen);
+			prep = await prepare(id, frozen);
 		} catch (err) {
 			console.error("[handwriting] pdf external adoption could not be prepared", id, err);
 			return adoptionHeld("io-failure");
@@ -417,7 +416,7 @@ export class PdfInkStore {
 			return adoptionHeld("unsettled");
 		}
 
-		accept.call(host, prep.prepared);
+		accept(prep.prepared);
 		rec.basePage = prep.prepared.data;
 		rec.strokes = prep.prepared.data.strokes.filter((s) => typeof s.page === "number");
 		const incomingPaths = prep.prepared.data.pdfPaths ?? [];

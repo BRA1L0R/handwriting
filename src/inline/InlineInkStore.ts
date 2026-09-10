@@ -177,14 +177,16 @@ export const ADOPTION_STILL_FAILING =
  * migration, so nothing is lost by making it.
  */
 function freezePage(page: PageData): PageData {
-	const clone = (globalThis as { structuredClone?: <T>(value: T) => T }).structuredClone;
-	return clone ? clone(page) : (JSON.parse(JSON.stringify(page)) as PageData);
+	return typeof structuredClone === "function"
+		? structuredClone(page)
+		: (JSON.parse(JSON.stringify(page)) as PageData);
 }
 
 /** `freezePage`'s copy, for anything that is not a whole page. */
 function deepCopy<T>(value: T): T {
-	const clone = (globalThis as { structuredClone?: <X>(x: X) => X }).structuredClone;
-	return clone ? clone(value) : (JSON.parse(JSON.stringify(value)) as T);
+	return typeof structuredClone === "function"
+		? structuredClone(value)
+		: (JSON.parse(JSON.stringify(value)) as T);
 }
 
 /**
@@ -1175,8 +1177,8 @@ export class InlineInkStore {
 		if (!rec) return ADOPTION_UNAVAILABLE;
 		if (!host) return adoptionHeld("missing-capability");
 		// Both halves or neither: half of this route is the loss it prevents.
-		const prepare = host.prepareExternalAdoption;
-		const accept = host.acceptExternalAdoption;
+		const prepare = host.prepareExternalAdoption?.bind(host);
+		const accept = host.acceptExternalAdoption?.bind(host);
 		if (!prepare || !accept) return adoptionHeld("missing-capability");
 		// An established record must also be settled and writable before capture.
 		if (rec.load !== "yes" || rec.loadInFlight || rec.claimInFlight) {
@@ -1211,7 +1213,7 @@ export class InlineInkStore {
 		const before = inkFingerprint(rec.strokes);
 		let prep: ExternalAdoptionPrep;
 		try {
-			prep = await prepare.call(host, id, frozen);
+			prep = await prepare(id, frozen);
 		} catch (err) {
 			// Preservation could not be completed. Nothing was adopted and
 			// nothing acknowledged, so the note is exactly where it was, both
@@ -1273,7 +1275,7 @@ export class InlineInkStore {
 		// that by construction rather than by an inventory of callers.
 		const current = this.snapshot(rec);
 		if (!current || JSON.stringify(current) !== capturedJson) return adoptionHeld("unsettled");
-		accept.call(host, prep.prepared);
+		accept(prep.prepared);
 		// The existing clean-adoption semantics: the incoming revision becomes
 		// the base and the visible ink. No union of missing ids - that is the
 		// deliberate non-solution, and the outgoing ids stay recoverable from

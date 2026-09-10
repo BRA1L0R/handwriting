@@ -217,7 +217,7 @@ export class PenLabView extends ItemView {
 		);
 		if (point) {
 			// Pen only here, so never flat; the style is what the shaper needs.
-			this.wetInk.beginStroke(point, this.penStyle, false);
+			this.wetInk.beginStroke(point, this.penStyle, false, this.builder.resolvedPressureProfile);
 			this.strokeAcceptedSamples++;
 			this.acceptedSamples++;
 		}

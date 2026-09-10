@@ -1,4 +1,4 @@
-import { PenStyle, widthForPressure } from "./PenStyle";
+import { PenStyle, pressureSensitivityEnabled, widthForPressure } from "./PenStyle";
 import { smoothSegments } from "./Smoothing";
 import { InkPoint } from "./Stroke";
 import { RibbonPt, flattenSegmentHw } from "./Ribbon";
@@ -183,9 +183,19 @@ export function applyEndTaper(
 	if (total < style.baseWidth) return;
 	const taperLen = Math.min(params.taperWidths * style.baseWidth, total * params.taperMaxShare);
 	if (taperLen < 1e-9) return;
+	let startFloor = params.tipFloor;
+	let endFloor = params.tipFloor;
+	if (style.pressureProfile === "exp7" && pressureSensitivityEnabled()) {
+		let maxHw = 0;
+		for (const point of pts) if (point.hw > maxHw) maxHw = point.hw;
+		if (maxHw > 0) {
+			startFloor = Math.max(params.tipFloor, pts[0]!.hw / maxHw);
+			endFloor = Math.max(params.tipFloor, pts[n - 1]!.hw / maxHw);
+		}
+	}
 	for (let i = 0; i < n; i++) {
-		const fromStart = taperEase(arc[i]! / taperLen, params.tipFloor);
-		const fromEnd = taperEase((total - arc[i]!) / taperLen, params.tipFloor);
+		const fromStart = taperEase(arc[i]! / taperLen, startFloor);
+		const fromEnd = taperEase((total - arc[i]!) / taperLen, endFloor);
 		pts[i]!.hw *= fromStart * fromEnd;
 	}
 }
@@ -239,6 +249,8 @@ export class IncrementalShaper {
 	private prev: InkPoint | undefined;
 	private arcFromStart = 0;
 	private lastHw = 0;
+	private startHw = 0;
+	private maxHw = 0;
 
 	constructor(private params: ShapeParams = PEN_SHAPE) {}
 
@@ -247,10 +259,10 @@ export class IncrementalShaper {
 		this.vHat = 0;
 		this.prev = first;
 		this.arcFromStart = 0;
-		this.lastHw =
-			first && style
-				? (widthForPressure(style, first.pressure) / 2) * this.params.tipFloor
-				: 0;
+		this.startHw = first && style ? widthForPressure(style, first.pressure) / 2 : 0;
+		this.maxHw = this.startHw;
+		this.lastHw = this.startHw *
+			(style?.pressureProfile === "exp7" && pressureSensitivityEnabled() ? 1 : this.params.tipFloor);
 	}
 
 	/** Shaped half-width at this sample, start taper included. */
@@ -267,12 +279,17 @@ export class IncrementalShaper {
 			this.params.minVelocityFactor,
 			1 / (1 + this.params.thinningK * this.vHat)
 		);
+		const hw = (widthForPressure(style, this.pHat) / 2) * f;
+		this.maxHw = Math.max(this.maxHw, hw);
+		const startFloor = style.pressureProfile === "exp7" && pressureSensitivityEnabled()
+			? Math.max(this.params.tipFloor, this.maxHw > 0 ? this.startHw / this.maxHw : this.params.tipFloor)
+			: this.params.tipFloor;
 		const taper = taperEase(
 			this.arcFromStart / (this.params.taperWidths * style.baseWidth),
-			this.params.tipFloor
+			startFloor
 		);
 		this.prev = pt;
-		this.lastHw = (widthForPressure(style, this.pHat) / 2) * f * taper;
+		this.lastHw = hw * taper;
 		return this.lastHw;
 	}
 

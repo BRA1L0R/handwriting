@@ -48,14 +48,14 @@ export function ribbonOf(stroke: InkStroke): RibbonPt[] {
 	const pts = stroke.points;
 	if (pts.length === 0) return [];
 	const flat = stroke.tool === "highlighter";
-	const shape = shapeFor(flat);
+	const shape = shapeFor(flat, stroke.pressureProfile);
 	// drawStroke's exact style derivation, so the widths match the note.
 	const baseStyle: PenStyle = {
 		color: stroke.color,
 		baseWidth: stroke.width,
 		...shape,
 	};
-	const widthPolicy = strokeWidthPolicy(baseStyle, stroke.widthMode);
+	const widthPolicy = strokeWidthPolicy(baseStyle, stroke.widthMode, flat ? undefined : stroke.pressureProfile);
 	const style = widthPolicy.style;
 	// Exports are always shaped (§5n, Alan, 2026-09-02): inkShapingEnabled()
 	// used to gate this too, so a Boox user - whose boox mode turns shaping

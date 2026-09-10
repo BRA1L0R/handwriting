@@ -178,6 +178,8 @@ class InkDemo {
 		ctx.scale(dpr, dpr);
 		for (const s of this.strokes) drawStroke(ctx, CAM, s, undefined, true);
 		if (this.live.length > 1) {
+			const builder = this.builder;
+			if (!builder) return;
 			const wet: InkStroke = {
 				id: "live",
 				tool: this.tool.tool,
@@ -186,6 +188,9 @@ class InkDemo {
 				points: this.live,
 				bbox: computeBBox(this.live, this.tool.width),
 				createdAt: 0,
+				...(builder.resolvedPressureProfile
+					? { pressureProfile: builder.resolvedPressureProfile }
+					: {}),
 			};
 			if (this.liveDevice) wet.device = this.liveDevice;
 			// Wet: a new object every frame over a growing point list, so it

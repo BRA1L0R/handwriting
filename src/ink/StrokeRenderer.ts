@@ -84,6 +84,7 @@ interface RibbonEntry {
 	pressure: boolean;
 	tool: InkStroke["tool"];
 	widthMode: InkStroke["widthMode"];
+	pressureProfile: InkStroke["pressureProfile"];
 	ribbon: RibbonPt[];
 }
 
@@ -217,7 +218,7 @@ export function drawStroke(
 	// A stroke describes its own pressure response through its tool, so it looks
 	// right on any layer without the caller having to remember which it was.
 	const flat = stroke.tool === "highlighter";
-	const shape = shapeFor(flat);
+	const shape = shapeFor(flat, stroke.pressureProfile);
 	const baseStyle: PenStyle = {
 		// Adapted here so every consumer of this derived style - the ribbon
 		// fill below, and drawSegment on the unribboned path - paints the one
@@ -231,7 +232,7 @@ export function drawStroke(
 		pressureOffWidthFactor:
 			styleOverride?.pressureOffWidthFactor ?? shape.pressureOffWidthFactor,
 	};
-	const widthPolicy = strokeWidthPolicy(baseStyle, stroke.widthMode);
+	const widthPolicy = strokeWidthPolicy(baseStyle, stroke.widthMode, flat ? undefined : stroke.pressureProfile);
 	const style = widthPolicy.style;
 	ctx.lineCap = "round";
 	ctx.lineJoin = "round";
@@ -278,7 +279,8 @@ export function drawStroke(
 			hit.smooth === smooth &&
 			hit.pressure === pressure &&
 			hit.tool === stroke.tool &&
-			hit.widthMode === stroke.widthMode
+			hit.widthMode === stroke.widthMode &&
+			hit.pressureProfile === stroke.pressureProfile
 		) {
 			cacheHits++;
 			fillRibbon(ctx, cam, hit.ribbon, strokeStyleFor(stroke), perSegment);
@@ -294,6 +296,7 @@ export function drawStroke(
 			pressure,
 			tool: stroke.tool,
 			widthMode: stroke.widthMode,
+			pressureProfile: stroke.pressureProfile,
 			ribbon: pts2,
 		});
 		fillRibbon(ctx, cam, pts2, strokeStyleFor(stroke), perSegment);

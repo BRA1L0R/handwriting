@@ -3,7 +3,7 @@
  * This is the in-memory shape; PageData serializes it for the sidecar.
  */
 
-import type { StrokeWidthMode } from "./StrokeWidth";
+import type { PressureProfile, StrokeWidthMode } from "./StrokeWidth";
 
 export interface InkPoint {
 	x: number;
@@ -36,6 +36,8 @@ export interface InkStroke {
 	createdAt: number;
 	/** Present on new finger strokes whose selected width stays constant. */
 	widthMode?: StrokeWidthMode;
+	/** Geometry generation used for newly-authored pressure-aware ink. */
+	pressureProfile?: PressureProfile;
 	/**
 	 * Present only for mouse-drawn strokes (v0.13.16). A mouse has no
 	 * pressure and its speed says nothing about intent, so the shaped width

@@ -14,6 +14,8 @@ export interface PenStyle {
 	maxWidthFactor: number;
 	/** Historical width factor when pressure sensitivity is disabled. */
 	pressureOffWidthFactor: number;
+	/** Per-stroke geometry generation, absent for the 1.4.12 policy. */
+	pressureProfile?: "exp7";
 }
 
 export const DEFAULT_PEN: PenStyle = {
@@ -45,6 +47,16 @@ export const HIGHLIGHTER_PEN: PenStyle = {
 	pressureOffWidthFactor: 0.95,
 };
 
+/** Exact accepted pressure generation, recovered from before-rollback.json. */
+export const EXP7_PEN: PenStyle = {
+	...DEFAULT_PEN,
+	minWidthFactor: 0.18,
+	gamma: 1.15,
+	maxWidthFactor: 3.2,
+	pressureOffWidthFactor: 0.9945718882219903,
+	pressureProfile: "exp7",
+};
+
 /**
  * The shape fields of a PenStyle that a stroke's tool alone decides:
  * DEFAULT_PEN's for pen/eraser strokes, HIGHLIGHTER_PEN's for the flat wash.
@@ -53,12 +65,13 @@ export const HIGHLIGHTER_PEN: PenStyle = {
  * moves both the screen and every export in one place.
  */
 export function shapeFor(
-	flat: boolean
+	flat: boolean,
+	pressureProfile?: "exp7"
 ): Pick<
 	PenStyle,
 	"minWidthFactor" | "gamma" | "maxWidthFactor" | "pressureOffWidthFactor"
 > {
-	const pen = flat ? HIGHLIGHTER_PEN : DEFAULT_PEN;
+	const pen = flat ? HIGHLIGHTER_PEN : pressureProfile === "exp7" ? EXP7_PEN : DEFAULT_PEN;
 	return {
 		minWidthFactor: pen.minWidthFactor,
 		gamma: pen.gamma,

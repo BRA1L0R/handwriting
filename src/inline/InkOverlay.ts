@@ -3386,7 +3386,7 @@ export class InkOverlayPlugin {
 			// ink drew smoothed and committed raw whenever the setting was
 			// off - the case the line above exists to protect.
 			this.ribbonPressure = point.pressure;
-			this.activeWet.beginStroke(point, this.activeStyle, tool === "highlighter");
+			this.activeWet.beginStroke(point, this.activeStyle, tool === "highlighter", this.builder.resolvedPressureProfile);
 			// A tap that never moves produces no rawupdate, so without this the
 			// dot only appears at pen-up. Draw the contact point immediately.
 			//

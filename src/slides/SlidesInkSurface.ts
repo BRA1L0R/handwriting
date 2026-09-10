@@ -2089,10 +2089,12 @@ export class SlidesDeck {
 		private readonly slidesEl: HTMLElement,
 		private readonly host: SlidesInkHost
 	) {
-		log(
-			`deck found: container ${describe(_container)}, reveal ${describe(revealEl)}, ` +
-				`slides ${describe(slidesEl)}, ${this.sections().length} section(s)`
-		);
+		if (diagnosticsEnabled()) {
+			log(
+				`deck found: container ${describe(_container)}, reveal ${describe(revealEl)}, ` +
+					`slides ${describe(slidesEl)}, ${this.sections().length} section(s)`
+			);
+		}
 		this.bind();
 		// Reveal may not have marked a slide `present` yet. If it has - an
 		// already-running deck - this mounts now; if it has not, the class
@@ -2108,7 +2110,7 @@ export class SlidesDeck {
 		// stroke. Start presentation acts on the active file, and by the time
 		// the reader draws, the workspace behind the deck may have moved on.
 		this.path = this.host.activeFilePath();
-		log(`file resolved: ${this.path ?? "none"}`);
+		if (diagnosticsEnabled()) log(`file resolved: ${this.path ?? "none"}`);
 		// Held, not fired and forgotten: a stroke drawn in the load window
 		// parks its write behind this promise, and teardown has to be able to
 		// wait for it rather than dropping the ink (`settle`, `dispose`).
@@ -2203,7 +2205,7 @@ export class SlidesDeck {
 		if (!pageId) {
 			// Unclaimed. Nothing to load - the first stroke claims - and that
 			// is not a failure, it is a note nobody has drawn on yet.
-			log(`sidecar loaded: none (${path} carries no page id yet)`);
+			if (diagnosticsEnabled()) log(`sidecar loaded: none (${path} carries no page id yet)`);
 			this.finishLoad();
 			return;
 		}
@@ -2278,7 +2280,7 @@ export class SlidesDeck {
 		}
 		if (this.stale()) return null;
 		if (!result) {
-			log(`sidecar loaded: none (${sidecarId} has no file yet)`);
+			if (diagnosticsEnabled()) log(`sidecar loaded: none (${sidecarId} has no file yet)`);
 			return null;
 		}
 		if (result.damaged) {
@@ -2443,10 +2445,12 @@ export class SlidesDeck {
 		// for one real resize costs a redundant re-measure, never a race.
 		if (typeof win.ResizeObserver !== "undefined") {
 			const ro = new win.ResizeObserver((entries) => {
-				const box = entries[0]?.contentRect;
-				log(
-					`reveal resize observed: ${box ? `${Math.round(box.width)}x${Math.round(box.height)}` : "?"}`
-				);
+				if (diagnosticsEnabled()) {
+					const box = entries[0]?.contentRect;
+					log(
+						`reveal resize observed: ${box ? `${Math.round(box.width)}x${Math.round(box.height)}` : "?"}`
+					);
+				}
 				this.refresh();
 			});
 			ro.observe(this.revealEl);
@@ -2657,7 +2661,7 @@ export class SlidesDeck {
 		if (index < 0) {
 			if (!this.awaitingPresent) {
 				this.awaitingPresent = true;
-				log("no slide marked present yet; waiting for reveal to mark one");
+				if (diagnosticsEnabled()) log("no slide marked present yet; waiting for reveal to mark one");
 			}
 			return;
 		}
@@ -2671,10 +2675,12 @@ export class SlidesDeck {
 			// on the input path can see this coming.
 			this.endStrokeForSlideChange();
 			l.index = index;
-			log(
-				`slide ${index} now present: repainting ` +
-					`${(this.strokes.get(index) ?? []).length} stroke(s)`
-			);
+			if (diagnosticsEnabled()) {
+				log(
+					`slide ${index} now present: repainting ` +
+						`${(this.strokes.get(index) ?? []).length} stroke(s)`
+				);
+			}
 		}
 		this.refresh();
 	}
@@ -2761,7 +2767,7 @@ export class SlidesDeck {
 			this.disposers.push(() => {
 				this.revealEl.setCssStyles({ position: saved });
 			});
-			log("reveal element was position:static; patched to relative");
+			if (diagnosticsEnabled()) log("reveal element was position:static; patched to relative");
 		}
 		// `.reveal` carries no tabindex of its own, so a later call from
 		// `ensureDeckFocused` to take DOM focus is a silent no-op: the
@@ -2773,12 +2779,14 @@ export class SlidesDeck {
 		// (a snippet, a Reveal plugin) is left exactly as it is.
 		if (this.revealEl.tabIndex < 0 && !this.revealEl.hasAttribute("tabindex")) {
 			this.revealEl.tabIndex = -1;
-			log("reveal element had no tabindex; patched to -1");
+			if (diagnosticsEnabled()) log("reveal element had no tabindex; patched to -1");
 		} else {
-			log(
-				`reveal element already has a tabindex ` +
-					`(${this.revealEl.getAttribute("tabindex") ?? this.revealEl.tabIndex}); left alone`
-			);
+			if (diagnosticsEnabled()) {
+				log(
+					`reveal element already has a tabindex ` +
+						`(${this.revealEl.getAttribute("tabindex") ?? this.revealEl.tabIndex}); left alone`
+				);
+			}
 		}
 		this.revealEl.appendChild(committed);
 		this.revealEl.appendChild(wetCanvas);
@@ -2826,17 +2834,19 @@ export class SlidesDeck {
 		// reader looking at a blank deck will find it. `capped` is the whole
 		// diagnosis for the silent-refusal failure: with no ceiling this
 		// surface asked for three stores of whatever the display implied.
-		const vw = this.revealEl.clientWidth;
-		const vh = this.revealEl.clientHeight;
-		const mountDpr = win.devicePixelRatio || 1;
-		const ratio = slidesBackingScale(vw, vh, mountDpr);
-		const mountSize = computeCanvasSize(vw, vh, ratio);
-		log(
-			`mount: three canvases on ${describe(this.revealEl)}, starting on slide ${index}, ` +
-				`wet desynchronized: requested ${wet.requested} actual ${wet.actualDesynchronized}, ` +
-				`backing ${mountSize.backingW}x${mountSize.backingH} at ratio ${ratio.toFixed(3)} ` +
-				`(dpr ${mountDpr}${ratio < mountDpr ? ", capped" : ""}), build ${this.host.buildId}`
-		);
+		if (diagnosticsEnabled()) {
+			const vw = this.revealEl.clientWidth;
+			const vh = this.revealEl.clientHeight;
+			const mountDpr = win.devicePixelRatio || 1;
+			const ratio = slidesBackingScale(vw, vh, mountDpr);
+			const mountSize = computeCanvasSize(vw, vh, ratio);
+			log(
+				`mount: three canvases on ${describe(this.revealEl)}, starting on slide ${index}, ` +
+					`wet desynchronized: requested ${wet.requested} actual ${wet.actualDesynchronized}, ` +
+					`backing ${mountSize.backingW}x${mountSize.backingH} at ratio ${ratio.toFixed(3)} ` +
+					`(dpr ${mountDpr}${ratio < mountDpr ? ", capped" : ""}), build ${this.host.buildId}`
+			);
+		}
 		this.measureDeckTheme();
 		return true;
 	}
@@ -2884,7 +2894,7 @@ export class SlidesDeck {
 	private setDeckTheme(dark: boolean, how: "measured" | "link" | "body"): void {
 		this.deckDark = dark;
 		setInkThemeOverride(dark);
-		log(`deck theme: ${dark ? "dark" : "light"} (${how})`);
+		if (diagnosticsEnabled()) log(`deck theme: ${dark ? "dark" : "light"} (${how})`);
 	}
 
 	/**
@@ -2978,7 +2988,9 @@ export class SlidesDeck {
 		if (!mq || typeof mq.addEventListener !== "function") return;
 		const fn = () => {
 			if (this.disposed) return;
-			log(`devicePixelRatio changed from ${dpr} to ${this.win().devicePixelRatio || 1}`);
+			if (diagnosticsEnabled()) {
+				log(`devicePixelRatio changed from ${dpr} to ${this.win().devicePixelRatio || 1}`);
+			}
 			this.refresh();
 			this.watchResolution();
 		};
@@ -3345,7 +3357,7 @@ export class SlidesDeck {
 	private logDeckTookFocus(from: Element | null): void {
 		if (this.deckFocusLogged) return;
 		this.deckFocusLogged = true;
-		log(`deck took focus from ${from ? describe(from) : "none"}`);
+		if (diagnosticsEnabled()) log(`deck took focus from ${from ? describe(from) : "none"}`);
 	}
 
 	private style(nib: SlideNib): PenStyle {
@@ -3469,7 +3481,8 @@ export class SlidesDeck {
 		l.wet.beginStroke(
 			{ x: p.x, y: p.y, pressure: ev.pressure, t: ev.timeStamp },
 			this.activeStyle,
-			nib.tool === "highlighter"
+			nib.tool === "highlighter",
+			this.builder.resolvedPressureProfile
 		);
 		// The contact point, on screen from the first event. The wet layer
 		// paints nothing until a segment settles - and when it does, it starts
@@ -3940,12 +3953,14 @@ export class SlidesDeck {
 	 * plugin (the `focused` class, its `keyboardCondition`) agree with the DOM.
 	 */
 	private logStrokeEndFocus(): void {
-		const active = this.revealEl.ownerDocument.activeElement;
-		log(
-			`focus at stroke end: active=${active ? describe(active) : "none"}, ` +
-				`insideDeck=${active ? this.revealEl.contains(active) : false}, ` +
-				`revealFocused=${this.revealEl.classList.contains("focused")}`
-		);
+		if (diagnosticsEnabled()) {
+			const active = this.revealEl.ownerDocument.activeElement;
+			log(
+				`focus at stroke end: active=${active ? describe(active) : "none"}, ` +
+					`insideDeck=${active ? this.revealEl.contains(active) : false}, ` +
+					`revealFocused=${this.revealEl.classList.contains("focused")}`
+			);
+		}
 	}
 
 	private commitStroke(pointerId: number, reason: StrokeEndReason, samples: number): void {
@@ -4062,8 +4077,8 @@ export class SlidesDeck {
 		// somewhere between pen-down and here. Not diagnosed - but every
 		// ending (a lift, a cancel, a hold expiry, a leave, the teardown) funnels
 		// through this one place, so re-taking focus here covers it either way.
-		// Logged UNCONDITIONALLY, before and after, because this is the
-		// diagnostic Alan's mouse-only machine could not get by hand.
+		// Focus recovery remains unconditional before and after the timer;
+		// only the diagnostic recording inside `logStrokeEndFocus` is opt-in.
 		this.logStrokeEndFocus();
 		this.ensureDeckFocused();
 		const win = this.revealEl.ownerDocument.defaultView ?? window;
@@ -4083,10 +4098,12 @@ export class SlidesDeck {
 				// touched (there is nothing to flush; `eraseAt` never ran) and
 				// the click passed through to Reveal or the close button.
 				if (l) {
-					log(
-						`erase end on slide ${l.index}: reason=tap, samples=${samples}, ` +
-							`nothing touched (click passed through)`
-					);
+					if (diagnosticsEnabled()) {
+						log(
+							`erase end on slide ${l.index}: reason=tap, samples=${samples}, ` +
+								`nothing touched (click passed through)`
+						);
+					}
 				}
 				return;
 			}
@@ -4099,14 +4116,18 @@ export class SlidesDeck {
 			this.erasedCount = 0;
 			if (!l) return;
 			if (erased === 0) {
-				log(`erase end on slide ${l.index}: reason=${reason}, samples=${samples}, nothing touched`);
+				if (diagnosticsEnabled()) {
+					log(`erase end on slide ${l.index}: reason=${reason}, samples=${samples}, nothing touched`);
+				}
 				return;
 			}
-			log(
-				`erase end on slide ${l.index}: reason=${reason}, samples=${samples}, ` +
-					`-${erased}, slide total ${this.strokes.get(l.index)?.length ?? 0}, ` +
-					`deck total ${this.totalStrokes()}`
-			);
+			if (diagnosticsEnabled()) {
+				log(
+					`erase end on slide ${l.index}: reason=${reason}, samples=${samples}, ` +
+						`-${erased}, slide total ${this.strokes.get(l.index)?.length ?? 0}, ` +
+						`deck total ${this.totalStrokes()}`
+				);
+			}
 			this.persist();
 			return;
 		}
@@ -4115,7 +4136,9 @@ export class SlidesDeck {
 			// A1: a TAP. Nothing is recorded and nothing was swallowed, so the
 			// click that follows reaches Reveal's arrow or Obsidian's close
 			// button exactly as a mouse click would.
-			log(`stroke end on slide ${l.index}: reason=tap, samples=${samples}, +0 (click passed through)`);
+			if (diagnosticsEnabled()) {
+				log(`stroke end on slide ${l.index}: reason=tap, samples=${samples}, +0 (click passed through)`);
+			}
 			return;
 		}
 		// The inline surface's release filter, not plain `finish()`: the same
@@ -4129,11 +4152,13 @@ export class SlidesDeck {
 			this.strokes.set(l.index, list);
 		}
 		this.repaint();
-		log(
-			`stroke end on slide ${l.index}: reason=${reason}, samples=${samples}, ` +
-				`+${finished.length}, slide total ${this.strokes.get(l.index)?.length ?? 0}, ` +
-				`deck total ${this.totalStrokes()}`
-		);
+		if (diagnosticsEnabled()) {
+			log(
+				`stroke end on slide ${l.index}: reason=${reason}, samples=${samples}, ` +
+					`+${finished.length}, slide total ${this.strokes.get(l.index)?.length ?? 0}, ` +
+					`deck total ${this.totalStrokes()}`
+			);
+		}
 		if (finished.length > 0) this.persist();
 	}
 
@@ -4259,10 +4284,12 @@ export class SlidesDeck {
 		if (!page || !sidecarId) return;
 		if (!immediate) {
 			this.host.scheduleSidecar(sidecarId, page);
-			log(`save scheduled: ${sidecarId}, ${page.strokes.length} stroke(s)`);
+			if (diagnosticsEnabled()) log(`save scheduled: ${sidecarId}, ${page.strokes.length} stroke(s)`);
 			return;
 		}
-		log(`save scheduled: ${sidecarId}, ${page.strokes.length} stroke(s) (first write after claim)`);
+		if (diagnosticsEnabled()) {
+			log(`save scheduled: ${sidecarId}, ${page.strokes.length} stroke(s) (first write after claim)`);
+		}
 		void this.host.saveSidecarNow(sidecarId, page).catch((err) => {
 			log(`save failed: ${sidecarId}: ${String(err)}`);
 			this.noticeSaveFailure();
@@ -4722,7 +4749,7 @@ export function setSlidesInk(on: boolean, next?: SlidesInkHost): void {
 		observer = null;
 		deck?.dispose();
 		deck = null;
-		log("slides ink off");
+		if (diagnosticsEnabled()) log("slides ink off");
 		return;
 	}
 	if (!host) {
@@ -4738,6 +4765,6 @@ export function setSlidesInk(on: boolean, next?: SlidesInkHost): void {
 	// whole body during a presentation would fire on every Reveal transition.
 	observer = new MutationObserver(() => scanForSlides());
 	observer.observe(doc.body, { childList: true });
-	log(`slides ink on; watching body for .slides-container, build ${host.buildId}`);
+	if (diagnosticsEnabled()) log(`slides ink on; watching body for .slides-container, build ${host.buildId}`);
 	scanForSlides();
 }

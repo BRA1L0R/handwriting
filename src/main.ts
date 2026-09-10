@@ -154,7 +154,6 @@ import {
 	markPenSeen,
 	penHardwareSeen,
 	penSeenThisSession,
-	nextPenToolsMode,
 	normalizePenToolsMode,
 	persistPenHardwareSeenToStore,
 	restorePenHardwareEverSeenFromStore,
@@ -3456,11 +3455,9 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			);
 		};
 		this.registerEvent(this.app.workspace.on("active-leaf-change", updateStatusBarClass));
-		// A theme switch arrives as `css-change` and nothing else. The ink
-		// adaptation is decided at draw time from the body class, so the
-		// cached flag is re-read and every surface repainted - otherwise
-		// the page keeps whatever it was painted under the old theme until
-		// an unrelated repaint happens by.
+		// A theme switch arrives as `css-change` and nothing else. Ink adaptation
+		// now reads the body class at draw time; `refreshInkTheme` is a compatibility
+		// no-op, while every surface still needs repainting under the new theme.
 		this.registerEvent(
 			this.app.workspace.on("css-change", () => {
 				refreshInkTheme(document);
@@ -5413,9 +5410,8 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		setPressureSensitivity(this.settings.pressureSensitivity);
 		setInkThemeAdaptation(this.settings.inkAdaptsToTheme);
 		setInkExportReadability(this.settings.inkReadableInExports);
-		// The theme flag is cached (InkTheme.ts: a DOM read per stroke per frame
-		// is a repaint-loop cost), so it has to be primed once here as well as
-		// refreshed on `css-change`.
+		// Compatibility call retained for callers from the former cached-theme
+		// implementation; `refreshInkTheme` is now a no-op.
 		refreshInkTheme(document);
 		this.applyBooxMode();
 		setInkColorHex("pen", this.settings.inkColors.pen);
@@ -6413,9 +6409,8 @@ class HandwritingSettingTab extends PluginSettingTab {
 			case "inkAdaptsToTheme":
 				s.inkAdaptsToTheme = on;
 				setInkThemeAdaptation(on);
-				// The theme may have moved since the last `css-change` this window
-				// saw (a settings tab opened in a second window, say), and the flag
-				// is what the repaint below will read.
+				// Compatibility call retained from the former cached-theme path;
+				// `refreshInkTheme` is now a no-op and the repaint reads live state.
 				refreshInkTheme(document);
 				repaintAllInkOverlays();
 				refreshAllStrips();

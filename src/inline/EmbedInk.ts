@@ -582,7 +582,7 @@ export function attachEmbedInkOnceReady(
  * it exists for), and disconnects the observer as the last probe leaves.
  */
 function watchBodyForSections(
-	view: (Window & typeof globalThis) | null,
+	view: Document["defaultView"],
 	body: HTMLElement | null,
 	probe: () => void
 ): (() => void) | null {
@@ -620,15 +620,13 @@ function watchBodyForSections(
  * and anywhere `defaultView` is null (a detached document).
  */
 function setTimer(view: Window | null, fn: () => void, ms: number): number {
-	const set = view?.setTimeout;
-	if (typeof set === "function") return set.call(view, fn, ms);
+	if (view && typeof view.setTimeout === "function") return view.setTimeout(fn, ms);
 	return setTimeout(fn, ms);
 }
 
 function clearTimer(view: Window | null, handle: number): void {
-	const clear = view?.clearTimeout;
-	if (typeof clear === "function") {
-		clear.call(view, handle);
+	if (view && typeof view.clearTimeout === "function") {
+		view.clearTimeout(handle);
 		return;
 	}
 	clearTimeout(handle);

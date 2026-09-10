@@ -1007,6 +1007,7 @@ type AnyEvent = Record<string, unknown> & { type: string };
 const deckLogs: string[] = [];
 
 beforeEach(() => {
+	setDiagnosticsEnabled(false);
 	deckLogs.length = 0;
 	vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
 		deckLogs.push(args.map(String).join(" "));
@@ -1014,6 +1015,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	setDiagnosticsEnabled(false);
 	vi.restoreAllMocks();
 	// The deck theme override is module-wide state in InkTheme, set at mount.
 	// A rig that was never disposed would otherwise hand its deck's reading to
@@ -1432,6 +1434,8 @@ interface RigOptions {
 	grantedDesynchronized?: boolean;
 	/** The host's `claimId`, when a test needs to hold the claim open. */
 	claim?: (path: string, proposed: string) => Promise<{ pageId: string; futureVersion?: number }>;
+	/** The host's immediate writer, when a test needs a real rejection. */
+	saveNow?: (sidecarId: string, page: PageData) => Promise<void>;
 	sectionText?: (i: number) => string;
 	/** The inline `position` already on `.reveal` before the surface mounts. */
 	revealPosition?: string;
@@ -1530,7 +1534,10 @@ function makeRig(opts: RigOptions = {}): Rig {
 			return opts.load ? opts.load(sidecarId) : null;
 		},
 		scheduleSidecar: (id, page) => void scheduled.push({ id, page }),
-		saveSidecarNow: async (id, page) => void savedNow.push({ id, page }),
+		saveSidecarNow: async (id, page) => {
+			savedNow.push({ id, page });
+			await opts.saveNow?.(id, page);
+		},
 		nib: () => ({ tool: "pen", color: "#123456", width: 2 }),
 		eraserRadiusPx: () => 12,
 		eraseWholeStrokes: () => {
@@ -1637,6 +1644,89 @@ function drawStrokeOn(rig: Rig): void {
 	rig.move(300, 300);
 	rig.end("pointerup");
 }
+
+describe("routine diagnostics", () => {
+	it("preserves mount and stroke behavior while routine logging work stays off", async () => {
+		const rig = makeRig();
+		await new Promise((r) => setTimeout(r, 0));
+		const totalStrokes = vi.spyOn(
+			rig.deck as unknown as { totalStrokes(): number },
+			"totalStrokes"
+		);
+		drawStrokeOn(rig);
+
+		expect(rig.scheduled).toHaveLength(1);
+		expect(rig.scheduled[0]!.page.strokes).toHaveLength(1);
+		expect(rig.logs.join("\n")).not.toContain("deck found:");
+		expect(rig.logs.join("\n")).not.toContain("mount: three canvases");
+		expect(rig.logs.join("\n")).not.toContain("deck took focus");
+		expect(rig.logs.join("\n")).not.toContain("focus at stroke end:");
+		expect(rig.logs.join("\n")).not.toContain("stroke end on slide 0:");
+		expect(totalStrokes).not.toHaveBeenCalled();
+
+		totalStrokes.mockRestore();
+		rig.deck.dispose();
+	});
+
+	it("emits the paired mount, focus, stroke and save lines when recording is on", async () => {
+		setDiagnosticsEnabled(true);
+		const rig = makeRig();
+		await new Promise((r) => setTimeout(r, 0));
+		const totalStrokes = vi.spyOn(
+			rig.deck as unknown as { totalStrokes(): number },
+			"totalStrokes"
+		);
+		drawStrokeOn(rig);
+
+		const lines = rig.logs.join("\n");
+		expect(lines).toContain("deck found: container div, reveal div, slides div, 2 section(s)");
+		expect(lines).toContain("mount: three canvases on div, starting on slide 0");
+		expect(lines).toContain("deck took focus from none");
+		expect(lines).toContain("focus at stroke end: active=div, insideDeck=true");
+		expect(lines).toContain("stroke end on slide 0: reason=up, samples=3, +1");
+		expect(lines).toContain("save scheduled: note-1.slides, 1 stroke(s)");
+		expect(totalStrokes).toHaveBeenCalledTimes(1);
+
+		totalStrokes.mockRestore();
+		rig.deck.dispose();
+	});
+
+	it("retains load and save failures, notices and persistence outcomes while off", async () => {
+		const readFailure = makeRig({
+			load: async () => {
+				throw new Error("read exploded");
+			},
+		});
+		await new Promise((r) => setTimeout(r, 0));
+		expect(readFailure.logs.join("\n")).toContain(
+			"sidecar load failed for note-1.slides: Error: read exploded"
+		);
+		expect(readFailure.notices).toEqual([]);
+		drawStrokeOn(readFailure);
+		expect(readFailure.scheduled).toHaveLength(1);
+		readFailure.deck.dispose();
+
+		let writes = 0;
+		const writeFailure = makeRig({
+			pageId: null,
+			saveNow: async () => {
+				if (++writes === 1) throw new Error("write exploded");
+			},
+		});
+		await new Promise((r) => setTimeout(r, 0));
+		drawStrokeOn(writeFailure);
+		for (let i = 0; i < 3; i++) await new Promise((r) => setTimeout(r, 0));
+		expect(writeFailure.logs.join("\n")).toContain(
+			"save failed: note-1.slides: Error: write exploded"
+		);
+		expect(writeFailure.notices).toEqual([
+			"Handwriting: this presentation's ink could not be saved.",
+		]);
+		expect(writeFailure.savedNow).toHaveLength(1);
+		expect(writeFailure.scheduled).toEqual([]);
+		writeFailure.deck.dispose();
+	});
+});
 
 describe("the load window (a stroke drawn before the sidecar lands)", () => {
 	it("merges the early stroke into the stored ink instead of overwriting it", async () => {
@@ -2220,6 +2310,7 @@ describe("the silent lift (S5 extended: a lift is not always an event)", () => {
 	});
 
 	it("ends the stroke on a hover sample, with the samples drawn so far", async () => {
+		setDiagnosticsEnabled(true);
 		const rig = makeRig();
 		await new Promise((r) => setTimeout(r, 0));
 		rig.down();
@@ -2241,6 +2332,7 @@ describe("the silent lift (S5 extended: a lift is not always an event)", () => {
 	});
 
 	it("ends the stroke after SILENT_LIFT_QUIET_MS of complete silence", async () => {
+		setDiagnosticsEnabled(true);
 		const clock = vi.spyOn(performance, "now");
 		clock.mockReturnValue(1000);
 		const rig = makeRig();
@@ -2340,6 +2432,7 @@ describe("the silent lift (S5 extended: a lift is not always an event)", () => {
 	});
 
 	it("ends an erase gesture the same way", async () => {
+		setDiagnosticsEnabled(true);
 		const rig = makeRig({ load: async () => storedPage("note-1.slides", "stored-1") });
 		await new Promise((r) => setTimeout(r, 0));
 		// The stored stroke sits at deck-logical (1,1); screen (21,26) is
@@ -2394,6 +2487,7 @@ describe("a slide change under a live stroke (the note surface's abandon rule)",
 	}
 
 	it("commits to the OLD slide, clears the live layers, and repaints the new one", async () => {
+		setDiagnosticsEnabled(true);
 		const rig = makeRig();
 		await new Promise((r) => setTimeout(r, 0));
 		rig.down();
@@ -2461,6 +2555,7 @@ describe("a slide change under a live stroke (the note surface's abandon rule)",
 	});
 
 	it("ends a live ERASE gesture the same way", async () => {
+		setDiagnosticsEnabled(true);
 		const rig = makeRig({ load: async () => storedPage("note-1.slides", "stored-1") });
 		await new Promise((r) => setTimeout(r, 0));
 		rig.down({ buttons: 32, clientX: 21, clientY: 26 });
@@ -2479,6 +2574,7 @@ describe("a slide change under a live stroke (the note surface's abandon rule)",
 	});
 
 	it("changes slide exactly as before when no stroke is live", async () => {
+		setDiagnosticsEnabled(true);
 		const rig = makeRig();
 		await new Promise((r) => setTimeout(r, 0));
 		drawStrokeOn(rig);
@@ -2974,6 +3070,7 @@ describe("A3: capture is taken at promotion, not at contact", () => {
 	// click under a tap exactly the way the arrows used to eat a pen tap
 	// before A1. It now takes the SAME promotion ink does (B1).
 	it("(a) an eraser tap - down and up within TAP_MS, no move - touches nothing and its click passes through", async () => {
+		setDiagnosticsEnabled(true);
 		const rig = makeRig({ load: async () => storedPage("note-1.slides", "stored-1") });
 		await new Promise((r) => setTimeout(r, 0));
 		// Same point as the stored stroke (deck-logical (1,1), k=0.5): if the
@@ -3236,6 +3333,7 @@ describe("the wet layer asks for a plain (non-desynchronized) canvas", () => {
 	});
 
 	it("mounts with the requested state and reports it on the mount log line", () => {
+		setDiagnosticsEnabled(true);
 		const rig = makeRig();
 		const l = (
 			rig.deck as unknown as {
@@ -3291,6 +3389,7 @@ describe("the deck takes the keyboard even when a note's caret never let go (Ala
 	});
 
 	it("(c) does nothing when focus is already inside .reveal", () => {
+		setDiagnosticsEnabled(true);
 		const rig = makeRig();
 		rig.doc.activeElement = rig.reveal;
 		callEnsureDeckFocused(rig);
@@ -3310,6 +3409,7 @@ describe("the deck takes the keyboard even when a note's caret never let go (Ala
 	});
 
 	it("(e) logs the tabindex patch once", () => {
+		setDiagnosticsEnabled(true);
 		const rig = makeRig();
 		const hits = rig.logs.filter((l) => l.includes("reveal element had no tabindex; patched to -1"));
 		expect(hits).toHaveLength(1);
@@ -3325,6 +3425,7 @@ describe("the deck takes the keyboard even when a note's caret never let go (Ala
 	});
 
 	it("(g) logs active/insideDeck/revealFocused at stroke end", () => {
+		setDiagnosticsEnabled(true);
 		const rig = makeRig();
 		drawStrokeOn(rig);
 		const line = rig.logs.find((l) => l.includes("focus at stroke end:"));
@@ -3346,6 +3447,8 @@ describe("the deck takes the keyboard even when a note's caret never let go (Ala
  * combination that was broken.
  */
 describe("the deck's theme is measured, not inherited from the workspace", () => {
+	beforeEach(() => setDiagnosticsEnabled(true));
+
 	/** How many times the surface announced a deck theme. */
 	const themeLines = (rig: Rig): string[] => rig.logs.filter((l) => l.includes("deck theme:"));
 
@@ -3945,6 +4048,10 @@ describe("a sidecar from a newer build: read-only, not invisible (InlineInkStore
 		rig.deck.dispose();
 		expect(rig.logs.join("\n")).toContain("sidecar loaded: REFUSED (damaged)");
 		expect(rig.logs.join("\n")).toContain("teardown: 0 slide(s) inked, 0 stroke(s)");
+		expect(rig.notices).toEqual([
+			"Handwriting: this presentation's ink file could not be read, so new ink is not being saved.",
+		]);
+		expect(rig.scheduled).toEqual([]);
 		expect(rig.savedNow).toEqual([]);
 	});
 });
@@ -3971,6 +4078,27 @@ describe("a claim in flight at teardown (the settle window)", () => {
 		expect(rig.savedNow[0]!.id).toBe("note-1.slides");
 		expect(rig.savedNow[0]!.page.strokes).toHaveLength(1);
 		expect(rig.logs.join("\n")).toContain("teardown: parked write flushed to note-1.slides");
+	});
+
+	it("reports a parked write dropped by a future note without saving it", async () => {
+		let release!: (r: { pageId: string; futureVersion: number }) => void;
+		const claim = new Promise<{ pageId: string; futureVersion: number }>((res) => {
+			release = res;
+		});
+		const rig = makeRig({ pageId: null, claim: () => claim });
+		await tick();
+		drawStrokeOn(rig);
+		rig.deck.dispose();
+		release({ pageId: "note-1", futureVersion: 99 });
+		expect(await settleSlidesInk()).toBe(true);
+		expect(rig.logs.join("\n")).toContain(
+			"teardown: parked write dropped - no page id was claimed"
+		);
+		expect(rig.notices).toEqual([
+			"Handwriting: this note declares a newer Handwriting format. Ink drawn on it is not saved.",
+		]);
+		expect(rig.scheduled).toEqual([]);
+		expect(rig.savedNow).toEqual([]);
 	});
 
 	it("merges the sidecar the note turned out to already have before that write", async () => {
@@ -4791,6 +4919,7 @@ describe("the module off-gate (item 8)", () => {
 	});
 
 	it("builds no deck for a container that appears while slides ink is OFF", () => {
+		setDiagnosticsEnabled(true);
 		const doc = new FakeDoc();
 		const win = new FakeWin();
 		doc.defaultView = win;
@@ -4855,6 +4984,7 @@ describe("the module off-gate (item 8)", () => {
 
 describe("the mount line reports the GRANTED desynchronized flag (item 9)", () => {
 	it("says actual true when the browser grants what was not requested", async () => {
+		setDiagnosticsEnabled(true);
 		// `SLIDES_DESYNCHRONIZED` is the A/B's answer; what the browser then
 		// GRANTS is its own business, and the diagnosis of a tearing deck is
 		// the difference between the two. Logging the request twice would read
@@ -4871,6 +5001,7 @@ describe("the mount line reports the GRANTED desynchronized flag (item 9)", () =
 
 describe("the mount line names the running build (stale-plugin visibility)", () => {
 	it("appends the host's buildId to the mount line", async () => {
+		setDiagnosticsEnabled(true);
 		const rig = makeRig();
 		await new Promise((r) => setTimeout(r, 0));
 		const mount = rig.logs.find((l) => l.includes("mount: three canvases"));

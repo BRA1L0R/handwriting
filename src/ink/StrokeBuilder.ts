@@ -1,5 +1,5 @@
 import { InkPoint, InkStroke, InkTool, computeBBox, newStrokeId } from "./Stroke";
-import type { StrokeWidthMode } from "./StrokeWidth";
+import type { StrokeWidthMode, PressureProfile } from "./StrokeWidth";
 
 /**
  * Some pens keep reporting contact while the nib is already leaving the
@@ -28,6 +28,7 @@ export class StrokeBuilder {
 	private width: number;
 	/** Min world-space movement to accept a new sample (dedupe threshold). */
 	private minDist: number;
+	private readonly pressureProfile: PressureProfile | undefined;
 
 	constructor(
 		tool: InkTool,
@@ -41,6 +42,7 @@ export class StrokeBuilder {
 		this.color = color;
 		this.width = width;
 		this.minDist = minDistWorld;
+		this.pressureProfile = tool === "pen" && widthMode !== "uniform" ? "exp7" : undefined;
 	}
 
 	get pointCount(): number {
@@ -49,6 +51,11 @@ export class StrokeBuilder {
 
 	get lastPoint(): InkPoint | undefined {
 		return this.points[this.points.length - 1];
+	}
+
+	/** Resolved once for this builder and passed to wet rendering at pen-down. */
+	get resolvedPressureProfile(): PressureProfile | undefined {
+		return this.pressureProfile;
 	}
 
 	start(now: number): void {
@@ -86,7 +93,8 @@ export class StrokeBuilder {
 
 	/** Finalize into a persistent stroke. Returns undefined for empty/dot-less strokes. */
 	finish(): InkStroke | undefined {
-		return this.buildStroke(this.points);
+		const result = this.buildStroke(this.points);
+		return result;
 	}
 
 	/**
@@ -99,11 +107,14 @@ export class StrokeBuilder {
 	 */
 	finishReleaseFiltered(): InkStroke[] {
 		const groups = this.releaseFilteredPointGroups();
-		if (groups.length === 0) return [];
+		if (groups.length === 0) {
+			return [];
+		}
 		const createdAt = Date.now();
-		return groups
+		const result = groups
 			.map((points) => this.buildStroke(points, createdAt))
 			.filter((stroke): stroke is InkStroke => stroke !== undefined);
+		return result;
 	}
 
 	private buildStroke(points: InkPoint[], createdAt = Date.now()): InkStroke | undefined {
@@ -123,6 +134,7 @@ export class StrokeBuilder {
 			createdAt,
 			...(this.device === "mouse" ? { device: this.device } : {}),
 			...(this.widthMode === "uniform" ? { widthMode: this.widthMode } : {}),
+			...(this.pressureProfile ? { pressureProfile: this.pressureProfile } : {}),
 		};
 	}
 

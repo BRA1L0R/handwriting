@@ -8,6 +8,7 @@ import { IncrementalShaper, centerlineSmoothed, inkShapingEnabled } from "./InkS
 import { fillRibbon } from "./RibbonRenderer";
 import { inkColorFor } from "./InkTheme";
 import { drawSegment } from "./StrokeRenderer";
+import { strokeWidthPolicy, type PressureProfile } from "./StrokeWidth";
 
 /**
  * The wet ink layer: incremental screen-space drawing of the stroke that is
@@ -116,6 +117,7 @@ export class WetInkRenderer {
 	private smoothThisStroke = true;
 	private lastMidHw: number | undefined;
 	private prevSampleHw = 0;
+	private strokeStyle: PenStyle | undefined;
 
 	/**
 	 * Start a stroke. `flat` is the TOOL's flatness - true for the
@@ -130,7 +132,12 @@ export class WetInkRenderer {
 	 * the exact inverse of its exemption. The committed renderer reads the
 	 * tool (StrokeRenderer.drawStroke) and the two must agree at pen-up.
 	 */
-	beginStroke(first: InkPoint, style?: PenStyle, flat = false): void {
+	beginStroke(first: InkPoint, style?: PenStyle, flat = false, pressureProfile?: PressureProfile): void {
+		const profile = pressureProfile;
+		this.strokeStyle = style && !flat && profile === "exp7"
+			? strokeWidthPolicy(style, undefined, profile).style
+			: undefined;
+		style = this.strokeStyle ?? style;
 		this.lastPoint = first;
 		this.smoother.reset(first);
 		this.lastRibbon = undefined;
@@ -147,6 +154,7 @@ export class WetInkRenderer {
 	}
 
 	appendPoint(cam: CameraState, style: PenStyle, point: InkPoint): void {
+		style = this.strokeStyle ?? style;
 		if (this.lastPoint) {
 			if (this.smooth && !this.smoothThisStroke) {
 				// Raw centerline: the ribbon runs straight from the previous
@@ -239,6 +247,7 @@ export class WetInkRenderer {
 	 * perfect; only the guess was drawn wrong.
 	 */
 	liveWidthPx(cam: CameraState, style: PenStyle, pressure: number): number {
+		style = this.strokeStyle ?? style;
 		return this.liveHalfWidth(style, pressure) * 2 * cam.zoom;
 	}
 
@@ -288,6 +297,7 @@ export class WetInkRenderer {
 	 * visible change on the raw path and it is the ruled one.
 	 */
 	liveHalfWidth(style: PenStyle, pressure: number): number {
+		style = this.strokeStyle ?? style;
 		return this.shapingThisStroke
 			? this.shaper.last()
 			: widthForPressure(style, pressure) / 2;
@@ -313,6 +323,7 @@ export class WetInkRenderer {
 	 * curve is allowed to exceed `baseWidth`.
 	 */
 	contactHalfWidth(style: PenStyle, _pressure: number): number {
+		style = this.strokeStyle ?? style;
 		return style.baseWidth / 2;
 	}
 
@@ -321,6 +332,7 @@ export class WetInkRenderer {
 	 * stroke reaches the nib before it is replaced by the committed one.
 	 */
 	finishStroke(cam: CameraState, style: PenStyle): void {
+		style = this.strokeStyle ?? style;
 		if (!this.smooth) return;
 		// Nothing to close on a raw centerline: appendPoint already drew out
 		// to the final sample.

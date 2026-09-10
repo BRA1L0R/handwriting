@@ -22,6 +22,8 @@ a note you never inked on is never modified.
 >
 > **iPad Settings → Apple Pencil → Scribble → Off**
 
+---
+
 ## what it does
 
 Here's a demonstration of some of the features: https://youtu.be/TUeniA9BZcc
@@ -166,7 +168,7 @@ hold the pen still for about a third of a second at the end of a stroke to snap 
 
 with a mouse, pause at the end of a stroke and select **Snap**.
 
-### obsidian sync notes
+## sync notes
 
 `.handwriting/` is a hidden folder. many sync services do not sync hidden folders by default, including Obsidian Sync, iCloud and Dropbox.
 

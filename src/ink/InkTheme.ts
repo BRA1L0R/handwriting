@@ -47,8 +47,7 @@
  * thousands of calls per frame on a long note - so after the first miss for a
  * given colour there is no allocation and no parse on this path: two Maps
  * (one per theme) keyed by the colour string itself, so the lookup key needs
- * no concatenation, and the theme flag is read from the DOM once per
- * `refreshInkTheme` rather than once per stroke.
+ * no concatenation.
  */
 
 import { InkTool } from "./Stroke";
@@ -434,15 +433,8 @@ export function isDarkTheme(doc: Document = document): boolean {
 }
 
 let adaptEnabled = true;
-let darkCached: boolean | null = null;
 /** `setInkThemeOverride`'s flag: non-null wins over the body class. */
 let darkOverride: boolean | null = null;
-/**
- * Depth rather than a boolean: the export painters nest (a snip draws the
- * highlighter wash and the pen inside one scope), and a boolean would have an
- * inner scope's exit re-arm adaptation for the rest of the outer one.
- */
-let rawDepth = 0;
 
 /** The persisted legacy `inkAdaptsToTheme` value, retained for compatibility. */
 export function setInkThemeAdaptation(on: boolean): void {
@@ -453,15 +445,10 @@ export function inkThemeAdaptationEnabled(): boolean {
 	return adaptEnabled;
 }
 
-/**
- * Re-read the theme from the DOM. Called on Obsidian's `css-change`, which is
- * the only notice a theme switch gives, and once at load. Everything else
- * reads the cached flag, because `classList.contains` per stroke per frame is
- * a DOM touch inside the repaint loop.
- */
+/** Compatibility seam for callers that refresh on Obsidian's `css-change`. */
 export function refreshInkTheme(doc?: Document): void {
-	const d = doc ?? (typeof document === "undefined" ? null : document);
-	darkCached = d === null ? false : isDarkTheme(d);
+	// Kept as a compatibility seam for callers that refresh on css-change.
+	void doc;
 }
 
 /**
@@ -484,8 +471,8 @@ export function refreshInkTheme(doc?: Document): void {
  * correct again.
  *
  * Not cleared by `refreshInkTheme`: a `css-change` during a presentation
- * (a theme switch, a snippet toggle) re-reads the body, which is exactly the
- * thing the override exists to ignore. `resetInkTheme` clears it, because a
+ * (a theme switch, a snippet toggle) must not disturb the override. The
+ * override exists to ignore body-theme changes. `resetInkTheme` clears it, because a
  * test seam that left it standing would leak one test's deck into the next.
  */
 export function setInkThemeOverride(dark: boolean | null): void {
@@ -541,16 +528,11 @@ export function inkColorFor(
  * with an on-screen surface, and this is how they say which they are.
  *
  * Live painting is already raw; this scope remains for export callers and
- * compatibility. Synchronous by contract: the flag is module-wide, so the
- * callback must not await inside the scope.
+ * compatibility. Synchronous by contract: the callback must not await inside
+ * the scope.
  */
 export function withRawInk<T>(painter: () => T): T {
-	rawDepth++;
-	try {
-		return painter();
-	} finally {
-		rawDepth--;
-	}
+	return painter();
 }
 
 /**
@@ -638,9 +620,7 @@ export function resetInkTheme(): void {
 	darkCache.clear();
 	lightCache.clear();
 	adaptEnabled = true;
-	darkCached = null;
 	darkOverride = null;
-	rawDepth = 0;
 	exportReadable = true;
 	destination = null;
 }

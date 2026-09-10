@@ -1,4 +1,6 @@
-import type { PenStyle } from "./PenStyle";
+import { EXP7_PEN, type PenStyle } from "./PenStyle";
+
+export type PressureProfile = "exp7";
 
 /**
  * A width policy stored with a stroke when its rendering must not depend on
@@ -20,9 +22,18 @@ export interface StrokeWidthPolicy {
  */
 export function strokeWidthPolicy(
 	style: PenStyle,
-	widthMode?: StrokeWidthMode
+	widthMode?: StrokeWidthMode,
+	pressureProfile?: PressureProfile
 ): StrokeWidthPolicy {
-	if (widthMode !== "uniform") return { style, shapeWidth: true };
+	if (widthMode !== "uniform") {
+		if (pressureProfile !== "exp7") return { style, shapeWidth: true };
+		return {
+			style: { ...style, minWidthFactor: EXP7_PEN.minWidthFactor, gamma: EXP7_PEN.gamma,
+				maxWidthFactor: EXP7_PEN.maxWidthFactor,
+				pressureOffWidthFactor: EXP7_PEN.pressureOffWidthFactor, pressureProfile },
+			shapeWidth: true,
+		};
+	}
 	return {
 		style: {
 			...style,
