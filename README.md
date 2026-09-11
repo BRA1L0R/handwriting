@@ -14,16 +14,6 @@ one line is written to the invisible frontmatter of a note when you first write 
 
 a note you never inked on is never modified.
 
----
-
-> **ipad**
->
-> turn off Scribble or ios will draw its own black ink over your strokes, and its scratch-out gesture may delete ink.
->
-> **iPad Settings → Apple Pencil → Scribble → Off**
-
----
-
 ## what it does
 
 Here's a demonstration of some of the features: https://youtu.be/TUeniA9BZcc
@@ -61,6 +51,16 @@ windows · macos · linux · ipad · boox · android
 ### doesn't really work on
 
 iphone
+
+---
+
+> **ipad users**
+>
+> turn off Scribble or ios will draw its own black ink over your strokes, and its scratch-out gesture may delete ink.
+>
+> **iPad Settings → Apple Pencil → Scribble → Off**
+
+---
 
 ## installing
 
@@ -164,15 +164,15 @@ hold the pen still for about a third of a second at the end of a stroke to snap 
 
 with a mouse, pause at the end of a stroke and select **Snap**.
 
-## sync notes
+---
 
-`.handwriting/` is a hidden folder. many sync services do not sync hidden folders by default, including Obsidian Sync, iCloud and Dropbox.
+> **sync notes**
+>
+> `.handwriting/` is a hidden folder. many sync services do not sync hidden folders by default, including Obsidian Sync, iCloud and Dropbox.
+>
+> if you use one of these services, enable **Compatibility with Obsidian Sync, iCloud and Dropbox** in Handwriting settings.
 
-if you use one of these services, enable **Compatibility with Obsidian Sync, iCloud and Dropbox** in Handwriting settings.
-
-**compatibility: sync between devices**
-
-this option switches where Handwriting stores ink- by default, ink is stored in the hidden .handwriting sidecar (which like half of services don't look at hidden folders by default, so won't sync with these services). Hitting this button creates a handwriting sidecar (no period in front), then points itself at it
+---
 
 ## how it works
 
@@ -322,5 +322,3 @@ Obsidian has almost reached feature-parity for me but there's one last integrati
 not to wax poetic but i am beyond ready to break out.
 
 Handwriting is designed for students, educators, engineers, artists, or anyone who needs to handwrite and type in Obsidian.
-
-i designed this app with a decade of OneNote experience driving my tastes, so a few of the quirks and nuances of operation should feel remarkably similar or remarkably bad. sometimes it's a matter of taste

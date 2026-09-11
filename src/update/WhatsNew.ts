@@ -166,6 +166,7 @@ export const RELEASE_NOTES: Record<string, string[]> = {
 		"notification bug fix",
 		"zoom and fit to ink",
 	],
+	"1.4.17": ["plugin verification oops\n\nthank you for downloading Handwriting.\n\n - alan :)"],
 };
 
 /** One release's own notes, kept apart so the toast can label them honestly. */
