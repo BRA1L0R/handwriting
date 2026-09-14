@@ -4,6 +4,8 @@ import { PenStyle, widthForPressure } from "./PenStyle";
 import { Point2 } from "./Smoothing";
 import { fillRibbon } from "./RibbonRenderer";
 import { inkColorFor } from "./InkTheme";
+import type { InkStroke } from "./Stroke";
+import { strokeRev } from "./StrokeRev";
 
 /**
  * How much width the predicted tail gives up by its tip.
@@ -34,6 +36,34 @@ export class TailRenderer {
 	private ctx: CanvasRenderingContext2D;
 	private dirty: { x0: number; y0: number; x1: number; y1: number } | null = null;
 	private readonly requested: boolean;
+	private spacePaths = new WeakMap<InkStroke,{rev:number;path:Path2D}>();
+	private blank = false;
+	private untrackedPixels = true;
+	private backingScale = 1;
+	beforeWrite?: () => void;
+	get provenBlank(): boolean { return this.blank; }
+	noteBackingCleared(): void { this.blank = true; this.untrackedPixels = false; }
+	/** See WetInkRenderer.carry: the band moved under a live stroke. */
+	carry(shiftX: number, shiftY: number): void {
+		if (shiftX === 0 && shiftY === 0) return;
+		this.beforeWrite?.();
+		const ctx = this.ctx, b = this.backingScale;
+		ctx.save();
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.globalCompositeOperation = "copy";
+		ctx.drawImage(this.canvas, Math.round(shiftX * b), Math.round(shiftY * b));
+		ctx.restore();
+		if (this.dirty) this.dirty = { x0: this.dirty.x0 + shiftX, y0: this.dirty.y0 + shiftY, x1: this.dirty.x1 + shiftX, y1: this.dirty.y1 + shiftY };
+	}
+	private fullClearCovers(width: number, height: number): boolean {
+		return Number.isFinite(width) && Number.isFinite(height) && this.backingScale > 0 &&
+			width >= this.canvas.width / this.backingScale && height >= this.canvas.height / this.backingScale;
+	}
+	private markPaint(): void {
+		this.beforeWrite?.();
+		this.blank = false;
+		this.untrackedPixels = true;
+	}
 
 	/**
 	 * `desynchronized` asks the browser to present this canvas without waiting
@@ -51,7 +81,7 @@ export class TailRenderer {
 	 * shape WetInkRenderer uses, and the reason a latency claim about this can
 	 * be checked instead of assumed.
 	 */
-	constructor(canvas: HTMLCanvasElement, desynchronized = false) {
+	constructor(private canvas: HTMLCanvasElement, desynchronized = false) {
 		this.requested = desynchronized;
 		// Exactly the call this made before the flag existed when nothing is
 		// asked for. Passing `{ desynchronized: false }` ought to be identical
@@ -81,6 +111,7 @@ export class TailRenderer {
 
 	applyDpr(dpr: number): void {
 		this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		this.backingScale = dpr;
 	}
 
 	/**
@@ -118,6 +149,7 @@ export class TailRenderer {
 	 * and get the fallback.
 	 */
 	clear(cssWidth?: number, cssHeight?: number): void {
+		this.beforeWrite?.();
 		const d = this.dirty;
 		if (!d) {
 			// No box. Clear everything if we were told how big everything is,
@@ -129,16 +161,20 @@ export class TailRenderer {
 				cssHeight > 0
 			) {
 				this.ctx.clearRect(0, 0, cssWidth, cssHeight);
+				if (this.fullClearCovers(cssWidth, cssHeight)) this.noteBackingCleared();
 			}
 			return;
 		}
 		this.ctx.clearRect(d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0);
+		this.blank = !this.untrackedPixels && Number.isFinite(d.x0) && Number.isFinite(d.y0) && Number.isFinite(d.x1) && Number.isFinite(d.y1);
 		this.dirty = null;
 	}
 
 	/** Erase everything, for stroke end / resize. */
 	clearAll(cssWidth: number, cssHeight: number): void {
+		this.beforeWrite?.();
 		this.ctx.clearRect(0, 0, cssWidth, cssHeight);
+		if (this.fullClearCovers(cssWidth, cssHeight)) this.noteBackingCleared();
 		this.dirty = null;
 	}
 
@@ -150,6 +186,7 @@ export class TailRenderer {
 	 */
 	drawLasso(cam: CameraState, world: readonly Point2[], color: string): void {
 		if (world.length < 2) return;
+		this.markPaint();
 		const ctx = this.ctx;
 		ctx.save();
 		ctx.strokeStyle = color;
@@ -171,6 +208,7 @@ export class TailRenderer {
 		box: { x: number; y: number; width: number; height: number },
 		color: string
 	): void {
+		this.markPaint();
 		const ctx = this.ctx;
 		const pad = 6;
 		ctx.save();
@@ -194,6 +232,7 @@ export class TailRenderer {
 	 * rule itself never moves.
 	 */
 	drawSpaceDivider(cam: CameraState, yWorld: number, color: string, cssWidth: number): void {
+		this.markPaint();
 		const y = (yWorld - cam.y) * cam.zoom;
 		const ctx = this.ctx;
 		ctx.save();
@@ -206,6 +245,41 @@ export class TailRenderer {
 		ctx.stroke();
 		ctx.restore();
 		this.dirty = null;
+	}
+
+	/** Actual stroke paths, never a union box or a stored color change. Hover
+	 * reuses geometry; offscreen strokes are rejected before path construction. */
+	drawSpaceStroke(cam:CameraState,stroke:InkStroke,color:string,width:number,height:number,cssScale:number):boolean {
+		const b=stroke.bbox,pad=4/cssScale;
+		if((b.x+b.width-cam.x)*cam.zoom < -pad || (b.y+b.height-cam.y)*cam.zoom < -pad ||
+			(b.x-cam.x)*cam.zoom > width+pad || (b.y-cam.y)*cam.zoom > height+pad || !stroke.points.length)return false;
+		this.markPaint();
+		let cached=this.spacePaths.get(stroke);
+		const rev=strokeRev(stroke);
+		if(!cached||cached.rev!==rev){
+			const path=new Path2D(),points=stroke.points;
+			path.moveTo(points[0]!.x,points[0]!.y);
+			for(let i=1;i<points.length;i++)path.lineTo(points[i]!.x,points[i]!.y);
+			if(points.length===1)path.lineTo(points[0]!.x+.001,points[0]!.y);
+			cached={rev,path};this.spacePaths.set(stroke,cached);
+		}
+		const ctx=this.ctx;
+		ctx.save();ctx.translate(-cam.x*cam.zoom,-cam.y*cam.zoom);ctx.scale(cam.zoom,cam.zoom);
+		ctx.strokeStyle=color;ctx.globalAlpha=.65;ctx.lineWidth=Math.max(stroke.width,4/(cssScale*cam.zoom));
+		ctx.lineCap="round";ctx.lineJoin="round";ctx.setLineDash([]);ctx.stroke(cached.path);ctx.restore();
+		this.dirty=null;
+		return true;
+	}
+
+	/** Small physical-size label/tick, including the exact rounded landing.
+	 * Keep origin and landing labels on opposite sides when their Y agrees. */
+	drawSpaceLabel(cam:CameraState,yWorld:number,label:string,color:string,cssScale:number,landing=false):void {
+		this.markPaint();
+		const ctx=this.ctx,y=(yWorld-cam.y)*cam.zoom;
+		ctx.save();ctx.translate(0,y);ctx.scale(1/cssScale,1/cssScale);
+		ctx.font="12px sans-serif";ctx.fillStyle=color;ctx.strokeStyle=color;ctx.lineWidth=2;ctx.setLineDash([]);
+		if(landing){ctx.beginPath();ctx.moveTo(8,-4);ctx.lineTo(8,4);ctx.moveTo(8,0);ctx.lineTo(30,0);ctx.stroke();}
+		ctx.fillText(label,landing?36:8,landing?16:-7);ctx.restore();this.dirty=null;
 	}
 
 	/**
@@ -242,6 +316,8 @@ export class TailRenderer {
 		const x2 = (to.x - cam.x) * cam.zoom;
 		const y2 = (to.y - cam.y) * cam.zoom;
 		const hw = hwWorld ?? widthForPressure(style, pressure) / 2;
+		const untracked = this.untrackedPixels;
+		this.markPaint();
 		fillRibbon(
 			this.ctx,
 			cam,
@@ -254,6 +330,7 @@ export class TailRenderer {
 			inkColorFor(style)
 		);
 		this.growDirty(x1, y1, x2, y2, hw * cam.zoom + 2);
+		this.untrackedPixels = untracked;
 	}
 
 	private growDirty(
@@ -294,6 +371,8 @@ export class TailRenderer {
 		lineWidthPx: number
 	): void {
 		if (points.length === 0) return;
+		const untracked = this.untrackedPixels;
+		this.markPaint();
 		const ctx = this.ctx;
 		// `color` here is always the pen's ink (the predicted tail), never
 		// selection chrome - the lasso and the dividers below keep their raw
@@ -328,5 +407,6 @@ export class TailRenderer {
 			if (p.y > y1) y1 = p.y;
 		}
 		this.growDirty(x0, y0, x1, y1, base / 2 + 2);
+		this.untrackedPixels = untracked;
 	}
 }

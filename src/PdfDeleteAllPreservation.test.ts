@@ -80,7 +80,7 @@ const NOT_READY = "Handwriting: this PDF's ink storage is not ready. nothing was
 const CHANGED =
 	"Handwriting: the ink changed while its backup was being made. nothing was deleted. run Delete all ink again if you still want to remove it.";
 const DISK_ERROR =
-	"Handwriting: could not copy this PDF's ink to the trash (disk error). nothing was deleted.";
+	"Handwriting: could not copy this PDF's ink to the trash (disk error). Nothing was deleted.";
 const UNREADABLE =
 	"Handwriting: this PDF's ink file could not be read. ink drawn on it is not saved.";
 const FUTURE =

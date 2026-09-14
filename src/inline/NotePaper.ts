@@ -31,7 +31,7 @@ export class NotePaper {
 			if (this.stopped || !(file instanceof TFile) || file.extension !== "md") return;
 			menu.addItem(item => item.setTitle("Paper background").setIcon("file-text").onClick(() => {
 				if (this.stopped) return;
-				const picker = new NotePaperPicker(this.app, file.path, this.choice(file), async choice => {
+				const picker: NotePaperPicker = new NotePaperPicker(this.app, file.path, this.choice(file), async choice => {
 					try { await this.save(file, choice); }
 					catch { this.notify("Could not save the paper background for this note."); }
 				}, () => this.pickers.delete(picker));

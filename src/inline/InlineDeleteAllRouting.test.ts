@@ -468,7 +468,7 @@ describe("the backup and the removal are one decision", () => {
 		expect(told()).toContain(TRASH);
 	});
 
-	// ---- Astra 17:29: the backup that came back has to be verified ----------
+	// ---- Ruled 17:29: the backup that came back has to be verified ---------
 
 	it("a backup that returns NO path stops the wipe: a non-empty note needs a real copy", async () => {
 		const sidecars = attachHost();
@@ -544,7 +544,7 @@ describe("the backup and the removal are one decision", () => {
 		expect(told()).not.toContain("removed");
 	});
 
-	// ---- Astra 18:34: ABA -----------------------------------------------------
+	// ---- Ruled 18:34: ABA ------------------------------------------------------
 
 	/**
 	 * REMOVE AND RE-ADD OF IDENTICAL INK DURING THE AWAIT, which is the one
@@ -893,7 +893,7 @@ describe("the backup and the removal are one decision", () => {
 		}
 	});
 
-	// ---- Astra 18:21: the refusal has a reporting path, and no copy ----------
+	// ---- Ruled 18:21: the refusal has a reporting path, and no copy ---------
 
 	/**
 	 * EVERY REFUSAL HAS A NAMED REASON, A CALL SITE, AND NOW ALAN'S SENTENCE.
@@ -2234,7 +2234,7 @@ describe("deleteAllReadiness classifies locks and unsettled records", () => {
  * On that measurement an earlier revision of this command let `unknown` proceed
  * to a no-copy wipe.
  *
- * Astra ruled the other way on 2026-09-08, and the ruling does not contradict
+ * It was ruled the other way on 2026-09-08, and the ruling does not contradict
  * the measurement - it answers a different question. `unknown` proves nothing:
  * not eligibility, not a valid capture, not an empty target, not an adequate
  * backup. An unproven state may not reach a destructive clear, a history entry

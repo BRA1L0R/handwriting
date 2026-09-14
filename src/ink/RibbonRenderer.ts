@@ -1,5 +1,6 @@
 import { CameraState } from "../camera/coordinates";
 import { RibbonPt, jointIndices, ribbonSides } from "./Ribbon";
+import { flooredHalfWidth } from "./WidthFloor";
 
 /**
  * Canvas side of ribbon rendering. Everything a stroke needs (both sides of
@@ -64,11 +65,27 @@ export function fillRibbon(
 	cam: CameraState,
 	pts: readonly RibbonPt[],
 	color: string,
-	perSegment = false
+	perSegment = false,
+	/**
+	 * Committed-paint sites only (see WidthFloor.ts). The exact backing
+	 * multiplier the canvas's own transform was set with, and the dpr that
+	 * same call received - never re-derived here from pinch scale or
+	 * cssScale. Undefined preserves today's behaviour exactly (wet, tail,
+	 * snip/export all pass nothing).
+	 */
+	floor?: { backing: number; dpr: number }
 ): void {
 	const n = pts.length;
 	if (n === 0) return;
 	ctx.fillStyle = color;
+	// Floor every point's half-width once, up front, so the quad body and
+	// both disc cases below all read the same already-floored value. The
+	// disc's own `Math.max(0.25, ...)` stays untouched - a dot-visibility
+	// constant at 100%, not a second floor - and now simply operates on hw
+	// after this pass instead of before it.
+	if (floor) {
+		pts = pts.map(p => ({ ...p, hw: flooredHalfWidth(p.hw, floor.backing, floor.dpr) }));
+	}
 
 	// A dot: one disc.
 	if (n === 1) {

@@ -211,7 +211,9 @@ export function drawStroke(
 	stroke: InkStroke,
 	styleOverride?: Partial<PenStyle>,
 	ribbon = false,
-	cacheRibbon = true
+	cacheRibbon = true,
+	/** Committed-paint sites only. See fillRibbon/WidthFloor.ts. */
+	floor?: { backing: number; dpr: number }
 ): void {
 	const pts = stroke.points;
 	if (pts.length < 2) return;
@@ -264,7 +266,8 @@ export function drawStroke(
 				cam,
 				flattenFor(pts, style, cam.zoom, shaping, smooth),
 				strokeStyleFor(stroke),
-				perSegment
+				perSegment,
+				floor
 			);
 			return;
 		}
@@ -283,7 +286,7 @@ export function drawStroke(
 			hit.pressureProfile === stroke.pressureProfile
 		) {
 			cacheHits++;
-			fillRibbon(ctx, cam, hit.ribbon, strokeStyleFor(stroke), perSegment);
+			fillRibbon(ctx, cam, hit.ribbon, strokeStyleFor(stroke), perSegment, floor);
 			return;
 		}
 		cacheMisses++;
@@ -299,7 +302,7 @@ export function drawStroke(
 			pressureProfile: stroke.pressureProfile,
 			ribbon: pts2,
 		});
-		fillRibbon(ctx, cam, pts2, strokeStyleFor(stroke), perSegment);
+		fillRibbon(ctx, cam, pts2, strokeStyleFor(stroke), perSegment, floor);
 		return;
 	}
 	for (let i = 1; i < pts.length; i++) {
@@ -323,7 +326,9 @@ export function drawRegion(
 	strokes: readonly InkStroke[],
 	rect: { x: number; y: number; width: number; height: number },
 	ribbon = false,
-	tool?: InkStroke["tool"]
+	tool?: InkStroke["tool"],
+	/** Committed-paint sites only, so a partial repaint matches a full one. See fillRibbon/WidthFloor.ts. */
+	floor?: { backing: number; dpr: number }
 ): void {
 	const cssX = (rect.x - cam.x) * cam.zoom;
 	const cssY = (rect.y - cam.y) * cam.zoom;
@@ -336,7 +341,7 @@ export function drawRegion(
 	ctx.clearRect(cssX, cssY, cssW, cssH);
 	for (const s of strokes) {
 		if (tool !== undefined && s.tool !== tool) continue;
-		drawStroke(ctx, cam, s, undefined, ribbon);
+		drawStroke(ctx, cam, s, undefined, ribbon, undefined, floor);
 	}
 	ctx.restore();
 }
@@ -355,7 +360,9 @@ export function drawCommitted(
 	 * unless the surface is mobile with diagnostics recording - the clear
 	 * above is what makes repainting it here mandatory rather than optional.
 	 */
-	sentinel = false
+	sentinel = false,
+	/** Committed-paint sites only. See fillRibbon/WidthFloor.ts. */
+	floor?: { backing: number; dpr: number }
 ): void {
 	ctx.clearRect(0, 0, viewportCssWidth, viewportCssHeight);
 	const worldLeft = cam.x;
@@ -375,7 +382,7 @@ export function drawCommitted(
 		) {
 			continue;
 		}
-		drawStroke(ctx, cam, s, undefined, ribbon);
+		drawStroke(ctx, cam, s, undefined, ribbon, undefined, floor);
 	}
 	if (sentinel) paintPurgeSentinel(ctx);
 }

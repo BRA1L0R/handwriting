@@ -1009,7 +1009,7 @@ const deckLogs: string[] = [];
 beforeEach(() => {
 	setDiagnosticsEnabled(false);
 	deckLogs.length = 0;
-	vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+	vi.spyOn(console, "debug").mockImplementation((...args: unknown[]) => {
 		deckLogs.push(args.map(String).join(" "));
 	});
 });

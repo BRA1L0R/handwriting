@@ -2189,9 +2189,9 @@ body [data-handwriting-paper]:not([data-handwriting-paper="dots"]) .markdown-sou
  */
 /* The horizontal axis patch. Obsidian ships `overflow-x: hidden` on the
    scroller; the ScrollAxisGuard adds this class while inline ink needs
-   horizontal scroll room and removes it on unmount. The Handwriting-page
-   ancestor supplies the specificity needed against theme rules. */
-.markdown-source-view.handwriting-page .cm-scroller.handwriting-hscroll-axis {
+   horizontal scroll room and removes it on unmount. The editor ancestor
+   supplies specificity even before the first stroke marks a Handwriting page. */
+.markdown-source-view .cm-editor .cm-scroller.handwriting-hscroll-axis {
 	overflow-x: auto;
 }
 
@@ -2958,9 +2958,22 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
 }
 
 /* The camera changes the viewport, never the normal text wrapping column. */
-.handwriting-note-viewport-pane { overflow: hidden; }
-.cm-editor.handwriting-note-viewport { flex: none; max-width: none; max-height: none; }
-.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-content {
+/*
+ * THE OWNED PANE IS A CLIP, NOT A SCROLL CONTAINER. `overflow: hidden` still
+ * makes the pane scrollable by script and by the browser's own scroll-into-view
+ * walks, and its scrollable overflow is the counter-sized host's LAYOUT box
+ * (13,500 x 16,000 px for a 1,350 x 1,600 pane at 10%), so one such write
+ * shifts the whole editor surface up and left and leaves bare pane on the right
+ * and bottom: no scroller under the pen there, no ink layer, no finger scroll.
+ * `overflow: clip` clips identically and can never be scrolled by anyone; the
+ * `hidden` before it is the fallback for an engine without `clip`, and
+ * `applyViewportBox` resets any offset such an engine lets through.
+ */
+.handwriting-note-viewport-pane { overflow: hidden; overflow: clip; }
+.cm-editor.handwriting-note-viewport,
+.markdown-source-view.mod-cm6 .cm-editor.handwriting-note-viewport { flex: none; max-width: none; max-height: none; }
+.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-content,
+.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-sizer > .cm-contentContainer > .cm-content {
  box-sizing: border-box;
  width: var(--handwriting-note-column-width);
  min-width: var(--handwriting-note-column-width);
@@ -2968,6 +2981,70 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
  flex: 0 0 var(--handwriting-note-column-width);
  margin-left: var(--handwriting-note-column-margin-left);
  margin-right: var(--handwriting-note-column-margin-right);
+}
+/*
+ * FREEZE THE COLUMN'S OFFSET WHILE THE NOTE VIEWPORT OWNS THE EDITOR.
+ *
+ * Readable line length centres the column. Inside the note viewport the host is
+ * counter-sized to width/k, so a margin that RE-CENTRES grows by the same 1/k:
+ * measured 341.25 content px at 100% and 6632.50 at 10%, all of it reachable
+ * once Infinite Canvas turns overflow-x on, against 0.00 with Readable line
+ * length off and an equally wide granted extent. The band is the editor's own
+ * centring, not our spacer, so clamping the granted extent cannot reach it.
+ *
+ * Frozen, not removed. The page has to look unchanged at 100% and nothing may
+ * jump: a margin held constant in HOST units scales with the camera like
+ * everything else - 341px at 100%, 34px at 10% - so the column shrinks toward
+ * the top-left with the ink rather than being re-centred away from it, and at
+ * k = 1 the frozen value IS the auto value, so an owned viewport at 100% is
+ * identical to an unowned one.
+ *
+ * ONE CARRIER. The offset lives on `.cm-sizer` alone and every inner element a
+ * theme might centre is forced to zero. Pinning all four to the same margin was
+ * tried and measured: they NEST, each re-applying the offset inside its
+ * parent's, which put the column at 166.25 instead of 341.25 and, under a
+ * theme that also centres the lines, at -175 - left of the surface origin.
+ *
+ * `clamp(0px, auto, frozen)` takes the smaller of the two and never goes
+ * negative: `100%` resolves against the host content width W/k, so the calc term
+ * is today's auto value, and above k ~ 1.95 it turns negative where auto would
+ * clamp to 0. The `var()` fallback is the same calc, so before the plugin has
+ * written the variable the declaration is still valid and the first owned frame
+ * is centred rather than hard-left.
+ *
+ * `!important` scoped to the owned class, deliberately: some themes centre the
+ * inner elements with `!important` (Minimal is one), so specificity alone cannot
+ * win. All of it lifts the moment the class does.
+ *
+ * CONSEQUENCE for the preview offset: at k <= 1 the column's host-local x is now
+ * constant, so applyPreviewInkOffset computes dx == 0 and writes nothing - that
+ * path is inert on zoom-out. At k > 1 the auto value applies, the column really
+ * moves, and it stays live. Its per-frame read is unchanged; gating it off where
+ * dx must be zero is a post-1.4.19 optimisation, beside the compute option.
+ *
+ * PHYSICAL properties throughout, because the measurement that feeds the
+ * variable is physical (a left edge minus a left edge). RTL IS NOT COVERED.
+ *
+ * NOT COVERED, beyond RTL: a theme that offsets the column with PADDING on
+ * `.cm-scroller` or `.cm-sizer`; flex centring (`justify-content: center` on the
+ * scroller); `transform: translateX(-50%)` with `left: 50%`; and `max-width`
+ * plus `margin: auto` on any wrapper outside the five reset below.
+ *
+ */
+.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-sizer {
+ margin-left: clamp(0px,
+                    calc((100% - var(--file-line-width)) / 2),
+                    var(--handwriting-column-margin-left,
+                        calc((100% - var(--file-line-width)) / 2))) !important;
+ margin-right: auto !important;
+}
+.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-sizer > .cm-contentContainer,
+.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-sizer .cm-content,
+.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-sizer .cm-content > .cm-line,
+.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-sizer .inline-title,
+.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-sizer .metadata-container {
+ margin-left: 0 !important;
+ margin-right: 0 !important;
 }
 .handwriting-note-viewport-controls { position:absolute; top:52px; right:8px; z-index:30; display:flex; gap:2px; padding:3px; border:1px solid var(--background-modifier-border); border-radius:8px; background:var(--background-primary); box-shadow:0 2px 8px #0002; }
 .handwriting-note-viewport-controls button { min-width:30px; height:30px; padding:0 6px; font-size:12px; }

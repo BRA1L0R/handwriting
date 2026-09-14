@@ -445,16 +445,13 @@ export class PointerRouter {
 	 * separately visible.
 	 */
 	private predictedFrom(e: PointerEvent): PenSample[] {
-		const fn = (
-			e as PointerEvent & { getPredictedEvents?: () => PointerEvent[] }
-		).getPredictedEvents;
-		if (typeof fn !== "function") {
+		if (typeof e.getPredictedEvents !== "function") {
 			telemetry.bump("pred.apiMissing");
 			return EMPTY_SAMPLES;
 		}
 		let events: PointerEvent[] = [];
 		try {
-			events = fn.call(e);
+			events = e.getPredictedEvents();
 		} catch (err) {
 			telemetry.fail("getPredictedEvents", err);
 			return EMPTY_SAMPLES;

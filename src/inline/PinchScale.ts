@@ -20,10 +20,32 @@
 import { validCameraScale } from "./ZoomScale";
 
 export const MAX_PINCH_SCALE = 4;
+export const MIN_PINCH_SCALE = 0.1;
 
-/** Positive representable requests have no arbitrary percentage floor. */
-export function clampPinchScale(scale: number): number {
- return validCameraScale(scale) ? Math.min(MAX_PINCH_SCALE, scale) : 1;
+/**
+ * Bound user zoom requests before creating an extreme counter-sized editor.
+ *
+ * `floor` is the lowest scale this request may reach. A floor can only lower
+ * the constant, never raise it.
+ */
+export function clampPinchScale(scale: number, floor = MIN_PINCH_SCALE): number {
+ const min = validCameraScale(floor) ? Math.min(MIN_PINCH_SCALE, floor) : MIN_PINCH_SCALE;
+ return validCameraScale(scale) ? Math.max(min, Math.min(MAX_PINCH_SCALE, scale)) : 1;
+}
+
+/** Intersect one stroke with the reachable right/down surface; never mutate it. */
+export function clampToReachable(
+ bounds: InkFitBounds | null,
+ origin: { originLeftNote: number; originTopNote: number },
+): InkFitBounds | null {
+ if (!bounds) return null;
+ const { originLeftNote: minX, originTopNote: minY } = origin;
+ if (![bounds.x, bounds.y, bounds.width, bounds.height, minX, minY].every(Number.isFinite)) return null;
+ if (bounds.width < 0 || bounds.height < 0) return null;
+ const right = bounds.x + bounds.width, bottom = bounds.y + bounds.height;
+ const x = Math.max(bounds.x, minX), y = Math.max(bounds.y, minY);
+ if (right < x || bottom < y) return null;
+ return { x, y, width: right - x, height: bottom - y };
 }
 
 export interface InkFitBounds { x:number; y:number; width:number; height:number; }
@@ -38,6 +60,8 @@ export function fitInkBounds(g:{bounds:InkFitBounds|null; viewportWidthScreen:nu
  const margin=Math.min(g.marginScreen,w/4,h/4);
  const zoom=Math.min(1,(w-2*margin)/(Math.max(1,b.width)*e*f),(h-2*margin)/(Math.max(1,b.height)*e*f));
  if (!validCameraScale(zoom,w/e,h/e)||Math.max(w/(e*zoom),h/(e*zoom),Math.abs(b.x*f),Math.abs(b.y*f),(b.x+b.width)*f,(b.y+b.height)*f)>MAX_VIEWPORT_LAYOUT) return {kind:"unrepresentable"};
+ // No MIN_PINCH_SCALE test: Fit is the one path allowed below it. The native
+ // layout bound above is what still refuses.
  return {kind:"fit",zoom};
 }
 
@@ -45,16 +69,30 @@ export function fitInkBounds(g:{bounds:InkFitBounds|null; viewportWidthScreen:nu
  * The scale a gesture is asking for. Always the scale captured at gesture
  * start times the spread ratio, never accumulated step to step, so a pinch out
  * and back lands exactly where it began.
+ *
+ * Below the floor zoom-out is locked (Alan 2026-09-14): only Fit commits under
+ * ten percent, and from there a gesture may zoom in but not back out, so its
+ * own reference scale is the lower bound until a commit reaches the floor.
  */
-export function pinchScale(referenceScale: number, ratio: number): number {
+export function pinchScale(referenceScale: number, ratio: number, floor = MIN_PINCH_SCALE): number {
 	if (!Number.isFinite(referenceScale) || referenceScale <= 0) return 1;
-	if (!Number.isFinite(ratio) || ratio <= 0) return clampPinchScale(referenceScale);
-	return clampPinchScale(referenceScale * ratio);
+	const lower = Math.min(floor, referenceScale);
+	if (!Number.isFinite(ratio) || ratio <= 0) return clampPinchScale(referenceScale, lower);
+	return clampPinchScale(referenceScale * ratio, lower);
 }
 
-/** Counter-size the viewport; its text column is held independently. */
-export function counterSizePercent(scale: number): number {
-	const k = clampPinchScale(scale);
+/**
+ * Counter-size the viewport; its text column is held independently.
+ *
+ * `floor` is REQUIRED, with no default, deliberately: with the constant baked
+ * in this answered 1000% for a 6% Fit scale, and nothing would have caught a
+ * future caller adopting it as the counter-size source. Production does not
+ * call this today - `applyViewportBox` divides the layout box by the committed
+ * scale directly - so the parameter is the guard that a caller must think
+ * about the floor, and the compiler enforces it.
+ */
+export function counterSizePercent(scale: number, floor: number): number {
+	const k = clampPinchScale(scale, floor);
 	return 100 / k;
 }
 

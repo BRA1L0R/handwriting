@@ -1,4 +1,4 @@
-import { requestUrl, App, Command, MarkdownRenderChild, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, SettingDefinitionItem, TAbstractFile, TFile, View, WorkspaceLeaf, normalizePath } from "obsidian";
+import { requestUrl, App, Command, MarkdownRenderChild, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, SettingDefinitionItem, type SettingGroup, TAbstractFile, TFile, View, WorkspaceLeaf, normalizePath } from "obsidian";
 import {
 	clearGatedCommandAction,
 	clearGatedCommandActions,
@@ -310,8 +310,8 @@ const DECLAIM_GRACE_MS = 2_000;
  *
  *    DO NOT STRIP THESE AGAIN ON THE STRENGTH OF THE 18:41 ENTRY. It is still
  *    on the record and still says the opposite; this paragraph is why. The
- *    authority is the 2026-09-09 17:14 CDT entry in `queue.md` /
- *    `lead-engineer.md` / `astra.md`, not this comment.
+ *    authority is the decision recorded 2026-09-09 17:14 CDT, not this
+ *    comment.
  *
  *    ONE SENTENCE IS RULED THE OTHER WAY and is not in this file: the
  *    ink-trash restore line stays BARE, because it ends in a file path where
@@ -869,7 +869,7 @@ export type DeleteAllRefusal =
  * line each - "okay delete-all just sy something like, your ink cannot be
  * deleted". Put back to him as the exact sentence below and not amended.
  *
- * SOURCE: `queue.md` / `lead-engineer.md`, entry stamped 2026-09-09 09:12 CDT,
+ * SOURCE: the decision stamped 2026-09-09 09:12 CDT,
  * which also carries the second string below. An earlier revision of this
  * marker said the words had only been relayed and were not on the record; they
  * are now, and this line points at them instead.
@@ -900,7 +900,7 @@ export type DeleteAllRefusal =
  *   Offered per-string or per-command, he chose consistency, restoring rather
  *   than stripping.
  *
- * Both entries are at source in queue.md / lead-engineer.md / astra.md, and
+ * Both decisions are recorded at their source, and
  * the earlier one still says the opposite - so read the date before acting on
  * either. A test asserts the BARE form appears in no shipped file.
  *
@@ -942,7 +942,7 @@ export const DELETE_ALL_REFUSED = "Handwriting: your ink cannot be deleted.";
  *   (17:14/17:21): "ehhhhhhhhhhhhhhhh we hsould be consistent, put a period
  *   back at end".
  *
- * All entries are at source in queue.md / lead-engineer.md / astra.md, and the
+ * All decisions are recorded at their source, and the
  * middle one still says the opposite - read the date before acting on either.
  * A test asserts the BARE form appears in no shipped file.
  */
@@ -951,8 +951,7 @@ export const DELETE_ALL_NO_INK = "Handwriting: no ink on this note.";
 /**
  * APPROVED BY ALAN, 2026-09-09 12:34 CDT, and SCOPED TO FOUR REASONS.
  *
- * SOURCE: the 12:34 entry, posted in `queue.md`, `lead-engineer.md`,
- * `1.4.10.md` and `astra.md` before the dispatch. The sentence below IS his
+ * SOURCE: the 12:34 decision, recorded before the work began. The sentence below IS his
  * answer - he was shown all eleven reasons rendered as the notices a user
  * actually sees, plus three candidate sentences, and typed this one back
  * himself rather than directing anyone to write it.
@@ -1085,7 +1084,7 @@ function finishDeleteAllInk(path: string, kept: string | null): void {
  * readable generation was found in the trash and renamed back into place.
  * `restoredTo` is that live file - the restore is a rename, so there is no kept
  * copy to name. Its sentence is Alan's, approved 2026-09-09; the authority is
- * the mailbox entry stamped 2026-09-09 18:26 CDT in `queue.md`, not this
+ * the decision stamped 2026-09-09 18:26 CDT, not this
  * comment. Lowercase `the`, curly quotes around the note, internal period kept,
  * no final period.
  *
@@ -1115,7 +1114,7 @@ export function bindRecoveryNotices(
 	// SO THE ASYMMETRY IS DELIBERATE. Six punctuated, this one bare. Anyone
 	// checking consistency will find this string the odd one and be tempted to
 	// "fix" it - that is what this comment is for. The authority is the 17:21
-	// entry in `queue.md` / `lead-engineer.md` / `astra.md`, not this comment,
+	// decision as recorded, not this comment,
 	// and `RecoveredAnnouncesTrashRestore.test.ts` reds if a period appears.
 	//
 	// The INTERNAL period after "trash" stays, as it always has.
@@ -1538,7 +1537,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		} catch (err) {
 			console.error("[handwriting] delete-all-pdf-ink backup failed", err);
 			new Notice(
-				"Handwriting: could not copy this PDF's ink to the trash (disk error). nothing was deleted."
+				"Handwriting: could not copy this PDF's ink to the trash (disk error). Nothing was deleted."
 			);
 			return;
 		}
@@ -2018,7 +2017,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// nothing", which are different bugs with the same symptom.
 		initEmbedInkDiagnostics((via, path, waitedMs) => {
 			if (!this.settings.devDiagnostics) return;
-			console.log(embedInkDiagLine(via, path, waitedMs));
+			console.debug(embedInkDiagLine(via, path, waitedMs));
 		});
 		this.registerMarkdownPostProcessor((el, ctx) => {
 			const path = ctx.sourcePath;
@@ -4015,7 +4014,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	/**
 	 * Is the captured target STILL the current one, synchronously, right now?
 	 *
-	 * Four clauses, and each is load-bearing (Astra, 2026-09-09T07:31:28):
+	 * Four clauses, and each is load-bearing (ruled 2026-09-09T07:31:28):
 	 *
 	 *  - `!this.unloaded` - the plugin itself is still live. Acting after
 	 *    unload writes through a store nobody is maintaining.
@@ -4181,7 +4180,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			return;
 		}
 
-		// `unknown` REFUSES, on Astra's 18:21 ruling, and this reverses what an
+		// `unknown` REFUSES, on the 18:21 ruling, and this reverses what an
 		// earlier revision of this command did. The measurement that revision
 		// rested on still stands - an unclaimed record's ink has no sidecar and
 		// cannot compose one, so there is nothing on disk to lose - but the
@@ -4258,7 +4257,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		} catch (err) {
 			console.error("[handwriting] delete-all-ink backup failed", err);
 			new Notice(
-				"Handwriting: could not copy this note's ink to the trash (disk error). nothing was deleted."
+				"Handwriting: could not copy this note's ink to the trash (disk error). Nothing was deleted."
 			);
 			return;
 		}
@@ -5328,7 +5327,33 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// The store is constructed before settings are read, so it starts on
 		// the default folder and is pointed at the real one here - before any
 		// note is opened, so nothing ever reads from the wrong place.
-		this.store.useInkFolder(this.settings.inkFolder);
+		// The desired folder can sync before this device starts. Merely
+		// repointing then leaves its existing hidden ink pinned by fallback,
+		// while the settings button already says compatibility is enabled.
+		// Reconcile that explicit saved choice before any surface is opened.
+		// Never overwrite collisions; retire the source as recovery data so a
+		// later startup cannot republish it after a synced removal. Genuine
+		// failures and newly arrived source files remain retryable.
+		if (!this.freshInstall && this.settings.inkFolder === SYNCED_INK_FOLDER) {
+			this.store.holdWrites();
+			try {
+				const result = await migrateInkFolder(this.app.vault.adapter, DEFAULT_INK_FOLDER, SYNCED_INK_FOLDER, { preserveCollisions: true });
+				if (result.preserved) {
+					new Notice("Handwriting: conflicting ink was kept in recovery files in the sync folder.");
+				}
+				if (result.unsupported || result.skipped > 0) {
+					new Notice("Handwriting: some existing ink could not be moved to the sync folder. The original files were kept.");
+				}
+			} catch (err) {
+				console.error("[handwriting] existing ink could not be moved to the sync folder", err);
+				new Notice("Handwriting: existing ink could not be moved to the sync folder. The original files were kept. Reload Handwriting to retry.");
+			} finally {
+				this.store.useInkFolder(this.settings.inkFolder);
+				this.store.releaseWrites();
+			}
+		} else {
+			this.store.useInkFolder(this.settings.inkFolder);
+		}
 		// The strip's eraser slider persists through here on release.
 		setPersistEraserRadius((px) => {
 			this.settings.eraserRadiusPx = px;
@@ -5832,6 +5857,22 @@ function platformOs(): string {
 }
 
 type SettingKey = keyof HandwritingSettings;
+
+/** The legacy painter reads our own definition data, not newer host API objects. */
+type LegacySettingControl =
+	| { type: "toggle"; key: SettingKey; disabled?: boolean | (() => boolean) }
+	| { type: "dropdown"; key: SettingKey; options: Readonly<Record<string, string>> }
+	| { type: "text" | "textarea" | "number" | "file" | "folder" | "slider" | "color" };
+
+type LegacySettingItem =
+	| { type: "page" }
+	| { type: "group" | "list"; heading?: string; items?: readonly LegacySettingItem[] }
+	| {
+		name: string;
+		desc?: string | DocumentFragment;
+		render?: (setting: Setting, group: SettingGroup) => void | (() => void);
+		control?: LegacySettingControl;
+	};
 
 const SUPPORT_LINE = "Handwriting is free. i'm still working on it almost every night.";
 
@@ -6522,7 +6563,7 @@ export class HandwritingSettingTab extends PluginSettingTab {
 	}
 
 	/** Draw definitions with the classic Setting builder, one row each. */
-	private paint(el: HTMLElement, items: readonly SettingDefinitionItem<SettingKey>[]): void {
+	private paint(el: HTMLElement, items: readonly LegacySettingItem[]): void {
 		for (const item of items) {
 			if ("type" in item) {
 				if (item.type === "page") continue;

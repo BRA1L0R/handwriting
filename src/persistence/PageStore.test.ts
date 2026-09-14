@@ -836,8 +836,11 @@ describe("externallyChanged — the live-reload poll primitive", () => {
 	// genuinely new failure would say nothing, which is the silence the latch
 	// exists to break.
 	it("a quiet recovery still clears the latch", async () => {
+		let now = 0;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
 		store.schedule("p1", pageWith("p1", "S"));
 		await store.flush();
+		const original = fake.files.get(".handwriting/p1.json")!;
 
 		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
 		const realRead = fake.read.bind(fake);
@@ -851,10 +854,17 @@ describe("externallyChanged — the live-reload poll primitive", () => {
 			expect(await store.externallyChanged("p1")).toBe(false);
 			expect(errors).toHaveBeenCalledTimes(1);
 
-			// Recovers, but the page is QUIET: mtime back to what we know, so
-			// the check completes and reports "no change" without a read.
-			fake.read = realRead;
+			// An equal-mtime throttle skip is not a successful recovery read.
 			fake.mtimes.set(".handwriting/p1.json", store["knownMtime"].get("p1") as number);
+			now = 4999;
+			expect(await store.externallyChanged("p1")).toBe(false);
+			expect(errors).toHaveBeenCalledTimes(1);
+			expect(store["changeCheckLogged"].has("p1")).toBe(true);
+			// Restore original bytes too: quiet now means verified equal
+			// content, not an mtime shortcut that never checked the adapter.
+			fake.read = realRead;
+			fake.files.set(".handwriting/p1.json", original);
+			now = 5000;
 			expect(await store.externallyChanged("p1")).toBe(false);
 
 			// A new failure after that quiet success is news again.
@@ -867,6 +877,7 @@ describe("externallyChanged — the live-reload poll primitive", () => {
 		} finally {
 			fake.read = realRead;
 			errors.mockRestore();
+			clock.mockRestore();
 		}
 	});
 

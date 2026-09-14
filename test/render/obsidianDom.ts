@@ -59,4 +59,31 @@ export function installObsidianDom(): void {
 	proto.setCssStyles = function (this: HTMLElement, styles: Record<string, string>): void {
 		Object.assign(this.style, styles);
 	};
+	// The FREE functions, not only the element methods. Obsidian declares both
+	// (`createDiv`, `createFragment` in obsidian.d.ts), the plugin checker
+	// requires them over `document.createElement`, and code that builds a node
+	// before it has a parent - the camera anchor's wrapper and its rungs - has
+	// no element to hang the method off. Without these that code throws here
+	// while working in the app, which is the worst way for a fixture to differ.
+	const g = globalThis as unknown as Record<string, unknown>;
+	g.createDiv = (o?: ElOpts | string, callback?: (el: HTMLElement) => void): HTMLElement => {
+		// Detached, like the app's: the caller decides where it goes.
+		const el = document.createElement("div");
+		const opts = typeof o === "string" ? { cls: o } : o ?? {};
+		// Throw rather than ignore: the app honours more keys than this models
+		// (a `parent` attaches the node), so a silently dropped key would build
+		// one DOM in Obsidian and a different one here.
+		const unknown = Object.keys(opts).filter(k => !["cls", "text", "attr"].includes(k));
+		if (unknown.length) throw new Error(`createDiv shim does not model: ${unknown.join(", ")}`);
+		if (opts.cls) for (const c of opts.cls.split(/\s+/).filter(Boolean)) el.classList.add(c);
+		if (opts.text !== undefined) el.textContent = opts.text;
+		if (opts.attr) for (const [k, v] of Object.entries(opts.attr)) el.setAttribute(k, v);
+		callback?.(el);
+		return el;
+	};
+	g.createFragment = (callback?: (el: DocumentFragment) => void): DocumentFragment => {
+		const fragment = document.createDocumentFragment();
+		callback?.(fragment);
+		return fragment;
+	};
 }

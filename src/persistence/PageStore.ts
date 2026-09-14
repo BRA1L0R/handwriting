@@ -372,8 +372,12 @@ export class PageStore {
 	 * revision is preserved as a conflict file instead of being overwritten.
 	 */
 	private knownMtime = new Map<string, number>();
+	/** A completed load found no sidecar; unlike an ID we have never opened. */
+	private observedMissing = new Set<string>();
 	/** Stamp of the content this session last read or wrote (see contentStamp). */
 	private knownHash = new Map<string, string>();
+	/** Bound same-mtime content reads to once per five seconds per polled page. */
+	private contentCheckedAt = new Map<string, number>();
 	/**
 	 * WHERE EACH PAGE LIVES: the path a page's sidecar was found at, or was
 	 * last written to. One page id, one live sidecar.
@@ -662,6 +666,7 @@ export class PageStore {
 	 * before any note opens) clears an empty map, which costs nothing.
 	 */
 	useInkFolder(folder: string): void {
+		this.contentCheckedAt.clear();
 		this.folder = folder;
 		this.resolved.clear();
 		// Both are statements ABOUT the pins, so they go with them: a
@@ -884,11 +889,14 @@ export class PageStore {
 
 	/**
 	 * Cheap poll primitive for live reload: has the sidecar on disk changed
-	 * behind our back? One stat on the fast path; a read only when the mtime
-	 * moved (sync tools preserve mtimes, so the content stamp decides).
+	 * behind our back? Changed mtimes are checked immediately. Unchanged
+	 * mtimes get a content check at most once per five seconds per polled
+	 * page, because sync can replace bytes without changing mtime or size.
+	 * This method never enumerates pages; callers supply eligible open IDs.
 	 * Never answers while a write for this page is queued - a half-landed
 	 * save of our own must not read as an external edit - and never for a
-	 * page this store has not read or written (nothing to compare against).
+	 * page this store has not read or written. A completed missing load is a
+	 * baseline too: the first JSON may arrive after the document was opened.
 	 * The write-path conflict guard stays the last word either way.
 	 *
 	 * See hasQueuedWrite above for why a caller must re-ask synchronously.
@@ -896,7 +904,9 @@ export class PageStore {
 	private async observeExternalChange(pageId: string): Promise<ExternalChangeObservation> {
 		if (this.hasQueuedWrite(pageId)) return "unchanged";
 		const known = this.knownMtime.get(pageId);
-		if (known === undefined) return "unchanged";
+		const knownHash = this.knownHash.get(pageId);
+		const folder = this.folder;
+		if (known === undefined && !this.observedMissing.has(pageId)) return "unchanged";
 		const adapter = this.app.vault.adapter;
 		let observation: ExternalChangeObservation;
 		try {
@@ -909,14 +919,24 @@ export class PageStore {
 				// `resolveFor` checked every eligible path with `exists`. This is
 				// positive absence, unlike a failed stat/read, and lets the inline
 				// caller start its hold notice without changing the shared boolean.
-				observation = "missing-live-sidecar";
+				observation = known === undefined ? "unchanged" : "missing-live-sidecar";
 			} else {
 				const st = await adapter.stat(watched.path).catch(() => null);
-				if (!st || st.mtime === known) {
+				const now = performance.now();
+				const checkedAt = this.contentCheckedAt.get(pageId);
+				if (!st) {
 					observation = "unchanged";
+				} else if (st.mtime === known && checkedAt !== undefined && now - checkedAt < 5000) {
+					// A skipped read is not recovery from a previously failed read.
+					return "unchanged";
 				} else {
+					// Record the attempt before I/O, including failed reads. A
+					// broken adapter or refused adoption must not cause a full
+					// same-mtime read every tick. Neither baseline is accepted here.
+					this.contentCheckedAt.set(pageId, now);
 					const stamp = contentStamp(await adapter.read(watched.path));
-					if (stamp === this.knownHash.get(pageId)) {
+					if (this.folder !== folder || this.hasQueuedWrite(pageId) || this.knownMtime.get(pageId) !== known || this.knownHash.get(pageId) !== knownHash) return "unchanged";
+					if (stamp === knownHash) {
 						// mtime churn without content change (a sync tool touching
 						// the file): remember it so the next poll stays one stat.
 						this.knownMtime.set(pageId, st.mtime);
@@ -1052,7 +1072,9 @@ export class PageStore {
 		// went. Nothing ever brought it back, so the note reopened empty and
 		// the next stroke began a SECOND sidecar under the same id, diverging
 		// from the copy sitting in the trash folder.
-		return await this.restoreFromTrash(pageId);
+		const restored = await this.restoreFromTrash(pageId);
+		if (restored === null) this.observedMissing.add(pageId);
+		return restored;
 	}
 
 	/**
@@ -2185,6 +2207,8 @@ export class PageStore {
 		this.pending.delete(pageId);
 		this.pendingWriter.delete(pageId);
 		this.knownMtime.delete(pageId);
+		this.contentCheckedAt.delete(pageId);
+		this.observedMissing.delete(pageId);
 		this.knownHash.delete(pageId);
 		// The page is gone; a later page under this id is a different page,
 		// and must not be reconciled against a writer that predates it.

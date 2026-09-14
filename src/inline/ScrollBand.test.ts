@@ -9,6 +9,7 @@ import {
 	bandMargin,
 	bandNeedsMove,
 } from "./ScrollBand";
+import { MAX_BACKING_AREA, backingScale } from "./ZoomScale";
 
 function viewport(over: Partial<BandViewport> = {}): BandViewport {
 	return {
@@ -27,6 +28,63 @@ describe("bandMargin", () => {
 		expect(bandMargin(900)).toBe(225);
 		expect(bandMargin(200)).toBe(BAND_MARGIN_MIN);
 		expect(bandMargin(4000)).toBe(BAND_MARGIN_MAX);
+	});
+
+	/**
+	 * THE CEILING IS IN THE READER'S PX, and below 1.0 those are not the
+	 * scroller's px. The counter-sized host makes a 900-px pane report a 9000-px
+	 * client height at 10%, so the quarter-of-the-viewport fraction asks for
+	 * 2250 - and the old ceiling cut it to 320, which is 32 px of headroom for a
+	 * fling that covers 113 of them per frame.
+	 */
+	it("lifts the ceiling by the zoom so the margin stays the same share of the screen", () => {
+		// The same pane, at 1.0 and at 0.1. The fraction is what survives.
+		expect(bandMargin(900)).toBe(225);
+		expect(bandMargin(9000, 0.1)).toBe(2250);
+		// Same headroom in visual px, which is the whole claim.
+		expect(bandMargin(9000, 0.1) * 0.1).toBe(bandMargin(900));
+		// The lifted ceiling still bites: a tall pane at 10% asks for 5000 and
+		// gets the ceiling, 320 visual px.
+		expect(bandMargin(20000, 0.1)).toBe(BAND_MARGIN_MAX / 0.1);
+	});
+
+	/**
+	 * THE GUARD, stated as a test rather than as a comment. Nothing at or above
+	 * 1.0 moves, and neither does a caller that reports no scale at all - which
+	 * is every caller outside the inline overlay, the PDF surface included.
+	 */
+	it("changes nothing at 1.0, above it, or without a scale", () => {
+		for (const h of [200, 900, 4000]) {
+			expect(bandMargin(h, 1)).toBe(bandMargin(h));
+			expect(bandMargin(h, 2)).toBe(bandMargin(h));
+			expect(bandMargin(h, 4)).toBe(bandMargin(h));
+		}
+		// A nonsense scale cannot shrink the margin either: the band is the
+		// thing ink is drawn on, and starving it is worse than ignoring a bad
+		// number.
+		expect(bandMargin(900, 0)).toBe(bandMargin(900));
+		expect(bandMargin(900, -1)).toBe(bandMargin(900));
+	});
+
+	/**
+	 * The band the margin feeds, and the hysteresis that decides when it moves,
+	 * must BOTH see the scale - a band sized for 10% whose slack was still
+	 * computed at the old ceiling would be re-pinned just as often, and moving
+	 * it is what costs a whole-world rasterisation.
+	 */
+	it("a zoomed-out band survives a flick that would have re-pinned it", () => {
+		// A 900x800 pane at 10%: the host is counter-sized, so the scroller
+		// reports ten times the px.
+		const v = viewport({ clientWidth: 8000, clientHeight: 9000, scrollWidth: 60000, scrollHeight: 200000, scrollLeft: 20000, scrollTop: 20000, scale: 0.1 });
+		const band = bandFor(v);
+		// 900 layout px is 90 visual px - a third of one fling frame.
+		const flick = { ...v, scrollLeft: v.scrollLeft + 900, scrollTop: v.scrollTop + 900 };
+		expect(bandNeedsMove(band, flick)).toBe(false);
+		expect(bandCovers(band, flick)).toBe(true);
+		// The premise: at the old ceiling this same flick moved the band. Read
+		// from a band built with no scale reported, which is the old geometry.
+		const oldBand = bandFor({ ...v, scale: undefined });
+		expect(bandNeedsMove(oldBand, { ...flick, scale: undefined })).toBe(true);
 	});
 });
 
@@ -215,5 +273,67 @@ describe("the invariant: a checked scroll position is always covered", () => {
 				throw new Error(`uncovered at scrollLeft=${v.scrollLeft}`);
 			}
 		}
+	});
+});
+
+/**
+ * WHAT THE LIFTED CEILING COSTS BELOW THE TEN-PERCENT FLOOR.
+ *
+ * Written when 0.1 was a floor every request had to clear, so the render
+ * harness could not settle at 0.019. Since 2026-09-13 Fit commits below it
+ * (Alan: Fit breaks the 10% clamp) and LagAtLowZoom's bandCost arm measures
+ * 0.019 through Fit's commit; this arithmetic stands as the unit-level twin.
+ * Computing the cost rather than leaving it unknown still holds: a
+ * ceiling divided by the scale is only defensible if the band's cost does NOT
+ * follow 1/scale, and the shipped functions can be asked directly.
+ *
+ * PURE, and therefore not evidence about a live host. It is evidence about the
+ * arithmetic every live host runs, which is the thing the ceiling changed.
+ */
+describe("band cost below the zoom floor", () => {
+	/** The pane the render arms use, in the px the reader sees. */
+	const PANE_W = 1397.5;
+	const PANE_H = 800;
+	const DPR = 2;
+
+	/** The counter-sized scroller a given scale produces from that pane. */
+	function at(scale: number): { margin: number; band: Band; backingPx: number } {
+		const v = viewport({
+			clientWidth: PANE_W / scale,
+			clientHeight: PANE_H / scale,
+			// Sideways scrollable, so the horizontal margin is actually spent.
+			scrollWidth: 60000 / scale,
+			scrollHeight: 200000 / scale,
+			scale,
+		});
+		const band = bandFor(v);
+		const b = backingScale(DPR, scale, band.width, band.height);
+		return { margin: bandMargin(v.clientHeight, scale), band, backingPx: Math.round(band.width * b) * Math.round(band.height * b) };
+	}
+
+	it("costs the same at 0.019 as at 1.0, and stays inside the per-canvas cap", () => {
+		const fit = at(0.019176);
+		const one = at(1);
+		// The margin is the same headroom for the reader at both scales...
+		expect(fit.margin * 0.019176).toBeCloseTo(one.margin, 0);
+		// ...so the band is the same size on screen...
+		expect(fit.band.width * 0.019176).toBeCloseTo(one.band.width, 0);
+		expect(fit.band.height * 0.019176).toBeCloseTo(one.band.height, 0);
+		// ...and the canvases are the same allocation, because `backingScale`
+		// multiplies by the very scale the band divided by.
+		expect(fit.backingPx / one.backingPx).toBeCloseTo(1, 1);
+		// THE CEILING THAT ACTUALLY EXISTS is per canvas, and neither scale is
+		// near it. If a pane ever crosses it, it crosses at 1.0 first.
+		expect(fit.backingPx).toBeLessThan(MAX_BACKING_AREA);
+		expect(one.backingPx).toBeLessThan(MAX_BACKING_AREA);
+	});
+
+	it("the ceiling, not the fraction, is what a tall pane meets - at every scale alike", () => {
+		// A pane over 1280 visual px tall asks for more than 320 visual px and
+		// gets the ceiling. That was true before this change and is still true:
+		// what changed is that the ceiling is now 320 of the READER's px rather
+		// than 320 of the scroller's.
+		expect(bandMargin(2000, 1)).toBe(BAND_MARGIN_MAX);
+		expect(bandMargin(2000 / 0.019176, 0.019176)).toBeCloseTo(BAND_MARGIN_MAX / 0.019176, 0);
 	});
 });

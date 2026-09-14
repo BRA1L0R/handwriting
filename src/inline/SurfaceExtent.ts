@@ -76,13 +76,13 @@ export class ScrollExpansionDemand {
 	}
 
  /** Programmatic navigation/resize rebases offsets without generating demand. */
- rebase(left:number,top:number):void {
+ rebase(left:number,top:number,preserveDemand=false):void {
   this.left=left; this.top=top;
   this.rebased=true;
-  if(this.room) { this.pendingX=false; this.pendingY=false; }
+  if(this.room && !preserveDemand) { this.pendingX=false; this.pendingY=false; }
  }
 
-	reserve(next: ScrollRoom): Extent {
+	reserve(next: ScrollRoom, navigation?: { left: number; top: number }): Extent {
 		if (!this.enabled || next.width <= 0 || next.height <= 0 || next.fontZoom <= 0) return ZERO_EXTENT;
 		const old = this.room;
 		const resized = !old || old.fontZoom !== next.fontZoom || old.pinchScale !== next.pinchScale;
@@ -93,11 +93,22 @@ export class ScrollExpansionDemand {
 		this.pendingX = this.pendingY = false;
 		const nativeWidth = next.nativeWidth ?? next.width;
 		const nativeHeight = next.nativeHeight ?? next.height;
+		// A zoom-out can consume the entire native range. Seed that newly
+		// stranded axis once, even after a camera rebase; stationary geometry
+		// and navigation within an existing range do not request another grant.
+		const strandedX = !!old && (resized || old.width !== next.width) && next.edgeX <= nativeWidth;
+		const strandedY = !!old && (resized || old.height !== next.height) && next.edgeY <= nativeHeight;
+		// A completed pinch supplies its accepted scroll demand before the
+		// browser clamps the write. Preview never mutates the extent or raster.
+		const left = navigation && Number.isFinite(navigation.left) ? Math.max(next.left, navigation.left) : next.left;
+		const top = navigation && Number.isFinite(navigation.top) ? Math.max(next.top, navigation.top) : next.top;
 		return {
-			x: x && next.edgeX - next.left - nativeWidth < next.width
-				? Math.max(0, (next.left + nativeWidth + next.width - next.origin.left) / next.fontZoom) : 0,
-			y: y && next.edgeY - next.top - nativeHeight < next.height
-				? Math.max(0, (next.top + nativeHeight + next.height - next.origin.top) / next.fontZoom) : 0,
+			x: Math.max(strandedX ? Math.max(0, (nativeWidth + next.width - next.origin.left) / next.fontZoom) : 0,
+				(x || left > next.left) && next.edgeX - left - nativeWidth < next.width
+					? Math.max(0, (left + nativeWidth + next.width - next.origin.left) / next.fontZoom) : 0),
+			y: Math.max(strandedY ? Math.max(0, (nativeHeight + next.height - next.origin.top) / next.fontZoom) : 0,
+				(y || top > next.top) && next.edgeY - top - nativeHeight < next.height
+					? Math.max(0, (top + nativeHeight + next.height - next.origin.top) / next.fontZoom) : 0),
 		};
 	}
 
@@ -213,6 +224,11 @@ export const WRITE_FRONTIER_VIEWPORT_FRACTION = 0.75;
  * phone, which is where the hand falls off (1.4.6 §5n, the folding-phone
  * report).
  *
+ * `clientHeight` is a SCREENFUL in the scroller's own coordinates, which is
+ * not the same element at every zoom: below 1.0 the note viewport counter-
+ * sizes the editor and scales it back down, so the screenful is the scroller's
+ * client box and the takeover pane is a fraction of it.
+ *
  * Same shape and units as `zoomFrontier`'s y: `origin.top` and
  * `contentBottom` are scroller-content px, the result is divided by
  * `fontZoom` (the spacer scales it back up), and it never goes negative.
@@ -227,11 +243,39 @@ export const WRITE_FRONTIER_VIEWPORT_FRACTION = 0.75;
  * is blank scroll range, not lost ink - but it must be written down rather
  * than rediscovered.
  *
- * Callers must compute this ONLY when the surface is being written on (ink
- * present, or the pen has been seen this session) and pass `ZERO_EXTENT`
- * otherwise - a note nobody has inked and no pen has touched must keep a
- * byte-identical extent, so a typing-only vault never gains phantom scroll.
+ * Callers must compute this ONLY when `writeFrontierApplies` says so and pass
+ * `ZERO_EXTENT` otherwise - a note nobody has inked, no pen has touched and
+ * nobody has zoomed out must keep a byte-identical extent, so a typing-only
+ * vault never gains phantom scroll.
  */
+/**
+ * When the vertical grant above is due.
+ *
+ * `writtenOn` is the original case: ink present, or the pen has been seen
+ * this session. ZOOMING THE NOTE VIEWPORT OUT is the second, and it is a
+ * handwriting act too - nobody pinches a text note down to a tenth to type
+ * into it, they do it to see the page they are about to write on. Without
+ * this, a note that has never been inked stops dead at the bottom of its own
+ * text: the whole page nearly fits the screen and there is nothing below it
+ * to scroll to, which reads as a scroll that only works sideways.
+ *
+ * Zoom IN grants nothing (`zoomFrontier` already covers the magnified
+ * overhang), and at 1.0 an untouched note is byte-identical to what it gets
+ * today.
+ *
+ * THE RATCHET applies here as well: grants never shrink, so a note zoomed
+ * out and then returned to 1.0 keeps the room it was granted at the zoom,
+ * in layout px, below its text for the rest of the session. Same trade
+ * `writeFrontier` and `zoomFrontier` already take - blank scroll range, not
+ * lost ink - and there is no shrink path.
+ */
+export function writeFrontierApplies(g: {
+	writtenOn: boolean;
+	pinchScale: number;
+}): boolean {
+	return g.writtenOn || g.pinchScale < 1;
+}
+
 export function writeFrontier(g: {
 	clientHeight: number;
 	/** Document bottom in scroller-content px, same value zoomFrontier used. */

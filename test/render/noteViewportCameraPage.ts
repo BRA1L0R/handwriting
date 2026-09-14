@@ -1,8 +1,8 @@
 import { setPenGestureGuardEnabled } from "../../src/inline/InlinePenRouter";
 import { EditorState, StateEffect } from "@codemirror/state";
 import { EditorView, Decoration, WidgetType } from "@codemirror/view";
-import { history, undoDepth, undo, redo } from "@codemirror/commands";
-import { inlineInk, inkOverlayExtension, overlayForPath, setScrollExpansionEnabled, setInlineEraserMode, setInlineLassoMode } from "../../src/inline/InkOverlay";
+import { history, undoDepth, undo, redo, isolateHistory } from "@codemirror/commands";
+import { inlineInk, inkOverlayExtension, overlayForPath, setScrollExpansionEnabled, setInlineEraserMode, setInlineLassoMode, setInlineSpaceMode } from "../../src/inline/InkOverlay";
 import { surfaceExtents } from "../../src/inline/SurfaceExtent";
 import { setPenInk } from "../../src/inline/PenInk";
 import { installObsidianDom } from "./obsidianDom";
@@ -51,8 +51,9 @@ async function run(zoom:number,candidate:boolean,axis: "x" | "y" = "y",font=1,ca
 	}
 	const strokes=JSON.parse(JSON.stringify(inlineInk.strokes(path)));
 	const contentRect=view.contentDOM.getBoundingClientRect();
-	const errors=strokes.map((s:any,i:number)=>({x:s.points[0].x-(corners[i]!.x-contentRect.left)/(zoom*font),y:s.points[0].y-(corners[i]!.y-contentRect.top)/(zoom*font)}));
-	const measured={fontZoom:(overlay as any).fontZoom,scaleX:view.scaleX,overlayScale:(overlay as any).cssScale,rect:scroller.getBoundingClientRect().toJSON(),contentWidth:view.contentDOM.offsetWidth,backings:[...host.querySelectorAll("canvas")].map(c=>({w:c.width,h:c.height}))};
+	const textTop=view.contentDOM.querySelector(".cm-line")!.getBoundingClientRect().top;
+	const errors=strokes.map((s:any,i:number)=>({x:s.points[0].x-(corners[i]!.x-contentRect.left)/(zoom*font),y:s.points[0].y-(corners[i]!.y-textTop)/(zoom*font)}));
+	const measured={paddingTop:Number.parseFloat(getComputedStyle(view.contentDOM).paddingTop),fontZoom:(overlay as any).fontZoom,scaleX:view.scaleX,overlayScale:(overlay as any).cssScale,rect:scroller.getBoundingClientRect().toJSON(),contentWidth:view.contentDOM.offsetWidth,backings:[...host.querySelectorAll("canvas")].map(c=>({w:c.width,h:c.height}))};
 	// Real routed touch after pen contact: observe whether this is assist/parole.
 	const touchTrace:any[]=[];
 	const router=(overlay as any).router;
@@ -115,23 +116,60 @@ async function mountControl() {
 // Persisted fixture data is loaded through the real store/host boundary.
 class InlineWidget extends WidgetType { toDOM(){const el=document.createElement("span");el.textContent="[widget]";return el;} }
 const rigs=new Map<string,{host:HTMLElement;view:EditorView;overlay:any;path:string}>();
-async function setup(id:string,kind="far",font=1,external=1) {
+async function setup(id:string,kind="far",font=1,external=1,initialDoc?:string) {
  const path=`fit-${id}.md`,pageId=`fit-page-${id}`;
  if(kind==="loading")blockedIds.add(pageId);
  setScrollExpansionEnabled(true);
  if(!ids.has(path)) {
   const data=emptyPage(pageId);data.surface="inline";
-  const points=kind==="empty"?[]:kind==="edge"?[[6,120]]:kind==="point"?[[80,120]]:kind==="huge"?[[200,200],[9_000_000,9_000_000]]:[[200,200],[18000,22000]];
+  const points=kind==="empty"?[]:kind==="edge"?[[6,120]]:kind==="point"?[[80,120]]:kind==="huge"?[[200,200],[9_000_000,9_000_000]]:kind==="below-minimum"?[[200,200],[100000,100000]]:kind==="former-far"?[[200,200],[18000,22000]]:kind==="fit-six"?[[200,200],[6736,6736]]:kind==="paper-scaled"?[[200,200],[900,1100]]:[[200,200],[1800,2200]];
   const long=kind!=="point"&&kind!=="edge";const width=long?32:2,dx=long?800:10,dy=long?600:8;
   data.strokes=points.map(([x,y],i)=>({id:`seed-${i}`,tool:"pen" as const,color:"#000000",width,createdAt:1,points:[{x:x!,y:y!,pressure:.5,t:0},{x:x!+dx,y:y!+dy,pressure:.5,t:10}],bbox:{x:x!-width,y:y!-width,width:dx+2*width,height:dy+2*width}}));
   if(kind==="thick-dot"||kind==="negative")data.strokes=[{id:"seed-0",tool:"pen",color:"#000000",width:kind==="thick-dot"?1000:2,createdAt:1,points:[{x:kind==="thick-dot"?3000:-100,y:3000,pressure:.5,t:0}],bbox:{x:0,y:0,width:0,height:0}}]; // Parse recomputes the stored bbox.
+  // Geometry below reproduces R2's mounted-review receipt exactly (bboxes
+  // 92,92 / 92,-60 / -508,99992 / 99992,-508, all 36x36), so the fixtures
+  // match the exact configuration R2 verified rather than an invented one.
+  // A single reachable stroke: x/y 96..124, pen width 2 -> bbox {x:92,y:92,width:36,height:36}.
+  if(kind==="reachable-body-only")data.strokes=[
+   {id:"body",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:96,y:96,pressure:.5,t:0},{x:124,y:124,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
+  ];
+  // Disjoint: the same reachable body plus TWO outliers, one left-and-below
+  // the origin (x<0, y huge positive) and one right-and-above (x huge
+  // positive, y<0). This is the pair the old combined-bbox clamp got wrong:
+  // each outlier is wholly unreachable on its OWN axis, but its OTHER axis
+  // sits well inside the reachable range, so a union taken before clipping
+  // fabricates a huge box neither outlier's reachable extent supports.
+  if(kind==="disjoint")data.strokes=[
+   {id:"outlierLeftBelow",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:-504,y:99996,pressure:.5,t:0},{x:-476,y:100024,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
+   {id:"outlierRightAbove",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:99996,y:-504,pressure:.5,t:0},{x:100024,y:-476,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
+   {id:"body",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:96,y:96,pressure:.5,t:0},{x:124,y:124,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
+  ];
+  // Ink above the first line (wholly unreachable) plus a separate reachable
+  // body below it - the shape of Alan's real note. The unreachable stroke
+  // must still let the reachable one produce "fit".
+  if(kind==="negative-y-with-body")data.strokes=[
+   {id:"aboveLine",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:96,y:-56,pressure:.5,t:0},{x:124,y:-28,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
+   {id:"body",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:96,y:96,pressure:.5,t:0},{x:124,y:124,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
+  ];
+  // Exactly R2's "disjoint-unreachable" case: the same two outliers with NO
+  // reachable body - distinct from "empty" (no strokes at all), which must
+  // still reset to 100% rather than refuse.
+  if(kind==="wholly-unreachable-multi")data.strokes=[
+   {id:"outlierLeftBelow",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:-504,y:99996,pressure:.5,t:0},{x:-476,y:100024,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
+   {id:"outlierRightAbove",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:99996,y:-504,pressure:.5,t:0},{x:100024,y:-476,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
+  ];
+  if(kind==="negative-width-padding"||kind==="partial-negative-y"){
+   const x=kind==="negative-width-padding"?0:100,y=kind==="partial-negative-y"?-4:100;
+   data.strokes=[{id:"edge-body",tool:"pen",color:"#000000",width:2,createdAt:1,points:[{x,y,pressure:.5,t:0},{x:x+20,y:y+28,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}}];
+  }
   ids.set(path,pageId);pages.set(pageId,serializePage(data));
  }
  const host=document.body.appendChild(document.createElement("div"));host.className="markdown-source-view camera-proof";host.dataset.rig=id;
+ if(kind==="zero-padding")host.classList.add("zero-padding-control");
  if(kind==="theme") {document.body.classList.add("handwriting-paper-grid");document.body.style.setProperty("--background-modifier-border","#aaaaaa");const style=document.createElement("style");style.textContent=`[data-rig="${id}"] .cm-content {max-width:500px;margin:0 auto;padding:20px 24px;} [data-rig="${id}"] .cm-line {padding:0 12px;}`;host.appendChild(style);}
  if(external!==1){host.style.transform=`scale(${external})`;host.style.transformOrigin="0 0";}
- const doc="alpha beta gamma delta ".repeat(30)+"\n# Heading\n- list item\nsecond line";
- const view=new EditorView({parent:host,state:EditorState.create({doc,extensions:[history(),EditorView.lineWrapping,EditorView.decorations.of(Decoration.set([Decoration.widget({widget:new InlineWidget()}).range(doc.indexOf("# Heading"))])),editorInfoField.init(()=>({app:{commands:{executeCommandById:()=>false}},file:{path},editor:{}})),inkOverlayExtension(),EditorView.theme({"&":{width:"640px",height:"480px"},".cm-content":{fontFamily:"monospace",fontSize:`${16*font}px`,lineHeight:"24px"}})]})});
+ const doc=initialDoc??("alpha beta gamma delta ".repeat(30)+"\n# Heading\n- list item\nsecond line");
+ const view=new EditorView({parent:host,state:EditorState.create({doc,extensions:[history(),EditorView.lineWrapping,EditorView.decorations.of(Decoration.set(doc.includes("# Heading")?[Decoration.widget({widget:new InlineWidget()}).range(doc.indexOf("# Heading"))]:[])),editorInfoField.init(()=>({app:{commands:{executeCommandById:()=>false}},file:{path},editor:{}})),inkOverlayExtension(),EditorView.theme({"&":{width:"640px",height:"480px"},".cm-content":{fontFamily:"monospace",fontSize:`${16*font}px`,lineHeight:"24px"}})]})});
  await settle();
  const overlay=overlayForPath(path)!;rigs.set(id,{host,view,overlay,path});
  return snap(id);
@@ -140,9 +178,76 @@ function snap(id:string) {
  const {host,view,overlay,path}=rigs.get(id)!;
  const cr=view.contentDOM.getBoundingClientRect(),sr=view.scrollDOM.getBoundingClientRect(),scale=overlay.cssScale,font=overlay.fontZoom;
  const paperStyle=getComputedStyle(view.scrollDOM);
- return {paper:{image:paperStyle.backgroundImage,attachment:paperStyle.backgroundAttachment},state:overlay.getNoteViewportState(),doc:view.state.doc.toString(),writes,history:undoDepth(view.state),strokes:JSON.parse(JSON.stringify(inlineInk.strokes(path))),extent:surfaceExtents.get(path),scroll:{left:view.scrollDOM.scrollLeft,top:view.scrollDOM.scrollTop,width:view.scrollDOM.scrollWidth,height:view.scrollDOM.scrollHeight},viewport:{x:sr.x,y:sr.y,width:sr.width,height:sr.height},ink:inlineInk.strokes(path).map(s=>({id:s.id,x:cr.left+s.bbox.x*scale*font,y:view.documentTop+s.bbox.y*scale*font,right:cr.left+(s.bbox.x+s.bbox.width)*scale*font,bottom:view.documentTop+(s.bbox.y+s.bbox.height)*scale*font})),layout:Array.from({length:100},(_,i)=>{const c=view.coordsAtPos(i)!;return[(c.left-cr.left)/scale,(c.top-cr.top)/scale];}),buttons:[...host.querySelectorAll(".handwriting-note-viewport-controls button")].map(b=>b.getBoundingClientRect().toJSON()),backings:[...host.querySelectorAll("canvas")].map(c=>c.width*c.height),selection:view.state.selection.main.toJSON(),selected:overlay.selection.strokeIds,handles:host.querySelectorAll(".handwriting-selection-handle").length};
+ return {paddingTop:Number.parseFloat(getComputedStyle(view.contentDOM).paddingTop),paper:{image:paperStyle.backgroundImage,attachment:paperStyle.backgroundAttachment},state:overlay.getNoteViewportState(),doc:view.state.doc.toString(),writes,history:undoDepth(view.state),strokes:JSON.parse(JSON.stringify(inlineInk.strokes(path))),extent:surfaceExtents.get(path),scroll:{left:view.scrollDOM.scrollLeft,top:view.scrollDOM.scrollTop,width:view.scrollDOM.scrollWidth,height:view.scrollDOM.scrollHeight},viewport:{x:sr.x,y:sr.y,width:sr.width,height:sr.height},ink:inlineInk.strokes(path).map(s=>({id:s.id,x:cr.left+s.bbox.x*scale*font,y:view.documentTop+s.bbox.y*scale*font,right:cr.left+(s.bbox.x+s.bbox.width)*scale*font,bottom:view.documentTop+(s.bbox.y+s.bbox.height)*scale*font})),layout:Array.from({length:Math.min(100,view.state.doc.length+1)},(_,i)=>{const c=view.coordsAtPos(i)!;return[(c.left-cr.left)/scale,(c.top-cr.top)/scale];}),buttons:[...host.querySelectorAll(".handwriting-note-viewport-controls button")].map(b=>b.getBoundingClientRect().toJSON()),backings:[...host.querySelectorAll("canvas")].map(c=>c.width*c.height),selection:view.state.selection.main.toJSON(),selected:overlay.selection.strokeIds,handles:host.querySelectorAll(".handwriting-selection-handle").length};
 }
 async function fit(id:string) {const r=rigs.get(id)!.overlay.fitHandwriting();await settle();return {result:r,...snap(id)};}
+/**
+ * Pixels the user can actually SEE after Fit: the committed ink canvas
+ * cropped to the scroller's on-screen viewport. Same shape as
+ * `visibleCommitted` in blankNotePastePage.ts - canvases stack
+ * highlight/highlightWet/committed/wet/tail, so index 2 is committed ink,
+ * and an oversized backing store (the surface grows right/bottom) must not
+ * count pixels that are painted but scrolled out of view.
+ */
+function visiblePainted(id:string):number {
+ const {host,view}=rigs.get(id)!;
+ const canvas=host.querySelectorAll<HTMLCanvasElement>(".handwriting-ink-layer canvas")[2];
+ if(!canvas) throw new Error("committed canvas missing");
+ const ctx=canvas.getContext("2d");
+ if(!ctx) throw new Error("committed context missing");
+ const canvasRect=canvas.getBoundingClientRect(),viewportRect=view.scrollDOM.getBoundingClientRect();
+ const left=Math.max(canvasRect.left,viewportRect.left),top=Math.max(canvasRect.top,viewportRect.top);
+ const right=Math.min(canvasRect.right,viewportRect.right),bottom=Math.min(canvasRect.bottom,viewportRect.bottom);
+ if(right<=left||bottom<=top||canvasRect.width<=0||canvasRect.height<=0) return 0;
+ const sx=Math.max(0,Math.floor((left-canvasRect.left)/canvasRect.width*canvas.width));
+ const sy=Math.max(0,Math.floor((top-canvasRect.top)/canvasRect.height*canvas.height));
+ const ex=Math.min(canvas.width,Math.ceil((right-canvasRect.left)/canvasRect.width*canvas.width));
+ const ey=Math.min(canvas.height,Math.ceil((bottom-canvasRect.top)/canvasRect.height*canvas.height));
+ const pixels=ctx.getImageData(sx,sy,Math.max(1,ex-sx),Math.max(1,ey-sy)).data;
+ let count=0;for(let i=3;i<pixels.length;i+=4)if(pixels[i]!==0)count++;
+ return count;
+}
+/**
+ * Painted pixels PER STROKE, so "the ink is visible" cannot pass on one
+ * stroke while the rest vanish.
+ *
+ * `visiblePainted` above counts every non-transparent pixel in the viewport
+ * and answers one bit: something painted. At a Fit scale below ten percent
+ * that is exactly the reading the low-zoom invisible-ink history produced -
+ * one surviving stroke carries the count while thinner ones disappear under
+ * the committed width floor. So each stroke is sampled inside its OWN
+ * on-screen box (the same client-space box `snap` reports), padded by 2 CSS
+ * px for the floor's own half pixel.
+ *
+ * ALPHA > 20, not > 0, and that is the whole point: a stroke thinned to a
+ * whisper still leaves antialiased pixels with a few units of alpha, and
+ * counting those would keep the defect green. 20 is the bar the lag
+ * harness's `endpointPixels` already uses for "this ink is really there".
+ */
+function strokesPainted(id:string):{id:string;painted:number;sampled:boolean}[] {
+ const {host,view,overlay,path}=rigs.get(id)!;
+ const canvas=host.querySelectorAll<HTMLCanvasElement>(".handwriting-ink-layer canvas")[2];
+ if(!canvas) throw new Error("committed canvas missing");
+ const ctx=canvas.getContext("2d");
+ if(!ctx) throw new Error("committed context missing");
+ const canvasRect=canvas.getBoundingClientRect(),viewportRect=view.scrollDOM.getBoundingClientRect();
+ const cr=view.contentDOM.getBoundingClientRect(),scale=overlay.cssScale,font=overlay.fontZoom;
+ if(canvasRect.width<=0||canvasRect.height<=0) return inlineInk.strokes(path).map(s=>({id:s.id,painted:0,sampled:false}));
+ const kx=canvas.width/canvasRect.width,ky=canvas.height/canvasRect.height;
+ return inlineInk.strokes(path).map(stroke=>{
+  const b=stroke.bbox;
+  const box={left:cr.left+b.x*scale*font-2,top:view.documentTop+b.y*scale*font-2,
+   right:cr.left+(b.x+b.width)*scale*font+2,bottom:view.documentTop+(b.y+b.height)*scale*font+2};
+  const left=Math.max(box.left,canvasRect.left,viewportRect.left),top=Math.max(box.top,canvasRect.top,viewportRect.top);
+  const right=Math.min(box.right,canvasRect.right,viewportRect.right),bottom=Math.min(box.bottom,canvasRect.bottom,viewportRect.bottom);
+  if(right<=left||bottom<=top) return {id:stroke.id,painted:0,sampled:false};
+  const px=ctx.getImageData(Math.max(0,Math.floor((left-canvasRect.left)*kx)),Math.max(0,Math.floor((top-canvasRect.top)*ky)),
+   Math.max(1,Math.ceil((right-left)*kx)),Math.max(1,Math.ceil((bottom-top)*ky))).data;
+  let painted=0;for(let i=3;i<px.length;i+=4)if(px[i]!>20)painted++;
+  return {id:stroke.id,painted,sampled:true};
+ });
+}
+async function fitVisible(id:string) {const r=rigs.get(id)!.overlay.fitHandwriting();await settle();return {result:r,visiblePainted:visiblePainted(id),strokesPainted:strokesPainted(id),...snap(id)};}
 async function growEmpty(id:string){surfaceExtents.grow(rigs.get(id)!.path,{x:500000,y:600000});rigs.get(id)!.overlay.updateExtent(true);await settle();return snap(id);}
 async function reopen(id:string) {const r=rigs.get(id)!;r.view.destroy();r.host.remove();await setup(id);return snap(id);}
 function penEvent(type:string,x:number,y:number,pointerId=120){document.elementFromPoint(x,y)?.dispatchEvent(new PointerEvent(type,{bubbles:true,cancelable:true,pointerType:"pen",pointerId,isPrimary:true,clientX:x,clientY:y,buttons:type==="pointerup"?0:1,pressure:.5}));}
@@ -165,7 +270,8 @@ async function stale(id:string) {
  r.view.dispatch({changes:{from:0,to:r.view.state.doc.length,insert:"replacement untouched"},effects:StateEffect.reconfigure.of([history(),editorInfoField.init(()=>({app:{commands:{executeCommandById:()=>false}},file:{path:next},editor:{}})),inkOverlayExtension()])});
  await settle();return {doc:r.view.state.doc.toString(),scroll:[r.view.scrollDOM.scrollLeft,r.view.scrollDOM.scrollTop],transform:r.view.dom.style.transform,flashes:r.host.querySelectorAll(".handwriting-ink-flash").length};
 }
-(window as any).viewportFixture={setup,snap,fit,growEmpty,reopen,gesture,stale,settle,
+(window as any).viewportFixture={setup,snap,fit,fitVisible,growEmpty,reopen,gesture,stale,settle,
+ hiddenFit:async(id:string)=>{const r=rigs.get(id)!;r.host.style.display="none";r.view.requestMeasure();await settle();const valid=r.overlay.scaleGeometryValid,result=r.overlay.fitHandwriting();return {valid,result,writes,strokes:JSON.parse(JSON.stringify(inlineInk.strokes(r.path)))};},
  caret:(id:string,pos:number)=>rigs.get(id)!.view.coordsAtPos(pos),
  keyboard:()=>setPenInk(false),
  hold:(id:string,on:boolean)=>{setPenInk(true);setInlineEraserMode(false);setInlineLassoMode(false);penEvent(on?"pointerdown":"pointerup",100,180,991);return snap(id).state.busy;},
@@ -215,9 +321,109 @@ async function momentum(zoom:number,axis:"x"|"y",mode:string) {
 
 // Audit entry points operate the mounted production controls/router/history.
 (window as any).edgeAudit={
+ commit:async(id:string,scale:number)=>{const accepted=rigs.get(id)!.overlay.commitCameraScale(scale);await settle();return {accepted,...snap(id)};},
+ floorPinch:async(id:string)=>{
+  const r=rigs.get(id)!;r.overlay.commitCameraScale(.2,{left:0,top:0});await settle();
+  const send=(type:string,pointerId:number,x:number)=>{const target=document.elementFromPoint(x,250);if(!target||!r.view.scrollDOM.contains(target))throw Error("pinch outside editor");target.dispatchEvent(new PointerEvent(type,{bubbles:true,cancelable:true,pointerType:"touch",pointerId,isPrimary:pointerId===701,clientX:x,clientY:250,buttons:type==="pointerup"?0:1,width:8,height:8}));};
+  send("pointerdown",701,250);send("pointerdown",702,350);send("pointermove",701,295);send("pointermove",702,305);await settle();
+  const live=snap(id);send("pointerup",701,295);send("pointerup",702,305);await settle();return {live,after:snap(id)};
+ },
  zoom:async(id:string,factor:number)=>{const accepted=rigs.get(id)!.overlay.zoomNoteBy(factor);await settle();return {accepted,...snap(id)};},
+ // A real two-finger pinch from the CURRENT scale: spread `from` px closing or
+ // opening to `to` px about (300,250). floorPinch above first commits 20%.
+ pinchBy:async(id:string,from:number,to:number)=>{
+  const r=rigs.get(id)!;
+  const send=(type:string,pointerId:number,x:number)=>{const target=document.elementFromPoint(x,250);if(!target||!r.view.scrollDOM.contains(target))throw Error("pinch outside editor");target.dispatchEvent(new PointerEvent(type,{bubbles:true,cancelable:true,pointerType:"touch",pointerId,isPrimary:pointerId===701,clientX:x,clientY:250,buttons:type==="pointerup"?0:1,width:8,height:8}));};
+  send("pointerdown",701,300-from/2);send("pointerdown",702,300+from/2);send("pointermove",701,300-to/2);send("pointermove",702,300+to/2);await settle();
+  const live=snap(id);send("pointerup",701,300-to/2);send("pointerup",702,300+to/2);await settle();return {live,after:snap(id)};
+ },
  history:async(id:string,action:string)=>{const accepted=(action==="undo"?undo:redo)(rigs.get(id)!.view);await settle();return {accepted,...snap(id)};},
  eraseOutlier:async(id:string)=>{const r=rigs.get(id)!;const b=snap(id).ink.at(-1)!;setPenInk(true);setInlineLassoMode(false);setInlineEraserMode(true);const x=(b.x+b.right)/2,y=(b.y+b.bottom)/2;penEvent("pointerdown",x,y);penEvent("pointermove",x+1,y+1);penEvent("pointerup",x+1,y+1);await settle();return snap(id);},
  heldTool:async(id:string,kind:string)=>{const r=rigs.get(id)!;setPenInk(true);setInlineEraserMode(kind==="erase");setInlineLassoMode(kind==="lasso");penEvent("pointerdown",300,250,876);penEvent("pointermove",310,260,876);const before=snap(id),result=r.overlay.fitHandwriting();penEvent("pointerup",310,260,876);await settle();return {before,result,after:snap(id)};},
  tinyTouch:async(id:string)=>{const r=rigs.get(id)!;setPenInk(false);setInlineEraserMode(false);setInlineLassoMode(false);setPenGestureGuardEnabled(false);const scroller=r.view.scrollDOM;const before=snap(id);const event=(type:string,pid:number,x:number,y:number)=>scroller.dispatchEvent(new PointerEvent(type,{bubbles:true,cancelable:true,pointerType:"touch",pointerId:pid,isPrimary:pid===701,clientX:x,clientY:y,buttons:type==="pointerup"?0:1,width:8,height:8}));event("pointerdown",701,300,350);event("pointermove",701,300,290);event("pointerup",701,300,290);await settle();const panned=snap(id);const fling=r.overlay.router.flingRaf!==0;event("pointerdown",701,250,250);event("pointerdown",702,350,250);event("pointermove",702,450,250);await settle();const pinched=snap(id);event("pointerup",701,250,250);event("pointerup",702,450,250);await settle();return {before,panned,pinched,after:snap(id),fling};},
+};
+
+// Reuse the real store, editor, camera and hit-tested router to compare the
+// Insert Space contact/preview boundary with the eventual text/ink operation.
+(window as any).insertSpaceProbe=async(zoom=1,font=1,scroll=0,wrapped=false,options:{dy?:number;end?:string;textOnly?:boolean;markup?:boolean;edit?:boolean;shortText?:string;context?:string;contactY?:number;tall?:boolean;sweep?:number[];moves?:number[];invalidTarget?:boolean;localColumns?:boolean;clickOnly?:boolean;verifySaved?:boolean}={})=>{
+ const id="space-precision",path=`fit-${id}.md`,pageId=`fit-page-${id}`;
+ const data=emptyPage(pageId);data.surface="inline";
+ data.strokes=[90,210].map((y,i)=>({id:`row-${i}`,tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:30,y,pressure:.5,t:0},{x:40,y:y+20,pressure:.5,t:10}],bbox:{x:28,y:y-2,width:14,height:24}}));
+ if(options.tall)data.strokes=[{id:"tall",x:30,top:50,bottom:190},{id:"distant",x:330,top:170,bottom:230},{id:"below",x:80,top:280,bottom:300}].map(s=>({id:s.id,tool:"pen",color:"#000000",width:2,createdAt:1,points:[{x:s.x,y:s.top,pressure:.3,t:0},{x:s.x+10,y:s.bottom,pressure:.8,t:10}],bbox:{x:s.x-2,y:s.top-2,width:14,height:s.bottom-s.top+4}}));
+ if(options.localColumns)data.strokes=[{id:"left-upper",x:0,w:200,top:60,bottom:95},{id:"right-upper",x:600,w:300,top:90,bottom:115},{id:"left-crossing",x:0,w:200,top:110,bottom:150},{id:"right-lower",x:600,w:300,top:140,bottom:170}].map(s=>({id:s.id,tool:"pen",color:"#000000",width:2,createdAt:1,points:[{x:s.x,y:s.top,pressure:.3,t:0},{x:s.x+s.w,y:s.bottom,pressure:.8,t:10}],bbox:{x:s.x-2,y:s.top-2,width:s.w+4,height:s.bottom-s.top+4}}));
+ if(options.textOnly)data.strokes=[];
+ ids.set(path,pageId);pages.set(pageId,serializePage(data));
+ const paragraph="word ".repeat(240);
+ const contextual=options.context==="setext-dash"?paragraph+"\n---\nlast":options.context==="setext-equals"?paragraph+"\n===\nlast":options.context==="fence"?"```\n"+paragraph+"\n```\nlast":options.context==="frontmatter"?"---\ntitle: "+paragraph+"\n---\nlast":undefined;
+ const doc=contextual??options.shortText??(wrapped?(options.markup?`**${paragraph}**`:paragraph)+"\nlast":Array.from({length:80},(_,i)=>`text line ${i+1}`).join("\n"));
+ await setup(id,"empty",1,1,doc);const r=rigs.get(id)!;
+ if(options.localColumns){r.view.dom.style.width="1000px";r.view.dom.parentElement!.style.width="1000px";r.view.requestMeasure();await settle();}
+ if(font!==1){r.view.contentDOM.style.fontSize=`${16*font}px`;r.view.requestMeasure();await settle();}
+ r.overlay.commitCameraScale(zoom,{left:0,top:scroll});await settle();
+ const origin=r.view.contentDOM.getBoundingClientRect().top+parseFloat(getComputedStyle(r.view.contentDOM).paddingTop)*r.overlay.cssScale;
+ const scale=r.overlay.scale,contact={x:100,y:origin+(options.contactY??104)*scale};
+ // Observe the actual transient renderer, not a copy of the planner's IDs.
+ // Each recorded stroke must also produce pixels at its projected midpoint.
+ let rendered:any[]=[],labels:any[]=[],guides:number[]=[];
+ const tail=r.overlay.tail,clear=tail.clearAll.bind(tail),draw=tail.drawSpaceStroke?.bind(tail),label=tail.drawSpaceLabel?.bind(tail),divider=tail.drawSpaceDivider.bind(tail);
+ tail.clearAll=(...args:any[])=>{rendered=[];labels=[];guides=[];return clear(...args);};
+ if(draw)tail.drawSpaceStroke=(cam:any,s:any,color:string,...args:any[])=>{
+  if(!draw(cam,s,color,...args))return false;
+  const a=s.points[0],b=s.points.at(-1),ctx=tail.ctx;
+  const px=((a.x+b.x)/2-cam.x)*cam.zoom,py=((a.y+b.y)/2-cam.y)*cam.zoom;
+  const ratio=ctx.canvas.width/r.overlay.cssWidth;
+  const data=ctx.getImageData(Math.floor(px*ratio)-1,Math.floor(py*ratio)-1,3,3).data;
+  const alpha=Array.from(data).filter((_,i)=>i%4===3).some(v=>(v as number)>0);
+  rendered.push({id:s.id,moving:color!=="#d98b00",alpha});return true;
+ };
+ if(label)tail.drawSpaceLabel=(cam:any,y:number,text:string,...args:any[])=>{labels.push({y,text});return label(cam,y,text,...args);};
+ tail.drawSpaceDivider=(cam:any,y:number,...args:any[])=>{guides.push(y);return divider(cam,y,...args);};
+ const feedback=()=>({rendered:structuredClone(rendered),labels:structuredClone(labels),guides:[...guides]});
+ if(options.invalidTarget)r.overlay.planSpace=()=>null;
+ const coords=()=>Array.from({length:r.view.state.doc.lines},(_,i)=>{const l=r.view.state.doc.line(i+1),c=r.view.coordsAtPos(l.from);return {text:l.text,top:c?.top,bottom:c?.bottom};});
+ const capture=()=>({doc:r.view.state.doc.toString(),strokes:JSON.parse(JSON.stringify(inlineInk.strokes(path))),text:coords(),rects:Array.from({length:r.view.state.doc.length+1},(_,i)=>r.view.coordsAtPos(i,1)),zoom:r.overlay.getNoteViewportState().zoom,history:undoDepth(r.view.state),scroll:{left:r.view.scrollDOM.scrollLeft,top:r.view.scrollDOM.scrollTop}});
+ const before=capture();
+ const otherPath="space-switch-other.md",otherId="space-switch-other";
+ let otherBefore:any=null,otherAfter:any=null;
+ if(options.end==="switch"){
+  const other=emptyPage(otherId);other.surface="inline";
+  // Deliberately reuse stroke IDs: an inverse applied to the new note is
+  // observable even when it looks superficially like the original moving set.
+  other.strokes=structuredClone(data.strokes);
+  for(const s of other.strokes){for(const p of s.points)p.y+=500;s.bbox.y+=500;}
+  ids.set(otherPath,otherId);pages.set(otherId,serializePage(other));await inlineInk.ensureLoaded(otherPath);
+  otherBefore=structuredClone(inlineInk.strokes(otherPath));
+ }
+ setPenInk(true);setInlineSpaceMode(true);
+ const sweep=[];
+ for(const y of options.sweep??[]){penEvent("pointermove",contact.x,origin+y*scale,921);await new Promise(requestAnimationFrame);sweep.push({y,reticle:r.overlay.penCursorEl?.getBoundingClientRect().top,...feedback()});}
+ penEvent("pointermove",contact.x,contact.y,921);
+ await new Promise(requestAnimationFrame);
+ const hover=r.overlay.penCursorEl?.getBoundingClientRect().top;
+ const hoverFeedback=feedback();
+ penEvent("pointerdown",contact.x,contact.y,921);
+ const down={cut:r.overlay.spaceLineY,ids:[...r.overlay.spaceIds],reticle:r.overlay.penCursorEl?.getBoundingClientRect().top,mode:r.overlay.mode,...feedback()};
+ const dy=options.clickOnly?0:options.dy??48;
+ const moves=[];
+ for(const y of options.moves??[]){penEvent("pointermove",contact.x,contact.y+y*scale,921);await new Promise(requestAnimationFrame);moves.push({dy:y,ids:[...r.overlay.spaceIds],strokes:capture().strokes,reticle:r.overlay.penCursorEl?.getBoundingClientRect().top,...feedback()});}
+ if(!options.clickOnly)penEvent("pointermove",contact.x,contact.y+dy*scale,921);
+ await new Promise(requestAnimationFrame);
+ const live={cut:r.overlay.spaceLineY,dy:r.overlay.spaceTotalDy,reticle:r.overlay.penCursorEl?.getBoundingClientRect().top,...feedback()};
+ if(options.edit)r.view.dispatch({changes:{from:r.view.state.doc.length,insert:" external"},annotations:isolateHistory.of("full")});
+ if(options.end==="blur")window.dispatchEvent(new Event("blur"));
+ else if(options.end==="unmount")r.overlay.unmount();
+ else if(options.end==="switch"){
+  const info=r.view.state.field(editorInfoField) as any;
+  info.file.path=otherPath;r.view.dispatch({});await settle();
+  otherAfter=structuredClone(inlineInk.strokes(otherPath));
+  info.file.path=path;r.view.dispatch({});
+ }else penEvent(options.end??"pointerup",contact.x,contact.y+dy*scale,921);
+ await settle();
+ const after=capture();
+ const ended=feedback();
+ let undone:ReturnType<typeof capture>|null=null,redone:ReturnType<typeof capture>|null=null;
+ let undoResult:boolean|null=null,persisted:any=null;
+ if(after.history>before.history||options.verifySaved){undoResult=undo(r.view);await settle();undone=capture();if(undoResult){redo(r.view);await settle();redone=capture();}}
+ if(options.verifySaved){inlineInk.save(path);await settle();persisted=parsePage(pages.get(pageId)!,pageId)!.data.strokes;}
+ return {zoom,font,scroll,wrapped,scale,origin,contact,hover,hoverFeedback,sweep,moves,down,live,ended,before,after,undone,redone,undoResult,persisted,otherBefore,otherAfter};
 };

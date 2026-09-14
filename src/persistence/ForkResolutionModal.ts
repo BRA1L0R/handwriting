@@ -15,10 +15,10 @@ import {
  *
  * EVERY STRING HERE IS ALAN'S AND APPROVED. They live in
  * `FORK_COPY_PLACEHOLDER`, which is where to change one - not here. THE
- * AUTHORITY IS THE MAILBOX, not this comment: the ten words were approved in
+ * AUTHORITY IS THE RECORDED DECISION, not this comment: the ten words were approved in
  * the entry stamped 2026-09-09 10:04 CDT, and the trailing period was removed
  * from `headline` by the 17:09 CDT ruling the same day. Both are in
- * `queue.md` / `lead-engineer.md`.
+ * that decision.
  *
  * `ForkCopyApproved.test.ts` pins all ten verbatim and reds if any is
  * reworded, so a change to the wording is a decision that goes back to him

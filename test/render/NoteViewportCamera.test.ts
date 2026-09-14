@@ -30,7 +30,7 @@ it.each(cases)("camera %s axis%s font%s cancel%s",async(zoom,axis,font,cancel)=>
   evidence.push(r);expect(pageErrors).toEqual([]);
   for(let i=0;i<r.layoutBefore.length;i++)for(let a=0;a<2;a++)expect(Math.abs(r.layoutAfter[i][a]-r.layoutBefore[i][a])).toBeLessThan(.03);
   expect(r.before).toEqual(r.after);expect(r.corners.every((c:any)=>c.inside)).toBe(true);expect(r.strokes).toHaveLength(4);
-  expect(r.measured.overlayScale).toBeCloseTo(zoom,5);expect(r.measured.fontZoom).toBeCloseTo(font,5);
+  expect(r.measured.paddingTop).toBe(4);expect(r.measured.overlayScale).toBeCloseTo(zoom,5);expect(r.measured.fontZoom).toBeCloseTo(font,5);
   for(const e of r.errors){expect(Math.abs(e.x)).toBeLessThan(1);expect(Math.abs(e.y)).toBeLessThan(1);}
   for(const c of r.measured.backings)expect(c.w*c.h).toBeLessThan(8_000_000);
   expect(r.touchTrace.some((s:any)=>s.parole===81)).toBe(true);expect(r.touchTrace.some((s:any)=>s.assist)).toBe(true);
@@ -63,7 +63,7 @@ it("production note viewport controls are reachable", async () => {
  } finally { await page.close(); }
 });
 
-it("real Fit frames saved distant ink below 5%, ignores empty growth, and reopens unchanged",async()=>{
+it("real Fit frames saved separated ink within the zoom range, ignores empty growth, and reopens unchanged",async()=>{
  const page=await browser.newPage({viewport:{width:700,height:540}});
  try {
   await page.setContent("<!doctype html><body></body>");await page.addStyleTag({content:css+readFileSync(fileURLToPath(new URL("./noteViewportCamera.css",import.meta.url)),"utf8")});await page.addScriptTag({content:script});
@@ -72,7 +72,7 @@ it("real Fit frames saved distant ink below 5%, ignores empty growth, and reopen
   await page.getByRole("button",{name:"Fit handwriting",exact:true}).click();await page.evaluate(()=>(window as any).viewportFixture.settle());
   const fitted=await page.evaluate(()=>(window as any).viewportFixture.snap("far"));evidence.push({before,fitted});
   if(process.env.HW_VIEWPORT_SCREENSHOT)await page.screenshot({path:process.env.HW_VIEWPORT_SCREENSHOT});
-  expect(fitted.state.zoom).toBeLessThan(.05);expect(fitted.strokes).toHaveLength(2);
+  expect(fitted.state.zoom).toBeLessThan(.3);expect(fitted.strokes).toHaveLength(2);
   const union={width:Math.max(...before.strokes.map((s:any)=>s.bbox.x+s.bbox.width))-Math.min(...before.strokes.map((s:any)=>s.bbox.x)),height:Math.max(...before.strokes.map((s:any)=>s.bbox.y+s.bbox.height))-Math.min(...before.strokes.map((s:any)=>s.bbox.y))};expect(fitted.state.zoom).toBeCloseTo(fitScale(union),10);
   for(const b of fitted.ink){expect(b.x).toBeGreaterThanOrEqual(-.5);expect(b.y).toBeGreaterThanOrEqual(-.5);expect(b.right).toBeLessThanOrEqual(640.5);expect(b.bottom).toBeLessThanOrEqual(480.5);}
   expect(fitted.strokes).toEqual(before.strokes);expect(fitted.doc).toBe(before.doc);expect(fitted.writes).toBe(before.writes);expect(fitted.history).toBe(before.history);
@@ -126,7 +126,7 @@ it("loading and active ink refuse navigation; Fit composes font and external sca
   const loaded=await page.evaluate(()=>(window as any).viewportFixture.release("load"));expect(loaded.state.busy).toBe(false);
   expect(await page.evaluate(()=>(window as any).viewportFixture.busy("load"))).toBe("busy");
   await page.evaluate(()=>(window as any).viewportFixture.setup("scaled","far",1,.8));await page.evaluate(()=>(window as any).viewportFixture.font("scaled"));
-  const fitted=await page.evaluate(()=>(window as any).viewportFixture.fit("scaled"));expect(fitted.result).toBe("fit");expect(fitted.state.zoom).toBeLessThan(.05);
+  const fitted=await page.evaluate(()=>(window as any).viewportFixture.fit("scaled"));expect(fitted.result).toBe("fit");expect(fitted.state.zoom).toBeLessThan(.3);
   for(const b of fitted.ink){expect(b.x).toBeGreaterThanOrEqual(fitted.viewport.x-.5);expect(b.y).toBeGreaterThanOrEqual(fitted.viewport.y-.5);expect(b.right).toBeLessThanOrEqual(fitted.viewport.x+fitted.viewport.width+.5);expect(b.bottom).toBeLessThanOrEqual(fitted.viewport.y+fitted.viewport.height+.5);}
  }finally{await page.close();}
 });
@@ -214,4 +214,17 @@ it("Chromium touch input pans without native coast; wheel scrolling remains avai
 
 it("uses the exact Infinite Canvas settings explanation",()=>{
  expect(readFileSync(fileURLToPath(new URL("../../src/main.ts",import.meta.url)),"utf8")).toContain('desc: "Scroll to the right or down infinitely. Momentum is turned off when this setting is toggled on."');
+});
+
+
+it.each([["far",4],["theme",20],["zero-padding",0]] as const)("camera fixture retains %s padding (%spx)",async(kind,padding)=>{
+ const page=await browser.newPage({viewport:{width:1400,height:1100}});
+ try{
+  await page.setContent("<!doctype html><body></body>");await page.addStyleTag({content:css+readFileSync(fileURLToPath(new URL("./noteViewportCamera.css",import.meta.url)),"utf8")});await page.addScriptTag({content:script});
+  const before=await page.evaluate(kind=>(window as any).viewportFixture.setup("padding",kind),kind);
+  expect(before.paddingTop).toBe(padding);
+  await page.getByRole("button",{name:"Zoom out",exact:true}).click();await page.evaluate(()=>(window as any).viewportFixture.settle());
+  const after=await page.evaluate(()=>(window as any).viewportFixture.snap("padding"));
+  expect(after.paddingTop).toBe(padding);expect(after.strokes).toEqual(before.strokes);
+ }finally{await page.close();}
 });

@@ -442,9 +442,9 @@ describe("delete all ink on a note the store may not write", () => {
 
 		await runDeleteAll();
 
-		// REFUSED. Legacy was NOT named in Astra's 17:22 ruling, which blocks
+		// REFUSED. Legacy was NOT named in the 17:22 ruling, which blocks
 		// future and duplicate, and was handed back as a declared extension;
-		// Astra ACCEPTED it at 18:21 as a typed blocked reason, so it is no
+		// It was ACCEPTED at 18:21 as a typed blocked reason, so it is no
 		// longer an extension awaiting a decision. The reasoning that earned
 		// it: `snapshot()` refuses for it identically, so the write dies in the
 		// same place - and because a legacy note's saved ink never reaches

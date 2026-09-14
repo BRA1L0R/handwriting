@@ -30,8 +30,8 @@ import { FORK_COPY_PLACEHOLDER } from "./ForkResolution";
  *      the whole tree, so the next placeholder anywhere is caught by the same
  *      rule rather than needing its own test.
  *
- * THE AUTHORITY FOR EVERY STRING BELOW is the mailbox entry, not this file:
- * `~/.claude/mailbox/queue.md` (mirrored in `lead-engineer.md`), "2026-09-09
+ * THE AUTHORITY FOR EVERY STRING BELOW is the recorded decision, not this
+ * file: "2026-09-09
  * 10:04 CDT ... ALL TEN FORK-SCREEN STRINGS ARE APPROVED". He wrote them live
  * from a rendered presentation of the screen.
  *

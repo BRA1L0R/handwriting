@@ -4063,7 +4063,7 @@ export class SlidesDeck {
 		// Called on the `active` flag rather than on the switch, so a stroke
 		// that started recording and had diagnostics turned off under it
 		// still stops its rAF loop instead of running for the session.
-		// `console.log` and not `log()` - the prefix is part of the line the
+		// `console.debug` and not `log()` - the prefix is part of the line the
 		// pure formatter is tested against, and log() would double it.
 		if (this.moveTrace.active) {
 			const line = this.moveTrace.end({
@@ -4071,7 +4071,7 @@ export class SlidesDeck {
 				cssHeight: l?.cssHeight ?? 0,
 				dpr: this.win().devicePixelRatio || 1,
 			});
-			if (line) console.log(line);
+			if (line) console.debug(line);
 		}
 		// Alan, same machine, caret NOT in the note: arrows worked before the
 		// stroke and stopped after it, so something ELSE also lets go of focus
@@ -4581,7 +4581,7 @@ let host: SlidesInkHost | null = null;
 const drains = new Set<Promise<void>>();
 
 function log(message: string): void {
-	console.log(`[slides] ${message}`);
+	console.debug(`[slides] ${message}`);
 }
 
 /**

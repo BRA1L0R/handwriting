@@ -15,6 +15,7 @@ import {
 } from "./PointerDeliveryTrace";
 import { captureUndoTrace, clearUndoTrace } from "../diag/UndoHistoryTrace";
 import { VelocitySample, flingStep, releaseVelocity } from "../input/Fling";
+import { carryFrom, carryPinned, carryStep, scrollGrid, type ScrollCarry } from "./AssistScroll";
 import { armGuardStyle, disarmGuardStyle } from "./GuardStyle";
 import { HOVER_GHOST_MS, isPenCompatMouseMove } from "./PenCursor";
 import { pinchEngaged, pinchMidpoint, pinchRatio, pinchSpread } from "./PinchScale";
@@ -62,6 +63,10 @@ import { FINGER_INK_PRESSURE } from "./FingerInk";
 
 export interface InlinePenCallbacks {
 	onPenDown(sample: PenSample, ev: PointerEvent): void;
+	/** Retire earlier viewport ownership before new input changes its frame. */
+	onViewportInput?(): void;
+	/** Finish pending raster coverage before the first sample is mapped. */
+	onBeforePenDown?(): void;
 	/**
 	 * Display-rate pen hover, outside an active contact.
 	 *
@@ -905,6 +910,9 @@ export function ownedMouseStroke(
 	return pointerType === "mouse" && activeIsMouse && activePointerId !== null && pointerId === activePointerId;
 }
 
+/** The default `originPan`: a surface whose ink layer never moves. */
+const NO_ORIGIN_PAN = Object.freeze({ x: 0, y: 0 });
+
 export class InlinePenRouter {
 	/** The element listeners attach to: the editor's scroller. */
 	private scrollEl: HTMLElement;
@@ -994,6 +1002,14 @@ export class InlinePenRouter {
 	private assistLastX = 0;
 	private assistLastY = 0;
 	private assistMoved = 0;
+	/**
+	 * The plugin's own finger scroll carries its position per gesture
+	 * (AssistScroll.ts): null between gestures, seeded from the settled
+	 * read-back on the gesture's first write, shared by the assist pan, the
+	 * parole catch-up and the fling that follows them.
+	 */
+	private scrollCarryX: ScrollCarry | null = null;
+	private scrollCarryY: ScrollCarry | null = null;
 	private assistEngaged = false;
 	/** Latched when the assist engages; the current touch gesture really panned. */
 	private gesturePanned = false;
@@ -1072,7 +1088,24 @@ export class InlinePenRouter {
 		 * a pinch, so "none" hands two-finger touches to the app, which reads
 		 * them as its open-the-sidebar swipe.
 		 */
-		private guardTouchAction: string = "none"
+		private guardTouchAction: string = "none",
+		/**
+		 * How far the ink the reader can see is translated, in visual px, away
+		 * from `rectEl`.
+		 *
+		 * `rectEl` is the overlay band, and the band is deliberately never
+		 * translated - the camera is derived from its rect, so a transform there
+		 * would be absorbed and then applied a second time. The ink the reader
+		 * is looking at rides one level in, on a layer that CAN be translated,
+		 * and while a pinch's focal anchor leaves a residual there the pen's
+		 * client point is in that translated frame while `this.rect` is not.
+		 * Subtracting it here is what keeps "the pen lands where the ink is" true
+		 * at the one moment the two frames differ.
+		 *
+		 * Returns the surface's OWN live object rather than a fresh one: this is
+		 * read once per pointer sample.
+		 */
+		private originPan: () => { x: number; y: number } = () => NO_ORIGIN_PAN
 	) {
 		this.scrollEl = scrollEl;
 		this.rectEl = rectEl;
@@ -2122,6 +2155,7 @@ export class InlinePenRouter {
 	}
 
 	private beginAssist(e: PointerEvent): void {
+		this.cb.onViewportInput?.();
 		this.cancelFling(); // a new finger takes over the glide
 		this.assistSamples = [];
 		this.assistPointerId = e.pointerId;
@@ -2129,6 +2163,10 @@ export class InlinePenRouter {
 		this.assistLastY = e.clientY;
 		this.assistMoved = 0;
 		this.assistEngaged = false;
+		// A new gesture starts from where the scroller settled, never from the
+		// previous gesture's carried target.
+		this.scrollCarryX = null;
+		this.scrollCarryY = null;
 	}
 
 	/** A new camera frame ends old screen-space momentum and touch run-up. */
@@ -2138,6 +2176,8 @@ export class InlinePenRouter {
 		this.assistEngaged = false;
 		this.assistSamples = [];
 		this.paroleId = null;
+		this.scrollCarryX = null;
+		this.scrollCarryY = null;
 	}
 
 	private assistMove(e: PointerEvent): boolean {
@@ -2160,8 +2200,7 @@ export class InlinePenRouter {
 			tr("guard", e, "assist pan engaged (transition gesture)");
 		}
 		if (this.assistEngaged) {
-			this.scrollEl.scrollLeft -= visualToNote(dx, this.scaleProvider());
-			this.scrollEl.scrollTop -= visualToNote(dy, this.scaleProvider());
+			this.carryScrollBy(dx, dy);
 			const now = performance.now();
 			this.assistSamples.push({ t: now, x: e.clientX, y: e.clientY });
 			if (this.assistSamples.length > 12) this.assistSamples.shift();
@@ -2210,18 +2249,38 @@ export class InlinePenRouter {
 			this.flingLastT = now;
 			this.flingVx = s.vx;
 			this.flingVy = s.vy;
-			const beforeL = this.scrollEl.scrollLeft;
-			const beforeT = this.scrollEl.scrollTop;
-			this.scrollEl.scrollLeft = beforeL - visualToNote(s.dx, this.scaleProvider());
-			this.scrollEl.scrollTop = beforeT - visualToNote(s.dy, this.scaleProvider());
-			const moved =
-				this.scrollEl.scrollLeft !== beforeL || this.scrollEl.scrollTop !== beforeT;
-			// Done when the physics say so, or the scroller is clamped at an
+			const w = this.carryScrollBy(s.dx, s.dy);
+			const pinned = carryPinned(w.x, w.left, w.grid) && carryPinned(w.y, w.top, w.grid);
+			// Done when the physics say so, or the carried target is clamped at an
 			// edge and the glide has nowhere left to go.
-			if (s.done || (!moved && Math.abs(s.dx) + Math.abs(s.dy) > 0.5)) return;
+			if (s.done || (pinned && Math.abs(s.dx) + Math.abs(s.dy) > 0.5)) return;
 			this.flingRaf = this.winRef.requestAnimationFrame(tick);
 		};
 		this.flingRaf = this.winRef.requestAnimationFrame(tick);
+	}
+
+	/**
+	 * Scroll by a screen-px hand delta as part of the current finger gesture:
+	 * content follows the hand, so the offsets move against it. The carried
+	 * target advances, is clamped to the scroller's range and is written
+	 * absolutely; the read-back is only compared with the last write, to
+	 * adopt a scroll something else made (AssistScroll.ts says why it is
+	 * never the start). The six reads share one layout: nothing between them
+	 * writes.
+	 */
+	private carryScrollBy(dx: number, dy: number) {
+		const el = this.scrollEl;
+		const scale = this.scaleProvider();
+		const grid = scrollGrid(visualToNote(1, scale));
+		const left = el.scrollLeft;
+		const top = el.scrollTop;
+		const x = carryStep(this.scrollCarryX ?? carryFrom(left), { offset: left, range: el.scrollWidth - el.clientWidth }, -visualToNote(dx, scale), grid);
+		const y = carryStep(this.scrollCarryY ?? carryFrom(top), { offset: top, range: el.scrollHeight - el.clientHeight }, -visualToNote(dy, scale), grid);
+		this.scrollCarryX = x.carry;
+		this.scrollCarryY = y.carry;
+		el.scrollLeft = x.carry.target;
+		el.scrollTop = y.carry.target;
+		return { x, y, left, top, grid };
 	}
 
 	private cancelFling(): void {
@@ -2388,11 +2447,28 @@ export class InlinePenRouter {
 		return this.cb.penOff?.() ?? false;
 	}
 
+	/** Inverse of the cached input mapping, without another geometry read. */
+	clientPointForSample(sample: PenSample): { x: number; y: number } {
+		const scale = this.scaleProvider(), pan = this.originPan?.();
+		return { x: this.rect.left + sample.x * scale + (pan && Number.isFinite(pan.x) ? pan.x : 0),
+			y: this.rect.top + sample.y * scale + (pan && Number.isFinite(pan.y) ? pan.y : 0) };
+	}
+
 	private sampleFrom(e: PointerEvent): PenSample {
 		const scale = this.scaleProvider();
+		// Guarded rather than trusted, twice over. The provider reads a live field
+		// on the surface, and a surface mid-teardown can hand back a partial
+		// object; and the unit fixtures reach this method on routers built with
+		// `Object.create`, which inherits the prototype's methods but none of the
+		// constructor's parameter properties - so the provider itself can be
+		// missing. A surface with no provider has no pan, which is the right
+		// answer for every one of them.
+		const pan = this.originPan?.();
+		const panX = pan && Number.isFinite(pan.x) ? pan.x : 0;
+		const panY = pan && Number.isFinite(pan.y) ? pan.y : 0;
 		return {
-			x: visualToNote(e.clientX - this.rect.left, scale),
-			y: visualToNote(e.clientY - this.rect.top, scale),
+			x: visualToNote(e.clientX - this.rect.left - panX, scale),
+			y: visualToNote(e.clientY - this.rect.top - panY, scale),
 			pressure:
 				e.pointerType === "touch"
 					? FINGER_INK_PRESSURE
@@ -2410,6 +2486,7 @@ export class InlinePenRouter {
 	// ---- pointerdown --------------------------------------------------------
 
 	private pointerDown(e: PointerEvent): void {
+		this.cb.onViewportInput?.();
 		this.cancelFling(); // any new contact ends the glide (pen wins instantly)
 		if (e.pointerType === "touch") {
 			this.lastTouchAt = performance.now();
@@ -2732,6 +2809,10 @@ export class InlinePenRouter {
 		}
 		// The down sample is the anchor and goes through raw: the reader of
 		// an export should find the stroke starting where the click was.
+		// Ending a live pinch above may have created a new settle owner. Revoke
+		// it before the first sample, retaining the pan it already painted.
+		this.cb.onViewportInput?.();
+		this.cb.onBeforePenDown?.();
 		this.cb.onPenDown(this.sampleFrom(e), e);
 	}
 
@@ -2755,6 +2836,10 @@ export class InlinePenRouter {
 			/* best-effort; the window backstop covers a failed capture */
 		}
 		this.mouseStrokeTrail = null;
+		// Ending a live pinch above may have created a new settle owner. Revoke
+		// it before the first sample, retaining the pan it already painted.
+		this.cb.onViewportInput?.();
+		this.cb.onBeforePenDown?.();
 		this.cb.onPenDown(this.sampleFrom(e), e);
 	}
 
@@ -2881,8 +2966,7 @@ export class InlinePenRouter {
 					// 1:1 pan from touchdown, so parole feels like touch slop,
 					// not a dead zone. Seed the velocity window with the down
 					// point so a fast conversion still flings correctly.
-					this.scrollEl.scrollLeft -= visualToNote(e.clientX - this.paroleDownX, this.scaleProvider());
-					this.scrollEl.scrollTop -= visualToNote(e.clientY - this.paroleDownY, this.scaleProvider());
+					this.carryScrollBy(e.clientX - this.paroleDownX, e.clientY - this.paroleDownY);
 					this.assistSamples.push({
 						t: this.paroleDownAt,
 						x: this.paroleDownX,

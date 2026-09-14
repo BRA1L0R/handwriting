@@ -135,7 +135,7 @@ export const RELEASE_NOTES: Record<string, string[]> = {
 		"slides added!!",
 		"data safety 2.0",
 		// ALAN'S OWN LINE, TYPED BY HIM AND SIGNED BY HIM (2026-09-09 23:32, at
-		// source in queue.md / lead-engineer.md / astra.md). It is a direct
+		// recorded at source). It is a direct
 		// message from him to his readers asking for a reply, and the
 		// informality is the point: lowercase throughout, no trailing period,
 		// `-alan` with no space after the hyphen. Do not capitalise it, do not
@@ -167,6 +167,9 @@ export const RELEASE_NOTES: Record<string, string[]> = {
 		"zoom and fit to ink",
 	],
 	"1.4.17": ["plugin verification oops\n\nthank you for downloading Handwriting.\n\n - alan :)"],
+	"1.4.19": [
+		"ZOOM BUG FIX",
+	],
 };
 
 /** One release's own notes, kept apart so the toast can label them honestly. */

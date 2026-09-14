@@ -21,7 +21,7 @@ import { parsePage, serializePage } from "./PageData";
  * different model on every load, and two devices opening one synced file
  * disagree about when its ink was drawn.
  *
- * WHAT IT BREAKS DOWNSTREAM, written here rather than left in a mailbox entry
+ * WHAT IT BREAKS DOWNSTREAM, written here rather than left in a side channel
  * because that is where a reader three weeks from now will be standing:
  * **`createdAt` ordering is used as EVIDENCE.** A fork analysis on 2026-09-08
  * used createdAt ordering as measured proof that no ink was lost in a sync

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
 	MAX_PINCH_SCALE,
+	MIN_PINCH_SCALE,
 	fitInkBounds,
 	anchoredScroll,
 	clampPinchScale,
@@ -22,9 +23,45 @@ describe("pinchScale", () => {
 		expect(pinchScale(start, 1)).toBe(start);
 	});
 
-	it("caps magnification and preserves positive lower requests", () => {
+	it("caps magnification and clamps zoom-out at ten percent", () => {
 		expect(pinchScale(1, 100)).toBe(MAX_PINCH_SCALE);
-		expect(pinchScale(1, 0.001)).toBe(0.001);
+		expect(pinchScale(1, 0.001)).toBe(0.1);
+		expect(pinchScale(0.1, 0.5)).toBe(0.1);
+		expect(pinchScale(0.1, 2)).toBe(0.2);
+	});
+
+	// Fit may commit below ten percent (Alan 2026-09-13, "get out of jail
+	// free"); pinch reads the floor Fit left and may never go past it.
+	it("clamps zoom-out at a Fit floor below ten percent without jumping up to it", () => {
+		// At Fit's 6% a pinch out stays at 6%. Clamping to the constant here would
+		// turn a zoom-out into a jump IN to 10%.
+		expect(pinchScale(0.06, 0.5, 0.06)).toBe(0.06);
+		expect(pinchScale(0.06, 4 / 3, 0.06)).toBeCloseTo(0.08, 12);
+		// Out and back in one gesture lands where it began, not below.
+		expect(pinchScale(0.06, 1, 0.06)).toBe(0.06);
+		expect(pinchScale(0.08, 0.75, 0.06)).toBeCloseTo(0.06, 12);
+		expect(pinchScale(0.08, 0.5, 0.06)).toBe(0.06);
+		// Junk ratio holds the reference instead of snapping it to 10%.
+		expect(pinchScale(0.06, Number.NaN, 0.06)).toBe(0.06);
+	});
+
+	// Alan 2026-09-14: below ten percent zoom-out is locked; only zoom-in, until
+	// ten percent again. The floor stays the constant; the gesture's reference
+	// scale is the lower bound while it is under the floor.
+	it("below ten percent a pinch cannot zoom out past its reference scale", () => {
+		expect(pinchScale(0.07, 6 / 7)).toBe(0.07);
+		expect(pinchScale(0.05, 0.5)).toBe(0.05);
+		expect(pinchScale(0.07, 9 / 7)).toBeCloseTo(0.09, 12);
+		expect(pinchScale(0.05, 2)).toBeCloseTo(0.1, 12);
+		expect(pinchScale(0.12, 0.05 / 0.12)).toBe(0.1);
+		expect(pinchScale(0.05, Number.NaN)).toBe(0.05);
+	});
+
+	it("never lets a floor raise the constant or come from junk", () => {
+		expect(clampPinchScale(0.05, 0.5)).toBe(0.1);
+		expect(clampPinchScale(0.05, Number.NaN)).toBe(0.1);
+		expect(clampPinchScale(0.05, 0)).toBe(0.1);
+		expect(clampPinchScale(0.05, -1)).toBe(0.1);
 	});
 
 	it("holds still on junk rather than collapsing the editor", () => {
@@ -37,10 +74,17 @@ describe("pinchScale", () => {
 describe("counterSizePercent", () => {
 	it("sizes the box so the painted result fills the pane", () => {
 		// Scaled 2x, the box must claim half the width to paint at 100%.
-		expect(counterSizePercent(2)).toBe(50);
-		expect(counterSizePercent(1)).toBe(100);
+		expect(counterSizePercent(2, MIN_PINCH_SCALE)).toBe(50);
+		expect(counterSizePercent(1, MIN_PINCH_SCALE)).toBe(100);
 		// Zooming out expands the viewport while the text column stays fixed.
-		expect(counterSizePercent(0.5)).toBe(200);
+		expect(counterSizePercent(0.5, MIN_PINCH_SCALE)).toBe(200);
+	});
+
+	// The floor is a required argument because this used to answer 1000% for a
+	// Fit scale below ten percent - a box too small for what is painted.
+	it("counter-sizes a Fit scale below ten percent against the floor Fit left", () => {
+		expect(counterSizePercent(0.06, 0.06)).toBeCloseTo(1000 / 0.6, 9);
+		expect(counterSizePercent(0.06, MIN_PINCH_SCALE)).toBe(1000);
 	});
 });
 
@@ -97,10 +141,21 @@ describe("anchoredScroll", () => {
 
 describe("fitInkBounds",()=>{
  const g={viewportWidthScreen:640,viewportHeightScreen:480,externalScale:1,fontZoom:1,marginScreen:24};
- it("fits distant ink below the former floor and accounts for font/external exactly once",()=>{
-  const bounds={x:0,y:0,width:18000,height:22000};
-  expect(fitInkBounds({...g,bounds})).toEqual({kind:"fit",zoom:432/22000});
-  expect(fitInkBounds({...g,bounds,fontZoom:1.5,externalScale:2})).toEqual({kind:"fit",zoom:432/(22000*3)});
+ it("fits separated ink within the zoom range and accounts for font/external exactly once",()=>{
+  const bounds={x:0,y:0,width:1800,height:2200};
+  expect(fitInkBounds({...g,bounds})).toEqual({kind:"fit",zoom:432/2200});
+  // Was "below-minimum" (refused) until Fit was allowed under ten percent.
+  expect(fitInkBounds({...g,bounds,fontZoom:1.5,externalScale:2})).toEqual({kind:"fit",zoom:432/(2200*2*1.5)});
+ });
+ // Revised 2026-09-13 (Alan: Fit breaks the 10% clamp). This used to pin the
+ // refusal of anything smaller than ten percent; those fits now commit, and
+ // only the native layout bound refuses.
+ it("fits an exact ten percent and anything smaller that native layout can represent",()=>{
+  expect(fitInkBounds({...g,bounds:{x:0,y:0,width:5920,height:4320}})).toEqual({kind:"fit",zoom:.1});
+  expect(fitInkBounds({...g,bounds:{x:0,y:0,width:5921,height:4320}})).toEqual({kind:"fit",zoom:592/5921});
+  expect(fitInkBounds({...g,bounds:{x:0,y:0,width:18000,height:22000}})).toEqual({kind:"fit",zoom:432/22000});
+  // The layout bound still refuses: 640 screen px at this zoom is past 8M layout px.
+  expect(fitInkBounds({...g,bounds:{x:0,y:0,width:7_600_000,height:1}})).toEqual({kind:"unrepresentable"});
  });
  it("caps a point at normal size and returns an explicit empty plan",()=>{
   expect(fitInkBounds({...g,bounds:{x:10,y:20,width:0,height:0}})).toEqual({kind:"fit",zoom:1});

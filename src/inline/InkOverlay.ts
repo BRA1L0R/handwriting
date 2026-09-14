@@ -1,5 +1,5 @@
 import { EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
-import { Prec } from "@codemirror/state";
+import { EditorSelection, EditorState, StateEffect, Prec, type Text, type SelectionRange } from "@codemirror/state";
 import type { Extension } from "@codemirror/state";
 import { isolateHistory, redo, redoDepth, undo, undoDepth } from "@codemirror/commands";
 import { Notice, Platform, editorInfoField } from "obsidian";
@@ -8,7 +8,9 @@ import { runGatedCommand } from "../CommandPaletteSplit";
 import { Camera } from "../camera/Camera";
 import { CameraState } from "../camera/coordinates";
 import { contentOrigin, contentOriginLeft } from "./ContentOrigin";
-import { anchorTop } from "./DocumentTop";
+import { anchorPaddingTop, anchorTop } from "./DocumentTop";
+import { RUNG_SPACING, anchorParityBar, cameraOriginYLayout, documentAnchorLadder, growDocumentAnchorLadder, impliedDocumentTop, refuseDocumentAnchor, rungIndexFor, unmountDocumentAnchor } from "./DocumentAnchor";
+import { stableCameraOriginY, type CameraOriginY } from "./CameraOriginY";
 import {
 	penContactIntent,
 	releaseTipMode,
@@ -21,10 +23,14 @@ import {
 	blankLinesAbove,
 	boundsOf,
 	lineSteps,
-	rowsOf,
-	snapLine,
 	strokeIdsBelow,
 	sweptRect,
+	InsertSpaceRows,
+	nearestSpaceBoundary,
+	type SpaceBoundary,
+	canSplitParagraph,
+	spaceProtectedBlocks,
+	type SpaceProtectedBlock,
 } from "./InsertSpace";
 import { MobileTools } from "./MobileTools";
 import { stripPenDown, stripPenUp } from "./StripPenChrome";
@@ -39,6 +45,81 @@ import {
 
 /** How long after a pinch-driven scroll write repaints stay suppressed. */
 const PINCH_SCROLL_QUIET_MS = 120;
+
+/**
+ * How long a pinch preview may hold CodeMirror's measure scheduling with no
+ * preview frame before the hold releases itself; see `holdMeasures`.
+ *
+ * Every end path releases the hold. This is the bound for an end that never
+ * arrives (a pointer lost without its cancel event, which leaves the preview
+ * flagged for the rest of the gesture's lifetime): past it, CodeMirror
+ * schedules again, so typing and scrolling get their measures back. The price
+ * is on the other side: a pinch held still for longer than this gets one
+ * CodeMirror rescale of the scroll under the frozen preview, the pre-fix
+ * displacement, once, until the next preview frame solves the pan against
+ * the moved scroll. Ten seconds is long for a held pinch and short for a
+ * lost end.
+ */
+const PINCH_MEASURE_HOLD_MAX_MS = 10_000;
+
+/** A CodeMirror measure request, as `EditorView.requestMeasure` takes it. */
+type CmMeasureRequest = NonNullable<Parameters<EditorView["requestMeasure"]>[0]>;
+
+/** One entry of the view the hold shadows; see `holdMeasures`. */
+interface MeasureHoldEntry {
+	name: "requestMeasure" | "measure";
+	/** The own-property descriptor the shadow displaced, if the view had one. */
+	displaced: PropertyDescriptor | undefined;
+	/** What a call reached before the hold: the displaced callable, else the prototype's. Captured once. */
+	callable: (this: EditorView, ...args: unknown[]) => unknown;
+	shadow: (...args: unknown[]) => unknown;
+}
+
+/** CodeMirror's measuring, held for a pinch preview; see `holdMeasures`. */
+interface MeasureHold {
+	entries: MeasureHoldEntry[];
+	/** Requests other callers made during the preview, last per key. */
+	requests: CmMeasureRequest[];
+	/** Whether a plain `requestMeasure()` was asked for during the preview. */
+	plain: boolean;
+	/** Whether a measure callback CodeMirror had already scheduled reached the shadow. */
+	swallowed: boolean;
+	/** The lost-end bound; see PINCH_MEASURE_HOLD_MAX_MS. */
+	timer: ReturnType<Window["setTimeout"]>;
+}
+
+/**
+ * How much of the note's box the focal pan must leave inside the pane.
+ *
+ * The pan is a translate with no clamp of its own, so a gesture computed
+ * against a degenerate frame - a zero-width column, a host mid-relayout - could
+ * ask for a displacement that carries the whole note off the pane and leaves
+ * the reader looking at nothing, with no scrollbar to bring it back because the
+ * scroller itself has not moved. Clamp against the note content bounds so
+ * this much overlap remains on each axis where possible. The natural top edge
+ * takes precedence when a very small note cannot provide that much overlap.
+ *
+ * NOT a dead band, and there is deliberately none of those: the preview pan is
+ * applied at full precision on every frame. A dead band big enough to swallow
+ * rect noise (the first attempt used 1.5px) is bigger than the 0.75px the
+ * written-ink drift guard permits, so it would trade one visible error for
+ * another; quantisation is handled where it actually arises, at the settle,
+ * where the scroll takes whole pixels and the fraction stays as pan.
+ */
+const PAN_MIN_VISIBLE_PX = 24;
+
+interface PinchConstraintGeometry {
+	left: number; top: number; paneWidth: number; paneHeight: number;
+	width: number; height: number; external: number; x: boolean; y: boolean;
+	/** Zero-native-scroll content-box inset, including its normal title/padding. */
+	naturalLeft: number | null;
+	naturalTop: number | null;
+}
+
+interface PinchConstraint {
+	clientX: number; clientY: number; offsetX: number; offsetY: number;
+	geometry: PinchConstraintGeometry | null;
+}
 
 /**
  * Canvas backing-store reallocations since load, across every editor.
@@ -151,7 +232,7 @@ import {
 	removeSelectedInlineStrokes,
 } from "./InlineSelectionDelete";
 import { StrokeFrame } from "./StrokeFrame";
-import { Band, BandViewport, bandFor, bandNeedsMove } from "./ScrollBand";
+import { Band, BandViewport, bandCovers, bandFor, bandNeedsMove } from "./ScrollBand";
 import { EINK_CAPS, adaptiveCaps, buildTail, correctionError } from "../ink/Prediction";
 import { presentLagMs, recordPresentAge } from "../ink/LatencyEstimate";
 import { predictionEinkOn, predictionEnabled } from "./StrokePrediction";
@@ -182,13 +263,13 @@ import { observeStrokeMax, strokeGain } from "../ink/PressureGain";
 import { embedInkLayerCount, embedInkPrintSwaps } from "./EmbedInk";
 import { notifyInkChanged, onInkChanged } from "./InkEvents";
 import { ExtentInputs, FrontierCache, sameExtentInputs } from "./FrontierCache";
-import { DamageLedger } from "../ink/DamageLedger";
+import { DamageLedger, shiftPlan } from "../ink/DamageLedger";
 import { StrokeIndex } from "../ink/StrokeIndex";
 import { DWELL_MS, snapStroke } from "../ink/ShapeSnap";
 import { beginUndoWindow, discardUndoTrace, isUndoRedoKey, registerUndoTraceView, unregisterUndoTraceView } from "../diag/UndoHistoryTrace";
 
 const sessionStartMs = Date.now();
-import { anchoredScroll, pinchScale, fitInkBounds, MAX_VIEWPORT_LAYOUT, type InkFitBounds } from "./PinchScale";
+import { anchoredScroll, pinchScale, fitInkBounds, clampToReachable, MIN_PINCH_SCALE, MAX_VIEWPORT_LAYOUT, type InkFitBounds } from "./PinchScale";
 import { ERASER_CURSOR_CLASS } from "./PenCursor";
 import { DEFAULT_ERASER_RADIUS_PX, clampEraserRadius } from "../ink/EraserSize";
 import {
@@ -198,7 +279,7 @@ import {
 	fontZoomFactor,
 	noteToVisual,
 	visualToNote,
-} from "./ZoomScale";
+ canvasLayerBox } from "./ZoomScale";
 import {
 	isPenProbeEnabled,
 	markMappedTip,
@@ -211,7 +292,7 @@ import { armMouseInkQuietly, markToolPicked, mouseInkEnabled, toolPickedHere } f
 import { penInkEnabled } from "./PenInk";
 import { fingerInkEligible } from "./FingerInk";
 import { describeEl, setHitProbeContext } from "./PenHitProbe";
-import { Extent, inkFrontier, isScrollableOverflow, ScrollAxisGuard, ScrollExpansionDemand, spacerPosition, surfaceExtents, surfaceOriginInScroller, writeFrontier, ZERO_EXTENT, zoomFrontier } from "./SurfaceExtent";
+import { Extent, inkFrontier, isScrollableOverflow, ScrollAxisGuard, ScrollExpansionDemand, spacerPosition, surfaceExtents, surfaceOriginInScroller, writeFrontier, writeFrontierApplies, ZERO_EXTENT, zoomFrontier } from "./SurfaceExtent";
 import { ProbeBox, capturePresented, parseHexColor, regionCensus } from "./PresentProbe";
 import {
 	bboxVisibleInViewport,
@@ -1180,6 +1261,25 @@ export function cutSelectionNoticeIsRoutine(outcome: CutSelectionOutcome): boole
 	return outcome.kind === "cut";
 }
 
+/**
+ * The width floor a committed paint uses, or undefined when there is no
+ * committed backing to floor against.
+ *
+ * A FREE FUNCTION, not a method, and that is load-bearing: `repaint` is invoked
+ * in the render harness on partial objects that carry the overlay's data fields
+ * without its prototype. `this.committedBacking` resolves there; a
+ * `committedFloorFor(this.committedBacking, this.dpr)` does not - it fails with "is not a function" inside
+ * the page, past the type checker, and only two render tests catch it. Taking
+ * the values as arguments keeps ONE definition for both paint sites without
+ * depending on what `this` is.
+ *
+ * `backing` is the exact multiplier the committed context was set with, never
+ * re-derived - see WidthFloor.ts.
+ */
+function committedFloorFor(backing: number | null, dpr: number): { backing: number; dpr: number } | undefined {
+	return backing === null ? undefined : { backing, dpr };
+}
+
 export class InkOverlayPlugin {
 	private view: EditorView;
 	private container: HTMLElement | null = null;
@@ -1282,6 +1382,8 @@ export class InkOverlayPlugin {
 	private strokeIndex = new StrokeIndex();
 	private indexDirty = true;
 	private lastPaintCam: { x: number; y: number; zoom: number } | null = null;
+	private originStyles = new WeakMap<Element, CSSStyleDeclaration>();
+	private retiring = false;
 	private selection = new SelectionModel();
 	private readonly selectionDeleteKeys = new InlineSelectionDeleteKeys(
 		() => !this.selection.isEmpty,
@@ -1297,20 +1399,39 @@ export class InkOverlayPlugin {
 	private spaceIds: string[] = [];
 	/** Box around those ids, tracked through the drag so damage stays bounded. */
 	private spaceBounds: BBox | null = null;
-	/** Viewport point of the contact, for locating the text line to open. */
-	private spaceClient: { x: number; y: number } | null = null;
+	/** The same text/ink seam as the guide, frozen before any live movement. */
+	private spacePlan: (SpaceBoundary & {doc: Text}) | null = null;
+	/** Record identity survives rename and cannot resolve to a replacement note. */
+	private spaceHistoryIdentity: symbol | null = null;
+	private spaceRowsCache = new InsertSpaceRows();
+	private spaceTextEnd: {doc:Text;pos:number;blocks:SpaceProtectedBlock[]} | null = null;
+	private spacePreview: {plan:SpaceBoundary;doc:Text;moving:string[];staying:string[];rows:ReturnType<InsertSpaceRows["get"]>} | null = null;
+	private spaceHoverY: number | null = null;
+	private spaceFeedbackRaf: number | null = null;
 	/** Last viewport point of a pan drag; client space, so scrolling cannot
 	 * feed back into the delta the way surface coordinates would. */
 	private panLast: { x: number; y: number } | null = null;
 	private spaceFromY = 0;
 	private spaceTotalDy = 0;
 	private penCursorEl: HTMLElement | null = null;
+	private penCursorPinned = false;
+	private penCursorClient: PenSample | null = null;
 	private mobileTools: MobileTools | null = null;
 	private eraserEl: HTMLElement | null = null;
 
 	private cssWidth = 0;
 	private cssHeight = 0;
 	private dpr = 1;
+	/**
+	 * The exact backing multiplier the committed canvas's OWN transform was
+	 * last set with (assigned at the same point as that setTransform call,
+	 * never recomputed). Reallocation is skipped whenever the "unchanged"
+	 * check holds, and cssScale can still move in the meantime (e.g. during
+	 * a locked frame) - so backingNow() read at paint time can disagree with
+	 * what the raster actually is. This field cannot: it is only ever the
+	 * value setTransform received.
+	 */
+	private committedBacking: number | null = null;
 	private resizeObserver: ResizeObserver | null = null;
 	/**
 	 * A second observer, on `.cm-content`. `resizeObserver` above watches
@@ -1408,16 +1529,37 @@ export class InkOverlayPlugin {
 	private metadataFrame: number | null = null;
 	/** Live magnification of this editor. Session-local; never persisted. */
 	private pinchScaleNow = 1;
+	/**
+	 * Lowest scale pinch, the zoom buttons and commitCameraScale may reach:
+	 * MIN_PINCH_SCALE. Only Fit commits below it. Below it zoom-out is locked
+	 * (Alan 2026-09-14): a pinch, a button or a commit may zoom in from the
+	 * current scale but not back out, until a committed scale reaches the floor.
+	 */
+	private zoomFloor = MIN_PINCH_SCALE;
 	/** The scale this gesture started from, so a pinch never accumulates. */
 	private pinchRefScale: number | null = null;
 	/** The pinch this frame owes, coalesced from however many moves arrived. */
 	private pinchPending: { next: number } | null = null;
 	/** When the pinch last wrote the scroll itself; see the scroll handler. */
 	private pinchScrollAt = 0;
+	/** Live transform owns the existing raster until the final layout transaction. */
+	private pinchPreview = false;
+	/** CodeMirror measures held back for the preview lifetime; null when CodeMirror schedules its own. */
+	private measureHold: MeasureHold | null = null;
+	/** True while CodeMirror is delivering an update to this plugin; see `update`. */
+	private inUpdate = false;
+	/** A resize the update hook met under a live hold, deferred whole to a frame; see `resizeOutOfUpdate`. */
+	private resizeOutOfUpdateRaf = 0;
+	/** The router's ratio at which `rebasePinch` re-anchored; its later ratios divide by it. */
+	private pinchRatioBase = 1;
+	/** The router's last raw move ratio, for `rebasePinch`. */
+	private pinchLastRatio = 1;
 	/** Hides a reticle left behind by a pen that never sent pointerleave. */
 	private hoverWatchdog: ReturnType<Window["setTimeout"]> | null = null;
 	/** Whether the metrics frame ticker is running; see startFrameTicker. */
 	private frameTicking = false;
+	private frameRaf = 0;
+	private frameTickToken: object | null = null;
 	/** Recent REAL samples, newest last: what prediction extrapolates from. */
 	private predReal: PenSample[] = [];
 	/** The tail drawn last event, kept only to score it against what arrived. */
@@ -1428,13 +1570,144 @@ export class InkOverlayPlugin {
 		scrollTop: number;
 		offsetX: number;
 		offsetY: number;
+		/** Screen px, so the anchoring below never re-derives them from a rect. */
+		focalX: number;
+		focalY: number;
+		/** Accepted screen target; the captured note reference above never changes. */
+		targetX?: number;
+		targetY?: number;
+		/** Rejected screen-space motion; never changes the captured content point. */
+		constraint?: PinchConstraint;
+		/**
+		 * The host's painted origin at gesture start, WITH whatever pan was in
+		 * force then folded in - so the reference frame is the one the reader
+		 * was actually looking at, not the unpanned one underneath it.
+		 */
+		hostLeft: number;
+		hostTop: number;
+		/** The column in host-local px at gesture start; null when unmeasurable. */
+		columnLocal: number | null;
+		/** The content's top in host-local px at gesture start; see anchorPanTo. */
+		contentTopLocal: number | null;
+		/** The scale the gesture started from, carried so the settle can reuse it. */
+		fromScale: number;
+	} | null = null;
+	/**
+	 * How far the note's contents are translated, in PAINTED px, to hold the
+	 * pinch focal point where the scroll cannot reach.
+	 *
+	 * Zooming out from the top of a note needs the content moved RIGHT and DOWN
+	 * to keep what is under the fingers under the fingers, and `scrollLeft` /
+	 * `scrollTop` only go one way from zero. Measured on 547fd8b4: every arm of
+	 * the focal-anchor probe reported `scrollLefts=[0]` - not clamped late, but
+	 * never moved at all, because `anchoredScroll`'s target was negative on
+	 * every frame and `Math.max(0, ...)` pinned it. A translate needs no scroll
+	 * range, which is also why it cannot land the surface short the way a
+	 * margin-based centring did (see the zoom-out-to-corner measurement).
+	 *
+	 * PAINTED px, because that is the frame the question is asked in: a finger
+	 * is at a screen point. `writeViewportPan` divides by the painted scale on
+	 * its way onto the elements, which live INSIDE the scaled host.
+	 */
+	private viewportPan = { x: 0, y: 0 };
+	/** Pan already drawn into the raster, in host-layout pixels. */
+	private rasterPan = { x: 0, y: 0 };
+	private cameraOriginY: CameraOriginY | null = null;
+	/**
+	 * The camera origin in LAYOUT px as the last accepted sync left it, which
+	 * is the only input to picking a rung. Not a basis term and deliberately
+	 * not one: the identity `cameraY_layout = k x spacing + residual/cssScale`
+	 * gives the same camera for every k, so a different rung reseeds nothing
+	 * and causes no redraw. NaN until the first sync, which falls back to the
+	 * scroll offset - the same quantity to within a viewport.
+	 */
+	private anchorCameraYLayout = Number.NaN;
+
+	/** F-2: set by `canonicalCameraY` when it adopted a raw that differs from
+	 * the retained origin - a basis reset, or a departure beyond the cap. Read
+	 * and cleared by `syncCamera`, the only caller allowed to pay for the gate's
+	 * rect read; the read-only twin never does. */
+	private anchorAdoptionEvent = false;
+
+	/** F-2: the gate has not run yet for the ladder now mounted, so the mount
+	 * itself is gated as well as every later adoption. */
+	private anchorGateDue = true;
+	private readonly rasterInputPan = { x: 0, y: 0 };
+	private committedBlank = false;
+	private highlightBlank = false;
+	private readonly pinchHiddenCanvases = new Map<HTMLCanvasElement,string>();
+	private pinchComposite = false;
+	/**
+	 * Did the pan path actually measure and hold this gesture?
+	 *
+	 * A pan of zero is ambiguous on its own - it is both "nothing needed
+	 * moving" and "there was nothing to measure". The settle spends the pan into
+	 * the scroll, which is only the right target in the first case; in the
+	 * second the old absolute anchor is still the best available answer. The
+	 * unit fixtures drive the gesture with no DOM to measure, and are exactly
+	 * that second case.
+	 */
+	private previewPanEngaged = false;
+	/**
+	 * The host's painted origin as of the last `columnLocalAt`, and whether that
+	 * read happened at all. Mutated rather than replaced: this is written once
+	 * per preview frame and a fresh object per frame is an allocation on the one
+	 * path `deferPinchRaster` exists to keep free of them.
+	 */
+	private previewHostOrigin = { left: 0, top: 0, valid: false };
+	/** The column in host-local px as of the last preview frame's one read. */
+	private previewColumnLocal: number | null = null;
+	/** `.cm-sizer`, cached: `writeViewportPan` runs once per preview frame. */
+	private panSizerEl: HTMLElement | null = null;
+	/**
+	 * Armed for the duration of ONE settle transaction, so the several scroll
+	 * writes inside `commitCameraScale` each re-derive the pan they need rather
+	 * than leaving the note wherever the browser's clamp put it.
+	 */
+	private panAnchorHold: {
+		focalX: number; focalY: number; targetX?: number; targetY?: number; hostLeft: number; hostTop: number;
+		columnLocal: number | null; contentTopLocal: number | null; fromScale: number; scrollTop: number; toScale: number; generation: number; path: string | null; container: HTMLElement | null;
+		expansion?: { left: number; top: number } | null;
+		left: number; top: number; ready: boolean; outcome: "pending" | "converged" | "cancelled" | "failed"; attempts: number; request: unknown; issuance: readonly unknown[];
 	} | null = null;
 	private pinchRaf = 0;
 	/** The scale the ink raster currently reflects, so a settle that would
 	 * change nothing does not reallocate every canvas. */
 	private pinchRasterScale = 1;
+	/** Host-local px the preview raster is currently translated by. See applyPreviewInkOffset. */
+	private previewInkOffset = 0;
+	/**
+	 * Where the column was, in HOST-LOCAL px, when the committed raster was
+	 * last drawn. Null when there is nothing measured to compare against.
+	 */
+	private rasterColumnLocal: number | null = null;
+	/**
+	 * The scroller's scrollLeft at the moment `rasterColumnLocal` was latched.
+	 * `columnLocalAt` is host-local and therefore moves with the scroll; the
+	 * ink layer rides inside the scroller and moves with it too, so a scroll
+	 * change since the latch must NOT enter the preview offset a second time.
+	 */
+	private rasterColumnScroll = 0;
+	/** A repaint redrew the raster mid-gesture; re-latch before the next box move. */
+	private previewAnchorStale = false;
+	private repaintDeferredByPinch = false;
+	private pinchDeferTimer = 0;
+	/**
+	 * The layer holding the canvases, inside the band.
+	 *
+	 * The preview offset is written HERE and not on the band, and that is
+	 * load-bearing: `syncCamera` derives the camera from
+	 * `this.container.getBoundingClientRect()`, so translating the band moves
+	 * the very box the camera is measured from - the camera absorbs the offset
+	 * and the transform then applies it a second time. Measured while the band
+	 * carried it: a pinch paused past PINCH_SCROLL_QUIET_MS came back 256.4px
+	 * out at k 0.30 and stayed out for the rest of the gesture. The layer fills
+	 * the band and nothing measures it.
+	 */
+	private inkLayer: HTMLElement | null = null;
 	/** The ink band's box in scroller-content coordinates; see ScrollBand. */
 	private band: Band | null = null;
+	private bandSyncDeferred = false;
 	// Font-zoom tracking (quick font size / touchpad pinch; see ZoomScale).
 	/** Live computed style of the content element; .fontSize is a cheap read. */
 	private contentStyle: CSSStyleDeclaration | null = null;
@@ -1470,7 +1743,16 @@ export class InkOverlayPlugin {
  private viewportStyleFrame = 0;
  private viewportStyleStamp = "";
  private viewportStyleDirty: {path:string|null;container:HTMLElement|null} | null = null;
- private viewportLayout: {parent:HTMLElement; paneWidth:number; paneHeight:number; externalScale:number; baseTransform:string; width:number; height:number; column:number; left:string; right:string; styles:Map<string,{value:string;priority:string}>} | null = null;
+ private viewportLayout: {parent:HTMLElement; paneWidth:number; paneHeight:number; externalScale:number; baseTransform:string; baseZoom:number; zoomVerified?:boolean; width:number; height:number; column:number; left:string; right:string; columnLocal:number|null; styles:Map<string,{value:string;priority:string}>} | null = null;
+ /** `CSS.supports("zoom", "0.5")`, asked once per overlay. See `hostZoomSupported`. */
+ private hostZoomSupport: boolean | null = null;
+ /**
+  * The reallocation's own check that the backing it just allocated matches
+  * the device pixels the container actually occupies. Null when they agree
+  * within a pixel; the pair when they do not. Read by the suites; nothing in
+  * production branches on it and nothing is logged.
+  */
+ backingBoxMismatch: {backingW:number; rectBackingW:number} | null = null;
 
 	private fontZoom = 1;
 	/** overflow-x re-checked once per resize/mount, not per repaint. */
@@ -1629,6 +1911,7 @@ export class InkOverlayPlugin {
 
 	mount(): void {
 		if (this.container || !enabled) return;
+		this.retiring = false;
 		// Not a file-backed markdown editor (e.g. a bare CM instance): stay inert.
 		if (this.view.state.field(editorInfoField, false) === undefined) return;
 
@@ -1689,6 +1972,7 @@ export class InkOverlayPlugin {
 		// being tested, and the two are measured by different numbers
 		// (age@present in the ink metrics against how the scroll feels).
 		const layer = container.createDiv({ cls: "handwriting-ink-layer" });
+		this.inkLayer = layer;
 		layer.setCssStyles({
 			position: "absolute",
 			inset: "0",
@@ -1745,7 +2029,11 @@ export class InkOverlayPlugin {
 		// One low-latency surface in the stack is apparently the budget.
 		this.tail = new TailRenderer(this.tailCanvas);
 
-		this.penCursorEl = container.createDiv({ cls: "handwriting-pen-cursor" });
+		// The reticle belongs to the pointer's client frame, outside the editor's
+		// pinch transform and scrolling raster band. Use this window's document.
+		this.penCursorEl = container.ownerDocument.body.createDiv({ cls: "handwriting-pen-cursor" });
+		this.penCursorEl.setCssStyles({ position: "fixed", left: "0", top: "0", zIndex: "10000" });
+		this.penCursorPinned = true;
 		this.penCursorEl.setAttribute("aria-hidden", "true");
 		this.eraserEl = container.createDiv({ cls: "handwriting-eraser-cursor" });
 		this.eraserEl.setAttribute("aria-hidden", "true");
@@ -1771,6 +2059,11 @@ export class InkOverlayPlugin {
 			container,
 			{
 				onPenDown: (s, ev) => this.penDown(s, ev),
+				onViewportInput: () => { this.retirePanSettle(); },
+				onBeforePenDown: () => {
+					this.restorePinchLayers();
+					if (this.rasterPanNeedsBake()) this.repaint();
+				},
 				// The pointerType is PASSED ON. The interface has always
 				// declared it (onPenHover(sample, pointerType?)) and the
 				// router has always supplied it; this call site dropped it,
@@ -1845,7 +2138,15 @@ export class InkOverlayPlugin {
 			// construct an InkOverlayPlugin to reach a closure.
 			onStrokeAbandoned: () => this.strokeAbandoned(),
 			},
-			() => this.cssScale
+			() => this.cssScale,
+			"none",
+			// The pen's client point is in the frame the ink is painted in.
+			// Subtract only the pan still carried by the layer's transform.
+			// Settled pan is already represented by the raster camera.
+			() => {
+				this.rasterInputPan.x = this.inkPanX(); this.rasterInputPan.y = this.inkPanY();
+				return this.rasterInputPan;
+			}
 		);
 
 		this.router.setCanvasMomentumDisabled(scrollExpansionEnabled);
@@ -1874,8 +2175,8 @@ export class InkOverlayPlugin {
 			if (!this.container) return null;
 			const rect = this.container.getBoundingClientRect();
 			const w = this.camera.screenToWorld(
-				visualToNote(clientX - rect.left, this.cssScale),
-				visualToNote(clientY - rect.top, this.cssScale)
+				visualToNote(clientX - rect.left - this.inkPanX(), this.cssScale),
+				visualToNote(clientY - rect.top - this.inkPanY(), this.cssScale)
 			);
 			const path = this.filePath();
 			const granted = path ? surfaceExtents.get(path) : ZERO_EXTENT;
@@ -1915,6 +2216,10 @@ export class InkOverlayPlugin {
 			// the same coordinate frame the camera froze with, and refreshing
 			// one without the other is exactly the forward/inverse mismatch
 			// the frozen pipeline exists to prevent.
+			// Only producer readbacks may compensate a settle. An unmatched
+			// scroll belongs to navigation, including programmatic scrolling.
+			const hold = this.panAnchorHold;
+			if (hold && (scrollLeft !== hold.left || scrollTop !== hold.top)) this.retirePanSettle();
 			if (!during) this.router?.refreshRect();
 			if (diagnosticsEnabled()) {
 				scrollProbeScroll(scrollLeft, scrollTop, during);
@@ -1935,6 +2240,8 @@ export class InkOverlayPlugin {
 			// own a few frames after the last pinch-driven scroll, whatever
 			// happens to the gesture.
 			if (performance.now() - this.pinchScrollAt < PINCH_SCROLL_QUIET_MS) return;
+			const path = this.filePath();
+			if (path) this.scrollExpansion?.sample(path, scrollExpansionEnabled, scrollLeft, scrollTop);
 			this.scheduleRepaint("scroll");
 		};
 		this.view.scrollDOM.addEventListener("scroll", this.scrollFn, { passive: true });
@@ -1943,6 +2250,7 @@ export class InkOverlayPlugin {
 		// touch pointers. Passive + capture: sees everything, changes nothing.
 		// Wholly diagnostic, so the whole body is behind the switch (RC4).
 		this.wheelFn = (e: WheelEvent) => {
+			this.retirePanSettle();
 			if (!diagnosticsEnabled()) return;
 			scrollProbeWheel(
 				e,
@@ -2282,6 +2590,8 @@ export class InkOverlayPlugin {
 	}
 
 	unmount(): void {
+		this.retiring = true;
+		this.retirePanSettle();
 		if (diagnosticsEnabled() && this.undoIdentity) discardUndoTrace(this.undoIdentity);
 		this.router?.dispose();
 		this.router = null;
@@ -2304,6 +2614,7 @@ export class InkOverlayPlugin {
 		this.offInkChanged?.();
 		this.offInkChanged = null;
 		this.lastExtentInputs = null;
+		this.cameraOriginY = null;
 		setHitProbeContext(null);
 		this.spacer?.remove();
 		this.spacer = null;
@@ -2330,13 +2641,35 @@ export class InkOverlayPlugin {
 		// A stroke interrupted by teardown never reaches pen-up, so the
 		// ticker rAF would keep rescheduling itself against a dead overlay.
 		this.stopFrameTicker();
+		this.restorePinchLayers();
 		this.container?.remove();
 		this.container = null;
+		this.inkLayer = null;
 		this.band = null;
 		// A pinch frame outliving the overlay would touch a torn-down editor.
 		if (this.pinchRaf !== 0) {
 			this.winRef.cancelAnimationFrame(this.pinchRaf);
 			this.pinchRaf = 0;
+		}
+		if (this.resizeOutOfUpdateRaf) { this.winRef.cancelAnimationFrame(this.resizeOutOfUpdateRaf); this.resizeOutOfUpdateRaf = 0; }
+		// A preview torn down mid-gesture gives CodeMirror its measuring back;
+		// the make-up measure waits a frame, since this can run inside
+		// CodeMirror's own update.
+		this.releaseMeasures(true);
+		// OUTSIDE that guard: a teardown can find a deferred-repaint timer
+		// armed with no pinch rAF in flight, and the timer would then be
+		// left running. Inert today - the callback bails on a missing
+		// container - but the contract is that the latch and the timer are
+		// cleared together, and relying on a bail in the other file is how
+		// that contract quietly stops holding.
+		this.clearDeferredRepaint();
+		// Same shape, and pre-existing: the insert-space feedback frame was
+		// only ever cancelled by clearSpaceFeedback, never at teardown, so a
+		// detach mid-hover left it queued against a dead overlay
+		// (release-1.4.19, ec802917).
+		if (this.spaceFeedbackRaf != null) {
+			this.winRef.cancelAnimationFrame(this.spaceFeedbackRaf);
+			this.spaceFeedbackRaf = null;
 		}
 		this.pinchPending = null;
 		// Hand the editor back the way it was found. The transform, the
@@ -2345,13 +2678,24 @@ export class InkOverlayPlugin {
 		// editor painted at scale in a fraction-width box, with the only
 		// code that could undo it now unloaded.
 		this.restoreViewportLayout();
+		// The camera anchor lives in the editor's own DOM, beside the content,
+		// and the editor OUTLIVES this overlay: a plugin disable or reload
+		// would otherwise leave the wrapper and its rungs in the note, and the
+		// next load would add another beside it.
+		unmountDocumentAnchor(this.view);
 		this.pinchScaleNow = 1;
+		this.zoomFloor = MIN_PINCH_SCALE;
 		this.pinchRasterScale = 1;
+		this.rasterColumnLocal = null;
+		this.previewAnchorStale = false;
 		this.pinchRefScale = null;
 		this.pinchAnchor = null;
 		this.pinchScrollAt = 0;
 		this.builder = null;
+		if (this.penCursorPinned) this.penCursorEl?.remove();
 		this.penCursorEl = null;
+		this.penCursorPinned = false;
+		this.penCursorClient = null;
 		this.eraserEl = null;
 		this.mobileTools?.destroy();
 		this.mobileTools = null;
@@ -2370,6 +2714,19 @@ export class InkOverlayPlugin {
 	}
 
 	update(u: ViewUpdate): void {
+		// EVERY ROUTE OUT OF HERE IS INSIDE CODEMIRROR'S UPDATE. The routes
+		// that can release the measure hold are handled by name (the file
+		// switch's reset defers its measure; a font-size reflow's resize is
+		// deferred whole, `resizeOutOfUpdate`). The flag is the net for a
+		// route nobody named: a release under it defers its measure and says so.
+		this.inUpdate = true;
+		try { this.updateInner(u); } finally { this.inUpdate = false; }
+	}
+
+	private updateInner(u: ViewUpdate): void {
+		const hold = this.panAnchorHold;
+		if (hold && u.transactions.some(tr => tr.docChanged || tr.selection || tr.scrollIntoView || tr.effects.some(effect => !hold.issuance.includes(effect)))) this.retirePanSettle();
+		if(u.docChanged)this.clearSpaceFeedback();
 		if (!this.container) {
 			if (enabled) this.mount();
 			return;
@@ -2395,6 +2752,7 @@ export class InkOverlayPlugin {
 
 		const path = this.filePath();
 		if (path !== this.lastPath) {
+			this.cameraOriginY = null;
 			if (diagnosticsEnabled() && this.undoIdentity) {
 				discardUndoTrace(this.undoIdentity);
 				unregisterUndoTraceView(this.view.dom);
@@ -2405,7 +2763,7 @@ export class InkOverlayPlugin {
 				this.undoIdentityStale = true;
 			}
    this.restoreViewportLayout();
-   this.pinchScaleNow=1; this.pinchRasterScale=1;
+   this.pinchScaleNow=1; this.zoomFloor=MIN_PINCH_SCALE; this.pinchRasterScale=1; this.rasterColumnLocal=null; this.previewAnchorStale=false;
    this.pinchPending=null; this.pinchAnchor=null; this.pinchRefScale=null;
    this.view.scrollDOM.scrollLeft=0; this.view.scrollDOM.scrollTop=0;
    this.scrollExpansion?.rebase(0,0);
@@ -2465,7 +2823,12 @@ export class InkOverlayPlugin {
 				this.contentStyle &&
 				this.contentStyle.fontSize !== this.lastFontStr
 			) {
-				this.handleResize();
+				// Under a held preview this resize can reach commitCameraScale,
+				// whose release runs CodeMirror's measure; that must not happen
+				// inside CodeMirror's own update, and deferring only the release
+				// would put the settle's scroll write before the fold. So the
+				// WHOLE resize moves to a frame of its own (`resizeOutOfUpdate`).
+				if (this.measureHold) this.resizeOutOfUpdate(); else this.handleResize();
 			}
 			// "scroll", not the default: the default marks the whole surface
 			// damaged and the index dirty, so every keystroke in a note with
@@ -2486,6 +2849,7 @@ export class InkOverlayPlugin {
 	}
 
 	handleKeyDown(event: KeyboardEvent): boolean {
+		this.retirePanSettle();
 		const undoKind = diagnosticsEnabled() ? isUndoRedoKey(event) : null;
 		if (undoKind) {
 			if (this.undoIdentityStale) {
@@ -2649,6 +3013,8 @@ export class InkOverlayPlugin {
 
 	/** The live overlay container, for the census's ghost detection. */
 	setCanvasMomentumDisabled(on: boolean): void {
+		if (this.panAnchorHold) this.panAnchorHold.expansion = null;
+		this.scrollExpansion?.rebase(this.view.scrollDOM.scrollLeft, this.view.scrollDOM.scrollTop);
 		this.router?.setCanvasMomentumDisabled(on);
 	}
 
@@ -2688,24 +3054,43 @@ export class InkOverlayPlugin {
 	// ---- geometry -----------------------------------------------------------
 
 	private handleResize(): void {
+  if(this.deferPinchRaster())return;
+		this.restorePinchLayers();
   this.mobileTools?.refresh();
-  this.scrollExpansion?.rebase(this.view.scrollDOM.scrollLeft,this.view.scrollDOM.scrollTop);
+  // A mechanical band resize must retain forward demand admitted by scroll.
+  this.scrollExpansion?.rebase(this.view.scrollDOM.scrollLeft,this.view.scrollDOM.scrollTop,true);
   const layout=this.viewportLayout;
+  if(layout&&layout.parent.clientWidth>0&&layout.parent.clientHeight>0&&this.viewportStyleDirty)this.scheduleViewportStyleRefresh();
   if(layout && !this.frame.locked && layout.parent.clientWidth>0 && layout.parent.clientHeight>0 &&
    (layout.parent.clientWidth!==layout.paneWidth||layout.parent.clientHeight!==layout.paneHeight)) {
    const width=layout.width+layout.parent.clientWidth-layout.paneWidth;
    const height=layout.height+layout.parent.clientHeight-layout.paneHeight;
    if(width>0&&height>0&&width/this.pinchScaleNow<=MAX_VIEWPORT_LAYOUT&&height/this.pinchScaleNow<=MAX_VIEWPORT_LAYOUT) {
-    layout.width=width;layout.height=height;layout.paneWidth=layout.parent.clientWidth;layout.paneHeight=layout.parent.clientHeight;
+    // Measure the natural column with ownership removed below. A fixed-left
+    // column does not follow half the width delta; a theme can change its cap.
+    // Preserve native scroll across this temporary unscaled-width layout.
+    const savedLeft=this.view.scrollDOM.scrollLeft,savedTop=this.view.scrollDOM.scrollTop;
+        layout.width=width;layout.height=height;layout.paneWidth=layout.parent.clientWidth;layout.paneHeight=layout.parent.clientHeight;
     const host=this.view.dom;
     host.classList.remove("handwriting-note-viewport");
     host.setCssStyles({width:`${width}px`,height:`${height}px`});
     const style=this.winRef.getComputedStyle(this.view.contentDOM);
-    layout.column=this.view.contentDOM.offsetWidth;layout.left=style.marginLeft;layout.right=style.marginRight;
-    this.commitCameraScale(this.pinchScaleNow);
-    return;
+    const column=this.view.contentDOM.offsetWidth;
+    if(column>0){layout.column=column;layout.left=style.marginLeft;layout.right=style.marginRight;}
+    const natural=contentOrigin(this.view.contentDOM);
+    layout.columnLocal=this.ownedColumnLayoutLeft(natural.line) ?? (natural.left===null?null:(natural.left-this.panX()-host.getBoundingClientRect().left)/this.cssScale+this.view.scrollDOM.scrollLeft);
+    // Hidden editors release their backings and invalidate geometry. Restore
+    // the full physical viewport before navigation can reject that stale state,
+    // then let the common resize path measure and rebuild the visible surface.
+    this.applyViewportBox(this.pinchScaleNow);
+    this.view.scrollDOM.scrollLeft=savedLeft;this.view.scrollDOM.scrollTop=savedTop;
+    if(this.scaleGeometryValid!==false&&this.commitCameraScale(this.pinchScaleNow, undefined, undefined, true))return;
    }
   }
+		// UNDER THE HOLD (D-COV, AD-4 i): a resize that did not commit above
+		// reallocates nothing and moves no band; the raster keeps the basis the
+		// preview translate was solved against until the settle re-rasters.
+		if (this.pinchPreview) return;
 		this.clearSnapPreview();
 		if (!this.container) return;
 		if (scrollExpansionEnabled) this.lastExtentInputs = null;
@@ -2877,13 +3262,34 @@ export class InkOverlayPlugin {
 			canvasReallocs++;
 			c.width = size.backingW;
 			c.height = size.backingH;
-			c.setCssStyles({ width: `${size.cssW}px`, height: `${size.cssH}px` });
+			// The compositor's layer follows this box, not the backing: keep it
+			// at the visual size and stretch it over the band (canvasLayerBox).
+			// Under a zoom-shrunk host the inherited zoom already does that, so
+			// the same call returns the plain band box and no transform.
+			const box = canvasLayerBox(size.cssW, size.cssH, measuredCssScale, this.hostZoomSupported());
+			c.setCssStyles({ width: `${box.width}px`, height: `${box.height}px`, transform: box.transform, transformOrigin: box.transform ? "0 0" : "" });
 		}
+		// The backing just allocated against the device pixels the container
+		// really occupies. `rect` is the read this method already made and
+		// nothing since has moved the container, so this costs no second forced
+		// layout. They disagree when the box and the backing were computed from
+		// different geometry, which resamples the ink: a host whose zoom came
+		// from injected CSS rather than the overlay's own write. Recorded for
+		// the suites, never logged.
+		const rectBackingW = Math.round(rect.width * this.dpr);
+		this.backingBoxMismatch = Math.abs(size.backingW - rectBackingW) > 1
+			? { backingW: size.backingW, rectBackingW }
+			: null;
 		this.committedCtx.setTransform(backing, 0, 0, backing, 0, 0);
+		this.committedBacking = backing;
 		this.highlightCtx.setTransform(backing, 0, 0, backing, 0, 0);
 		this.wet.applyDpr(backing);
 		this.highlightWet.applyDpr(backing);
 		this.tail.applyDpr(backing);
+		this.wet.noteBackingCleared?.();
+		this.highlightWet.noteBackingCleared?.();
+		this.tail.noteBackingCleared?.();
+		this.committedBlank = this.highlightBlank = true;
 		// Same guard as the unchanged arm's: re-basing the router's rect
 		// mid-stroke shifts every sample after it while the camera stays
 		// frozen. The backings above are reallocated either way - that blanks
@@ -2979,9 +3385,17 @@ export class InkOverlayPlugin {
 		);
 	}
 
-	/** `resolveColumnLeft` over a fresh scan, for the sites that only paint. */
+	/**
+	 * `resolveColumnLeft` over a fresh scan, for the sites that only paint.
+	 *
+	 * UNPANNED, and every caller wants it that way: the camera this feeds paints
+	 * into the ink layer. Its raster camera and transform together carry the
+	 * focal pan. De-panned BEFORE `resolveColumnLeft` so the
+	 * cached last-good value is in the same frame as the live ones - a cache
+	 * holding a panned number would come back out against a different pan.
+	 */
 	private columnLeft(): number {
-		return this.resolveColumnLeft(contentOriginLeft(this.view.contentDOM));
+		return this.resolveColumnLeft(this.unpanX(contentOriginLeft(this.view.contentDOM)));
 	}
 
 	/**
@@ -3088,6 +3502,7 @@ export class InkOverlayPlugin {
 	 * the one frame in which CM's own answer for it is not yet true.
 	 */
 	private syncCamera(): void {
+		if (this.deferPinchRaster()) return;
 		if (!this.container) return;
 		// A stroke in flight owns its coordinate frame until it ends.
 		if (this.frame.locked) return;
@@ -3098,7 +3513,13 @@ export class InkOverlayPlugin {
 		// installed once - and since the scan has just run anyway, the re-arm
 		// costs one reference comparison on the frames where it did not move.
 		const origin = contentOrigin(this.view.contentDOM);
-		const contentLeft = this.resolveColumnLeft(origin.left);
+		// De-panned, like every other camera-facing column read: `.cm-content`
+		// rides inside `.cm-sizer`, which carries the text half of the focal
+		// pan. The raster camera below accounts only for its baked portion;
+		// the ink layer carries the rest. Letting raw pan into this read is the double-apply a
+		// deferral lapse - a finger held still past PINCH_SCROLL_QUIET_MS, which
+		// lets this method run mid-gesture - would otherwise produce.
+		const contentLeft = this.resolveColumnLeft(this.unpanX(origin.left));
 		this.watchOriginLine(origin.line, contentLeft);
 		// THE ANCHOR THE TEXT IS LAID OUT WITH, which for one frame is not the
 		// anchor CodeMirror reports.
@@ -3133,7 +3554,7 @@ export class InkOverlayPlugin {
 		// rects above have forced layout, and no `getComputedStyle` call. Absent
 		// only before the first `handleResize` has run, and `anchorTop` falls
 		// back to CodeMirror's own answer there.
-		const documentTop = anchorTop(this.view, this.contentStyle?.paddingTop);
+
 		// Measure the SCALE from the same rect read as the camera, every
 		// time, instead of trusting the value handleResize last cached.
 		//
@@ -3199,6 +3620,14 @@ export class InkOverlayPlugin {
 		// can move on a frame where the css scale did not, and leaving
 		// `this.scale` stale there was half of the same defect.
 		this.scale = this.cssScale * this.fontZoom;
+		// Use the adopted scale in both this method and its read-only twin.
+		// ONE rect read, and it is the ANCHOR PROBE's rather than
+		// `.cm-content`'s - see DocumentAnchor.ts for why the large rect is the
+		// defect. `anchorTop` is still the fallback and is still what the
+		// number below means, so nothing downstream changes shape.
+		const anchor = this.anchorCameraY(overlay.top);
+		const documentTopPanned = anchor ? anchor.impliedTop : anchorTop(this.view, this.contentStyle?.paddingTop, this.cssScale);
+		const documentTop = documentTopPanned - this.panY();
 		// Stashed for the scroll probe: read once, here, never re-read there.
 		this.lastSyncRectLeft = overlay.left;
 		this.lastSyncRectTop = overlay.top;
@@ -3217,11 +3646,36 @@ export class InkOverlayPlugin {
 		// zoom). The font zoom itself rides on the camera as a real zoom:
 		// worldToScreen multiplies by it, screenToWorld divides by it, so the
 		// forward and inverse transforms are inverses by construction.
+		// Subtract the two scrolling rects before adding the pan. Removing it
+		// from only one operand first rounds differently as both rects scroll,
+		// creating camera motion and a full repaint while the band is still.
+		const layoutColumn = this.ownedColumnLayoutLeft(origin.line);
 		this.camera.setState(
-			visualToNote(overlay.left - contentLeft, this.scale),
-			visualToNote(overlay.top - documentTop, this.scale),
+			(layoutColumn === null ? visualToNote(origin.left === null ? overlay.left - contentLeft : (overlay.left - origin.left) + this.panX(), this.scale) : (this.band!.left - layoutColumn) / this.fontZoom) - (this.rasterPan?.x ?? 0) / this.fontZoom,
+			// THE ANCHORED FORM, when the ladder answered: the rung's own offset
+			// enters as an exact integer of layout px, and only the residual -
+			// at most half a rung spacing from where the camera was left - is
+			// divided by the believed cssScale. The fallback is the shipped
+			// expression, unchanged, so a view without the widget is
+			// arithmetically what it was.
+			this.canonicalCameraY(anchor
+				? anchor.layout / this.fontZoom - (this.rasterPan?.y ?? 0) / this.fontZoom
+				: visualToNote((overlay.top - documentTopPanned) + this.panY(), this.scale) - (this.rasterPan?.y ?? 0) / this.fontZoom, true),
 			this.fontZoom
 		);
+		// Where the next sync starts looking for a rung. A stored number, not a
+		// DOM write: nothing inside contentDOM is touched on the scroll path.
+		if (anchor) this.anchorCameraYLayout = anchor.layout;
+		// F-2: gate at mount, at every basis reset and at every adoption. All
+		// three already cost a mount or a full redraw, and `basisResets` measures
+		// 0 per round on the far arms, so the gate's one rect read is never on
+		// the steady scroll path.
+		if (anchor && (this.anchorGateDue || this.anchorAdoptionEvent)) {
+			const why = this.anchorGateDue ? "mount" : "adoption";
+			this.anchorGateDue = false;
+			this.gateAnchorParity(why, anchor.impliedTop, anchor.rung * RUNG_SPACING);
+		}
+		this.anchorAdoptionEvent = false;
 		// THE ORIGIN MOVED SINCE THE PIXELS WERE DRAWN. Ask for the frame that
 		// redraws them.
 		//
@@ -3308,6 +3762,7 @@ export class InkOverlayPlugin {
 		// back. The class comes off when the pen leaves (onPenLeave), not
 		// when it touches down.
 		if (this.penCursorEl) this.penCursorEl.setCssStyles({ display: "none" });
+		this.penCursorClient = null;
 		// The only layout reads on the whole stroke happen here, once. From
 		// here the frame is frozen until pen-up.
 		this.frame.end();
@@ -3761,6 +4216,117 @@ export class InkOverlayPlugin {
 		});
 	}
 
+	private originStyle(el: Element): CSSStyleDeclaration {
+		this.originStyles ??= new WeakMap<Element, CSSStyleDeclaration>();
+		let value = this.originStyles.get(el);
+		if (!value) { value = this.winRef.getComputedStyle(el); this.originStyles.set(el, value); }
+		return value;
+	}
+
+	/** Untransformed column position for the owned normal-flow sizer tree.
+	 * A transformed DOM rect loses precision as it crosses the viewport; its
+	 * de-panned value cannot be made stable by rearranging subtraction. Read
+	 * resolved fractional margins and insets in the same layout coordinates
+	 * as band.left instead. Unsupported positioning keeps the live DOM path.
+	 */
+	private ownedColumnLayoutLeft(line: Element | null): number | null {
+		if (!this.viewportLayout || !this.band || !line) return null;
+		const scroller = this.view.scrollDOM, sizer = this.panSizer();
+		if (!sizer || !sizer.contains(line)) return null;
+
+		let x = 0;
+		for (let el: Element | null = line; el && el !== scroller; el = el.parentElement) {
+			const parent: Element | null = el.parentElement;
+			if (!parent) return null;
+			const cs = this.originStyle(el), ps = this.originStyle(parent);
+			if (cs.direction !== 'ltr' || cs.writingMode !== 'horizontal-tb' || cs.cssFloat !== 'none' ||
+				(cs.position !== 'static' && cs.position !== 'relative') ||
+				(cs.position === 'relative' && ((cs.left !== 'auto' && parseFloat(cs.left) !== 0) || (cs.right !== 'auto' && parseFloat(cs.right) !== 0))) ||
+				(el !== sizer && cs.transform !== 'none') || cs.translate !== 'none' || cs.rotate !== 'none' || cs.scale !== 'none' ||
+				(cs.display !== 'block' && cs.display !== 'flow-root' && cs.display !== 'flex') || ps.display.includes('grid') ||
+				(cs.zoom !== '1' && cs.zoom !== 'normal') || (ps.zoom !== '1' && ps.zoom !== 'normal')) return null;
+			if (ps.display.includes('flex')) {
+				const row = ps.flexDirection === 'row';
+				const alignment = cs.alignSelf === 'auto' ? ps.alignItems : cs.alignSelf;
+				if (ps.flexWrap !== 'nowrap' || cs.order !== '0') return null;
+				if (row && ps.justifyContent !== 'normal' && ps.justifyContent !== 'start' && ps.justifyContent !== 'flex-start' && ps.justifyContent !== 'left') return null;
+				if (!row && (ps.flexDirection !== 'column' || (alignment !== 'normal' && alignment !== 'stretch' && alignment !== 'start' && alignment !== 'flex-start'))) return null;
+				if (row) for (let sibling: Element | null = parent.firstElementChild; sibling; sibling = sibling.nextElementSibling) {
+					if (sibling === el) continue;
+					const ss = this.originStyle(sibling);
+					if (ss.display !== 'none' && ss.position !== 'absolute' && ss.position !== 'fixed') return null;
+				}
+			}
+			const margin = parseFloat(cs.marginLeft), padding = parseFloat(ps.paddingLeft), border = parent === scroller ? 0 : parseFloat(ps.borderLeftWidth);
+			if (!Number.isFinite(margin) || !Number.isFinite(padding) || !Number.isFinite(border)) return null;
+			x += margin + padding + border;
+			if (parent === scroller) return x;
+		}
+		return null;
+	}
+
+	/** Keep scroll-only rect rounding out of the camera shared by paint/input.
+	 * A changed basis accepts raw geometry immediately. Unobserved flow changes
+	 * still compare against the retained reference and cannot accumulate drift.
+	 */
+	private canonicalCameraY(raw: number, adopt: boolean): number {
+		const canvases = [this.committedCanvas, this.highlightCanvas, this.wetCanvas, this.highlightWetCanvas, this.tailCanvas];
+		const backing = Math.max(...canvases.map(c => c ? Math.max(c.width / this.cssWidth, c.height / this.cssHeight) : NaN));
+		if (!this.viewportLayout || !this.band || !this.scaleGeometryValid || !Number.isFinite(raw) || !Number.isFinite(backing)) {
+			if (adopt) this.cameraOriginY = null;
+			return raw;
+		}
+		// NOT `viewportGeneration`. That counter is continuation OWNERSHIP: a
+		// pen-down, a pinch start, `restoreViewportLayout` and a navigation each
+		// bump it so a pending async measure can tell it no longer owns the
+		// view. None of the four is a geometry input in its own right, and every
+		// geometry a bump could stand for is already a term here - the band,
+		// both pans, both scales, the padding, the dpr, the backing, the layout
+		// object. With it in the basis every pen-down reseeded the retained
+		// origin, so the first stroke after a scroll adopted a raw Y that sat
+		// INSIDE both caps and re-rasterised the whole note for it: measured at
+		// 6-17 ms a stroke, one per round at 0.15 and one per scroll at 0.10,
+		// near and far alike, and every sub-cap basis reset in that measurement
+		// was attributed to this term and to nothing else.
+		// Removing it does not disable the rule at a pen-down; it stops a
+		// pen-down from disabling the rule.
+		const basis = [this.filePath(), this.view.contentDOM, this.container, this.panSizer(), this.band,
+			this.cssScale, this.fontZoom, this.panX(), this.panY(), this.rasterPan?.x, this.rasterPan?.y,
+			this.contentStyle?.paddingTop, this.view.scaleX, this.view.scaleY, this.dpr, backing,
+			this.viewportLayout];
+		// F-2/F-3: did this call ADOPT a raw that differs from the retained one?
+		// That is either a basis reset or a raw beyond the cap, and both are the
+		// moments the anchor has to be re-proved against `anchorTop` - a theme
+		// switch that displaces the wrapper by a constant looks exactly like
+		// genuine text movement otherwise. Recorded here, acted on by
+		// `syncCamera`, because the gate costs a rect read and this method is
+		// called by the read-only twin too.
+		const priorY = this.cameraOriginY ? this.cameraOriginY.y : null;
+		const y = stableCameraOriginY(raw, this.cameraOriginY, basis, this.cssScale, this.fontZoom, backing);
+		if (adopt) this.anchorAdoptionEvent = priorY === null || (y === raw && raw !== priorY);
+		if (adopt && (y === raw || !this.cameraOriginY)) this.cameraOriginY = { y, basis };
+		return y;
+	}
+
+	/**
+	 * F-2: prove the ladder still stands for the same document top `anchorTop`
+	 * reports, and take it out of service for this view's lifetime if not.
+	 *
+	 * ONE `contentDOM` rect read, and only at the events that already cost a
+	 * full redraw or a mount - `basisResets` measures 0 per round on the far
+	 * arms, so this is never on the steady scroll path. Every consumer falls
+	 * back together because the ladder itself is unmounted: the camera, the
+	 * read-only twin and the diagnostics all ask `documentAnchorLadder` first.
+	 */
+	private gateAnchorParity(reason: string, implied: number, rungTopLayout: number): void {
+		const shipped = anchorTop(this.view, this.contentStyle?.paddingTop, this.cssScale);
+		const contentTop = this.view.contentDOM.getBoundingClientRect().top;
+		const bar = anchorParityBar(contentTop, rungTopLayout, this.cssScale);
+		if (Number.isFinite(implied) && Number.isFinite(shipped) && Math.abs(implied - shipped) <= bar) return;
+		refuseDocumentAnchor(this.view, { implied, shipped, bar, reason });
+		scrollProbeExtent(`document anchor refused (${reason}): implied ${implied} vs anchorTop ${shipped}, delta ${Math.abs(implied - shipped)} > bar ${bar}`);
+	}
+
 	/**
 	 * What syncCamera WOULD produce right now, without touching the camera.
 	 * Read-only diagnostic twin of syncCamera: while frameLocked freezes the
@@ -3775,12 +4341,46 @@ export class InkOverlayPlugin {
 	private freshFrame(): { x: number; y: number } | null {
 		if (!this.container) return null;
 		const overlay = this.container.getBoundingClientRect();
-		const contentLeft = this.columnLeft();
-		const documentTop = anchorTop(this.view, this.contentStyle?.paddingTop);
+		const origin = contentOrigin(this.view.contentDOM);
+		const contentLeft = this.resolveColumnLeft(this.unpanX(origin.left));
+		// The twin reads the anchor the same way and RE-PLACES NOTHING: a
+		// read-only diagnostic that moved the probe would be a write.
+		const anchor = this.anchorCameraY(overlay.top);
+		const documentTopPanned = anchor ? anchor.impliedTop : anchorTop(this.view, this.contentStyle?.paddingTop, this.cssScale);
+		const layoutColumn = this.ownedColumnLayoutLeft(origin.line);
 		return {
-			x: visualToNote(overlay.left - contentLeft, this.scale),
-			y: visualToNote(overlay.top - documentTop, this.scale),
+			x: (layoutColumn === null ? visualToNote(origin.left === null ? overlay.left - contentLeft : (overlay.left - origin.left) + this.panX(), this.scale) : (this.band!.left - layoutColumn) / this.fontZoom) - (this.rasterPan?.x ?? 0) / this.fontZoom,
+			y: this.canonicalCameraY(anchor
+				? anchor.layout / this.fontZoom - (this.rasterPan?.y ?? 0) / this.fontZoom
+				: visualToNote((overlay.top - documentTopPanned) + this.panY(), this.scale) - (this.rasterPan?.y ?? 0) / this.fontZoom, false),
 		};
+	}
+
+	/**
+	 * E's Y origin from the anchor probe, or `null` to fall back.
+	 *
+	 * ONE rect read, replacing the `.cm-content` rect read `anchorTop` would
+	 * have done, so the layout-read count per sync is unchanged. Read-only:
+	 * the re-placement is a separate call the twin does not make.
+	 */
+	private anchorCameraY(overlayTop: number): { layout: number; rung: number; impliedTop: number } | null {
+		const held = documentAnchorLadder(this.view);
+		if (!held) return null;
+		// The wrapper sits at `.cm-content`'s BORDER-BOX top, so the document's
+		// own padding edge is this much lower. Shared with `anchorTop` so the two
+		// agree bit-for-bit; `null` means give up and let `anchorTop` answer.
+		const padding = anchorPaddingTop(this.view, this.contentStyle?.paddingTop, this.cssScale);
+		if (padding === null) return null;
+		// WHICH RUNG, arithmetically and with no layout read of its own: where
+		// the camera was left last sync, or - on the very first one - the scroll
+		// offset. A wrong answer costs distance and never correctness.
+		const from = Number.isFinite(this.anchorCameraYLayout) ? this.anchorCameraYLayout : this.view.scrollDOM.scrollTop;
+		const k = rungIndexFor(from, held.spacing, held.rungs.length);
+		const rungTopLayout = k * held.spacing;
+		const rungRectTop = held.rungs[k]!.getBoundingClientRect().top;
+		const layout = cameraOriginYLayout(rungTopLayout, overlayTop, rungRectTop, this.panY(), this.cssScale, padding);
+		if (layout === null) return null;
+		return { layout, rung: k, impliedTop: impliedDocumentTop(rungTopLayout, rungRectTop, this.cssScale, padding) };
 	}
 
 	/** One scroll-probe row per acquisition: everything the mapping read. */
@@ -3833,6 +4433,11 @@ export class InkOverlayPlugin {
 		// Whatever the gesture was, it is over: the frame is live again and
 		// re-reads the editor's current origin.
 		this.frame.end();
+		// Complete a band update skipped while the contact froze its geometry.
+		if (this.bandSyncDeferred) {
+			this.bandSyncDeferred = false;
+			this.scheduleRepaint("scroll");
+		}
 		if(this.viewportStyleDirty)this.scheduleViewportStyleRefresh();
 		// The stroke is over: the strip returns (a beat later, so an eraser
 		// scrub's rapid lift-and-reland does not strobe it) and its buttons
@@ -4032,16 +4637,43 @@ export class InkOverlayPlugin {
 			// style write and the draw are presented together, and the
 			// desynchronized canvas cannot show what it is no longer showing.
 			drawCommitted: () => {
+				// A stroke can commit while a pinch preview is live - a pen
+				// landing during a touch pinch, or a preview left standing by a
+				// lost end event. This path writes the committed canvas WITHOUT
+				// going through `repaint`, so nothing here would otherwise drop
+				// the preview offset or invalidate its anchor.
+				//
+				// It is drawn at the CURRENT camera, which already accounts for
+				// where the column is now, so the layer's translation would put
+				// it dx away from the pen - permanently, since the pixels are
+				// committed. Clearing that translation first is therefore not
+				// optional.
+				//
+				// And clearing alone is not enough: the loop below draws only
+				// `strokes`, while the rest of the layer still holds pixels
+				// rasterised when the translation WAS in force. So ask for a
+				// full frame as well, and let repaint's own guard re-latch the
+				// anchor. One frame of inconsistency against a stroke that
+				// would otherwise sit wrong until the gesture ended.
+				// UNDER THE HOLD (D-COV, AD-4 i) the stroke is drawn at the camera
+				// the raster already has, so it lands consistently with every
+				// other pixel under the same translation; nothing is cleared,
+				// invalidated or re-rastered. The paragraph above describes the
+				// re-base this replaced (2026-09-13: it culled the panned-in ink).
+				const paintCam = this.pinchPreview && this.lastPaintCam ? this.lastPaintCam : this.camera.snapshot;
 				if (this.activeWet === this.highlightWet) {
 					this.highlightWetCanvas.setCssStyles({ opacity: "0" });
 				}
 				for (const finished of strokes) {
+					this.markCommittedPaint(finished.tool);
 					drawStroke(
 						this.committedCtxFor(finished.tool),
-						this.camera.snapshot,
+						paintCam,
 						finished,
 						undefined,
-						true
+						true,
+						undefined,
+						committedFloorFor(this.committedBacking, this.dpr)
 					);
 				}
 			},
@@ -4464,53 +5096,104 @@ export class InkOverlayPlugin {
 	// ---- eraser (canvas semantics: whole-stroke, hit-circle, live) -----------
 
 	/**
-	 * Two-finger pinch resizes the editor's base font, which reflows the note.
-	 * Ink follows through the font-zoom path the overlay already runs, so
-	 * nothing here touches a stored coordinate. The size is always computed
-	 * from what was captured at "start", so a pinch out and back lands exactly
-	 * where it began.
+	 * Two-finger pinch magnifies the editor without changing stored coordinates.
+	 * Layout and raster changes wait until the gesture ends. Scale is computed
+	 * from what was captured at "start", so an unconstrained pinch out and back
+	 * lands exactly where it began. Visibility bounds discard blocked motion.
 	 */
 	private pinch(
 		phase: "start" | "move" | "end",
 		ratio: number,
 		centroid: { x: number; y: number }
 	): void {
+		if (this.retiring) return;
+		// The router's ratios are relative to ITS gesture start. A preview the
+		// watchdog settled in place re-anchors mid-gesture (`rebasePinch`), so
+		// from then on they divide by the ratio at which that happened.
+		if (phase === "start") { this.pinchRatioBase = 1; this.pinchLastRatio = 1; }
+		else if (phase === "move") { this.pinchLastRatio = ratio; ratio = ratio / (this.pinchRatioBase || 1); }
 		if (phase === "start") {
 			if(this.getNoteViewportState().busy) return;
+			this.retirePanSettle();
+			this.hideBlankPinchLayers();
+			// Invalidate an earlier navigation's pending measure write.
+			this.viewportGeneration++;
 			this.pinchRefScale = this.pinchScaleNow;
 			// The anchor is captured ONCE, here. Every frame of the gesture
 			// is then computed from this state, so the view cannot chase the
 			// fingers as they drift and rounding cannot accumulate.
 			const scroller = this.view.scrollDOM;
 			const rect = scroller.getBoundingClientRect();
+			// COLUMN-RELATIVE, because host-local is not a fixed frame: under
+			// Readable line length `.cm-sizer`'s auto margins re-centre the
+			// column as the counter-sized host grows, so the same note point
+			// has a different host-local x at every scale. Measured ONCE here;
+			// `columnLocalAt` leaves the host's painted origin in
+			// `previewHostOrigin`, so this costs the gesture one read and the
+			// frames after it none.
+			this.previewPanEngaged = false;
+			const columnLocal = this.columnLocalAt(this.pinchScaleNow);
+			const origin = this.previewHostOrigin;
+			const contentTopLocal = this.contentTopLocalAt(this.pinchScaleNow);
 			this.pinchAnchor = {
 				scrollLeft: scroller.scrollLeft,
 				scrollTop: scroller.scrollTop,
 				offsetX: centroid.x - rect.left,
 				offsetY: centroid.y - rect.top,
+				focalX: centroid.x,
+				focalY: centroid.y,
+				// The PANNED origin: `columnLocalAt` and `contentTopLocalAt`
+				// both subtract the live pan, so folding it back in here is what
+				// makes the pair describe where the note was actually painted
+				// when the fingers went down. A gesture that starts on top of a
+				// residual pan is then the same arithmetic with no special case.
+				hostLeft: (origin?.valid ? origin.left : rect.left) + this.panX(),
+				hostTop: (origin?.valid ? origin.top : rect.top) + this.panY(),
+				columnLocal,
+				contentTopLocal,
+				fromScale: this.pinchScaleNow,
+				constraint: { clientX: centroid.x, clientY: centroid.y, offsetX: 0, offsetY: 0, geometry: null },
 			};
+			// Capture the geometry once before coalescing can discard an input.
+			// Preparing the layout records its dimensions; it does not paint a zoom.
+			if (this.panSizer() && this.prepareViewportLayout()) this.refreshPinchConstraint(columnLocal, contentTopLocal);
 			return;
 		}
+		const anchor = this.pinchAnchor;
+		const constraint = anchor?.constraint;
+		const targetMoved = !!anchor && Number.isFinite(centroid.x) && Number.isFinite(centroid.y) &&
+			(centroid.x !== (constraint?.clientX ?? anchor.targetX ?? anchor.focalX) || centroid.y !== (constraint?.clientY ?? anchor.targetY ?? anchor.focalY));
+		const next = phase === "end" ? this.pinchPending?.next ?? this.pinchScaleNow : pinchScale(this.pinchRefScale ?? this.pinchScaleNow, ratio, this.zoomFloor);
+		if (anchor && Number.isFinite(centroid.x) && Number.isFinite(centroid.y)) {
+			if (constraint) { constraint.clientX = centroid.x; constraint.clientY = centroid.y; }
+			else { anchor.targetX = centroid.x; anchor.targetY = centroid.y; }
+			this.reducePinchConstraint(next);
+		}
 		if (phase === "end") {
+			if (targetMoved && this.pinchPending === null) this.pinchPending = { next: this.pinchScaleNow };
 			// Nothing may still be queued behind the settle: a live frame
 			// running after it would write the mid-gesture styles back.
 			if (this.pinchRaf !== 0) {
 				this.winRef.cancelAnimationFrame(this.pinchRaf);
 				this.pinchRaf = 0;
+				this.clearDeferredRepaint();
 			}
 			try {
 				// Settle while the gesture-start anchor and scale are still
 				// available to the final coalesced move.
 				this.flushPinch(true);
 			} finally {
+				this.restorePinchLayers();
 				this.pinchRefScale = null;
 				this.pinchAnchor = null;
+				this.pinchPreview = false;
+				this.releaseMeasures();
+				if (this.viewportStyleDirty) this.scheduleViewportStyleRefresh();
 			}
 			return;
 		}
 		if (this.pinchRefScale === null || this.pinchAnchor === null) return;
-		const next = pinchScale(this.pinchRefScale, ratio);
-		if (next === this.pinchScaleNow) return;
+		if (next === this.pinchScaleNow && this.pinchPending === null && !targetMoved) return;
 		// Coalesce to one update per FRAME. Two fingers deliver pointermoves
 		// faster than the display refreshes, and the work below is not the
 		// kind you do twice for one frame.
@@ -4523,13 +5206,71 @@ export class InkOverlayPlugin {
 		}
 	}
 
+	/** Snapshot only at existing geometry reads, never for each pointer event. */
+	private refreshPinchConstraint(columnLocal: number | null, contentTopLocal: number | null): void {
+		const constraint = this.pinchAnchor?.constraint, layout = this.viewportLayout, origin = this.previewHostOrigin;
+		if (!constraint) return;
+		constraint.geometry = null;
+		if (!layout || !origin?.valid || !this.panSizer()) return;
+		const path = this.filePath(), extent = path ? surfaceExtents.get(path) : { x: 0, y: 0 };
+		const width = Math.max(layout.column, extent.x * this.fontZoom);
+		const height = Math.max(this.view.contentHeight, extent.y * this.fontZoom);
+		const naturalLeft = columnLocal === null ? null : columnLocal + this.view.scrollDOM.scrollLeft * layout.externalScale;
+		const naturalTop = contentTopLocal === null ? null : contentTopLocal + this.view.scrollDOM.scrollTop * layout.externalScale;
+		if (![origin.left, origin.top, layout.paneWidth, layout.paneHeight, width, height, layout.externalScale].every(Number.isFinite) ||
+			layout.paneWidth <= 0 || layout.paneHeight <= 0 || !validCameraScale(layout.externalScale) || width < 0 || height < 0) return;
+		constraint.geometry = { left: origin.left, top: origin.top, paneWidth: layout.paneWidth, paneHeight: layout.paneHeight,
+			width, height, external: layout.externalScale, x: naturalLeft !== null && Number.isFinite(naturalLeft), naturalLeft,
+			y: naturalTop !== null && Number.isFinite(naturalTop), naturalTop };
+	}
+
+	/** Consume blocked motion in input order while leaving rendering coalesced.
+	 * The measured column/content origin cancels from effective-target bounds.
+	 * Offsets are painted pixels, including when a scale change hits a bound.
+	 * A new snapshot reconciles the accepted target once; it cannot reconstruct
+	 * unobserved intermediate layout changes. Settle receives only the final target.
+	 */
+	private reducePinchConstraint(next: number): void {
+		const anchor = this.pinchAnchor, constraint = anchor?.constraint;
+		if (!anchor || !constraint) return;
+		const geometry = constraint.geometry, layout = this.viewportLayout;
+		if (geometry && layout && !this.frame.locked && this.scaleGeometryValid !== false &&
+			validCameraScale(next) && validCameraScale(next * geometry.external) &&
+			validCameraScale(next, layout.width, layout.height) &&
+			[layout.width / next, layout.height / next].every(n => Number.isFinite(n) && n >= 0 && n <= MAX_VIEWPORT_LAYOUT)) {
+			const axis = (client: number, offset: number, focal: number, host: number, local: number | null,
+				origin: number, pane: number, extent: number, measured: boolean, naturalInset?: number | null): number => {
+				if (local === null || !measured) return offset;
+				const q = (focal - host) / anchor.fromScale - local;
+				const visible = Math.max(0, pane * geometry.external - PAN_MIN_VISIBLE_PX);
+				const size = extent * next * geometry.external;
+				const lower = scrollExpansionEnabled && naturalInset != null
+					? origin + (q + naturalInset) * next - MAX_VIEWPORT_LAYOUT * next * geometry.external
+					: origin + q * next + (size > 0 ? PAN_MIN_VISIBLE_PX - size : -visible);
+				const upper = origin + q * next + (naturalInset == null ? visible : naturalInset * next);
+				const requested = client + offset;
+				if (![lower, upper, requested].every(Number.isFinite)) return offset;
+				// Natural left/top origins win if a tiny note cannot supply the
+				// minimum opposite-edge overlap.
+				// Consume rejected movement even when the accepted position is unchanged.
+				const accepted = naturalInset == null ? Math.max(lower, Math.min(upper, requested)) : Math.min(upper, Math.max(lower, requested));
+				return accepted === requested ? offset : accepted - client;
+			};
+			constraint.offsetX = axis(constraint.clientX, constraint.offsetX, anchor.focalX, anchor.hostLeft, anchor.columnLocal,
+				geometry.left, geometry.paneWidth, geometry.width, geometry.x, geometry.naturalLeft);
+			constraint.offsetY = axis(constraint.clientY, constraint.offsetY, anchor.focalY, anchor.hostTop, anchor.contentTopLocal,
+				geometry.top, geometry.paneHeight, geometry.height, geometry.y, geometry.naturalTop);
+		}
+		anchor.targetX = constraint.clientX + constraint.offsetX;
+		anchor.targetY = constraint.clientY + constraint.offsetY;
+	}
+
 	/**
 	 * Apply the pinch that this frame is owed.
 	 *
-	 * Live frames write ONLY the compositor transform and the anchored scroll.
-	 * The expensive half - resizing the counter-scaled box, which reflows the
-	 * whole editor, and `handleResize`, which reallocates the canvases and
-	 * re-rasterizes every stroke - waits for the fingers to leave.
+	 * Live frames keep the physical viewport fixed with a counter-sized box,
+	 * transform and anchored scroll. The fixed text column does not rewrap.
+	 * `handleResize`, canvas allocation and rerasterization wait for lift.
 	 *
 	 * Doing all of it per pointermove is what made the gesture jagged and
 	 * laggy on hardware (alan, 2026-08-27): a forced layout read, a full
@@ -4544,7 +5285,7 @@ export class InkOverlayPlugin {
 		this.pinchPending = null;
 		if (!pending && !settle) return;
 		if (pending) this.applyPinchScale(pending.next, settle);
-		else if (settle && this.pinchScaleNow !== this.pinchRasterScale)
+		else if (settle && (this.pinchPreview || this.pinchScaleNow !== this.pinchRasterScale))
 			this.applyPinchScale(this.pinchScaleNow, true);
 	}
 
@@ -4564,22 +5305,1001 @@ export class InkOverlayPlugin {
 		// reference the gesture started at, and where it is being asked to go.
 		const from = this.pinchRefScale ?? this.pinchScaleNow;
 		const external=this.cssScale/this.pinchScaleNow;
-		const nextLeft = anchoredScroll(anchor.scrollLeft, anchor.offsetX, from*external, next*external);
-		const nextTop = anchoredScroll(anchor.scrollTop, anchor.offsetY, from*external, next*external);
 
-		if (!this.commitCameraScale(next, {left:nextLeft,top:nextTop})) return;
-		// A final native scroll write needs the final range first. Browsers clamp
-		// against the old range synchronously and do not retry after the extent
-		// grows, so settle before committing the original-anchor offsets.
-		if (settle) this.settlePinchRaster();
-		this.setViewportScroll(nextLeft,nextTop);
+		if (settle) {
+			// SPEND THE PAN INTO THE SCROLL, as far as the surface reaches. The
+			// preview holds the note with a translate, which needs no scroll
+			// range; the settle would rather carry it as scroll, because scroll
+			// is the state every other part of the camera already understands -
+			// and because the browser positions a scroll to whole pixels, which
+			// is where the mid-gesture fractions go to die. Moving the scroll by
+			// dS shifts painted content by -dS * effective, so a pan of P is
+			// worth a scroll of -P/effective. Whatever the clamp refuses, and
+			// whatever fraction the whole-pixel scroll cannot express, comes
+			// straight back as pan in `reanchorPan` - which is what keeps the
+			// settled frame standing exactly where the last preview frame stood.
+			const effScale = external * next;
+			const pan = this.previewPanEngaged ? this.viewportPan : null;
+			const spendable = !!pan && Number.isFinite(effScale) && effScale > 0;
+			let nextLeft = spendable && Number.isFinite(pan.x)
+				? Math.max(0, anchor.scrollLeft - pan.x / effScale)
+				: anchoredScroll(anchor.scrollLeft, anchor.offsetX, from*external, next*external);
+			let nextTop = spendable && Number.isFinite(pan.y)
+				? Math.max(0, anchor.scrollTop - pan.y / effScale)
+				: anchoredScroll(anchor.scrollTop, anchor.offsetY, from*external, next*external);
+			// The accepted target includes the final coalesced input, even if no
+			// preview frame has painted. Derive its equivalent native offset from
+			// the same zero-scroll snapshot used by the ordered constraint reducer.
+			const geometry = anchor.constraint?.geometry;
+			const offset = (focal: number, host: number, local: number | null, target: number,
+				origin: number, inset: number | null, measured: boolean): number | null => {
+				if (!measured || local === null || inset === null) return null;
+				const q = (focal - host) / anchor.fromScale - local;
+				const result = (origin + (q + inset) * next - target) / effScale;
+				return Number.isFinite(result) ? Math.max(0, Math.min(MAX_VIEWPORT_LAYOUT, result)) : null;
+			};
+			const left = scrollExpansionEnabled && geometry ? offset(anchor.focalX, anchor.hostLeft, anchor.columnLocal,
+				anchor.targetX ?? anchor.focalX, geometry.left, geometry.naturalLeft, geometry.x) : null;
+			const top = scrollExpansionEnabled && geometry ? offset(anchor.focalY, anchor.hostTop, anchor.contentTopLocal,
+				anchor.targetY ?? anchor.focalY, geometry.top, geometry.naturalTop, geometry.y) : null;
+			if (left !== null) nextLeft = left;
+			if (top !== null) nextTop = top;
+			this.pinchPreview = false;
+			this.releaseMeasures();
+			this.clearDeferredRepaint();
+			// The commit below re-rasters against the settled column, so the
+			// preview's translation must come off first or it would be applied
+			// twice - once in the pixels, once in the transform.
+			this.clearPreviewInkOffset();
+			// Keep authority through geometry convergence and the owned scroll
+			// request's consumption. New input or navigation retires it first.
+			this.panAnchorHold = this.panSizer() ? {
+				expansion: scrollExpansionEnabled && (left !== null || top !== null) ? {
+					left: left ?? this.view.scrollDOM.scrollLeft, top: top ?? this.view.scrollDOM.scrollTop,
+				} : null,
+				focalX: anchor.focalX, focalY: anchor.focalY, targetX: anchor.targetX, targetY: anchor.targetY,
+				hostLeft: anchor.hostLeft, hostTop: anchor.hostTop,
+				columnLocal: anchor.columnLocal, contentTopLocal: anchor.contentTopLocal,
+				fromScale: anchor.fromScale, scrollTop: anchor.scrollTop, toScale: next,
+				generation: this.viewportGeneration + 1, path: this.filePath(), container: this.container,
+				left: this.view.scrollDOM.scrollLeft, top: this.view.scrollDOM.scrollTop, ready: false, outcome: "pending", attempts: 0, request: null, issuance: [],
+			} : null;
+			// The final transaction establishes the range before its scroll writes.
+			const committed = this.commitCameraScale(next, {left:nextLeft,top:nextTop}, this.panAnchorHold);
+			// A REFUSED SETTLE IS AN EXIT PATH. Nothing downstream is going to
+			// re-derive this pan, so it must not be left on the children with
+			// no gesture tracking it.
+			if (!committed) { this.retirePanSettle(); this.clearViewportPan(); return; }
+			this.pinchRasterScale = next;
+			this.setViewportScroll(nextLeft,nextTop);
+			this.reanchorPan();
+		} else {
+			const effective = external * next;
+			if (this.frame.locked || this.scaleGeometryValid === false || next > 4 ||
+				!validCameraScale(next) || !validCameraScale(effective) || !this.prepareViewportLayout()) return;
+			const layout = this.viewportLayout!;
+			// The scroll target is no longer in this guard because a preview
+			// frame no longer writes one: the anchoring is a translate, and its
+			// own bound is in `anchorPanTo`. What is left is the counter-sized
+			// box, which this frame does write.
+			if (!validCameraScale(next, layout.width, layout.height) ||
+				![layout.width / next, layout.height / next]
+					.every(n => Number.isFinite(n) && n >= 0 && n <= MAX_VIEWPORT_LAYOUT)) return;
+			// FIRST frame of this gesture: latch the column against the raster
+			// now on screen, while the host still carries the old scale. After
+			// applyViewportBox below, that state is gone.
+			// The hold goes on BEFORE the capture below and before the box
+			// write: a CodeMirror measure between them would move the scroll
+			// under the column the capture reads (`holdMeasures`).
+			this.holdMeasures();
+			if (!this.pinchPreview || this.previewAnchorStale) {
+				this.captureRasterColumn(this.pinchScaleNow);
+				this.previewAnchorStale = false;
+			}
+			this.pinchPreview = true;
+			this.pinchScrollAt = performance.now();
+			this.pinchScaleNow = next;
+			this.cssScale = effective;
+			this.scale = effective * this.fontZoom;
+			this.router?.cameraTransformChanged();
+			// Keep the scroller's physical viewport fixed while magnifying its
+			// contents. Reuse the raster; observers cannot allocate it mid-move.
+			this.applyViewportBox(next);
+			// THIS FRAME'S READS ONLY. Both are filled by the single
+			// `columnLocalAt` below; clearing them first is what stops
+			// `anchorPanTo` anchoring against a rect from an earlier frame on a
+			// frame that could not measure (a detached view, a unit fixture).
+			if (this.previewHostOrigin) this.previewHostOrigin.valid = false;
+			this.previewColumnLocal = null;
+			// ...and keep that reused raster on the column, which the box above
+			// has just re-centred under Readable line length.
+			this.applyPreviewInkOffset(next);
+			// THE FOCAL ANCHOR, and it deliberately does not touch the scroll.
+			// A preview frame that wrote the scroll could only ever anchor in
+			// the directions the surface already extends into - measured on
+			// 547fd8b4, that was none of them on zoom-out, because the target
+			// was negative on every frame. The translate reaches every
+			// direction and costs no layout of its own; the settle above turns
+			// as much of it as the surface allows back into scroll.
+			const contentTopLocal = this.contentTopLocalAt(next);
+			// Reconcile only the latest accepted target against this fresh geometry.
+			// Earlier inputs were reduced against their own snapshot, not replayed.
+			this.refreshPinchConstraint(this.previewColumnLocal, contentTopLocal);
+			this.reducePinchConstraint(next);
+			this.anchorPanTo(next, anchor, this.previewColumnLocal, contentTopLocal);
+		}
+		this.refreshPenCursor();
 		// Stamp AFTER the writes: the scroll events they queue are the ones
 		// the handler above should let pass without a repaint.
 		this.pinchScrollAt = performance.now();
 	}
 
+	/**
+	 * The column's left edge in HOST-LOCAL px, or null when it cannot be read.
+	 *
+	 * VIEWPORT-RELATIVE IS THE WRONG FRAME, and that was a real defect: both
+	 * `contentOriginLeft` and `getBoundingClientRect().left` are measured from
+	 * the viewport, so a difference of two of them taken at different scales
+	 * keeps a `hostLeft * (1 - k/k0)` term. With a sidebar open (host left ~300)
+	 * a zoom to 10% put +270px of drift on EVERY pinch, Readable line length off
+	 * included. Subtracting the host's own left first removes that term at the
+	 * source; dividing by the scale in force puts the answer in the host's
+	 * untransformed units, where it can be compared across scales at all.
+	 */
+	private columnLocalAt(scale: number): number | null {
+		const host = this.view?.dom;
+		if (!host || !this.view?.contentDOM || !validCameraScale(scale)) return null;
+		// THE HOST RECT FIRST, and kept. The host is the one element in this
+		// chain the focal pan is NOT written to, so its painted origin is the
+		// unpanned frame everything else is measured against - and reading it
+		// before the column scan means a frame where the scan finds nothing
+		// still leaves a usable origin for the vertical anchor. A second
+		// `getBoundingClientRect` for that would double the per-frame forced
+		// layout on the one path `deferPinchRaster` exists to keep cheap.
+		const rect = host.getBoundingClientRect();
+		const origin = this.previewHostOrigin;
+		if (origin) { origin.left = rect.left; origin.top = rect.top; origin.valid = true; }
+		const column = contentOriginLeft(this.view.contentDOM);
+		if (column === null) return null;
+		// UNPANNED. `.cm-content` sits inside `.cm-sizer`, which carries the
+		// text half of the focal pan, so a raw read moves with the pan - and
+		// the preview ink offset computed from it would then apply the pan a
+		// second time on the layer that is already carrying it.
+		const local = (column - this.panX() - rect.left) / scale;
+		return Number.isFinite(local) ? local : null;
+	}
+
+	/**
+	 * The content's top in HOST-LOCAL px, against the host origin the last
+	 * `columnLocalAt` read. Measured only where the scroll moves under the
+	 * anchor - gesture start and settle - never per preview frame, where the
+	 * scroll is constant and the term cancels out of the difference entirely.
+	 */
+	private contentTopLocalAt(scale: number): number | null {
+		const content = this.view?.contentDOM, origin = this.previewHostOrigin;
+		if (!content || !origin?.valid || !validCameraScale(scale)) return null;
+		const local = (content.getBoundingClientRect().top - this.panY() - origin.top) / scale;
+		return Number.isFinite(local) ? local : null;
+	}
+
+	/** The live focal pan on x, in painted px. Zero when there is none. */
+	private panX(): number {
+		const pan = this.viewportPan;
+		return pan && Number.isFinite(pan.x) ? pan.x : 0;
+	}
+	/** The live focal pan on y, in painted px. Zero when there is none. */
+	private panY(): number {
+		const pan = this.viewportPan;
+		return pan && Number.isFinite(pan.y) ? pan.y : 0;
+	}
+	/** Only the pan not already represented by the raster camera moves pixels. */
+	private inkPanX(): number { return this.panX() - (this.rasterPan?.x ?? 0) * this.cssScale; }
+	private inkPanY(): number { return this.panY() - (this.rasterPan?.y ?? 0) * this.cssScale; }
+	private rasterPanNeedsBake(): boolean {
+		return !this.frame.locked && this.builder === null && !this.pinchPreview && Number.isFinite(this.cssScale) && this.cssScale > 0 &&
+			((this.rasterPan?.x ?? 0) !== this.panX() / this.cssScale || (this.rasterPan?.y ?? 0) !== this.panY() / this.cssScale);
+	}
+	private hideBlankPinchLayers(): void {
+		this.restorePinchLayers();
+		if (this.preparePinchComposite()) return;
+		const layers: [HTMLCanvasElement | undefined, boolean | undefined][] = [
+			[this.committedCanvas, this.committedBlank], [this.highlightCanvas, this.highlightBlank],
+			[this.wetCanvas, this.wet?.provenBlank], [this.highlightWetCanvas, this.highlightWet?.provenBlank],
+			[this.tailCanvas, this.tail?.provenBlank],
+		];
+		for (const [canvas, blank] of layers) if (blank && canvas?.style && canvas.style.visibility !== "hidden") {
+			this.pinchHiddenCanvases.set(canvas,canvas.style.visibility);
+			canvas.setCssStyles({ visibility: "hidden" });
+		}
+		if (this.pinchHiddenCanvases.size) this.armPinchLayerRestore();
+	}
+	/** Reuse an empty wet backing; originals remain intact until preview ends. */
+	private preparePinchComposite(): boolean {
+		const target = this.wetCanvas;
+		if (this.frame.locked || this.builder !== null || !this.wet?.provenBlank || !target?.style || !(target.width > 0) || !this.winRef?.getComputedStyle) return false;
+		const layers: [HTMLCanvasElement, boolean][] = [
+			[this.highlightCanvas, this.highlightBlank], [this.highlightWetCanvas, this.highlightWet.provenBlank],
+			[this.committedCanvas, this.committedBlank], [this.tailCanvas, this.tail.provenBlank],
+		];
+		const occupied = layers.filter(([,blank]) => !blank);
+		if (occupied.length < 2) return false;
+		const targetStyle = this.winRef.getComputedStyle(target);
+		// A transform is fine as long as every input carries the SAME one: the
+		// composite draws backings into a backing, and the five canvases share
+		// one box and one transform, whichever the path wrote - the counter-scale
+		// below 1.0, or none at all under a zoom-shrunk host (canvasLayerBox).
+		// Equality against the target is the check, not equality against a
+		// constant, so neither path needs naming here and any canvas placed
+		// differently from the target still refuses.
+		// Filters, blend modes and clips would change the pixels.
+		const supported = (style: CSSStyleDeclaration) => style.filter === "none" &&
+			style.mixBlendMode === "normal" && style.clipPath === "none";
+		if (!supported(targetStyle) || targetStyle.opacity !== "1" || targetStyle.visibility !== "visible" || targetStyle.display === "none") return false;
+		const inputs: { canvas: HTMLCanvasElement; opacity: number }[] = [];
+		for (const [canvas] of occupied) {
+			if (canvas.width !== target.width || canvas.height !== target.height) return false;
+			const style = this.winRef.getComputedStyle(canvas), opacity = Number(style.opacity);
+			if (style.visibility !== "visible" || style.display === "none") continue;
+			if (!supported(style) || !Number.isFinite(opacity) || opacity < 0 || opacity > 1 ||
+				style.width !== targetStyle.width || style.height !== targetStyle.height ||
+				style.left !== targetStyle.left || style.top !== targetStyle.top ||
+				// Equal PLACEMENT, not only an equal `transform` string: the origin
+				// and the individual translate/rotate/scale properties move
+				// pixels too and are not part of the computed `transform`.
+				style.transform !== targetStyle.transform || style.transformOrigin !== targetStyle.transformOrigin ||
+				style.translate !== targetStyle.translate || style.rotate !== targetStyle.rotate || style.scale !== targetStyle.scale) return false;
+			inputs.push({canvas, opacity});
+		}
+		if (inputs.length < 2) return false;
+		const ctx = target.getContext("2d");
+		if (!ctx) return false;
+		this.pinchComposite = true;
+		ctx.save();
+		try {
+			ctx.setTransform(1,0,0,1,0,0);ctx.globalCompositeOperation = "source-over";ctx.filter = "none";
+			for (const {canvas,opacity} of inputs) { ctx.globalAlpha = opacity;ctx.drawImage(canvas,0,0); }
+		} catch {
+			ctx.restore();this.restorePinchLayers();return false;
+		}
+		ctx.restore();this.wet.notePixelsChanged();
+		for (const [canvas] of layers) { this.pinchHiddenCanvases.set(canvas,canvas.style.visibility);canvas.setCssStyles({ visibility: "hidden" }); }
+		this.armPinchLayerRestore();
+		return true;
+	}
+	private armPinchLayerRestore(): void {
+		const restore = () => this.restorePinchLayers();
+		this.wet.beforeWrite = restore;this.highlightWet.beforeWrite = restore;this.tail.beforeWrite = restore;
+	}
+	private restorePinchLayers(): void {
+		if (this.wet) this.wet.beforeWrite = undefined;
+		if (this.highlightWet) this.highlightWet.beforeWrite = undefined;
+		if (this.tail) this.tail.beforeWrite = undefined;
+		if (this.pinchComposite) {
+			this.pinchComposite = false;
+			// A renderer callback may have already begun the next stroke.
+			// Remove only the borrowed pixels, preserving its new gesture state.
+			const ctx = this.wetCanvas.getContext("2d");
+			if (ctx) {
+				ctx.save();ctx.setTransform(1,0,0,1,0,0);
+				ctx.clearRect(0,0,this.wetCanvas.width,this.wetCanvas.height);ctx.restore();
+				this.wet.noteBackingCleared();
+			}
+		}
+		for (const [canvas,visibility] of this.pinchHiddenCanvases ?? []) canvas.style.visibility = visibility;
+		this.pinchHiddenCanvases?.clear();
+	}
+	private markCommittedPaint(tool: InkTool): void {
+		this.restorePinchLayers();
+		if (tool === "highlighter") this.highlightBlank = false; else this.committedBlank = false;
+	}
+	/** A painted x read, moved back into the unpanned frame the camera uses. */
+	private unpanX(value: number | null): number | null {
+		return value === null ? null : value - this.panX();
+	}
+
+	/**
+	 * `view.documentTop` in the same unpanned frame as `columnLeft`.
+	 *
+	 * CodeMirror computes it as `contentDOM.getBoundingClientRect().top +
+	 * paddingTop`, and `.cm-content` rides inside `.cm-sizer`, which carries the
+	 * text half of the focal pan. The two callers below pair it with
+	 * `columnLeft`, which is de-panned, to build ONE surface origin: a panned
+	 * top against an unpanned left is not a frame at all, it is the pan sitting
+	 * on one axis of a pair that is then differenced against scroll numbers the
+	 * pan never touched. Both consumers - Fit's reachable-region clip and the
+	 * extent grow - produce absolute scroll targets, and a scroll target is
+	 * spent through `commitCameraScale`, which CLEARS the pan on its way: the
+	 * frame those targets have to be right in is the one with no pan in it.
+	 */
+	private documentTopUnpanned(): number {
+		return this.view.documentTop - this.panY();
+	}
+
+	/** Latch where the column was when the raster now on screen was drawn. */
+	private captureRasterColumn(scale: number): void {
+		this.rasterColumnLocal = this.columnLocalAt(scale);
+		this.rasterColumnScroll = this.view?.scrollDOM?.scrollLeft ?? 0;
+	}
+
+	/**
+	 * Keep the REUSED preview raster sitting on the text column.
+	 *
+	 * A pinch preview deliberately does not re-rasterise: it scales the raster
+	 * the note already has (see the scroll handler's suppression comment). That
+	 * is correct only while the column's position is a pure scaling of where it
+	 * was - true when the column starts at the host's origin, false when Readable
+	 * line length auto-centres `.cm-sizer` inside it.
+	 *
+	 * `applyViewportBox` re-lays the host out at `layout.width / k`, so the
+	 * centring margin is recomputed every preview frame and the column lands at
+	 * `(W - lineWidth*k) / 2`, while the raster merely scales about the origin.
+	 * The gap is `W * (k/k0 - 1) / 2`: zero at k = k0, negative zooming out,
+	 * growing the further the gesture goes, healed at pinch end because
+	 * `commitCameraScale` re-rasters against the settled column. Measured in the
+	 * render harness before this existed: at W 1398, k0 1 -> k 0.1 the ink sat
+	 * 629.125 px LEFT of the column - W * 0.45 to three decimals - and healed to
+	 * exactly 0 at settle. Alan, Orion, Readable line length ON: "the ink moves
+	 * when zooming out".
+	 *
+	 * BOTH TERMS ARE HOST-LOCAL AND CAPTURED ATOMICALLY. The first cut compared
+	 * `lastSyncContentLeft` against `pinchRasterScale`, two fields written by
+	 * different methods at different moments: hold a pinch still past
+	 * `PINCH_SCROLL_QUIET_MS` and `deferPinchRaster` goes false, any of six
+	 * `syncCamera` callers rewrites the column at the CURRENT scale while the
+	 * stored scale still describes the raster, and the offset is then wrong by
+	 * the whole ratio. `rasterColumnLocal` is latched in one statement from one
+	 * DOM state, at the moment the raster it describes was drawn, and re-latched
+	 * whenever a repaint actually redraws that raster.
+	 *
+	 * READABLE LINE LENGTH OFF IS UNTOUCHED, by construction rather than by a
+	 * flag: the column is then a fixed offset inside the host (zero, or the
+	 * scrollbar gutter), so the local value is scale-invariant, the difference is
+	 * exactly 0 and no transform is written. The same holds for any constant
+	 * local inset.
+	 *
+	 * COLUMN NOT FOUND leaves the offset alone: a frame where the scan cannot see
+	 * the column has no better answer than the one already on screen.
+	 *
+	 * WHAT A PREVIEW FRAME COSTS, counted rather than estimated. ONE forced
+	 * synchronous layout: this reads after `applyViewportBox` has written, and it
+	 * must, because the column it needs is the post-box one. Rect reads are 12 in
+	 * the ordinary case, 24 bounded, 36 if phase B runs (ContentOrigin.ts:59, :72,
+	 * :244-247). A latch frame does 2 reads and still only 1 forced layout. The
+	 * host rect is NOT cached across the gesture: a pan moves the host.
+	 *
+	 * The deferred-repaint latch beside this costs at most ONE timer per
+	 * PINCH_SCROLL_QUIET_MS while a repaint is being held - about 8 wake-ups a
+	 * second, and zero when nothing is pending - against the 60/s a re-armed
+	 * requestAnimationFrame would have cost for the whole gesture.
+	 *
+	 * This spends on exactly the path `deferPinchRaster` exists to keep cheap, so
+	 * it is worth saying plainly that it is a layout read per gesture frame and
+	 * nothing outside a preview. Computing the column from the layout box instead
+	 * of measuring it would remove the read entirely; that is a post-1.4.19
+	 * option and should be gated on a profile, not on this comment.
+	 */
+	private applyPreviewInkOffset(next: number): void {
+		const band = this.inkLayer;
+		// `pinch` is driven in unit fixtures against partial objects that carry
+		// the overlay's fields without a real DOM - the pinch-end unit fixtures build
+		// a container with no `style` and a view with no `contentDOM`. Nothing
+		// here is worth a throw: with nothing to measure or move, leaving the
+		// raster where it is IS the right answer.
+		if (!band || !band.style) return;
+		// ONE read per preview frame, and it happens before the early returns
+		// below because the focal anchor needs its by-product (the host origin)
+		// on exactly the frames this runs on.
+		const localNow = this.columnLocalAt(next);
+		this.previewColumnLocal = localNow;
+		const anchor = this.rasterColumnLocal;
+		if (anchor === null || localNow === null) return;
+		// THE COLUMN'S MOVE IN CONTENT COORDINATES, not in host-local ones.
+		// `columnLocalAt` reads host-local px, which fall as the scroller
+		// scrolls right; the layer this offset is written to sits inside the
+		// scroller and has already moved by exactly that scroll. Measured on
+		// the pixel arm (fleet 3, 2026-09-13): with Readable line length on, a
+		// zoom-out preview that moved scrollLeft 93 -> 52 -> 0 wrote +41 and
+		// +52 layer px here and the committed ink sat that far right of its
+		// text until the next repaint. Adding the scroll change since the latch
+		// leaves only the centring margin's own move, which is what the raster
+		// needs to follow; the zoom-in compensation above 1.0 keeps its value
+		// because there the column really moves.
+		//
+		// UNITS. `columnLocalAt` divides the client difference by the OWNED
+		// scale only, so its px still carry the host's external scale, while
+		// the layer this offset is written to counts layout px (the same way
+		// `viewportLayout.columnLocal` divides by the external scale before it
+		// adds `scrollLeft`). So the column term is divided by that scale and
+		// the scroll delta, already layout px, is added as it is. Measured at
+		// external scale 0.8 (2026-09-13): with the factor on the scroll term
+		// instead, a genuine column move on zoom-in to 1.6 was applied at 0.8
+		// of its size and the ink sat 34 device px off its text; scroll-only
+		// frames cancel in either form, which is why the zoom-out cells could
+		// not tell the two apart. At external scale 1 the two are identical.
+		const scrollNow = this.view?.scrollDOM?.scrollLeft ?? this.rasterColumnScroll;
+		const external = this.viewportLayout?.externalScale ?? (Number.isFinite(this.cssScale) && this.pinchScaleNow > 0 ? this.cssScale / this.pinchScaleNow : 1);
+		const e = Number.isFinite(external) && external > 0 ? external : 1;
+		const dx = (localNow - anchor) / e + (scrollNow - this.rasterColumnScroll);
+		if (!Number.isFinite(dx)) return;
+		this.previewInkOffset = dx;
+		// Host-local units already: the band lives inside the scaled host, so no
+		// second division by `k` belongs here.
+		this.writeInkLayerTransform();
+	}
+
+	/**
+	 * THE ONE WRITER for the ink layer's transform, and it must stay the only
+	 * one.
+	 *
+	 * Two different corrections land on this element and neither may clobber the
+	 * other: the column offset that keeps a REUSED preview raster on a column
+	 * the centring margin has moved, and the focal pan that holds the note under
+	 * the fingers. Two methods each assigning `style.transform` is not two
+	 * corrections, it is whichever ran last - which is how the first attempt at
+	 * this lane lost the column offset on every frame the pan moved. Summing
+	 * them in one place is the whole fix.
+	 *
+	 * UNITS. The offset is already in the layer's own px (`columnLocalAt`
+	 * divided the scale out, and the layer rides inside the scaled host). The
+	 * pan is in PAINTED px, because that is the frame a finger is in, so it is
+	 * divided by the painted scale on the way in.
+	 */
+	private writeInkLayerTransform(): void {
+		const layer = this.inkLayer;
+		if (!layer?.style) return;
+		const k = this.cssScale;
+		const s = Number.isFinite(k) && k > 0 ? 1 / k : 0;
+		const x = this.previewInkOffset + this.panX() * s - (this.rasterPan?.x ?? 0);
+		const y = this.panY() * s - (this.rasterPan?.y ?? 0);
+		layer.style.transform = x === 0 && y === 0 ? "" : `translate(${x}px,${y}px)`;
+	}
+
+	/**
+	 * The pan goes on the SCROLLER'S CHILDREN, never on the host and never on
+	 * the scroller.
+	 *
+	 * The host contains the scroller, so panning the host moves the scroller's
+	 * own box off the pane - and a pointer at a fixed client point then lands
+	 * outside the hit surface entirely. That is the low-zoom input-death class,
+	 * where the pen stops reaching the note at all; measured on the first
+	 * attempt as "input outside scroller 710,350" at 0.1 zoom. Translating the
+	 * children instead leaves the scroller exactly where it was, so it stays the
+	 * hit surface at every scale.
+	 *
+	 * BOTH children, at the same level, or the cure is worse than the disease.
+	 * `.cm-sizer` carries the text; the ink rides on the layer inside the band.
+	 * Panning one without the other would slide ink across the words, which is
+	 * the defect this whole lane exists to fix. Moving them together is also why
+	 * this is invisible to the written-ink drift guard: that measures the ink
+	 * canvas RELATIVE TO a `.cm-line`, and a shared translate cancels out of a
+	 * difference.
+	 *
+	 * THE BAND ITSELF IS NOT TOUCHED, and that is load-bearing rather than
+	 * incidental: `syncCamera` derives the camera from
+	 * `this.container.getBoundingClientRect()`, so a pan on the band is absorbed
+	 * into the camera and then applied a second time by the transform. Measured
+	 * with the band carrying it: the focal drift went from 2.25/3.14 to
+	 * 11.86/16.02/4.11 against a 2px threshold.
+	 */
+	private writeViewportPan(): void {
+		const k = this.cssScale;
+		const s = Number.isFinite(k) && k > 0 ? 1 / k : 0;
+		const x = this.panX() * s, y = this.panY() * s;
+		const sizer = this.panSizer();
+		if (sizer?.style) sizer.style.transform = x === 0 && y === 0 ? "" : `translate(${x}px,${y}px)`;
+		this.writeInkLayerTransform();
+	}
+
+	/** `.cm-sizer`, found once and re-found only if it leaves the document. */
+	private panSizer(): HTMLElement | null {
+		const cached = this.panSizerEl;
+		if (cached && cached.isConnected) return cached;
+		const found = this.view?.dom?.querySelector?.<HTMLElement>(".cm-sizer");
+		this.panSizerEl = found && found.style ? found : null;
+		return this.panSizerEl;
+	}
+
+	/** Drop the preview offset; the committed raster is drawn on the column. */
+	private clearPreviewInkOffset(): void {
+		if (this.previewInkOffset === 0) return;
+		this.previewInkOffset = 0;
+		this.writeInkLayerTransform();
+	}
+
+	/**
+	 * Hold the note under the fingers, for this frame, with a translate.
+	 *
+	 * THE ONE INVARIANT: the note point that was under the focal point when the
+	 * gesture started is still under it now. Written as an ABSOLUTE target and
+	 * not as an increment - every term comes from an element the pan is not
+	 * written to, or has had the live pan taken back out of it, so the answer is
+	 * the whole pan rather than a correction to it. That is what makes a
+	 * `syncCamera` during a deferral lapse (a pause past PINCH_SCROLL_QUIET_MS)
+	 * harmless: there is no state here for it to absorb and re-apply, and a
+	 * suppressed or re-derived frame cannot accumulate into the next.
+	 *
+	 * Horizontally the anchored point is held COLUMN-RELATIVE. Host-local is not
+	 * a fixed frame: with Readable line length on, `.cm-sizer`'s auto margins
+	 * re-centre the column inside the counter-sized host, so one note point has
+	 * a different host-local x at every scale. `p` below - the point's offset
+	 * from the column's left edge - does not, at any scale or scroll.
+	 *
+	 * Vertically there is no column, and none is needed: the content's top is a
+	 * constant host-local offset while the scroll is constant, and a constant
+	 * cancels out of the difference entirely. That is why the per-frame path
+	 * reads the host's origin and nothing else for y.
+	 */
+	private anchorPanTo(
+		next: number,
+		a: { focalX: number; focalY: number; targetX?: number; targetY?: number; hostLeft: number; hostTop: number; columnLocal: number | null; contentTopLocal: number | null; fromScale: number; scrollTop: number },
+		columnLocal: number | null,
+		contentTopLocal?: number | null
+	): void {
+		if (!validCameraScale(next) || !validCameraScale(a.fromScale)) return;
+		// NO SIZER, NO PAN. The text half of the pan goes on `.cm-sizer`; a
+		// surface without one takes the ink half and nothing else, which is ink
+		// sliding off the words - the very defect this lane exists to fix.
+		//
+		// It is also unrecoverable rather than merely partial. Every term here
+		// is measured against a column that has had the LIVE pan subtracted from
+		// it, on the understanding that the column carries that pan; when it does
+		// not, each frame subtracts a displacement the text never received and
+		// asks for it again on top. Measured on the edge-audit fixture, whose
+		// editor has no sizer: a 0.2 -> 0.1 pinch with identical inputs on every
+		// frame walked the column read 0, -1612.5, -3225, -4837.5, -6160 and the
+		// pan 161.25, 322.5, 483.75, 616 (clamped), 616 - a pane-sized
+		// displacement out of a gesture that needed 161. Refusing here leaves
+		// `previewPanEngaged` false. Preview remains scale-only on such hosts;
+		// settle uses the existing `anchoredScroll` fallback.
+		if (!this.panSizer()) return;
+		const origin = this.previewHostOrigin;
+		// The unit fixtures drive `pinch` against partial objects built with
+		// Object.create, which reach the methods but not the class fields.
+		const pan = this.viewportPan;
+		if (!origin?.valid || !pan) return;
+		// THE VERTICAL ORIGIN IS MEASURED, every frame, and the closed form it
+		// replaces is worth naming because it looks right and is not. That form
+		// assumed the content's top is a fixed host-local offset for the whole
+		// gesture, on the grounds that no preview frame writes the scroll. The
+		// scroll moves anyway, for two reasons a `scrollTop` delta cannot tell
+		// apart: zooming OUT grows the scroller's client box inside the
+		// counter-sized host, the reachable range shrinks with it and the browser
+		// clamps `scrollTop` down - the content really has moved; zooming IN makes
+		// CodeMirror re-anchor its own scroll to hold the visible text still - the
+		// content has NOT moved, and correcting for that scroll is pure error.
+		// Measured on the render fixture at scrollTop 2000: the closed form alone
+		// left 9.60px on the zoom-out arms, and the scroll-delta correction that
+		// fixes those put 144px on the zoom-in ones. The rect answers both.
+		//
+		// The cost is ONE `getBoundingClientRect` on `.cm-content` and NO extra
+		// forced layout: `columnLocalAt` has already flushed the layout on this
+		// frame, so this reads a clean tree. Callers with nothing to measure pass
+		// null and get the closed form, which is exact for them.
+		const y = contentTopLocal !== undefined && contentTopLocal !== null && a.contentTopLocal !== null
+			? (a.targetY ?? a.focalY) - (origin.top + (contentTopLocal + ((a.focalY - a.hostTop) / a.fromScale - a.contentTopLocal)) * next)
+			: (a.targetY ?? a.focalY) - origin.top - (a.focalY - a.hostTop) * (next / a.fromScale);
+		// Without a column measurement at BOTH ends there is no column-relative
+		// frame to hold, and a host-local fallback would silently reintroduce
+		// the centring term. Hold y, leave x where it is: a partial anchor is
+		// visible, a wrong one is a drift nobody can attribute.
+		const x = columnLocal === null || a.columnLocal === null
+			? pan.x
+			: (a.targetX ?? a.focalX) - (origin.left + (columnLocal + ((a.focalX - a.hostLeft) / a.fromScale - a.columnLocal)) * next);
+		// KEEP THE NOTE ON THE PANE. The translate has no clamp of its own and
+		// the scroller does not move with it, so an unbounded pan can carry the
+		// whole note off screen with nothing to bring it back.
+		const layout = this.viewportLayout;
+		const bx = layout ? Math.max(0, layout.paneWidth * layout.externalScale - PAN_MIN_VISIBLE_PX) : MAX_VIEWPORT_LAYOUT;
+		const by = layout ? Math.max(0, layout.paneHeight * layout.externalScale - PAN_MIN_VISIBLE_PX) : MAX_VIEWPORT_LAYOUT;
+		const path = this.filePath(), extent = path ? surfaceExtents.get(path) : { x: 0, y: 0 };
+		const effective = layout ? next * layout.externalScale : next;
+		// Bound the NOTE's visible overlap, not the translation's magnitude.
+		// After scrolling, a pan larger than the pane can still leave the note
+		// covering it. A symmetric pane-sized clamp broke the next zoom there.
+		const left = columnLocal === null ? 0 : columnLocal * next;
+		const top = contentTopLocal == null ? 0 : contentTopLocal * next;
+		const width = Math.max(layout?.column ?? 0, extent.x * this.fontZoom) * effective;
+		const height = Math.max(this.view.contentHeight, extent.y * this.fontZoom) * effective;
+		const minX = width > 0 ? PAN_MIN_VISIBLE_PX - left - width : -bx;
+		const minY = height > 0 ? PAN_MIN_VISIBLE_PX - top - height : -by;
+		// Only native scroll may be spent into right/down pan. At scroll zero
+		// the content stays at its natural inset, including column/title margins.
+		// Use the same origin-first precedence as the ordered input reducer.
+		const nativeLeft = this.view.scrollDOM.scrollLeft, nativeTop = this.view.scrollDOM.scrollTop;
+		const cx = columnLocal !== null && Number.isFinite(nativeLeft)
+			? Math.min(nativeLeft * effective, Math.max(scrollExpansionEnabled ? (nativeLeft - MAX_VIEWPORT_LAYOUT) * effective : minX, x)) : pan.x;
+		const cy = contentTopLocal != null && Number.isFinite(nativeTop)
+			? Math.min(nativeTop * effective, Math.max(scrollExpansionEnabled ? (nativeTop - MAX_VIEWPORT_LAYOUT) * effective : minY, y)) : pan.y;
+		if (!Number.isFinite(cx) || !Number.isFinite(cy)) return;
+		this.previewPanEngaged = true;
+		if (cx === pan.x && cy === pan.y) return;
+		// Mutated, not replaced: this runs once per preview frame, and a fresh
+		// object per frame is an allocation on the one path the pinch deferral
+		// exists to keep free of them.
+		pan.x = cx; pan.y = cy;
+		this.writeViewportPan();
+	}
+
+	/**
+	 * Put back, as pan, whatever the scroll write could not deliver.
+	 *
+	 * The browser clamps `scrollLeft`/`scrollTop` to the range the surface has
+	 * actually grown into, and positions what it does accept on whole pixels -
+	 * both silently. A settle that asked for more than that would otherwise land
+	 * the note somewhere the preview never showed: a jump at pinch end, in the
+	 * direction of the clamp. Re-measuring here and re-deriving the pan makes
+	 * the settled frame agree with the last preview frame whether the scroll
+	 * arrived in full, in part, or not at all - and leaves the pan at zero in
+	 * the ordinary case where it did.
+	 */
+	private reanchorPan(): void {
+		const hold = this.panAnchorHold;
+		if (!hold) return;
+		if (!this.ownsPanSettle(hold)) { if (this.panAnchorHold === hold) this.retirePanSettle(); return; }
+		// Read the owned column without its pan. Subtracting a full-precision
+		// pan from the browser's rounded transformed rect feeds a small error
+		// back into every iteration and can prevent exact convergence.
+		const sizer = this.panSizer();
+		if (!sizer) return;
+		const transform = sizer.style.transform;
+		let local: number | null = null, top: number | null = null;
+		try {
+			sizer.style.removeProperty("transform");
+			const host = this.view.dom.getBoundingClientRect();
+			const column = contentOriginLeft(this.view.contentDOM);
+			const content = this.view.contentDOM.getBoundingClientRect();
+			this.previewHostOrigin = { left: host.left, top: host.top, valid: true };
+			local = column === null ? null : (column - host.left) / hold.toScale;
+			top = (content.top - host.top) / hold.toScale;
+		} finally { sizer.style.transform = transform; }
+		this.anchorPanTo(hold.toScale, hold, local, top);
+		hold.left = this.view.scrollDOM.scrollLeft; hold.top = this.view.scrollDOM.scrollTop;
+	}
+
+	private get scrollRangeOwners(): WeakMap<SelectionRange, object> {
+		return viewportScrollLifetime(this.view).owners;
+	}
+
+	/** Preserve the public range value while carrying provenance through the
+	 * actual mapping performed by CM. Only the private wrapper is registered;
+	 * a fresh foreign range with identical positions remains unrelated.
+	 */
+	private ownScrollRange(range: SelectionRange, owner: object): SelectionRange | null {
+		if (!Number.isSafeInteger(range.from) || !Number.isSafeInteger(range.to) || range.from < 0 || range.to > this.view.state.doc.length) return null;
+		const wrappers = new WeakMap<SelectionRange, SelectionRange>();
+		const wrap = (original: SelectionRange): SelectionRange => {
+			const existing = wrappers.get(original);
+			if (existing) return existing;
+			const map = (...args: Parameters<SelectionRange["map"]>): SelectionRange =>
+				wrap(original.map(...args));
+			const wrapped = new Proxy(original, {
+				get: (target, key, receiver): unknown => key === "map" ? map : Reflect.get(target, key, receiver),
+			});
+			wrappers.set(original, wrapped);
+			this.scrollRangeOwners.set(wrapped, owner);
+			return wrapped;
+		};
+		return wrap(range);
+	}
+
+	private firstSettleConsumer(): boolean {
+		return this.view.state.facet(EditorView.scrollHandler)[0] === consumeViewportScroll;
+	}
+
+	/** A receipt survives cancellation so its pending request cannot become a
+	 * default scroll. This consumer never changes geometry or dispatches.
+	 */
+	consumeViewportScroll(range: SelectionRange): boolean {
+		const owner = this.scrollRangeOwners.get(range);
+		if (!owner) { this.retirePanSettle(); return false; }
+		const hold = this.panAnchorHold;
+		if (hold === owner) {
+			if (!this.ownsPanSettle(hold) || this.view.scrollDOM.scrollLeft !== hold.left || this.view.scrollDOM.scrollTop !== hold.top) hold.outcome = "cancelled";
+			else if (!hold.ready) { hold.outcome = "failed"; console.warn("Pinch settlement consumed before convergence"); }
+			else hold.outcome = "converged";
+			this.retirePanSettle();
+		}
+		return true;
+	}
+
+	private retirePanSettle(): void {
+		const hold = this.panAnchorHold;
+		if (hold?.outcome === "pending") hold.outcome = "cancelled";
+		this.panAnchorHold = null;
+	}
+
+	private ownsPanSettle(hold: NonNullable<InkOverlayPlugin["panAnchorHold"]>): boolean {
+		return this.panAnchorHold === hold && hold.generation === this.viewportGeneration &&
+			hold.path === this.filePath() && hold.container === this.container && !!this.container &&
+			!this.retiring && !this.frame.locked;
+	}
+
+	/** Take the pan off the children; every exit from a gesture lands here. */
+	private clearViewportPan(): void {
+		this.restorePinchLayers();
+		this.previewPanEngaged = false;
+		this.retirePanSettle();
+		this.previewColumnLocal = null;
+		if (this.previewHostOrigin) this.previewHostOrigin.valid = false;
+		const pan = this.viewportPan;
+		const had = !pan || pan.x !== 0 || pan.y !== 0;
+		if (pan) { pan.x = 0; pan.y = 0; }
+		// Written even when the pan was already zero on the `!pan` branch: the
+		// unit fixtures have no field to read, and a stale transform left on a
+		// real `.cm-sizer` outlives this overlay.
+		if (had) this.writeViewportPan();
+		this.panSizerEl = null;
+	}
+
+	/**
+	 * Hold ONE repaint until the pinch deferral lapses.
+	 *
+	 * Idempotent: while the latch is set nothing new is scheduled, so a gesture
+	 * of any length costs one timer and no per-frame work. The timer re-arms
+	 * itself only while the deferral is still in force, which a live gesture
+	 * keeps true; a settle clears the latch through `clearDeferredRepaint`
+	 * before this can matter.
+	 */
+	private armDeferredRepaint(): void {
+		if (this.repaintDeferredByPinch) return;
+		this.repaintDeferredByPinch = true;
+		const tick = (): void => {
+			this.pinchDeferTimer = 0;
+			if (!this.container) { this.repaintDeferredByPinch = false; return; }
+			if (!this.repaintDeferredByPinch) return;
+			if (this.deferPinchRaster()) {
+				this.pinchDeferTimer = this.winRef.setTimeout(tick, PINCH_SCROLL_QUIET_MS);
+				return;
+			}
+			this.repaintDeferredByPinch = false;
+			// "partial" preserves the pending rects; every other via asserts
+			// `damage.addAll()` and would escalate them to a full re-raster.
+			this.scheduleRepaint("partial");
+		};
+		this.pinchDeferTimer = this.winRef.setTimeout(tick, PINCH_SCROLL_QUIET_MS);
+	}
+
+	/** The deferral is over and the raster is being redrawn anyway. */
+	private clearDeferredRepaint(): void {
+		this.repaintDeferredByPinch = false;
+		if (this.pinchDeferTimer) {
+			this.winRef.clearTimeout(this.pinchDeferTimer);
+			this.pinchDeferTimer = 0;
+		}
+	}
+
+	/**
+	 * Keep CodeMirror from measuring for the preview lifetime.
+	 *
+	 * THE WRITER OF THE MID-PREVIEW SCROLL IS CODEMIRROR. Every preview frame
+	 * writes the counter-sized host box and its scale; CodeMirror's observer
+	 * schedules a measure for that, and `EditorView.measure` (6.38.6) reads
+	 * `scrollTop` with its previous `scaleY`, refreshes the scale, then writes
+	 * `scrollTop = S x k_prev / k_next` back, keeping its scaled scroll
+	 * constant across a scale change its ancestor made. That write lands in
+	 * CodeMirror's animation frame, after this frame's pan solve and before
+	 * the paint, so the pan is one rescale behind on every frame it runs.
+	 * Measured on the far fixture at scrollTop 114820, k 0.10 -> 0.11: the
+	 * write was 105252, about 1052 visual px, and text and ink left the pane
+	 * together, registration intact (2026-09-13, lag-far-xy-fixture d4nav2).
+	 * The preview needs no measure of its own: it is a transform and a
+	 * translate, and its reads are client rects. So the scheduling entry is
+	 * held for the preview and released on every end path, where CodeMirror
+	 * then measures once against the settled layout, which is also where the
+	 * plugin's own settle requests go. Other callers' requests made meanwhile
+	 * are kept, last per key as CodeMirror itself keeps them, and replayed at
+	 * the release. What goes with the write: the two or three CodeMirror
+	 * measures a preview frame paid before.
+	 *
+	 * TWO ENTRIES ARE SHADOWED on the instance, and both are needed.
+	 * `requestMeasure`, the public scheduler, is where the resize debounce,
+	 * the mutation flush and every other caller arrive. `measure`, the sink,
+	 * is where a callback CodeMirror scheduled BEFORE the hold went on still
+	 * arrives (its animation frame resolves `this.measure` at call time), and
+	 * where the synchronous measure a scroll event runs arrives - and the
+	 * browser raises a scroll event on its own when a zoom-out shrinks the
+	 * scroll range under a far scroll and clamps it. Holding the scheduler
+	 * alone leaves both of those to rescale the scroll under the pan.
+	 * `measure` is not in CodeMirror's typings (marked internal); a build
+	 * where it is absent degrades to holding the scheduler only.
+	 *
+	 * A swallowed callback leaves CodeMirror's own "measure scheduled" mark
+	 * set, and its public scheduler queues without scheduling while that mark
+	 * is set, so the release does not rely on it: when anything was held, the
+	 * release runs the captured `measure` itself in the next animation frame,
+	 * which drains every queued request and clears the mark (a destroyed view
+	 * returns from it at once). Each shadow is inert once its hold is over:
+	 * a caller that kept the function, or a wrapper that displaced it, reaches
+	 * the callable captured at install, never the live property, so no wrapper
+	 * chain can loop. The release puts back what it displaced only where the
+	 * property is still its own. Re-armed on every preview frame;
+	 * PINCH_MEASURE_HOLD_MAX_MS bounds a lost end (`rebasePinch`).
+	 */
+	private holdMeasures(): void {
+		const view = this.view as EditorView | null;
+		if (!view) return;
+		const held = this.measureHold ?? null;
+		if (held) {
+			this.winRef.clearTimeout(held.timer);
+			held.timer = this.winRef.setTimeout(() => this.rebasePinch(), PINCH_MEASURE_HOLD_MAX_MS);
+			return;
+		}
+		const hold: MeasureHold = { entries: [], requests: [], plain: false, swallowed: false, timer: 0 };
+		const target = view as unknown as Record<string, unknown>;
+		for (const name of ["requestMeasure", "measure"] as const) {
+			const displaced = Object.getOwnPropertyDescriptor(view, name);
+			const resolved: unknown = displaced ? (displaced.get ? displaced.get.call(view) : displaced.value) : (Object.getPrototypeOf(view) as Record<string, unknown> | null)?.[name];
+			if (typeof resolved !== "function") continue;
+			const callable = resolved as MeasureHoldEntry["callable"];
+			const shadow = name === "requestMeasure"
+				? (request?: CmMeasureRequest): void => {
+					if (this.measureHold !== hold) { callable.call(view, request); return; }
+					if (!request) { hold.plain = true; return; }
+					if (hold.requests.includes(request)) return;
+					const key: unknown = request.key;
+					const at = key == null ? -1 : hold.requests.findIndex((r) => r.key === key);
+					if (at > -1) hold.requests[at] = request; else hold.requests.push(request);
+				}
+				: (flush?: boolean): void => {
+					if (this.measureHold !== hold) { callable.call(view, flush); return; }
+					hold.swallowed = true;
+				};
+			Object.defineProperty(target, name, { configurable: true, writable: true, enumerable: false, value: shadow });
+			hold.entries.push({ name, displaced, callable, shadow: shadow as MeasureHoldEntry["shadow"] });
+		}
+		// COMPATIBILITY LIMIT, not an observed case: CodeMirror 6.38.6 has
+		// `measure` on the instance chain and every build measured had it. In
+		// a build without it the supported fallback is the scheduler-only
+		// hold: the preview, the clip lift and the settle proceed; requests
+		// through `requestMeasure` are still held and replayed; but a measure
+		// entered synchronously (a scroll event, an intersection flip) would
+		// rescale the scroll under the pan, and the release's plain
+		// `requestMeasure()` cannot put the fold before the settle write. The
+		// warning names that once per gesture; `measureHold.entries` says
+		// which entries were found, for the arms that read the hold state.
+		if (!hold.entries.some((e) => e.name === "measure")) console.warn("Handwriting: pinch preview holds CodeMirror's scheduler only; view.measure was not found");
+		hold.timer = this.winRef.setTimeout(() => this.rebasePinch(), PINCH_MEASURE_HOLD_MAX_MS);
+		this.measureHold = hold;
+		// THE CONTAINER'S CLIP COMES OFF FOR THE SAME LIFETIME. With the scroll
+		// held, the focal pan carries the whole move, and the inner layer's
+		// translate takes the canvases out of the band-sized, overflow-hidden
+		// container, which clips them (measured 2026-09-13, zoom-out to k 0.3
+		// at scrollTop 1809: translate 983 layout px, the mark inside the band
+		// and inside the pane, and absent). `.cm-sizer` carries the same
+		// translate with no clip of its own, so the pixels land where the text
+		// does. One style write per gesture; the clip returns with the release.
+		this.container?.setCssStyles({ overflow: "visible" });
+	}
+
+	/**
+	 * A resize met inside CodeMirror's update while the measure hold is live,
+	 * run whole in the next frame with the state re-checked: the same view,
+	 * note and viewport generation, and a container still mounted. Outside
+	 * the update its commit releases the hold the ordinary way, fold first.
+	 */
+	private resizeOutOfUpdate(): void {
+		if (this.resizeOutOfUpdateRaf) return;
+		const view = this.view, path = this.filePath(), generation = this.viewportGeneration;
+		this.resizeOutOfUpdateRaf = this.winRef.requestAnimationFrame(() => {
+			this.resizeOutOfUpdateRaf = 0;
+			if (this.retiring || !this.container || this.view !== view || this.filePath() !== path || this.viewportGeneration !== generation) return;
+			this.handleResize();
+		});
+	}
+
+	/**
+	 * Give CodeMirror its measuring back and replay what was held. Idempotent;
+	 * every end path calls it.
+	 *
+	 * THE FOLD COMES FIRST. CodeMirror's first measure after a scale change
+	 * rescales `scrollTop` by the scale ratio it missed; on the settle path
+	 * that measure must land BEFORE the settle's own scroll write, as it did
+	 * when CodeMirror measured every frame, so the settle overwrites the fold
+	 * and not the other way round (measured 2026-09-13 with the fold replayed
+	 * a frame later: zoom-in 1 -> 2 settled at scrollTop 969 for 2048). So
+	 * the captured `measure` runs synchronously here whenever anything was
+	 * held; a teardown passes `deferred` and gets it in the next frame, since
+	 * an unmount can run inside CodeMirror's own update.
+	 */
+	private releaseMeasures(deferred = false): void {
+		const hold = this.measureHold ?? null;
+		if (!hold) return;
+		if (this.inUpdate && !deferred) {
+			// The net, not a route: see `update`. Named so it can be found.
+			console.warn("Handwriting: measure hold released inside CodeMirror's update; measure deferred a frame", new Error().stack);
+			deferred = true;
+		}
+		this.measureHold = null;
+		this.winRef.clearTimeout(hold.timer);
+		// THE TRANSLATE COMES OFF BEFORE THE CLIP RETURNS (D-COV, AD-4 ii): a
+		// resize commit ends the preview without the pinch-end path, and the
+		// column term it left on the layer put the mark into the pane's own
+		// clip (measured on e355b259: translate(-341.25px, 0) at in2 k 2.0,
+		// 59% of the mark by the detector's area). Every release is a commit
+		// or a teardown, and both re-raster against the settled column.
+		this.clearPreviewInkOffset();
+		this.container?.setCssStyles({ overflow: "hidden" });
+		const view = this.view as EditorView | null;
+		if (!view) return;
+		const target = view as unknown as Record<string, unknown>;
+		for (const entry of hold.entries) {
+			// Still the hold's own property: put back what it displaced. A
+			// wrapper that took the property over meanwhile keeps it; the
+			// shadow it may still reach is inert now (see holdMeasures).
+			if (Object.getOwnPropertyDescriptor(view, entry.name)?.value !== entry.shadow) continue;
+			if (entry.displaced) Object.defineProperty(target, entry.name, entry.displaced);
+			else delete target[entry.name];
+		}
+		for (const request of hold.requests) view.requestMeasure(request);
+		if (!hold.plain && !hold.swallowed && hold.requests.length === 0) return;
+		const measure = hold.entries.find((e) => e.name === "measure")?.callable;
+		if (!measure) view.requestMeasure();
+		else if (deferred) this.winRef.requestAnimationFrame(() => {
+			// OWNERSHIP AT FIRE TIME, through the view's LIVE entry. A hold this
+			// overlay installed since the capture takes the measure as its own
+			// swallowed callback; so does a hold a SUCCESSOR overlay on the same
+			// view installed after this one unmounted (its shadow is what the
+			// live entry resolves to, and it replays at that hold's release).
+			// Only when nothing holds the view does the call reach CodeMirror.
+			// The captured callable is never called from here: it would measure
+			// beneath whatever hold is live.
+			if (this.view !== view) return;
+			const own = this.measureHold ?? null;
+			if (own) { own.swallowed = true; return; }
+			const entry = (view as unknown as Record<string, unknown>).measure;
+			if (typeof entry === "function") (entry as (this: EditorView, flush?: boolean) => unknown).call(view, false);
+			else view.requestMeasure();
+		});
+		else measure.call(view, false);
+	}
+
+	/**
+	 * The watchdog's outcome for a preview still live at PINCH_MEASURE_HOLD_MAX_MS.
+	 *
+	 * Releasing the hold under a frozen preview would let CodeMirror's next
+	 * measure rescale the scroll under the pan - the displacement the hold
+	 * exists to prevent - and re-arming it would keep an editor whose end
+	 * event was lost from measuring for its lifetime. So the gesture is
+	 * settled IN PLACE, the way a lift settles it (the raster lands at the
+	 * current scale where the preview showed it), and re-anchored at once at
+	 * the same target, the way the router itself re-arms a live pinch when a
+	 * third finger lands. Fingers still on the glass continue from that
+	 * anchor: their ratios are the router's, relative to its own start, so
+	 * `pinch` divides them by the ratio at which this happened. A lost end
+	 * gets the same settle and a harmless re-anchor the next real start
+	 * replaces.
+	 */
+	private rebasePinch(): void {
+		const anchor = this.pinchAnchor;
+		if (!this.pinchPreview || !anchor || this.pinchRefScale === null || this.retiring) { this.releaseMeasures(); return; }
+		// THE RAW CLIENT CENTROID, not the accepted target: `pinch` takes the
+		// client point and applies the constraint's offset itself, so the
+		// offset-applied target would be offset twice and a still hold would
+		// move when this fires. With the same client point the next move reads
+		// as not moved, which is what a still hold is.
+		const c = anchor.constraint;
+		const target = c ? { x: c.clientX, y: c.clientY } : { x: anchor.targetX ?? anchor.focalX, y: anchor.targetY ?? anchor.focalY };
+		const base = this.pinchLastRatio || 1;
+		this.pinch("end", 1, target);
+		this.pinch("start", 1, target);
+		this.pinchRatioBase = base;
+	}
+
+	private deferPinchRaster(): boolean {
+		// Match the scroll handler's bounded suppression: a lost end event must
+		// never suppress future geometry work for the lifetime of the editor.
+		return this.pinchPreview && performance.now() - this.pinchScrollAt < PINCH_SCROLL_QUIET_MS;
+	}
+
 
  private restoreViewportLayout():void {
+  this.pinchPreview=false;
+  // Reached from update() on a file switch, inside CodeMirror's own update:
+  // the make-up measure waits a frame (a synchronous one would nest).
+  this.releaseMeasures(true);
+  this.clearViewportPan();
+  this.clearPreviewInkOffset();
+  this.rasterColumnLocal=null; this.previewAnchorStale=false; this.clearDeferredRepaint();
   this.viewportGeneration++;
   this.viewportPaneObserver?.disconnect();this.viewportPaneObserver=null;
   this.viewportStyleObserver?.disconnect();this.viewportStyleObserver=null;
@@ -4600,9 +6320,21 @@ export class InkOverlayPlugin {
   const host=this.view.dom,parent=host.parentElement;
   if(!parent||!host.clientWidth||!host.clientHeight) return false;
   if(!this.viewportLayout) {
-   const names=["width","height","transform","transform-origin","--handwriting-note-column-width","--handwriting-note-column-margin-left","--handwriting-note-column-margin-right","--handwriting-paper-pitch","--handwriting-paper-rule"];
+   // `zoom` is in the list because the release replays exactly what is named
+   // here: a shrink the host was never given back would outlive the overlay,
+   // with no counter-sized box left to justify it.
+   // THE HOST'S OWN `zoom`, before the overlay writes one. `zoom` is a
+   // single property, so the box write below REPLACES a theme's
+   // `.cm-editor { zoom: 1.25 }` rather than composing with it, and the
+   // camera would then be reading a scale the host is not at. Captured
+   // here, once per takeover, and multiplied into every frame's write.
+   // Read while no plugin zoom is on the host: the release replays the
+   // saved inline value, so a later capture sees the theme's again.
+   // Not a finite positive number - `normal`, or a rig with no `zoom` at
+   // all - is a factor of 1, which writes exactly what it wrote before.
+   const names=["width","height","transform","transform-origin","zoom","--handwriting-note-column-width","--handwriting-note-column-margin-left","--handwriting-note-column-margin-right","--handwriting-column-margin-left","--handwriting-paper-pitch","--handwriting-paper-rule"];
    const style=this.winRef.getComputedStyle(this.view.contentDOM);
-   this.viewportLayout={parent,paneWidth:parent.clientWidth,paneHeight:parent.clientHeight,externalScale:this.cssScale/this.pinchScaleNow,baseTransform:this.winRef.getComputedStyle(host).transform,width:host.clientWidth,height:host.clientHeight,column:this.view.contentDOM.offsetWidth,left:style.marginLeft,right:style.marginRight,styles:new Map(names.map(n=>[n,{value:host.style.getPropertyValue(n),priority:host.style.getPropertyPriority(n)}]))};
+   this.viewportLayout={parent,paneWidth:parent.clientWidth,paneHeight:parent.clientHeight,externalScale:this.cssScale/this.pinchScaleNow,baseTransform:this.winRef.getComputedStyle(host).transform,baseZoom:(()=>{const z=Number.parseFloat(this.winRef.getComputedStyle(host).zoom);return Number.isFinite(z)&&z>0?z:1;})(),width:Number.parseFloat(this.winRef.getComputedStyle(host).width)||host.clientWidth,height:Number.parseFloat(this.winRef.getComputedStyle(host).height)||host.clientHeight,column:this.view.contentDOM.offsetWidth,left:style.marginLeft,right:style.marginRight,columnLocal:(()=>{const x=this.columnLocalAt(this.pinchScaleNow);return x===null?null:x/(this.cssScale/this.pinchScaleNow)+this.view.scrollDOM.scrollLeft;})(),styles:new Map(names.map(n=>[n,{value:host.style.getPropertyValue(n),priority:host.style.getPropertyPriority(n)}]))};
   }
   if(!this.viewportPaneObserver) {
    this.viewportPaneObserver=new ResizeObserver(()=>this.handleResize());
@@ -4633,31 +6365,182 @@ export class InkOverlayPlugin {
    if(!dirty)return;
    if(dirty.path!==this.filePath()||dirty.container!==this.container){this.viewportStyleDirty=null;return;}
    // Keep one dirty marker; pen-up schedules the single retry, never a loop.
-   if(this.frame.locked)return;
-   this.viewportStyleDirty=null;
-   this.refreshViewportColumn();
+   if(this.frame.locked||this.deferPinchRaster()||!this.viewportLayout?.parent.clientWidth||!this.viewportLayout.parent.clientHeight)return;
+   if(this.refreshViewportColumn())this.viewportStyleDirty=null;
   });
  }
 
  /** Re-measure the ordinary column when a theme changes at constant pane size. */
- private refreshViewportColumn():void {
+ private refreshViewportColumn():boolean {
   const layout=this.viewportLayout;
-  if(!layout||this.frame.locked||!this.container)return;
-  const host=this.view.dom;
+  if(!layout||this.frame.locked||!this.container)return false;
+  const host=this.view.dom,scroller=this.view.scrollDOM;
+  const savedLeft=scroller.scrollLeft,savedTop=scroller.scrollTop;
   host.classList.remove("handwriting-note-viewport");
   host.setCssStyles({width:`${layout.width}px`,height:`${layout.height}px`});
   const style=this.winRef.getComputedStyle(this.view.contentDOM);
   const column=this.view.contentDOM.offsetWidth,left=style.marginLeft,right=style.marginRight;
-  const changed=column!==layout.column||left!==layout.left||right!==layout.right;
-  host.classList.add("handwriting-note-viewport");
-  host.setCssStyles({width:`${layout.width/this.pinchScaleNow}px`,height:`${layout.height/this.pinchScaleNow}px`});
-  if(changed){layout.column=column;layout.left=left;layout.right=right;this.commitCameraScale(this.pinchScaleNow);}
+  const natural=contentOrigin(this.view.contentDOM);
+  const columnLocal=this.ownedColumnLayoutLeft(natural.line) ?? (natural.left===null?null:(natural.left-this.panX()-host.getBoundingClientRect().left)/this.cssScale+scroller.scrollLeft);
+  const changed=column!==layout.column||left!==layout.left||right!==layout.right||columnLocal!==layout.columnLocal;
+  if(column>0&&changed){layout.column=column;layout.left=left;layout.right=right;layout.columnLocal=columnLocal;}
+  this.applyViewportBox(this.pinchScaleNow);
+  scroller.scrollLeft=savedLeft;scroller.scrollTop=savedTop;
+  if(column>0&&changed)this.commitCameraScale(this.pinchScaleNow, undefined, undefined, true);
+  return column>0;
  }
 
  private setViewportScroll(left:number,top:number):void {
   const scroller=this.view.scrollDOM;
   scroller.scrollLeft=left;scroller.scrollTop=top;
   this.scrollExpansion?.rebase(scroller.scrollLeft,scroller.scrollTop);
+ }
+
+ /**
+  * Does this engine have standard CSS `zoom`? Chromium 128+ and WebKit 17.4+
+  * do; older mobile WebKit does not, and there the host keeps the scale
+  * transform it has always had, byte for byte.
+  *
+  * Asked ONCE and cached: `applyViewportBox` runs per pinch-preview frame,
+  * and a feature query per frame is a parse per frame. The answer cannot
+  * change for the life of a window.
+  */
+ private hostZoomSupported():boolean {
+  // `typeof`, not `=== null`: a class field initialiser does not run for an
+  // object made with `Object.create`, which is how the unit rigs build one.
+  if(typeof this.hostZoomSupport!=="boolean") {
+   const css=(this.winRef as unknown as {CSS?:{supports?:(property:string,value:string)=>boolean}}).CSS;
+   this.hostZoomSupport=css?.supports?.("zoom","0.5")===true;
+  }
+  return this.hostZoomSupport;
+ }
+
+ /**
+  * The five ink canvases' layer boxes, from the band box and scale already
+  * cached on the overlay - the same `canvasLayerBox` the reallocation path
+  * calls, with no read of its own, so it is safe on a frame that owns the
+  * layout. Silent until the band box is known: before the first allocation
+  * there is nothing to place.
+  */
+ private placeCanvasLayers():void {
+  if(!(this.cssWidth>0)||!(this.cssHeight>0))return;
+  const box=canvasLayerBox(this.cssWidth,this.cssHeight,this.cssScale,this.hostZoomSupported());
+  for(const c of [this.committedCanvas,this.wetCanvas,this.tailCanvas,this.highlightCanvas,this.highlightWetCanvas]) {
+   c?.setCssStyles({width:`${box.width}px`,height:`${box.height}px`,transform:box.transform,transformOrigin:box.transform?"0 0":""});
+  }
+ }
+
+ private applyViewportBox(next:number):void {
+  const layout=this.viewportLayout!,host=this.view.dom;
+  host.classList.add("handwriting-note-viewport");layout.parent.classList.add("handwriting-note-viewport-pane");
+  // The pane must never carry a scroll offset of its own: the stylesheet makes
+  // it a clip rather than a scroll container, and this resets whatever an
+  // engine without `overflow: clip` let through, so an already-shifted surface
+  // heals the next time its box is applied. Cheap: two reads, writes only when
+  // nonzero.
+  const pane=layout.parent;
+  if(pane.scrollLeft!==0||pane.scrollTop!==0){pane.scrollLeft=0;pane.scrollTop=0;}
+  host.style.setProperty("--handwriting-note-column-width",`${layout.column}px`);
+  host.style.setProperty("--handwriting-note-column-margin-left",layout.left);
+  // THE COLUMN'S OWN host-local left, frozen at the scale the viewport was
+  // taken over at. Written from `contentOriginLeft` minus the host rect - the
+  // read syncCamera already does - so it records where the column ACTUALLY
+  // was, whichever element the theme used to put it there. `layout.left`
+  // above cannot serve: it reads contentDOM, which under Readable line length
+  // carries no margin at all because the editor centres the sizer.
+  // Left unset when the column could not be measured, so the stylesheet's
+  // fallback keeps the declaration valid and the frame stays centred.
+  // Stored RAW and clamped only here: a pane narrower than the line drives it
+  // negative, and keeping that lets a later widening recover the exact value
+  // instead of starting from a floor.
+  if(layout.columnLocal!==null)host.style.setProperty("--handwriting-column-margin-left",`${Math.max(0,layout.columnLocal)}px`);
+  host.style.setProperty("--handwriting-note-column-margin-right",layout.right);
+  // THE SHRINK. `zoom` where the engine has it: it is a layout property with
+  // no transform node, so the host's effect node never gets the render
+  // surface that a scale transform over composited descendants earns - the
+  // surface that is redrawn at LAYOUT resolution on every inked frame far
+  // out. The counter-sized box is unchanged either way; only the mechanism
+  // that shrinks it back moves. A theme's own transform is kept whole (the
+  // shrink is no longer folded into it), and the origin only matters while
+  // such a transform is there. Anything a previous path left in `transform`
+  // is cleared in the same write: a scale under a zoom would shrink twice.
+  // The clear runs BOTH ways - the fallback clears a zoom the same way - so
+  // neither branch can inherit the other's shrink and land at k squared. The
+  // cached gate means production never crosses between them; only code that
+  // changes the feature query's answer at runtime could, and a host shrunk
+  // twice then reports a coordinate fault that code caused, not the overlay.
+  // The PRODUCT, not `next`: the host's own factor is part of the scale the
+  // camera measured, and a bare `next` would drop it. With no zoom of its own
+  // the factor is 1 and the written string is what it always was.
+  const base=layout.baseTransform!=="none"?layout.baseTransform:"";
+  // `zoom: ""` above clears the property outright, which is right for a zoom
+  // THIS path wrote and wrong for one the host brought with it INLINE: that
+  // declaration is the host's own, and removing it is a shrink taken away from
+  // an element the overlay never gave one to - visible even against a
+  // competing stylesheet, because the inline one may be the `!important` that
+  // wins. Replayed with its priority, exactly as the release replays it, and
+  // only when there was one: a host with no inline zoom is left with the
+  // property removed, which is what the clear already did.
+  const fallback=():void=>{
+   host.setCssStyles({width:`${layout.width/next}px`,height:`${layout.height/next}px`,zoom:"",transform:`${layout.baseTransform!=="none"?layout.baseTransform+" ":""}scale(${next})`,transformOrigin:"0 0"});
+   const saved=layout.styles.get("zoom");
+   if(saved?.value)host.style.setProperty("zoom",saved.value,saved.priority);
+  };
+  if(this.hostZoomSupported()) {
+   const want=layout.baseZoom*next;
+   host.setCssStyles({width:`${layout.width/next}px`,height:`${layout.height/next}px`,zoom:String(want),transform:base,transformOrigin:base?"0 0":""});
+   // THE PRIORITY THE HOST'S OWN DECLARATION HAD. The bulk write above is a
+   // camelCase assignment, which cannot carry `!important`: on a host whose
+   // own `zoom` was inline AND important it replaces a declaration that was
+   // winning the cascade with one that loses to any `!important` sheet rule,
+   // so the host lands on the SHEET's factor instead of the product. At a
+   // shrink the read-back below catches that; at unity there is no read-back -
+   // `baseZoom * 1` asks for nothing, so nothing is certified - and the host
+   // would sit demoted until some later frame. Re-writing the product with the
+   // saved priority keeps the declaration where it was, and at unity makes the
+   // write a restore of exactly what was there.
+   // Only when there was an important one to inherit: with no priority to
+   // carry, the bulk write above already produced the same declaration, and
+   // the shipping host - which has no inline zoom at all - is written the same
+   // single call it always was.
+   const saved=layout.styles.get("zoom");
+   if(saved?.priority)host.style.setProperty("zoom",String(want),saved.priority);
+   // DID IT TAKE? A stylesheet `zoom: ... !important` out-specifies an inline
+   // write, and the host would keep its full size behind a camera that
+   // believes it shrank. One read per TAKEOVER, never per frame, and the
+   // fallback form - which out-specifies nothing - is written in the same
+   // call so no frame is painted at the wrong size.
+   // ONLY a factor that asks the host to move can certify anything. At k = 1
+   // the product IS the host's own factor, so the read agrees with the write
+   // whether or not the write had any effect - a stylesheet `!important` at
+   // that same factor passes it - and certifying there would spend the one
+   // read on the one value that cannot fail, leaving the real shrink
+   // unverified behind a counter-sized box. The first owned factor off unity
+   // does the reading; after it there are no more reads, preview frames
+   // included.
+   if(layout.zoomVerified!==true&&Math.abs(next-1)>SCALE_EPSILON) {
+    layout.zoomVerified=true;
+    const got=Number.parseFloat(this.winRef.getComputedStyle(host).zoom);
+    if(Number.isFinite(got)&&Math.abs(got-want)>1e-6){
+     this.hostZoomSupport=false;fallback();
+     // The five canvases were placed for the zoom form - the plain band box,
+     // no transform - and the host has just moved to the other one, where the
+     // layer that matters is the band times k stretched back. Left alone they
+     // stay full-band compositor layers (five of 19900x22380 on Orion), which
+     // is the cost `canvasLayerBox` exists to cap. Re-placed from the cached
+     // box and scale: no DOM read, and nothing to do until one exists.
+     this.placeCanvasLayers();
+    }
+   }
+  }
+  else fallback();
+  // The pan is stored in PAINTED px and written in the children's own units, so
+  // the scale it is divided by has just changed underneath it. Re-stamping here
+  // costs two style writes and no read, and is what stops a frame being painted
+  // with the previous scale's quotient. The host's own transform above is scale
+  // only: the pan is never written here, because this element contains the
+  // scroller and moving it takes the hit surface off the pane.
+  if(this.panX()!==0||this.panY()!==0)this.writeViewportPan();
  }
 
  private updatePaperSpacing():void {
@@ -4671,6 +6554,11 @@ export class InkOverlayPlugin {
   }
  }
 
+ // CodeMirror owns the root class attribute and rewrites it on focus changes.
+ // Its facet must agree with our synchronous camera writes, including while a
+ // stroke owns the frame. Reading the DOM class here would retain its loss.
+ ownsNoteViewport():boolean {return this.viewportLayout!==null;}
+
  getNoteViewportState():{zoom:number;busy:boolean;fitAvailable:boolean} {
   const path=this.filePath();
   const busy=!this.container || !path || !inlineInk.isLoaded(path) || inlineInk.deleteAllReadiness(path).kind==="unsettled" || this.frame.locked || this.builder!==null || this.mode!=="ink";
@@ -4679,7 +6567,10 @@ export class InkOverlayPlugin {
 
  zoomNoteBy(factor:number):boolean {
   if(this.getNoteViewportState().busy||!Number.isFinite(factor)||factor<=0) return false;
-  return this.zoomAroundCenter(Math.min(4,this.pinchScaleNow*factor));
+  // Below the floor the lower bound is the current scale: minus is a no-op
+  // there, never a jump in to the floor.
+  const next=Math.max(Math.min(this.zoomFloor,this.pinchScaleNow),Math.min(4,this.pinchScaleNow*factor));
+  return next===this.pinchScaleNow || this.zoomAroundCenter(next);
  }
  resetNoteZoom():boolean {
   return !this.getNoteViewportState().busy && this.zoomAroundCenter(1);
@@ -4694,75 +6585,151 @@ export class InkOverlayPlugin {
   if(this.getNoteViewportState().busy) return "busy";
   const refuse=()=>{new Notice("Handwriting: this ink cannot fit in the current view.");return "unrepresentable" as const;};
   const path=this.filePath()!;
-  let bounds:InkFitBounds|null=null;
-  for(const stroke of inlineInk.strokes(path)) {
-   // Loaded and freshly built bboxes already include width*2 allowance.
-   const b=stroke.bbox;
-   if(![b.x,b.y,b.width,b.height].every(Number.isFinite)||b.width<0||b.height<0) return refuse();
-   const x=b.x,y=b.y,right=b.x+b.width,bottom=b.y+b.height;
-   if(!bounds) bounds={x,y,width:right-x,height:bottom-y};
-   else {const endX=Math.max(bounds.x+bounds.width,right),endY=Math.max(bounds.y+bounds.height,bottom);bounds.x=Math.min(bounds.x,x);bounds.y=Math.min(bounds.y,y);bounds.width=endX-bounds.x;bounds.height=endY-bounds.y;}
-  }
   const scroller=this.view.scrollDOM,rect=scroller.getBoundingClientRect();
   const external=this.viewportLayout?.externalScale??this.cssScale/this.pinchScaleNow;
   const screenWidth=this.viewportLayout?this.viewportLayout.width*external:rect.width;
   const screenHeight=this.viewportLayout?this.viewportLayout.height*external:rect.height;
+  // The surface grows right and bottom only, so ink above or left of the origin
+  // cannot be scrolled to. Frame the reachable part instead of refusing the whole
+  // note: one stroke above the first line used to disable Fit forever.
+  //
+  // Clip EACH stroke before the union, not the finished union. A stroke that is
+  // wholly unreachable must contribute nothing at all; clamping afterwards lets
+  // its other dimension still drag the union outward, so Fit zooms away to
+  // accommodate ink it can never display.
+  const origin=surfaceOriginInScroller({contentLeftVisual:this.columnLeft(),documentTopVisual:this.documentTopUnpanned(),scrollRectLeft:rect.left,scrollRectTop:rect.top,scrollLeft:scroller.scrollLeft,scrollTop:scroller.scrollTop,scale:this.cssScale});
+  const f=Number.isFinite(this.fontZoom)&&this.fontZoom>0?this.fontZoom:1;
+  const reach={originLeftNote:-origin.left/f,originTopNote:-origin.top/f};
+  let bounds:InkFitBounds|null=null,sawStroke=false;
+  for(const stroke of inlineInk.strokes(path)) {
+   // Loaded and freshly built bboxes already include width*2 allowance.
+   const b=stroke.bbox;
+   if(![b.x,b.y,b.width,b.height].every(Number.isFinite)||b.width<0||b.height<0) return refuse();
+   sawStroke=true;
+   const clipped=clampToReachable({x:b.x,y:b.y,width:b.width,height:b.height},reach);
+   if(!clipped) continue;
+   const right=clipped.x+clipped.width,bottom=clipped.y+clipped.height;
+   if(!bounds) bounds={x:clipped.x,y:clipped.y,width:clipped.width,height:clipped.height};
+   else {const endX=Math.max(bounds.x+bounds.width,right),endY=Math.max(bounds.y+bounds.height,bottom);bounds.x=Math.min(bounds.x,clipped.x);bounds.y=Math.min(bounds.y,clipped.y);bounds.width=endX-bounds.x;bounds.height=endY-bounds.y;}
+  }
+  // Strokes exist but not one of them is reachable: the only remaining refusal.
+  // No strokes at all stays "empty", which resets to 100% rather than refusing.
+  if(sawStroke&&!bounds) return refuse();
   const plan=fitInkBounds({bounds,viewportWidthScreen:screenWidth,viewportHeightScreen:screenHeight,externalScale:external,fontZoom:this.fontZoom,marginScreen:24});
   if(plan.kind==="unrepresentable") return refuse();
   if(!bounds) return this.commitCameraScale(1,{left:0,top:0})?"empty":refuse();
-  const origin=surfaceOriginInScroller({contentLeftVisual:this.columnLeft(),documentTopVisual:this.view.documentTop,scrollRectLeft:rect.left,scrollRectTop:rect.top,scrollLeft:scroller.scrollLeft,scrollTop:scroller.scrollTop,scale:this.cssScale});
   const scale=external*plan.zoom;
-  const left=Math.max(0,origin.left+(bounds.x+bounds.width/2)*this.fontZoom-screenWidth/scale/2);
-  const top=Math.max(0,origin.top+(bounds.y+bounds.height/2)*this.fontZoom-screenHeight/scale/2);
-  if(origin.left+bounds.x*this.fontZoom<0||origin.top+bounds.y*this.fontZoom<0) return refuse();
-  return this.commitCameraScale(plan.zoom,{left,top})?"fit":refuse();
+  // `f`, not raw fontZoom: the same guarded value the reachable region above
+  // was built from, so a stroke placed with it lands exactly where the
+  // reachability test thought it was. (Today the two never actually differ -
+  // fitInkBounds already refused above whenever fontZoom fails the same
+  // finite/>0 test that makes f fall back - but that agreement is worth
+  // keeping explicit rather than relying on a guard two calls away.)
+  const left=Math.max(0,origin.left+(bounds.x+bounds.width/2)*f-screenWidth/scale/2);
+  const top=Math.max(0,origin.top+(bounds.y+bounds.height/2)*f-screenHeight/scale/2);
+  // Fit alone passes bypassFloor: it may commit below the manual floor.
+  return this.commitCameraScale(plan.zoom,{left,top},undefined,false,true)?"fit":refuse();
  }
 
  /** One validated transaction owns layout, transform, native range and scroll. */
- commitCameraScale(next:number,scroll?:{left:number;top:number}):boolean {
-  if(this.frame.locked||this.scaleGeometryValid===false||next>4||!validCameraScale(next,this.view.dom.clientWidth,this.view.dom.clientHeight))return false;
+ commitCameraScale(next:number,scroll?:{left:number;top:number},settleHold?:object|null,preserveScrollDemand=false,bypassFloor=false):boolean {
+	this.restorePinchLayers();
+  if(this.panAnchorHold!==settleHold)this.retirePanSettle();
+  this.pinchPreview=false;
+  this.releaseMeasures();
+  // Below the floor only a scale at or above the reference commits: the
+  // gesture's start while a pinch settles (its previews already wrote
+  // pinchScaleNow), else the current scale, so a re-commit in place passes.
+  if(this.frame.locked||this.scaleGeometryValid===false||(!bypassFloor&&next<this.zoomFloor&&!(next>=(this.pinchRefScale??this.pinchScaleNow)))||next>4||!validCameraScale(next,this.view.dom.clientWidth,this.view.dom.clientHeight))return false;
   const previous=this.pinchScaleNow,effective=this.cssScale/previous*next;
   if(!validCameraScale(effective)||!this.prepareViewportLayout())return false;
   const layout=this.viewportLayout!;
   const width=layout.width/next,height=layout.height/next;
   const target=scroll??{left:this.view.scrollDOM.scrollLeft,top:this.view.scrollDOM.scrollTop};
+  // An explicit navigation that is NOT a pinch settle - Fit, the zoom buttons,
+  // reset - computes its own absolute scroll and expects the note square on its
+  // origin. Leaving a previous gesture's residual pan in place would displace
+  // every one of those targets by it.
+  if(scroll&&!this.panAnchorHold&&(this.panX()!==0||this.panY()!==0))this.clearViewportPan();
   if(![width,height,target.left,target.top].every(n=>Number.isFinite(n)&&n>=0&&n<=MAX_VIEWPORT_LAYOUT)||width===0||height===0)return false;
   if(next!==previous)this.router?.cameraTransformChanged();
-  const host=this.view.dom;
   const generation=++this.viewportGeneration,path=this.filePath();
+  const hold=this.panAnchorHold, container=this.container;
+  const owns=()=>generation===this.viewportGeneration&&path===this.filePath()&&container===this.container&&!!container&&!this.retiring&&!this.frame.locked&&(!hold||this.ownsPanSettle(hold));
+  const matchesScroll=()=>!hold||(this.view.scrollDOM.scrollLeft===hold.left&&this.view.scrollDOM.scrollTop===hold.top);
+  const finish=()=>{if(hold){if(hold.outcome==="pending")hold.outcome="cancelled";if(this.panAnchorHold===hold)this.retirePanSettle();}};
   this.pinchScaleNow=next;this.cssScale=effective;this.scale=effective*this.fontZoom;
   this.updatePaperSpacing();
-  host.classList.add("handwriting-note-viewport");layout.parent.classList.add("handwriting-note-viewport-pane");
-  host.style.setProperty("--handwriting-note-column-width",`${layout.column}px`);
-  host.style.setProperty("--handwriting-note-column-margin-left",layout.left);
-  host.style.setProperty("--handwriting-note-column-margin-right",layout.right);
-  host.setCssStyles({width:`${width}px`,height:`${height}px`,transform:`${layout.baseTransform!=="none"?layout.baseTransform+" ":""}scale(${next})`,transformOrigin:"0 0"});
-  this.scrollExpansion?.rebase(this.view.scrollDOM.scrollLeft,this.view.scrollDOM.scrollTop);
-  this.handleResize();this.updateExtent(true);this.setViewportScroll(target.left,target.top);
+  this.refreshPenCursor();
+  this.applyViewportBox(next);
+  this.scrollExpansion?.rebase(this.view.scrollDOM.scrollLeft,this.view.scrollDOM.scrollTop,preserveScrollDemand);
+  this.handleResize();this.updateExtent(true,hold?.expansion??undefined);this.setViewportScroll(target.left,target.top);this.reanchorPan();
+  // The target scroll can leave the old raster band, especially on zoom-out.
+  // Finish its coverage before the router can map and lock the next pen down.
+  if(this.syncBand()!=="none")this.handleResize();
   const settledLeft=this.view.scrollDOM.scrollLeft,settledTop=this.view.scrollDOM.scrollTop;
-  this.view.requestMeasure({key:this,read:()=>generation===this.viewportGeneration&&path===this.filePath()&&!!this.container&&this.view.scrollDOM.scrollLeft===settledLeft&&this.view.scrollDOM.scrollTop===settledTop,write:valid=>{
-   if(!valid||generation!==this.viewportGeneration||path!==this.filePath()||this.frame.locked)return;
-   this.handleResize();this.updateExtent(true);this.setViewportScroll(target.left,target.top);this.scheduleRepaint();
-   // CodeMirror adjusts its text scroll anchor after measurement writes.
-   // Finish this explicit camera navigation after that adjustment, before
-   // the next input event, retaining the same note/gesture ownership guards.
+  if(hold && this.firstSettleConsumer()) {
+   // Use a real currently visible document position. Issue separately from
+   // edits: CM clips an incoming effect against the existing document.
+   const range=this.ownScrollRange(EditorSelection.cursor(this.view.viewport.from),hold);
+   if(!range){finish();return false;}
+   const request=EditorView.scrollIntoView(range,{x:"nearest",y:"nearest"});
+   hold.request=request;
+   const lifetime=viewportScrollLifetime(this.view);
+   lifetime.pending=hold;
+   const effects=[request,StateEffect.appendConfig.of(lifetime.extension)];
+   hold.issuance=effects;
+   const geometry=()=>[this.panX(),this.panY(),this.view.scrollDOM.scrollLeft,this.view.scrollDOM.scrollTop,this.view.scrollDOM.scrollWidth,this.view.scrollDOM.scrollHeight,this.view.contentHeight,this.view.viewport.from,this.view.viewport.to];
+   const measure={key:this,read:()=>owns()&&matchesScroll()?geometry():null,write:(before:number[]|null)=>{
+    if(!before||!owns()||!matchesScroll()){finish();return;}
+    this.handleResize();this.updateExtent(true,hold?.expansion??undefined);this.setViewportScroll(target.left,target.top);this.reanchorPan();
+    if(this.syncBand()!=="none")this.handleResize();
+    this.scheduleRepaint();
+    const after=geometry();
+    hold.ready=after.every((value,index)=>value===before[index]);
+    // Pending measurements keep CM's explicit target ahead of auto-anchoring
+    // until a full readback needs no further geometry correction.
+    if(!hold.ready) {
+     // Bound failure by attempted corrections, never declare convergence
+     // merely because time or frames passed. Leave the canceled receipt
+     // recognizable so draining it cannot perform default scrolling.
+     if(++hold.attempts>=4){hold.outcome="failed";console.warn("Pinch geometry did not converge");finish();}
+     else this.view.requestMeasure(measure);
+    }
+   }};
+   this.view.requestMeasure(measure);
+   this.view.dispatch({effects,filter:false});
+  } else if(hold) {
+   finish();
+  } else {
+  this.view.requestMeasure({key:this,read:()=>{
+   const valid=owns()&&matchesScroll()&&(!!hold||(this.view.scrollDOM.scrollLeft===settledLeft&&this.view.scrollDOM.scrollTop===settledTop));
+
+   return valid;
+  },write:valid=>{
+   if(!valid||!owns()||!matchesScroll()){finish();return;}
+   this.handleResize();this.updateExtent(true);this.setViewportScroll(target.left,target.top);this.reanchorPan();
+   if(this.syncBand()!=="none")this.handleResize();
+   this.scheduleRepaint();
+   const complete=()=>{
+    if(!owns()){finish();return;}
+    this.setViewportScroll(target.left,target.top);this.reanchorPan();
+    this.updateExtent(true);this.reanchorPan();
+    if(this.syncBand()!=="none")this.handleResize();
+    this.scheduleRepaint();
+    finish();
+   };
+   // Generic camera navigation keeps its existing guarded follow-up.
+   // Pinch settlement completes through the owned consumer above.
    queueMicrotask(()=>{
-    if(generation!==this.viewportGeneration||path!==this.filePath()||!this.container||this.frame.locked)return;
-    this.setViewportScroll(target.left,target.top);this.scheduleRepaint();
+    if(!owns()||!matchesScroll()){finish();return;}
+    complete();
    });
   }});
+  }
   this.mobileTools?.refresh();
   return true;
  }
-
-	private settlePinchRaster(): void {
-		if (this.pinchScaleNow === this.pinchRasterScale) return;
-		this.pinchRasterScale = this.pinchScaleNow;
-		// A transform does not resize CodeMirror's layout box. Refresh its
-		// measured scale before a later Undo captures a viewport snapshot.
-		this.view.requestMeasure();
-		this.handleResize();
-	}
 
 	private showPenCursor(sample: PenSample, pointerType?: string): void {
 		// Keyboard mode is an overarching pause for mouse ink. The router keeps
@@ -4884,12 +6851,27 @@ export class InkOverlayPlugin {
 		if (mousePointer) this.clearHoverWatchdog();
 		else this.armHoverWatchdog();
 		this.view.scrollDOM.classList.add(PEN_HOVER_CLASS);
+		const client = this.penCursorPinned ? this.router?.clientPointForSample(sample) : null;
+		const position = client ? { ...sample, x: client.x, y: client.y } : sample;
+		this.penCursorClient = client ? position : null;
+		this.paintPenCursor(position, this.penCursorPinned ? 1 : this.cssScale,
+			this.camera.zoom * (this.penCursorPinned ? this.cssScale : 1), sample);
+	}
+
+	/** Cursor-only writes: no input replay, watchdog extension or raster work. */
+	private refreshPenCursor(): void {
+		if (!this.penCursorClient || !this.penCursorEl || this.penCursorEl.style.display === "none") return;
+		this.paintPenCursor(this.penCursorClient, 1, this.camera.zoom * this.cssScale, null);
+	}
+
+	private paintPenCursor(sample: PenSample, cursorScale: number, cursorZoom: number, feedbackSample: PenSample | null): void {
+		if (!this.penCursorEl) return;
 		// In eraser mode the nib width is a lie: what the tip is about to do
 		// is bounded by the eraser radius, so the reticle shows THAT. Radius
 		// is screen-space (same physical size at any zoom), like the eraser
 		// cursor that follows a live erase.
 		if (tipMode() === "eraser") {
-			const r = visualToNote(inlineEraserRadiusPx, this.cssScale);
+			const r = visualToNote(inlineEraserRadiusPx, cursorScale);
 			this.penCursorEl.classList.remove(LASSO_CURSOR_CLASS);
 			this.penCursorEl.classList.remove(SPACE_CURSOR_CLASS);
 			this.penCursorEl.classList.remove(PAN_CURSOR_CLASS);
@@ -4908,7 +6890,7 @@ export class InkOverlayPlugin {
 		// Lasso mode: the nib is about to select, and the reticle says so - a
 		// dashed ring, fixed size, visually distinct from both nib and eraser.
 		if (tipMode() === "lasso") {
-			const r = visualToNote(9, this.cssScale);
+			const r = visualToNote(9, cursorScale);
 			this.penCursorEl.classList.remove(SPACE_CURSOR_CLASS);
 			this.penCursorEl.classList.remove(PAN_CURSOR_CLASS);
 			this.penCursorEl.classList.add(LASSO_CURSOR_CLASS);
@@ -4923,11 +6905,10 @@ export class InkOverlayPlugin {
 			return;
 		}
 		this.penCursorEl.classList.remove(LASSO_CURSOR_CLASS);
-		// Insert-space mode: the reticle IS the divider, in miniature - a
-		// short dashed rule lying where the seam would be planted. The nib
-		// dot would say "pen" for a tip that is about to move rows instead.
+		// Aim stays under the pointer. The eligible seam and whole-group
+		// exceptions live on the transient canvas, independently of this mark.
 		if (tipMode() === "space") {
-			const half = visualToNote(24, this.cssScale);
+			const half = visualToNote(7, cursorScale);
 			this.penCursorEl.classList.add(SPACE_CURSOR_CLASS);
 			this.penCursorEl.setCssStyles({
 				display: "block",
@@ -4937,13 +6918,14 @@ export class InkOverlayPlugin {
 				backgroundColor: "transparent",
 				opacity: "1",
 			});
+			if (feedbackSample) this.queueSpaceFeedback(this.camera.screenToWorld(feedbackSample.x,feedbackSample.y).y);
 			return;
 		}
 		this.penCursorEl.classList.remove(SPACE_CURSOR_CLASS);
 		// Pan mode: a solid ring, the one reticle that is not dashed, so the
 		// tip reads as "grab" rather than as any of the marking tools.
 		if (tipMode() === "pan") {
-			const r = visualToNote(11, this.cssScale);
+			const r = visualToNote(11, cursorScale);
 			this.penCursorEl.classList.add(PAN_CURSOR_CLASS);
 			this.penCursorEl.setCssStyles({
 				display: "block",
@@ -4964,8 +6946,8 @@ export class InkOverlayPlugin {
 			x: sample.x,
 			y: sample.y,
 			strokeWidth,
-			cameraZoom: this.camera.zoom,
-			cssScale: this.cssScale,
+			cameraZoom: cursorZoom,
+			cssScale: cursorScale,
 		});
 		this.penCursorEl.setCssStyles({
 			display: "block",
@@ -4983,6 +6965,8 @@ export class InkOverlayPlugin {
 	 * `ensurePenTools` already have for their own fan-outs.
 	 */
 	hidePenCursor(): void {
+		this.penCursorClient = null;
+		this.clearSpaceFeedback();
 		this.clearHoverWatchdog();
 		this.view.scrollDOM.classList.remove(PEN_HOVER_CLASS);
 		// The pan drag's grabbing hand comes off wherever the reticle does,
@@ -5044,17 +7028,25 @@ export class InkOverlayPlugin {
 	private startFrameTicker(): void {
 		if (this.frameTicking) return;
 		this.frameTicking = true;
+		const token = this.frameTickToken = {};
 		const tick = (ts: number): void => {
-			if (!this.frameTicking) return;
+			if (this.frameTickToken !== token) return;
+			this.frameRaf = 0;
 			this.snapPreview?.check();
+			if (this.frameTickToken !== token) return;
 			metrics.recordFrame(ts);
-			this.winRef.requestAnimationFrame(tick);
+			this.frameRaf = this.winRef.requestAnimationFrame(tick);
 		};
-		this.winRef.requestAnimationFrame(tick);
+		this.frameRaf = this.winRef.requestAnimationFrame(tick);
 	}
 
 	private stopFrameTicker(): void {
 		this.frameTicking = false;
+		// A new pen-down may precede the old callback. Cancel its frame and
+		// invalidate its closure so consecutive strokes cannot multiply tickers.
+		this.frameTickToken = null;
+		if (this.frameRaf) this.winRef.cancelAnimationFrame(this.frameRaf);
+		this.frameRaf = 0;
 	}
 
 	/**
@@ -5255,8 +7247,8 @@ export class InkOverlayPlugin {
 		// reason: the hardware and pen-seen claims belong to the hover and the
 		// pen-down that already happened. `mouseStroke` answers for a mouse.
 		this.showPenCursor({
-			x: visualToNote(ev.clientX - rect.left, this.cssScale),
-			y: visualToNote(ev.clientY - rect.top, this.cssScale),
+			x: visualToNote(ev.clientX - rect.left - this.inkPanX(), this.cssScale),
+			y: visualToNote(ev.clientY - rect.top - this.inkPanY(), this.cssScale),
 			pressure: 0,
 			timestamp: ev.timeStamp,
 			tiltX: 0,
@@ -5450,35 +7442,148 @@ export class InkOverlayPlugin {
 
 	// ---- insert space (divider gesture: ink below the line follows the pen) --
 
-	private spaceDown(sample: PenSample, ev: PointerEvent): void {
+	/** A visual line start, not the beginning of its entire Markdown paragraph.
+	 * Layout rectangles are screen pixels; converting through the fresh note
+	 * origin and effective ink scale also covers font scaling and scrolling. */
+	private spaceTextBoundary(y:number,direction:-1|1):SpaceBoundary|null {
+		if (!this.container || !this.view.dom.isConnected || !(this.scale>0)) return null;
+		const origin=anchorTop(this.view,this.contentStyle?.paddingTop,this.cssScale);
+		const clientY=origin+y*this.scale;
+		const x=this.view.contentDOM.getBoundingClientRect().left+this.cssScale;
+		const find=(screenY:number):SpaceBoundary|null=>{
+			const pos=this.view.posAtCoords({x,y:screenY});
+			if(pos===null)return null;
+			const hit=this.view.coordsAtPos(pos,1);
+			if(!hit)return null;
+			// CM's visual-line navigation samples one SCREEN pixel inside the
+			// editor. At 10% that can skip the first character. Find the first
+			// position on this rendered row by its vertical coordinates instead.
+			let from=this.view.state.doc.lineAt(pos).from,hi=pos;
+			while(from<hi){
+				const mid=Math.floor((from+hi)/2),rect=this.view.coordsAtPos(mid,1);
+				if(!rect)return null;
+				if(rect.top<hit.top-.01*this.cssScale)from=mid+1;else hi=mid;
+			}
+			const line=this.view.state.doc.lineAt(from);
+			const block=this.spaceTextEnd?.blocks.find(block=>line.number>=block.from&&line.number<=block.to);
+			let blockFallback=false;
+			if(block&&(line.number>block.from||from>line.from||block.frontmatter)){
+				blockFallback=true;
+				if(direction<0){if(block.frontmatter)return null;from=this.view.state.doc.line(block.from).from;}
+				else if(block.to<this.view.state.doc.lines)from=this.view.state.doc.line(block.to+1).from;
+				else return null;
+			}else if(from>line.from&&!canSplitParagraph(line.text,from-line.from)){
+				blockFallback=true;
+				if(direction<0)from=line.from;
+				else if(line.number<this.view.state.doc.lines)from=this.view.state.doc.line(line.number+1).from;
+				else return null;
+			}
+			const rect=this.view.coordsAtPos(from,1);
+			if(!rect)return null;
+			const dom=this.view.domAtPos(from).node;
+			const el=(dom.nodeType===1?dom as Element:dom.parentElement)?.closest(".cm-line");
+			if(!el)return null;
+			const style=this.winRef.getComputedStyle(el);
+			const lh=parseFloat(style.lineHeight)*this.cssScale || this.view.defaultLineHeight;
+			if(!(lh>0))return null;
+			const top=el.getBoundingClientRect().top;
+			const rowTop=top+Math.max(0,Math.round((rect.top-top)/lh))*lh;
+			return {y:(rowTop-origin)/this.scale,from,lineHeight:lh/this.scale,blockFallback};
+		};
+		let boundary=find(clientY);
+		if(!boundary)return null;
+		if(direction>0&&boundary.y<y-1e-5) {
+			boundary=find(origin+(boundary.y+boundary.lineHeight)*this.scale+Math.min(.1,this.cssScale));
+		}
+		if(!boundary||(boundary.y-y)*direction < -1e-5)return null;
+		return boundary;
+	}
+
+	private planSpace(y:number):SpaceBoundary|null {
+		const doc=this.view.state.doc;
+		if(this.spaceTextEnd?.doc!==doc){
+			let pos=0;
+			for(let n=doc.lines;n>0;n--){const line=doc.line(n),text=line.text.trimEnd();if(text.trim()){pos=line.from+text.length;break;}}
+			this.spaceTextEnd={doc,pos,blocks:spaceProtectedBlocks(n=>doc.line(n).text,doc.lines)};
+		}
+		// No text below the contact: the ink seam remains continuous instead
+		// of jumping back to the final Markdown line. No blank lines are
+		// manufactured in a note just to move ink that has no text to follow.
+		const end=this.spaceTextEnd.pos;
+		const textBottom=end===0?0:this.view.lineBlockAt(end).bottom/this.scale;
+		if(end===0||y>=textBottom){
+			return {y,from:doc.length,lineHeight:this.view.defaultLineHeight/this.scale,text:false};
+		}
+		return nearestSpaceBoundary(y,(at,direction)=>this.spaceTextBoundary(at,direction));
+	}
+
+	private previewSpace(plan:SpaceBoundary):NonNullable<InkOverlayPlugin["spacePreview"]> {
+		const strokes=this.strokesHere();
+		const rows=(this.spaceRowsCache??=new InsertSpaceRows()).get(strokes);
+		const moving=strokeIdsBelow(strokes,plan.y,rows),ids=new Set(moving);
+		const staying=rows.filter(row=>row.top<plan.y&&row.bottom>plan.y)
+			.flatMap(row=>row.ids).filter(id=>!ids.has(id));
+		return {plan,doc:this.view.state.doc,moving,staying,rows};
+	}
+
+	/** Coalesce hover feedback without repainting the committed ink layer.
+	 * The pointer itself updates synchronously, even when no seam is legal. */
+	private queueSpaceFeedback(y:number):void {
+		if(!this.tail)return;
+		this.spaceHoverY=y;
+		if(this.spaceFeedbackRaf!=null)return;
+		this.spaceFeedbackRaf=this.winRef.requestAnimationFrame(()=>{
+			this.spaceFeedbackRaf=null;
+			// The overlay can be torn down between the request and the frame;
+			// planSpace/previewSpace/redrawSelectionUI all reach geometry that
+			// is gone by then.
+			if(!this.container)return;
+			if(this.spaceHoverY===null||tipMode()!=="space")return;
+			if(this.mode!=="space"){
+				const plan=this.planSpace(this.spaceHoverY);
+				this.spacePreview=plan?this.previewSpace(plan):null;
+			}
+			this.redrawSelectionUI();
+		});
+	}
+
+	private clearSpaceFeedback():void {
+		if(this.spaceFeedbackRaf!=null)this.winRef.cancelAnimationFrame(this.spaceFeedbackRaf);
+		this.spaceFeedbackRaf=null;
+		this.spaceHoverY=null;
+		const hadPreview=!!this.spacePreview;
+		this.spacePreview=null;
+		if(hadPreview)this.redrawSelectionUI();
+	}
+
+	private spaceDown(sample: PenSample, _ev: PointerEvent): void {
 		// Same watchdog reasoning as lassoDown and the pan branch above: this
 		// is the one call site into a space gesture, so the reticle persists
 		// through it from the first sample rather than only from whatever
 		// hover happened to leave behind.
-		this.showSpaceCursor(sample);
 		const w = this.camera.screenToWorld(sample.x, sample.y);
 		const here = this.strokesHere();
-		// Snap out of any row the line was drawn through, and DRAW it where it
-		// snapped: the seam the gesture will actually cut at is the one worth
-		// showing, and seeing it jump into the gap is how the rule explains
-		// itself without a word of documentation.
-		const cut = snapLine(rowsOf(here), w.y);
+		// Resolve the seam once for the text position, ink membership and
+		// displayed guide. Never re-hit-test the original contact at release.
+		const plan=this.planSpace(w.y);
+		if(!plan){this.spacePlan=null;this.spaceLineY=null;this.clearSpaceFeedback();this.showSpaceCursor(sample);return;}
+		const cut = plan.y;
+		this.spacePlan={...plan,doc:this.view.state.doc};
+		const path=this.filePath();
+		this.spaceHistoryIdentity=path?inlineInk.captureHistoryIdentity(path):null;
+		this.spacePreview=this.previewSpace(plan);
 		this.spaceLineY = cut;
+		this.showSpaceCursor(sample);
 		this.spaceFromY = w.y;
 		this.spaceTotalDy = 0;
 		// The id list freezes at pen-down, and so does the box around it:
 		// membership cannot change mid-drag, so the damage region is just
 		// that box swept by the distance travelled.
-		this.spaceIds = strokeIdsBelow(here, w.y);
+		this.spaceIds = [...this.spacePreview.moving];
 		this.spaceBounds = boundsOf(here, this.spaceIds);
-		// The contact's CLIENT point, kept as-is: the editor can turn that
-		// into a document position exactly, with no world-to-viewport
-		// conversion of ours to drift out of step with the camera.
-		this.spaceClient = { x: ev.clientX, y: ev.clientY };
-		if (this.spaceIds.length === 0) {
-			// A gesture that moves nothing is indistinguishable from a broken
-			// one - it cost an evening of hardware testing to learn that once.
-			new Notice("Handwriting: no ink below the line");
+		if (this.spaceIds.length === 0 && !this.view.state.doc.sliceString(plan.from).trim()) {
+			new Notice("Handwriting: no content below the line");
+			this.spacePlan=null;this.spaceLineY=null;this.clearSpaceFeedback();
 		}
 		this.redrawSelectionUI();
 	}
@@ -5497,9 +7602,8 @@ export class InkOverlayPlugin {
 		inlineInk.moveStrokes(path, this.spaceIds, 0, dy);
 		this.spaceTotalDy += dy;
 		this.spaceFromY = w.y;
-		// The line rides with the pen, leading the ink it is pushing: it stays
-		// under the nib all through the drag, so the gesture reads as shoving a
-		// seam down the page rather than watching a mark sit still.
+		// The live seam follows raw displacement. The origin and rounded
+		// release destination are drawn separately from the frozen plan.
 		if (this.spaceLineY !== null) this.spaceLineY += dy;
 		// Damage the swept band only. Marking the whole page dirty per frame
 		// re-rasterized every stroke in the note and the drag went jagged on
@@ -5521,13 +7625,17 @@ export class InkOverlayPlugin {
 		const path = this.filePath();
 		const applied = this.spaceTotalDy;
 		const strokeIds = this.spaceIds;
-		const client = this.spaceClient;
+		const plan = this.spacePlan;
+		// This is the normal commit path (also native cancel/blur). Teardown
+		// must never undo its movement again after the paired transaction.
+		this.spaceHistoryIdentity = null;
 		this.spaceLineY = null;
 		this.spaceIds = [];
 		this.spaceBounds = null;
-		this.spaceClient = null;
+		this.spacePlan = null;
 		this.spaceTotalDy = 0;
-		if (!path || applied === 0 || strokeIds.length === 0) {
+		this.clearSpaceFeedback();
+		if (!path || applied === 0 || !plan) {
 			this.redrawSelectionUI();
 			return;
 		}
@@ -5540,7 +7648,7 @@ export class InkOverlayPlugin {
 		// writing that must not be deleted, settles back to zero rather than
 		// leaving the ink permanently offset from the line it belongs to -
 		// which is the one thing this gesture exists to prevent.
-		const change = this.spaceTextChange(client, applied);
+		const change = this.spaceTextChange(plan, applied);
 		const dy = change.dy;
 		const correction = dy - applied;
 		if (correction !== 0) inlineInk.moveStrokes(path, strokeIds, 0, correction);
@@ -5552,13 +7660,13 @@ export class InkOverlayPlugin {
 			this.redrawSelectionUI();
 			return;
 		}
-		inlineInk.save(path);
-		const op = this.stampInkIdentity({ type: "move", path, strokeIds, dx: 0, dy });
+		if(strokeIds.length)inlineInk.save(path);
+		const op = strokeIds.length?this.stampInkIdentity({ type: "move", path, strokeIds, dx: 0, dy }):null;
 		try {
 			this.view.dispatch({
 				changes: change.changes ?? undefined,
-				effects: inkEffect.of(op),
-				annotations: [inkApplied.of(true), isolateHistory.of("full")],
+				effects: op?inkEffect.of(op):undefined,
+				annotations: op?[inkApplied.of(true), isolateHistory.of("full")]:isolateHistory.of("full"),
 			});
 		} catch (err) {
 			console.error("[handwriting] insert-space dispatch failed", err);
@@ -5574,31 +7682,32 @@ export class InkOverlayPlugin {
 	 * closed a gap. Returns the SNAPPED distance too, because the ink has to
 	 * land on the same whole number of lines the text just moved by.
 	 *
-	 * Null when there is nothing honest to do - no contact point, a drag
-	 * shorter than half a line, or a close-up drag over text that is not
-	 * blank. In every one of those the ink still moves; only the text is
-	 * left alone.
+	 * A changed document, short drag or upward drag over nonblank text
+	 * returns zero; the caller then rolls back the live ink movement.
 	 */
 	private spaceTextChange(
-		client: { x: number; y: number } | null,
+		plan: (SpaceBoundary & {doc: Text}) | null,
 		applied: number
 	): { changes: { from: number; to: number; insert: string } | null; dy: number } {
 		const none = { changes: null, dy: 0 };
-		if (!client) return none;
-		const lineHeight = visualToNote(this.view.defaultLineHeight, this.scale);
+		if (!plan || plan.doc!==this.view.state.doc) return none;
+		if(plan.text===false)return {changes:null,dy:applied};
+		const lineHeight = plan.lineHeight;
 		const steps = lineSteps(applied, lineHeight);
 		if (steps === 0) return none;
-		const pos = this.view.posAtCoords(client);
-		if (pos === null) return none;
+		const pos = plan.from;
 		const doc = this.view.state.doc;
 		const line = doc.lineAt(pos);
 		if (steps > 0) {
 			return {
-				changes: { from: line.from, to: line.from, insert: "\n".repeat(steps) },
+				// An internal break replaces an existing visual wrap. One extra
+				// newline preserves that wrap before opening the requested space.
+				changes: { from: pos, to: pos, insert: "\n".repeat(steps+(pos>line.from?1:0)) },
 				dy: steps * lineHeight,
 			};
 		}
 		// Closing up: take back only blank lines, never a word of writing.
+		if(pos!==line.from)return none;
 		const removable = blankLinesAbove((n) => doc.line(n).text, line.number, -steps);
 		if (removable === 0) return none;
 		const first = doc.line(line.number - removable);
@@ -5615,6 +7724,7 @@ export class InkOverlayPlugin {
 
 	/** The strip's active-tool marks are stale; recompute them. */
 	refreshStrip(): void {
+		if(tipMode()!=="space")this.clearSpaceFeedback();
 		this.snapPreview?.check();
 		this.mobileTools?.refresh();
 	}
@@ -5653,8 +7763,25 @@ export class InkOverlayPlugin {
 		if (this.lassoActive && this.lassoPts.length > 1) {
 			this.tail.drawLasso(cam, this.lassoPts, SELECTION_COLOR);
 		}
-		if (this.spaceLineY !== null) {
-			this.tail.drawSpaceDivider(cam, this.spaceLineY, SELECTION_COLOR, this.cssWidth);
+		// A reload/erase while hovering invalidates the affected-set promise.
+		// A live drag intentionally keeps its frozen set despite translations.
+		if(this.spacePreview&&!this.spacePlan&&this.spaceRowsCache.get(this.strokesHere())!==this.spacePreview.rows)this.spacePreview=null;
+		const preview=this.spacePreview;
+		if (preview && preview.doc===this.view.state.doc) {
+			const moving=new Set(preview.moving),staying=new Set(preview.staying);
+			for(const stroke of this.strokesHere()){
+				if(moving.has(stroke.id)||staying.has(stroke.id))this.tail.drawSpaceStroke(
+					cam,stroke,moving.has(stroke.id)?SELECTION_COLOR:"#d98b00",this.cssWidth,this.cssHeight,this.cssScale);
+			}
+			this.tail.drawSpaceDivider(cam,preview.plan.y,SELECTION_COLOR,this.cssWidth);
+			const label=preview.plan.blockFallback?"Block boundary":preview.plan.text===false?"Ink gap":"Text boundary";
+			this.tail.drawSpaceLabel(cam,preview.plan.y,label+(moving.size?" · blue ink moves":"")+(staying.size?" · amber ink stays":""),SELECTION_COLOR,this.cssScale);
+			if(this.spacePlan && this.spaceLineY!==null){
+				const dy=this.spaceTextChange(this.spacePlan,this.spaceTotalDy).dy;
+				const landing=this.spacePlan.y+dy;
+				const gap=this.spacePlan.text===false?`${Math.round(dy*10)/10} gap`:`${Math.round(dy/this.spacePlan.lineHeight)} lines`;
+				this.tail.drawSpaceLabel(cam,landing,`Release: ${gap}`,SELECTION_COLOR,this.cssScale,true);
+			}
 		}
 		const bounds = this.selectionBounds();
 		if (bounds) this.tail.drawSelectionBox(cam, bounds, SELECTION_COLOR);
@@ -5722,8 +7849,10 @@ export class InkOverlayPlugin {
 	 * name, for the identical reason.
 	 */
 	private strokeAbandoned(): void {
+		const replayBand = this.bandSyncDeferred;
 		stripPenUp(this.mobileTools);
 		this.resetGestureState();
+		if (replayBand) this.scheduleRepaint("scroll");
 		this.wet.clear(this.cssWidth, this.cssHeight);
 		this.highlightWet.clear(this.cssWidth, this.cssHeight);
 		// A teardown mid-handoff would otherwise strand the wet highlighter
@@ -5749,12 +7878,14 @@ export class InkOverlayPlugin {
 	}
 
 	private resetGestureState(): void {
+		this.rollbackSpaceMove();
 		this.clearSnapPreview();
 		// Lifecycle rule (v0.13.6 fix): every gesture-state reset releases the
 		// stroke frame lock. File switch and unmount reach here mid-stroke;
 		// leaving the lock held froze the NEXT note's camera and repaints
 		// until its first pen-down. A cancelled frame never leaks forward.
 		this.frame.cancel();
+		this.bandSyncDeferred = false;
 		// A standing snap offer belongs to the note and the stroke it was made
 		// about, and this method is every way both of those go away: a file
 		// switch, an unmount (which is also what `destroy` and plugin unload
@@ -5790,7 +7921,7 @@ export class InkOverlayPlugin {
 		this.spaceLineY = null;
 		this.spaceIds = [];
 		this.spaceBounds = null;
-		this.spaceClient = null;
+		this.spacePlan = null;
 		this.spaceTotalDy = 0;
 		this.panLast = null;
 		// The gesture is over, so the device that started it stops answering
@@ -5811,6 +7942,24 @@ export class InkOverlayPlugin {
 		// emptyNotice.forgetAll() themselves, right after this.
 		this.hidePenCursor();
 		this.hideEraserCursor();
+	}
+
+	/** A note switch has already changed filePath/lastPath when reset runs.
+	 * Resolve the ORIGINAL record instead, before throwing away the inverse.
+	 * This also handles unmount and ignores a deleted/replaced record. */
+	private rollbackSpaceMove():void {
+		const identity=this.spaceHistoryIdentity,dy=this.spaceTotalDy;
+		this.spaceHistoryIdentity=null;
+		this.spaceTotalDy=0;
+		if(!identity||!dy||!this.spaceIds.length)return;
+		const path=inlineInk.pathForHistoryIdentity(identity);
+		if(!path)return;
+		inlineInk.moveStrokes(path,this.spaceIds,0,-dy);
+		// Persist the restored state even if another save observed the live
+		// provisional coordinates. Store guards still own write eligibility.
+		inlineInk.save(path);
+		this.frontierCache.invalidate(path);
+		this.repaintPath(path);
 	}
 
 	// ---- history --------------------------------------------------------------
@@ -6171,8 +8320,89 @@ export class InkOverlayPlugin {
 		return tool === "highlighter" ? this.highlightCtx : this.committedCtx;
 	}
 
+	/**
+	 * Draw committed ink for one frame: everything at `cam` when `work` is
+	 * "all", else the damaged rects through the stroke index. Shared by the
+	 * ordinary repaint and the repaint under a pinch hold, which paints at
+	 * the RETAINED camera (see `repaint`). Returns whether the purge probe
+	 * is armed, for the heal check that follows an ordinary repaint.
+	 */
+	private paintCommittedWork(cam: { x: number; y: number; zoom: number }, work: "all" | BBox[], strokes: readonly InkStroke[]): boolean {
+		const probeArmed = purgeProbeArmed(Platform.isMobileApp, diagnosticsEnabled());
+		// One source for both branches: a partial repaint must match a full
+		// one, or ink would visibly change width between a damage frame and
+		// the next full one. See fillRibbon/WidthFloor.ts.
+		const floor = committedFloorFor(this.committedBacking, this.dpr);
+		if (work === "all") {
+			this.markCommittedPaint("highlighter");
+			this.markCommittedPaint("pen");
+			drawCommitted(this.highlightCtx, cam, strokes, this.cssWidth, this.cssHeight, true, "highlighter", undefined, floor);
+			drawCommitted(this.committedCtx, cam, strokes, this.cssWidth, this.cssHeight, true, "pen", probeArmed, floor);
+			this.highlightBlank = !strokes.some(stroke => stroke.tool === "highlighter");
+			this.committedBlank = !probeArmed && !strokes.some(stroke => stroke.tool !== "highlighter");
+		} else if (work.length > 0) {
+			this.markCommittedPaint("highlighter");
+			this.markCommittedPaint("pen");
+			if (this.indexDirty) {
+				this.strokeIndex.rebuild(strokes);
+				this.indexDirty = false;
+			}
+			for (const rect of work) {
+				const hit = this.strokeIndex.query(rect);
+				drawRegion(this.highlightCtx, cam, hit, rect, true, "highlighter", floor);
+				drawRegion(this.committedCtx, cam, hit, rect, true, "pen", floor);
+			}
+			// A damage rect covering the band corner clears the marker, and
+			// `drawRegion` has no reason to know about it. Repainting is
+			// idempotent, so this needs no test for whether it was hit.
+			if (probeArmed) paintPurgeSentinel(this.committedCtx);
+		}
+		return probeArmed;
+	}
+
 	private repaint(): void {
+		if (this.deferPinchRaster()) {
+			// The queued frame is CONSUMED here: `scheduleRepaint`'s rAF clears
+			// `repaintQueued` before calling this. During an active pinch
+			// `pinchScrollAt` is re-stamped every preview frame, so this stays
+			// true for the whole gesture and damage pending when the deferral
+			// began would never be drawn. The case that matters is a stroke
+			// committing mid-gesture: `drawCommitted` clears the preview offset
+			// and marks the layer dirty synchronously so the new stroke lands
+			// right, but the REST of the layer would keep showing the pre-gesture
+			// raster, untranslated, for the rest of the pinch - the original
+			// slide, re-introduced by the fix for it.
+			//
+			// A LATCH AND ONE TIMER, not a re-armed rAF. Re-arming per frame is a
+			// requestAnimationFrame loop for the duration of the gesture, on the
+			// path the deferral exists to keep free. Settle needs nothing:
+			// `commitCameraScale` re-rasters and clears the latch. What is left is
+			// a pause past the quiet window or a lost end event, and one timer
+			// covers both.
+			if (!this.damage.isEmpty) this.armDeferredRepaint();
+			return;
+		}
+		this.restorePinchLayers();
 		if (!this.container) return;
+		// UNDER THE HOLD (D-COV, RULING-4 AD-4 i): no band move, no reallocation,
+		// no camera re-base, no offset clearing. The raster keeps the basis the
+		// preview translate was solved against, and damage that arrived
+		// mid-gesture (a stroke committing) paints into the retained backing at
+		// that camera, so the new ink lands where the pen put it and the rest
+		// of the layer stays put. Measured on e355b259 (2026-09-13): a stroke
+		// committing in a held zoom-in at k 0.75 sent this frame through
+		// syncBand and handleResize, which re-sized the band from the unpanned
+		// viewport (6000 -> 1601 layout px tall), and the mark at rows
+		// 2372-2612 fell outside it until the settle. What a bigger band would
+		// show waits for the settle, which re-rasters against the settled column.
+		if (this.pinchPreview && this.lastPaintCam !== null) {
+			const work = this.damage.take();
+			if (work === "all" || work.length > 0) {
+				const path = this.filePath();
+				this.paintCommittedWork(this.lastPaintCam, work, path ? inlineInk.strokes(path) : []);
+			}
+			return;
+		}
 		if ((this.winRef.devicePixelRatio || 1) !== this.dpr) {
 			this.handleResize();
 			return;
@@ -6186,6 +8416,18 @@ export class InkOverlayPlugin {
 		if (this.syncBand() === "resized") {
 			this.handleResize();
 			return;
+		}
+		if (this.rasterPanNeedsBake()) {
+			// A settled pan must move ink within the bounded raster, not move
+			// every canvas away from part of the writable editor. Change the
+			// camera and input origin together, then redraw all affected layers.
+			this.rasterPan = { x: this.panX() / this.cssScale, y: this.panY() / this.cssScale };
+			this.writeInkLayerTransform();
+			this.wet.clear(this.cssWidth, this.cssHeight);
+			this.highlightWet.clear(this.cssWidth, this.cssHeight);
+			this.tail.clearAll(this.cssWidth, this.cssHeight);
+			this.damage.addAll();
+			this.router?.refreshRect();
 		}
 		this.syncCamera();
 		const path = this.filePath();
@@ -6203,28 +8445,28 @@ export class InkOverlayPlugin {
 			work = "all";
 		}
 		this.lastPaintCam = { x: cam.x, y: cam.y, zoom: cam.zoom };
+		// This frame redraws the committed layer against the CURRENT column, so
+		// any preview translation is now baked into the pixels and must come
+		// off, and the anchor must describe this raster rather than the one it
+		// replaced. Reachable mid-gesture: holding a pinch still past
+		// PINCH_SCROLL_QUIET_MS lets deferPinchRaster go false and a repaint
+		// through.
+		if (this.pinchPreview) {
+			this.clearPreviewInkOffset();
+			// INVALIDATE, do not re-latch here. The anchor has to be read while
+			// the host still carries the scale the raster was drawn at, and by
+			// the time the NEXT preview frame calls this method
+			// `applyViewportBox` has already moved the column. Re-latching from
+			// inside repaint measured the column one box-change too late and
+			// put a constant 855 host-local px into the anchor - measured as a
+			// residual that decayed exactly in proportion to k (-256.4 at 0.30,
+			// -170.9 at 0.20, -128.2 at 0.15, -85.5 at 0.10; all -855 * k).
+			this.previewAnchorStale = true;
+		}
 		// The purged-canvas marker, and everything about it, is off unless
 		// this is a mobile surface with diagnostics recording (PurgeSentinel.ts
 		// says why it is not on for everyone yet). Desktop pays one boolean.
-		const probeArmed = purgeProbeArmed(Platform.isMobileApp, diagnosticsEnabled());
-		if (work === "all") {
-			drawCommitted(this.highlightCtx, cam, strokes, this.cssWidth, this.cssHeight, true, "highlighter");
-			drawCommitted(this.committedCtx, cam, strokes, this.cssWidth, this.cssHeight, true, "pen", probeArmed);
-		} else if (work.length > 0) {
-			if (this.indexDirty) {
-				this.strokeIndex.rebuild(strokes);
-				this.indexDirty = false;
-			}
-			for (const rect of work) {
-				const hit = this.strokeIndex.query(rect);
-				drawRegion(this.highlightCtx, cam, hit, rect, true, "highlighter");
-				drawRegion(this.committedCtx, cam, hit, rect, true, "pen");
-			}
-			// A damage rect covering the band corner clears the marker, and
-			// `drawRegion` has no reason to know about it. Repainting is
-			// idempotent, so this needs no test for whether it was hit.
-			if (probeArmed) paintPurgeSentinel(this.committedCtx);
-		}
+		const probeArmed = this.paintCommittedWork(cam, work, strokes);
 		// ---- the purge heal (1.4.12-design.md §14, cause B) -----------------
 		// A scroll repaint with no work drew nothing, which is correct while
 		// the camera is still and catastrophic if WebKit has quietly taken the
@@ -6250,7 +8492,7 @@ export class InkOverlayPlugin {
 		}
 		// Selection chrome lives in world coordinates: scrolling and reflow
 		// repaint it at the strokes' current position.
-		if (!this.selection.isEmpty || this.lassoActive || this.spaceLineY !== null)
+		if (!this.selection.isEmpty || this.lassoActive || this.spaceLineY !== null || this.spacePreview)
 			this.redrawSelectionUI();
 		// While a stroke is active this repaint ran with the LOCKED pen-down
 		// camera (syncCamera above was a no-op); measure how far that frame
@@ -6300,7 +8542,7 @@ export class InkOverlayPlugin {
 	 * waiting - the band scrolls with the text on its own.
 	 */
 	private syncBand(): "none" | "moved" | "resized" {
-		if (!this.container || this.frame.locked) return "none";
+		if (!this.container) return "none";
 		const scroller = this.view.scrollDOM;
 		const viewport: BandViewport = {
 			scrollLeft: scroller.scrollLeft,
@@ -6309,7 +8551,28 @@ export class InkOverlayPlugin {
 			clientHeight: scroller.clientHeight,
 			scrollWidth: scroller.scrollWidth,
 			scrollHeight: scroller.scrollHeight,
+			// The band's margin is headroom for a fling, and a fling is measured
+			// in the px the reader sees. Below 1.0 the host is counter-sized, so
+			// the scroller's own px are worth `cssScale` of those - without this
+			// term the margin shrinks with the zoom and the band is re-pinned on
+			// every frame of a flick, each one a whole-world rasterisation.
+			scale: this.cssScale,
 		};
+		if (this.frame.locked) {
+			// A stroke owns the frame. The band may stay where it is ONLY while
+			// every pixel the viewport shows is inside it: deferring past that
+			// point leaves the pen walking off the canvas edge, drawing wet ink
+			// nowhere (Orion 2026-09-13, 10% far down and right: the mark that
+			// lands before the frame that would have followed the last scroll
+			// sits on a band one scroll behind, and its right-hand end is never
+			// painted). A size change is still deferred: a reallocation blanks
+			// five canvases and cannot be carried.
+			if (!this.band || bandCovers(this.band, viewport)) { this.bandSyncDeferred = true; return "none"; }
+			const want = bandFor(viewport);
+			if (want.width !== this.band.width || want.height !== this.band.height) { this.bandSyncDeferred = true; return "none"; }
+			return this.carryBandUnderLock(want);
+		}
+		this.bandSyncDeferred = false;
 		if (!bandNeedsMove(this.band, viewport)) return "none";
 		const band = bandFor(viewport);
 		// A SIZE change has to reach handleResize, and the ResizeObserver will
@@ -6344,6 +8607,68 @@ export class InkOverlayPlugin {
 	}
 
 
+	/**
+	 * Move the band under a live stroke without moving anything the reader
+	 * sees, and without a whole-world raster on the pen's own frame.
+	 *
+	 * The frozen pipeline's rule stands: the camera and the router's rect
+	 * froze together at pen-down and are moved together here, by one delta.
+	 * The band container slides by (dx, dy) layout px; the camera's world
+	 * origin moves by the same amount, so every sample after this maps to the
+	 * same world point it would have before; the router re-reads the
+	 * container's rect once, so the client point the pen reports is measured
+	 * against the box where it now is. Ink already painted on the five
+	 * canvases is slid by the opposite amount, a WHOLE number of device px
+	 * (the delta is snapped to the backing grid first), so it is pixel-exact,
+	 * not resampled. The strips the move uncovers are the only committed work
+	 * left, and they go through the ordinary partial-repaint path; the last
+	 * painted camera is advanced so repaint() does not read the shift as a
+	 * camera move and re-raster the world mid-contact.
+	 *
+	 * Wet ink that was never painted because it lay past the old edge is not
+	 * recovered here; the commit redraws the stroke from its world points.
+	 */
+	private carryBandUnderLock(want: Band): "none" | "moved" {
+		const current = this.band!, container = this.container;
+		if (!container) return "none";
+		const backing = this.committedBacking ?? this.backingNow();
+		if (!(backing > 0) || !Number.isFinite(backing)) { this.bandSyncDeferred = true; return "none"; }
+		// Snap to the backing grid: an integer device-px blit is exact.
+		const dx = Math.round((want.left - current.left) * backing) / backing;
+		const dy = Math.round((want.top - current.top) * backing) / backing;
+		if (dx === 0 && dy === 0) { this.bandSyncDeferred = true; return "none"; }
+		const cam = this.camera.snapshot;
+		// UNITS. The band and the blit are layout px; the camera is note units
+		// with the font zoom as its zoom (syncCamera divides the band offset by
+		// fontZoom before setState). A layout delta enters the camera divided
+		// by the same factor, and shiftPlan multiplies it back out for the
+		// css-px blit, so the two agree at every font size and not only at 1.
+		const f = Number.isFinite(this.fontZoom) && this.fontZoom > 0 ? this.fontZoom : 1;
+		const camX = cam.x + dx / f, camY = cam.y + dy / f;
+		const plan = shiftPlan(dx / f, dy / f, cam.zoom, camX, camY, this.cssWidth, this.cssHeight);
+		if (plan === null) { this.bandSyncDeferred = true; return "none"; }
+		this.band = { left: current.left + dx, top: current.top + dy, width: current.width, height: current.height };
+		container.setCssStyles({ left: `${this.band.left}px`, top: `${this.band.top}px` });
+		this.camera.setState(camX, camY, cam.zoom);
+		for (const [ctx, canvas] of [[this.committedCtx, this.committedCanvas], [this.highlightCtx, this.highlightCanvas]] as const) {
+			ctx.save();
+			ctx.setTransform(1, 0, 0, 1, 0, 0);
+			ctx.globalCompositeOperation = "copy";
+			ctx.drawImage(canvas, Math.round(plan.shiftX * backing), Math.round(plan.shiftY * backing));
+			ctx.restore();
+		}
+		this.wet.carry(plan.shiftX, plan.shiftY);
+		this.highlightWet.carry(plan.shiftX, plan.shiftY);
+		this.tail.carry(plan.shiftX, plan.shiftY);
+		// The pixels moved with the camera: the next repaint owes only the
+		// uncovered strips, not the world.
+		this.lastPaintCam = { x: camX, y: camY, zoom: cam.zoom };
+		for (const rect of plan.exposed) this.damage.addRect(rect);
+		this.router?.refreshRect();
+		this.bandSyncDeferred = false;
+		return "moved";
+	}
+
 	// ---- surface extent -----------------------------------------------------
 	//
 	// Reconstructed from the 2026-08-20 deployed hardware build (its source
@@ -6362,7 +8687,8 @@ export class InkOverlayPlugin {
 	// suspect in the 2026-08 touchpad dead-zone investigation, which is why
 	// every mutation here is traced.
 
-	private updateExtent(force = false): void {
+	private updateExtent(force = false, navigation?: { left: number; top: number }): void {
+		if (this.deferPinchRaster()) return;
 		if (!this.container || this.frame.locked) return;
 		const path = this.filePath();
 		if (!path) return;
@@ -6400,6 +8726,13 @@ export class InkOverlayPlugin {
 		};
 		if (!force && sameExtentInputs(this.lastExtentInputs, inputs)) return;
 		this.lastExtentInputs = inputs;
+		// RP-4, FIRST OF TWO: the ladder must cover the surface that already
+		// exists, not only the one the spacer invents. A long note with Infinite
+		// Canvas off never reaches the spacer branch below at all, and its own
+		// scroll height is the whole distance the anchor has to span. This is
+		// past the skip above, so it is not on the scroll path, and the method
+		// has already forced layout for its own reads.
+		growDocumentAnchorLadder(this.view, scroller.scrollHeight);
 		// The origin is needed BEFORE growing now: the zoom frontier is
 		// origin-relative, and it joins the ink frontier in one grow so a
 		// magnified note's overhang is scrollable (see zoomFrontier).
@@ -6407,7 +8740,7 @@ export class InkOverlayPlugin {
 		const preRect = scroller.getBoundingClientRect();
 		const origin = surfaceOriginInScroller({
 			contentLeftVisual: this.columnLeft(),
-			documentTopVisual: this.view.documentTop,
+			documentTopVisual: this.documentTopUnpanned(),
 			scrollRectLeft: preRect.left,
 			scrollRectTop: preRect.top,
 			scrollLeft: scroller.scrollLeft,
@@ -6417,7 +8750,9 @@ export class InkOverlayPlugin {
 		const ink = inputs.frontier;
 		// Shared with writeFrontier below - both need the same document-bottom
 		// number and neither may re-read layout to get it.
-		const contentBottom = (contentRect.bottom - preRect.top) / this.cssScale + scroller.scrollTop;
+		// Content extent is unpanned, just like the origin above. Including
+		// residual pan here makes settling change its own native scroll range.
+		const contentBottom = (contentRect.bottom - this.panY() - preRect.top) / this.cssScale + scroller.scrollTop;
 		const zoom = this.viewportLayout ? ZERO_EXTENT : zoomFrontier({
 			clientWidth: scroller.clientWidth,
 			clientHeight: scroller.clientHeight,
@@ -6426,12 +8761,22 @@ export class InkOverlayPlugin {
 			pinchScale: this.pinchScaleNow,
 			fontZoom: this.fontZoom,
 		});
-		// Room to write at the top of the screen (1.4.6 §5n): only granted
-		// while the surface is being written on, so a typing-only note keeps a
-		// byte-identical extent.
-		const write = inputs.writtenOn
+		// Room to write at the top of the screen (1.4.6 §5n): granted while the
+		// surface is being written on, and while the note viewport is zoomed
+		// out, which is a handwriting act of its own. A typing-only note at 1.0
+		// keeps a byte-identical extent.
+		const write = writeFrontierApplies(inputs)
 			? writeFrontier({
-					clientHeight: this.viewportLayout?.height ?? scroller.clientHeight,
+					// WHICH VIEWPORT the 0.75 is a fraction OF. Zoomed out, the
+					// scroller is counter-sized and CSS-scaled back down, so the
+					// takeover pane height is a TENTH of a screenful at 0.1 - the
+					// grant it buys is ~60 visual px, which is the same "nothing
+					// below the text" the frontier is here to fix. Below 1.0 the
+					// screenful IS the scroller's client box, so measure against
+					// that; written-on notes have the same need and take the same
+					// term. At and above 1.0 the term is unchanged, so zoom-in and
+					// 100% stay byte-identical.
+					clientHeight: inputs.pinchScale < 1 ? scroller.clientHeight : (this.viewportLayout?.height ?? scroller.clientHeight),
 					contentBottom,
 					origin,
 					fontZoom: this.fontZoom,
@@ -6444,7 +8789,7 @@ export class InkOverlayPlugin {
 			height: scroller.clientHeight,
 			edgeX: scroller.scrollWidth, edgeY: scroller.scrollHeight,
 			origin, fontZoom: this.fontZoom, pinchScale: this.pinchScaleNow,
-		}) : ZERO_EXTENT;
+		}, navigation) : ZERO_EXTENT;
 		const granted = surfaceExtents.grow(path, {
 			x: Math.max(ink.x, zoom.x, scroll.x),
 			y: Math.max(ink.y, zoom.y, write.y, scroll.y),
@@ -6465,7 +8810,6 @@ export class InkOverlayPlugin {
 			});
 			scrollProbeExtent("spacer created");
 		}
-		this.ensureScrollableAxis(scroller);
 		// The origin computed above, and the granted extent (note px)
 		// converted with the font zoom, so the scroll range tracks the
 		// ink's rendered size.
@@ -6486,16 +8830,56 @@ export class InkOverlayPlugin {
 			moved = true;
 		}
 		if (moved) scrollProbeExtent(`spacer -> (${pos.left},${pos.top})`);
+		// RP-4, SECOND OF TWO: the spacer's own demand, which can exceed the
+		// scroll height the browser has applied so far. Growth is monotonic and
+		// idempotent, so the two calls cannot fight; between them the ladder
+		// covers whichever of the two surfaces is longer, and it never reaches
+		// past the surface that exists.
+		//
+		// HERE AND NOWHERE ELSE (with the call above): this frame is already a
+		// write moment and has already forced layout, so the one childList
+		// mutation costs the CodeMirror measure that any mutation costs on a
+		// frame that was doing that work anyway - instead of putting a measure
+		// on the scroll path, which is what ruling 2B ruled out.
+		growDocumentAnchorLadder(this.view, pos.top);
 		scroller.classList.toggle("handwriting-hscroll", granted.x > 0);
+		// AFTER the class rather than twenty-one lines before it. ORDER IS NOT THE
+		// MECHANISM, and saying so was wrong: measured on read, `handwriting-hscroll`
+		// styles only the horizontal scrollbar (styles.css:2198-2211); the property
+		// the guard reads is changed by `handwriting-hscroll-axis`, which the guard
+		// itself adds. So the pre-class read saw the same `overflow-x` the post-class
+		// read sees, and moving the call cannot by itself have fixed anything. It is
+		// kept because reading the state a pass established, in that pass, is the
+		// honest order - not because it was the defect.
+		//
+		// THE DEFECT IS THE LATCH BELOW, and that one is on the read: the check
+		// marked itself done without a verdict, so a pass with nothing to open
+		// spent the only attempt the note ever got. The
+		// axis then stayed shut for the life of the note, and the only things
+		// that re-arm it are teardown and handleResize's reallocation, which is
+		// exactly why toggling the setting off and on was the cure and nothing
+		// else was (alan: "i cannot scroll to the right because i havent toggled
+		// infinite canvas off and then on").
+		//
+		// Left ink only, which is what made it look arbitrary: the surface never
+		// goes negative, so ink to the RIGHT is reachable without granting an x
+		// extent at all and never needs the axis. A stroke left of the column is
+		// the one case that does.
+		this.ensureScrollableAxis(scroller);
 		if (moved || !this.lastReach) this.measureReach(scroller, pos.left + 1);
 	}
 
 	private ensureScrollableAxis(scroller: HTMLElement): void {
 		if (this.axisChecked || this.axisGuard.patched) return;
-		this.axisChecked = true;
+		// LATCHED ONLY ON A VERDICT. Setting this before knowing the outcome spent
+		// the single check on a pass that had nothing to open, and no later pass
+		// could try again. The guard is idempotent - `assert` returns immediately
+		// once `patched` - so leaving it unlatched costs one early-out per extent
+		// pass and buys back every retry.
 		const overflowX = this.winRef.getComputedStyle(scroller).overflowX;
 		this.axisGuard.assert(scroller, overflowX);
 		if (this.axisGuard.patched) {
+			this.axisChecked = true;
 			scrollProbeExtent(`axis guard: overflow-x "${overflowX}" -> auto`);
 		}
 	}
@@ -6540,7 +8924,11 @@ export class InkOverlayPlugin {
 	}
 }
 
-const inkOverlayPlugin = ViewPlugin.fromClass(InkOverlayPlugin);
+const inkOverlayPlugin = ViewPlugin.fromClass(InkOverlayPlugin, {
+	provide: plugin => EditorView.editorAttributes.of(view =>
+		view.plugin(plugin)?.ownsNoteViewport() ? { class: "handwriting-note-viewport" } : null
+	),
+});
 
 // Obsidian's ordinary editor keymap also handles Delete and Backspace. Put
 // the selected-ink handler first, but claim those keys only while ink is
@@ -6559,8 +8947,48 @@ const inlineSelectionKeyHandlers = Prec.highest(
 	})
 );
 
+type ViewportScrollLifetime = {
+	owners: WeakMap<SelectionRange, object>;
+	pending: object | null;
+	extension: Extension;
+};
+const viewportScrollLifetimes = new WeakMap<EditorView, ViewportScrollLifetime>();
+
+/** Cancellation belongs to the issued request's editor, beyond the overlay's
+ * own lifetime. Reconfiguration may remove every ordinary plugin extension.
+ */
+function viewportScrollLifetime(view: EditorView): ViewportScrollLifetime {
+	const existing = viewportScrollLifetimes.get(view);
+	if (existing) return existing;
+	const lifetime: ViewportScrollLifetime = { owners: new WeakMap(), pending: null, extension: [] };
+	const extender: Parameters<typeof EditorState.transactionExtender.of>[0] = tr => {
+		if (!lifetime.pending) return null;
+		const state = tr.state;
+		if (state.facet(EditorView.scrollHandler).includes(consumeViewportScroll) &&
+			state.facet(EditorState.transactionExtender).includes(extender)) return null;
+		// Preserve only cancellation capability. Never reinstall the overlay,
+		// change a document/selection, or replace another navigation request.
+		return { effects: StateEffect.appendConfig.of(lifetime.extension) };
+	};
+	const retirement = ViewPlugin.define(() => ({ destroy: () => { lifetime.pending = null; } }));
+	lifetime.extension = [Prec.highest(EditorView.scrollHandler.of(consumeViewportScroll)), EditorState.transactionExtender.of(extender), retirement];
+	viewportScrollLifetimes.set(view, lifetime);
+	return lifetime;
+}
+
+const consumeViewportScroll = (view: EditorView, range: SelectionRange): boolean => {
+	const lifetime = viewportScrollLifetimes.get(view);
+	// CM has one pending target. A foreign target reaching this handler also
+	// proves it replaced the old request; that discarded receipt will never
+	// get a separate completion. Recognition stays weak, preservation stops.
+	if (lifetime) lifetime.pending = null;
+	const overlay = view.plugin(inkOverlayPlugin);
+	return overlay ? overlay.consumeViewportScroll(range) : !!lifetime?.owners.has(range);
+};
+
 export function inkOverlayExtension(): Extension {
 	return [
+		Prec.highest(EditorView.scrollHandler.of(consumeViewportScroll)),
 		inlineSelectionKeyHandlers,
 		inkOverlayPlugin,
 		inkHistorySupport(),

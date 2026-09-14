@@ -1,7 +1,7 @@
 /**
  * The tail layer's three states, measured: what does `clear()` erase?
  *
- * Rebuilt on this tree rather than ported (Astra's ruling). Three states x
+ * Rebuilt on this tree rather than ported, as ruled. Three states x
  * two zooms x two device pixel ratios, each run on both arms - `clear()` and
  * `clearAll()` as the control - and every pixel of the backing store counted
  * afterwards. Read `tailClearPage.ts`'s header for why the count is written

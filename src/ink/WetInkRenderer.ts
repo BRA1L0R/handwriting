@@ -40,6 +40,41 @@ export class WetInkRenderer {
 	private lastRibbon: RibbonPt | undefined;
 	/** Screen box of everything this stroke has painted, for clearStroke. */
 	private dirty: { x0: number; y0: number; x1: number; y1: number } | null = null;
+	private blank = false;
+	private strokeOwnsAllPixels = false;
+	private incompletePaint = false;
+	private backingScale = 1;
+	beforeWrite?: () => void;
+	get provenBlank(): boolean { return this.blank; }
+	noteBackingCleared(): void { this.blank = true; this.strokeOwnsAllPixels = true; this.incompletePaint = false; }
+	notePixelsChanged(): void { this.blank = false; this.strokeOwnsAllPixels = false; }
+	/**
+	 * The band moved under a live stroke (InkOverlay.carryBandUnderLock): slide
+	 * every pixel by a whole number of device px so the ink stays where it is
+	 * on screen, and slide the dirty box with it so the stroke's own clear
+	 * still finds its pixels. `shiftX/Y` are css px, already snapped by the
+	 * caller to a multiple of 1/backingScale. World-space state (last point,
+	 * ribbon, smoother) is untouched: the camera moved by the same delta.
+	 */
+	carry(shiftX: number, shiftY: number): void {
+		if (shiftX === 0 && shiftY === 0) return;
+		this.beforeWrite?.();
+		const ctx = this.ctx, b = this.backingScale;
+		ctx.save();
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.globalCompositeOperation = "copy";
+		ctx.drawImage(this.canvas, Math.round(shiftX * b), Math.round(shiftY * b));
+		ctx.restore();
+		if (this.dirty) this.dirty = { x0: this.dirty.x0 + shiftX, y0: this.dirty.y0 + shiftY, x1: this.dirty.x1 + shiftX, y1: this.dirty.y1 + shiftY };
+	}
+	private fullClearCovers(width: number, height: number): boolean {
+		return Number.isFinite(width) && Number.isFinite(height) && this.backingScale > 0 &&
+			width >= this.canvas.width / this.backingScale && height >= this.canvas.height / this.backingScale;
+	}
+	private markPaint(): void {
+		this.beforeWrite?.();
+		this.blank = false;
+	}
 
 	/** What we asked Chromium for. */
 	readonly requested: boolean;
@@ -83,6 +118,7 @@ export class WetInkRenderer {
 	/** Call after the canvas backing store has been resized (dpr-scaled). */
 	applyDpr(dpr: number): void {
 		this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		this.backingScale = dpr;
 	}
 
 	/**
@@ -141,6 +177,7 @@ export class WetInkRenderer {
 		this.lastPoint = first;
 		this.smoother.reset(first);
 		this.lastRibbon = undefined;
+		this.strokeOwnsAllPixels = this.blank;
 		this.dirty = null;
 		// The committed rule, restated: shaped only for a non-flat tool on a
 		// device that shapes, with the switch on (drawStroke's `shaping`).
@@ -154,6 +191,9 @@ export class WetInkRenderer {
 	}
 
 	appendPoint(cam: CameraState, style: PenStyle, point: InkPoint): void {
+		if (this.lastPoint) this.markPaint();
+		const incomplete = this.incompletePaint;
+		this.incompletePaint = true;
 		style = this.strokeStyle ?? style;
 		if (this.lastPoint) {
 			if (this.smooth && !this.smoothThisStroke) {
@@ -224,6 +264,7 @@ export class WetInkRenderer {
 			}
 		}
 		this.lastPoint = point;
+		this.incompletePaint = incomplete;
 	}
 
 	/**
@@ -350,13 +391,19 @@ export class WetInkRenderer {
 		const strip: RibbonPt[] = this.lastRibbon
 			? [this.lastRibbon, ...flatSeg]
 			: flatSeg;
+		this.markPaint();
+		const incomplete = this.incompletePaint;
+		this.incompletePaint = true;
 		fillRibbon(this.ctx, cam, strip, inkColorFor(style));
 		this.growDirtyStrip(cam, strip);
 		this.lastRibbon = strip[strip.length - 1];
+		this.incompletePaint = incomplete;
 	}
 
 	clear(cssWidth: number, cssHeight: number): void {
+		this.beforeWrite?.();
 		this.ctx.clearRect(0, 0, cssWidth, cssHeight);
+		if (this.fullClearCovers(cssWidth, cssHeight)) this.noteBackingCleared();
 		this.reset();
 	}
 
@@ -370,6 +417,7 @@ export class WetInkRenderer {
 	 * Clearing the stroke's own box keeps the damage the size of the ink.
 	 */
 	clearStroke(cssWidth: number, cssHeight: number): void {
+		this.beforeWrite?.();
 		const d = this.dirty;
 		const x0 = d ? Math.max(0, Math.floor(d.x0)) : NaN;
 		const y0 = d ? Math.max(0, Math.floor(d.y0)) : NaN;
@@ -378,8 +426,13 @@ export class WetInkRenderer {
 		// No box, or a box that is not a box (a NaN pressure poisons the
 		// width): clear everything. Leaving wet ink behind is the one outcome
 		// this must never produce.
-		if (x1 > x0 && y1 > y0) this.ctx.clearRect(x0, y0, x1 - x0, y1 - y0);
-		else this.ctx.clearRect(0, 0, cssWidth, cssHeight);
+		if (x1 > x0 && y1 > y0) {
+			this.ctx.clearRect(x0, y0, x1 - x0, y1 - y0);
+			this.blank = this.strokeOwnsAllPixels && !this.incompletePaint && this.fullClearCovers(cssWidth, cssHeight);
+		} else {
+			this.ctx.clearRect(0, 0, cssWidth, cssHeight);
+			if (this.fullClearCovers(cssWidth, cssHeight)) this.noteBackingCleared();
+		}
 		this.reset();
 	}
 

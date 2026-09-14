@@ -171,7 +171,10 @@ describe("the readback is behind the guards, in the source", () => {
 	});
 
 	it("the marker is painted only when armed, on both the full and partial paths", () => {
-		expect(overlay).toMatch(/"pen",\s*probeArmed\)/);
+		// `probeArmed` is followed by the width-floor argument now, not a bare
+		// close-paren - matches either shape, but still pins that `probeArmed`
+		// is the argument in that position and nothing renamed it away.
+		expect(overlay).toMatch(/"pen",\s*probeArmed[,)]/);
 		expect(overlay).toMatch(/if \(probeArmed\) paintPurgeSentinel\(/);
 	});
 

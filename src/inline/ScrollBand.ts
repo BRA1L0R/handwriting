@@ -37,11 +37,41 @@ export const BAND_MARGIN_FRACTION = 0.25;
 /** Floor, so a short editor pane still has room to scroll into. */
 export const BAND_MARGIN_MIN = 120;
 /**
- * Ceiling. The margin is raster area on five canvases and it is charged
- * against MAX_BACKING_AREA, so an unbounded fraction would buy scroll headroom
- * by making ink softer at high zoom.
+ * Ceiling, in the px the READER sees. The margin is raster area on five
+ * canvases and it is charged against MAX_BACKING_AREA, so an unbounded fraction
+ * would buy scroll headroom by making ink softer at high zoom.
  */
 export const BAND_MARGIN_MAX = 320;
+
+/**
+ * The ceiling in the scroller's own layout px, which are not the reader's px
+ * once the note viewport owns the editor.
+ *
+ * Below 1.0 the host is counter-sized by 1/scale and CSS-scaled back down, so
+ * one layout px is `scale` visual px: a ceiling of 320 LAYOUT px is 32 visual
+ * px of headroom at 10% zoom. The margin exists to be "the distance a fling can
+ * cover before a late repaint could show anything" (this file's header), and a
+ * fling measured on hardware covers 113 visual px per frame - 1130 layout px at
+ * 10% - so the band was re-pinned on every single frame of one. Measured in the
+ * render harness at 0.1 with 1500 strokes: 30 scroll events over 500 ms moved
+ * the band 30 times and took 30 whole-world rasterisations; the same 30 events
+ * kept inside the margin moved it twice and took two.
+ *
+ * WHY THIS AND NOT A LARGER CONSTANT: the FRACTION above is already right at
+ * any zoom - it is a quarter of the viewport, and the viewport is the viewport
+ * whatever the scale - so lifting the ceiling simply lets it apply. The band
+ * then covers the same share of the reader's screen at 10% as at 100%, and
+ * costs the same backing area it already costs at 100%, because `backingScale`
+ * sizes the canvases from `cssScale` and so charges for visual area, not
+ * layout area.
+ *
+ * ONLY EVER UPWARDS. At 1.0 and above this returns BAND_MARGIN_MAX unchanged,
+ * so nothing outside the zoomed-out regime moves at all - including every
+ * caller that does not report a scale.
+ */
+export function bandMarginMax(scale = 1): number {
+	return scale > 0 && scale < 1 ? BAND_MARGIN_MAX / scale : BAND_MARGIN_MAX;
+}
 /**
  * How far the wanted position must differ before the band is actually moved.
  *
@@ -65,6 +95,16 @@ export interface BandViewport {
 	clientHeight: number;
 	scrollWidth: number;
 	scrollHeight: number;
+	/**
+	 * Visual px per layout px - the host's CSS scale, not the total scale that
+	 * includes font zoom: font zoom changes how big the text is, not how many
+	 * screen px a scroller px is worth.
+	 *
+	 * OPTIONAL, and 1 is the whole guard. A caller that does not report a scale
+	 * gets exactly the geometry it got before this field existed, which is why
+	 * the PDF surface and the unit fixtures are untouched by it.
+	 */
+	scale?: number;
 }
 
 /** The band's box in the scroller's CONTENT coordinates. */
@@ -99,9 +139,9 @@ function reachable(reported: number, viewportEdge: number): number {
 	return Math.min(Math.max(reported, viewportEdge), reported + 1);
 }
 
-export function bandMargin(clientHeight: number): number {
+export function bandMargin(clientHeight: number, scale = 1): number {
 	const want = Math.round(clientHeight * BAND_MARGIN_FRACTION);
-	return Math.min(BAND_MARGIN_MAX, Math.max(BAND_MARGIN_MIN, want));
+	return Math.min(bandMarginMax(scale), Math.max(BAND_MARGIN_MIN, want));
 }
 
 /**
@@ -129,7 +169,7 @@ export function bandFor(v: BandViewport): Band {
 	// band is what lets the canvases be released there instead of holding five
 	// full-size backings on an invisible surface.
 	if (v.clientWidth <= 0 || v.clientHeight <= 0) return emptyBand();
-	const margin = bandMargin(v.clientHeight);
+	const margin = bandMargin(v.clientHeight, v.scale);
 	const height = v.clientHeight + margin * 2;
 	// `scrollHeight` is reported as a rounded integer while `scrollTop` is
 	// fractional, so a scroller can sit a fraction of a pixel past its own
@@ -175,7 +215,7 @@ export function bandNeedsMove(current: Band | null, v: BandViewport): boolean {
 	// A size change is a resize, not a scroll: always take it, or the canvases
 	// keep a stale box and the zero-size release never happens.
 	if (current.width !== want.width || current.height !== want.height) return true;
-	const slack = bandMargin(v.clientHeight) / 2;
+	const slack = bandMargin(v.clientHeight, v.scale) / 2;
 	if (Math.abs(current.top - want.top) >= BAND_MOVE_EPSILON) {
 		const above = v.scrollTop - current.top;
 		const below = current.top + current.height - (v.scrollTop + v.clientHeight);

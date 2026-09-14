@@ -174,6 +174,42 @@ export const MAX_ZOOM_BACKING = 2;
 export const MAX_BACKING_AREA = 10_000_000;
 
 /**
+ * The css box an ink canvas is given, and the transform that keeps it on the
+ * band, so that the COMPOSITOR sizes its layer by the visual box and not by
+ * the band's layout box.
+ *
+ * Below 1.0 the note viewport lays the editor out at 1/scale and CSS-scales
+ * it back down, so a canvas covering the band is `cssW x cssH` LAYOUT px:
+ * at 10% about 13,000 x 10,000 for a 1,300 x 1,000 visual band. The backing
+ * store is already charged for visual area (`backingScale`), but Chromium
+ * sizes the canvas's compositor layer by the element's css box, and the
+ * device (Orion, 2026-09-13, DevTools Layers) held five 19,900 x 22,380
+ * layers, about 9 GB and 79% of its GPU memory limit, at the far position
+ * where every pen frame waited 100-280 ms on the GPU process.
+ *
+ * So the element's box is the VISUAL size, `cssW * scale x cssH * scale`,
+ * and a `scale(1/scale)` transform from the top-left corner stretches it back
+ * over the band. Everything drawn into the canvas is unchanged: the backing
+ * dimensions, the context transform (device px per layout px) and every
+ * coordinate the renderers and the router use are in layout px as before;
+ * only the box the compositor measures moves. At 1.0 and above the box is
+ * the layout box and the transform is empty, so nothing outside the
+ * zoomed-out regime changes at all.
+ *
+ * `hostZoom` is the other way the host can be shrunk: CSS `zoom` instead of
+ * `transform: scale`. Zoom is inherited EFFECTIVE zoom, so the compositor
+ * already measures a descendant's css box at the zoomed size - the band's
+ * layout box times k IS the visual box - and the counter-scale above would
+ * shrink the layer a second time. Under it the canvas is plain: the band's
+ * own box, no element transform, nothing for a transform node to attach to.
+ */
+export function canvasLayerBox(cssW: number, cssH: number, cssScale: number, hostZoom = false): { width: number; height: number; transform: string } {
+	const k = Number.isFinite(cssScale) && cssScale > 0 && cssScale < 1 ? cssScale : 1;
+	if (k === 1 || hostZoom) return { width: cssW, height: cssH, transform: "" };
+	return { width: cssW * k, height: cssH * k, transform: `scale(${1 / k})` };
+}
+
+/**
  * The device-pixel factor a canvas needs so its layout-px coordinate space
  * still rasterises 1:1 with physical pixels when the editor is scaled -
  * bounded, because 1:1 is not always affordable.

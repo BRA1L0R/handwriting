@@ -88,12 +88,13 @@ function sample(x: number, y: number): PenSample {
 }
 
 /** A DOM-free stand-in good enough for `createDiv`/`createEl`/`setCssStyles`. */
-function fakeEl(): Record<string, unknown> {
+function fakeEl(ownerDocument?: Record<string, unknown>): Record<string, unknown> {
 	const el: Record<string, unknown> = {
+		ownerDocument,
 		setCssStyles: () => {},
 		setAttribute: () => {},
-		createDiv: () => fakeEl(),
-		createEl: () => fakeEl(),
+		createDiv: () => fakeEl(ownerDocument),
+		createEl: () => fakeEl(ownerDocument),
 		// Truthy and otherwise inert: WetInkRenderer/TailRenderer only check
 		// that a context came back, never call anything on it during mount.
 		getContext: () => ({}),
@@ -117,17 +118,19 @@ describe("note: onPenMove really calls StrokeMetrics.recordEvent", () => {
 	 */
 	function mountFake(): void {
 		const win = { getComputedStyle: () => ({ position: "relative" }) };
-		const dom = { ...fakeEl(), ownerDocument: { defaultView: win } };
+		const doc = { defaultView: win, body: fakeEl() };
+		const dom = fakeEl(doc);
 		const view = {
 			state: { field: () => ({}) }, // truthy, no `.app` - ensurePenTools bails itself
 			dom,
-			scrollDOM: fakeEl(),
+			scrollDOM: fakeEl(doc),
 		};
 		const plugin = Object.create(InkOverlayPlugin.prototype) as Record<string, unknown>;
 		plugin.view = view;
 		try {
 			(plugin as unknown as { mount(): void }).mount();
-		} catch {
+		} catch (error) {
+			if (!captured.cb) throw error;
 			// Expected past the router line - see the comment above.
 		}
 	}

@@ -20,13 +20,14 @@
  *
  * Both failed because they judge strokes INDIVIDUALLY. Any horizontal line
  * through a page of handwriting passes through something. So membership is
- * decided a ROW at a time instead: the strokes are grouped into rows of
- * writing, the divider snaps to the nearest gap BETWEEN rows, and whole
- * rows move. A letter cannot come apart because nothing ever cuts through
- * a row - which is also what the gesture means when a person draws it.
+ * decided a ROW at a time instead. The nearest row edge determines which
+ * whole rows move; it no longer relocates the visible insertion guide.
+ * The overlay previews crossing groups explicitly so the line cannot imply
+ * that a letter or a large transitive group will be cut apart.
  */
 
 import type { BBox, InkStroke } from "../ink/Stroke";
+import { strokeRev } from "../ink/StrokeRev";
 
 /** A row of writing: its vertical extent and the strokes that make it up. */
 export interface InkRow {
@@ -35,29 +36,94 @@ export interface InkRow {
 	ids: string[];
 }
 
-function extentOf(stroke: InkStroke): { top: number; bottom: number } {
+/** Hover must not rescan every point in the note. Moves mutate strokes in
+ * place, so both object identity and the renderer's revision are significant. */
+export class InsertSpaceRows {
+	private entries: {stroke: InkStroke; rev: number}[] = [];
+	private rows: InkRow[] = [];
+	get(strokes: readonly InkStroke[]): readonly InkRow[] {
+		if (strokes.length !== this.entries.length || strokes.some((s,i)=>
+			this.entries[i]!.stroke !== s || this.entries[i]!.rev !== strokeRev(s))) {
+			this.entries = strokes.map(stroke=>({stroke,rev:strokeRev(stroke)}));
+			this.rows = localRowsOf(strokes);
+		}
+		return this.rows;
+	}
+}
+
+export interface SpaceBoundary { y: number; from: number; lineHeight: number; text?: boolean; blockFallback?: boolean }
+
+export interface SpaceProtectedBlock { from: number; to: number; frontmatter?: boolean }
+
+/** Block context for paragraph eligibility, cached per immutable CM document.
+ * Setext underlines belong to the preceding nonblank paragraph; fence bodies
+ * and leading YAML are not paragraphs even when their individual lines look
+ * like ordinary words. Returned line numbers are one-based and inclusive. */
+export function spaceProtectedBlocks(textAt:(line:number)=>string,count:number):SpaceProtectedBlock[] {
+	const blocks:SpaceProtectedBlock[]=[];
+	let paragraph=0,open:{from:number;mark:string;length:number;frontmatter?:boolean}|null=null;
+	for(let n=1;n<=count;n++){
+		const text=textAt(n);
+		if(open){
+			const close=open.frontmatter?/^(?:---|\.\.\.)\s*$/.test(text):
+				new RegExp(`^ {0,3}${open.mark}{${open.length},}\\s*$`).test(text);
+			if(close){blocks.push({from:open.from,to:n,frontmatter:open.frontmatter});open=null;}
+			continue;
+		}
+		if(n===1&&/^\uFEFF?---\s*$/.test(text)){open={from:n,mark:"",length:0,frontmatter:true};paragraph=0;continue;}
+		const fence=/^ {0,3}(`{3,}|~{3,})/.exec(text);
+		if(fence){open={from:n,mark:fence[1]![0]!,length:fence[1]!.length};paragraph=0;continue;}
+		if(!text.trim()){paragraph=0;continue;}
+		if(paragraph&&/^ {0,3}(?:=+|-+)\s*$/.test(text)){
+			blocks.push({from:paragraph,to:n});paragraph=0;continue;
+		}
+		if(!paragraph)paragraph=n;
+	}
+	if(open)blocks.push({from:open.from,to:count,frontmatter:open.frontmatter});
+	return blocks;
+}
+
+/** Internal paragraph breaks are safe between ordinary words. Keep structured
+ * Markdown lines whole rather than breaking a link, code span, emphasis,
+ * heading or list marker across the new paragraph. No characters are removed. */
+export function canSplitParagraph(text: string, offset: number): boolean {
+	if(offset<=0||offset>=text.length)return false;
+	if(!/\s/.test(text[offset-1]!)&&!/\s/.test(text[offset]!))return false;
+	if(/^(?: {4}|\t| {0,3}(?:#{1,6}\s|>|[-+*]\s|\d+[.)]\s|~{3}))/.test(text))return false;
+	return !/[`*_\\[\]<>|$]/.test(text);
+}
+
+/** Nearest eligible text seam, independent of ink group extents. The caller
+ * previews whole-group membership separately instead of moving the guide. */
+export function nearestSpaceBoundary(
+	y: number,
+	at: (y: number, direction: -1 | 1) => SpaceBoundary | null
+): SpaceBoundary | null {
+	const candidates: SpaceBoundary[] = [];
+	for (const direction of [-1,1] as const) {
+		const boundary=at(y,direction);
+		if (boundary && Number.isFinite(boundary.y)) candidates.push(boundary);
+	}
+	return candidates.sort((a,b)=>Math.abs(a.y-y)-Math.abs(b.y-y)||b.y-a.y)[0]??null;
+}
+
+function extentOf(stroke: InkStroke): { top: number; bottom: number; left:number; right:number } {
 	const pts = stroke.points;
-	if (pts.length === 0) return { top: stroke.bbox.y, bottom: stroke.bbox.y + stroke.bbox.height };
+	if (pts.length === 0) return { top: stroke.bbox.y, bottom: stroke.bbox.y + stroke.bbox.height, left:stroke.bbox.x, right:stroke.bbox.x+stroke.bbox.width };
 	let top = Infinity;
 	let bottom = -Infinity;
+	let left = Infinity, right = -Infinity;
 	for (const p of pts) {
 		if (p.y < top) top = p.y;
 		if (p.y > bottom) bottom = p.y;
+		if (p.x < left) left = p.x;
+		if (p.x > right) right = p.x;
 	}
-	return { top, bottom };
+	return { top, bottom, left, right };
 }
 
-/**
- * Group strokes into rows of writing, top to bottom.
- *
- * Two passes. First, a stroke joins the row above it when their vertical
- * extents OVERLAP - which covers most of a line of writing, since letters
- * on a line share a band. Rows that merely touch stay separate, which is
- * what lets two lines written tight against each other be pulled apart.
- *
- * Then the floating marks are attached: a dot never touches its stem, so
- * overlap alone strands it as a row of its own. See the second pass.
- */
+/** Existing PDF grouping: retain its globally snapped guide contract. Ordinary
+ * notes opt into local groups through InsertSpaceRows instead. */
 export function rowsOf(strokes: readonly InkStroke[]): InkRow[] {
 	const spans = new Map<string, { left: number; right: number }>();
 	for (const s of strokes) spans.set(s.id, { left: s.bbox.x, right: s.bbox.x + s.bbox.width });
@@ -118,38 +184,85 @@ function xSpan(
 }
 
 /**
- * Where the cut actually lands: the divider snaps out of any row it was
- * drawn through, to whichever edge of that row is nearer.
- *
- * Drawing through a row is not ambiguous about intent - a person putting a
- * line halfway down a word means "make room around this line", not "tear
- * this word in half" - so the row goes wholly above or wholly below, and
- * the drawn line moves to say which. Everything else is left alone.
+ * Local whole handwriting groups. Two strokes join when their vertical
+ * spans overlap and their horizontal gap is at most THREE times the shorter
+ * stroke's height. This permits loose letter spacing, while a tall drawing
+ * cannot enlarge a small word's reach to consume a distant column. Compare
+ * actual constituent spans, never a growing group's union box. Touching rows
+ * remain separate. Ratios use note geometry, so zoom/translation/uniform
+ * scaling do not change membership. Detached marks attach in a second pass.
+ * Groups in different columns may overlap vertically; they are not bands.
+ */
+function localRowsOf(strokes: readonly InkStroke[]): InkRow[] {
+	const items = strokes
+		.map((s) => ({ id: s.id, ...extentOf(s) }))
+		.sort((a, b) => a.top - b.top || a.left-b.left);
+	const parents=items.map((_,i)=>i);
+	const root=(i:number):number=>{
+		while(parents[i]!==i){parents[i]=parents[parents[i]!]!;i=parents[i]!;}
+		return i;
+	};
+	let active:number[]=[];
+	for(let i=0;i<items.length;i++){
+		const a=items[i]!;
+		active=active.filter(j=>items[j]!.bottom>a.top);
+		for(const j of active){
+			const b=items[j]!;
+			if(a.bottom<=b.top)continue;
+			const gap=Math.max(0,a.left-b.right,b.left-a.right);
+			if(gap<=3*Math.min(a.bottom-a.top,b.bottom-b.top))parents[root(i)]=root(j);
+		}
+		active.push(i);
+	}
+	const grouped=new Map<number,InkRow & {left:number;right:number}>();
+	items.forEach((s,i)=>{
+		const key=root(i),row=grouped.get(key);
+		if(row){row.ids.push(s.id);row.top=Math.min(row.top,s.top);row.bottom=Math.max(row.bottom,s.bottom);row.left=Math.min(row.left,s.left);row.right=Math.max(row.right,s.right);}
+		else grouped.set(key,{top:s.top,bottom:s.bottom,left:s.left,right:s.right,ids:[s.id]});
+	});
+	const rows=[...grouped.values()].sort((a,b)=>a.top-b.top||a.left-b.left);
+	// A floating mark chooses the nearest eligible LOCAL host below it,
+	// regardless of interleaved groups in another column. The height-relative
+	// width/overhang allowance also handles a dot above a lone vertical stem.
+	for(const mark of [...rows].reverse()){
+		const hosts=rows.filter(host=>{
+			if(host===mark)return false;
+			const height=host.bottom-host.top,gap=host.top-mark.bottom;
+			return height>0 && gap>=0 && gap<=height && mark.bottom-mark.top<=height*.34 &&
+				mark.right-mark.left<=Math.max(host.right-host.left,height*.25)*.34 &&
+				mark.left>=host.left-height*.1 && mark.right<=host.right+height*.1;
+		}).sort((a,b)=>(a.top-mark.bottom)-(b.top-mark.bottom)||
+			Math.abs(a.left+a.right-mark.left-mark.right)-Math.abs(b.left+b.right-mark.left-mark.right)||a.left-b.left);
+		const host=hosts[0];
+		if(!host)continue;
+		host.ids.push(...mark.ids);host.top=mark.top;
+		host.left=Math.min(host.left,mark.left);host.right=Math.max(host.right,mark.right);
+		rows.splice(rows.indexOf(mark),1);
+	}
+	return rows.sort((a,b)=>a.top-b.top||a.left-b.left).map(({top,bottom,ids})=>({top,bottom,ids}));
+}
+
+/**
+ * Nearest group edge, for callers needing a snapped position. Local groups
+ * may overlap, so consider all crossing edges. Insert Space membership must
+ * NOT use this global position: it judges each group at the original guide.
  */
 export function snapLine(rows: readonly InkRow[], lineY: number): number {
-	for (const row of rows) {
-		if (lineY > row.top && lineY < row.bottom) {
-			const toTop = lineY - row.top;
-			const toBottom = row.bottom - lineY;
-			return toBottom <= toTop ? row.bottom : row.top;
-		}
-	}
-	return lineY;
+	return rows.filter(row=>lineY>row.top&&lineY<row.bottom).flatMap(row=>[row.top,row.bottom])
+		.sort((a,b)=>Math.abs(a-lineY)-Math.abs(b-lineY)||b-a)[0]??lineY;
 }
 
 /**
  * Which strokes an insert-space divider at world y moves, in store order.
  *
- * The line is snapped first, so this can only ever take whole rows. A row
- * exactly meeting the line moves: the divider reads as "everything from
- * here down".
+ * Each group uses the ORIGINAL line. Groups wholly below move; crossing
+ * groups move only in their upper half, with midpoint ties staying. One
+ * column's crossing group must never move the cut used by another column.
  */
-export function strokeIdsBelow(strokes: readonly InkStroke[], lineY: number): string[] {
-	const rows = rowsOf(strokes);
-	const cut = snapLine(rows, lineY);
+export function strokeIdsBelow(strokes: readonly InkStroke[], lineY: number, rows: readonly InkRow[] = rowsOf(strokes)): string[] {
 	const moving = new Set<string>();
 	for (const row of rows) {
-		if (row.top >= cut) for (const id of row.ids) moving.add(id);
+		if (row.top >= lineY || lineY < (row.top+row.bottom)/2) for (const id of row.ids) moving.add(id);
 	}
 	// Store order, so z-order and the op's id list stay in the store's terms.
 	return strokes.filter((s) => moving.has(s.id)).map((s) => s.id);

@@ -89,7 +89,7 @@ export class DiagnosticTextModal extends Modal {
 					parsed.events?.reduce((n, e) => n + (Array.isArray(e.cs) ? e.cs.length : 0), 0) ?? 0;
 				summary.setText(`${events} events captured, ${samples} pen samples`);
 			} catch {
-				summary.setText("recording ready");
+				summary.setText("Recording ready");
 			}
 		}
 		const field = this.contentEl.createEl("textarea", {
@@ -135,7 +135,7 @@ export class DiagnosticTextModal extends Modal {
 				const failed = (): void => {
 					up.disabled = false;
 					up.setText("Upload to developer");
-					new Notice("Handwriting: upload failed - Copy or Save to vault instead");
+					new Notice("Handwriting: upload failed - copy or save to vault instead");
 				};
 				const timer = window.setTimeout(() => first(failed), UPLOAD_TIMEOUT_MS);
 				this.upload!(this.text)
@@ -154,15 +154,15 @@ export class DiagnosticTextModal extends Modal {
 						// tablet, where selecting it by hand is the worst text
 						// gesture there is - and an id that copied on click
 						// without saying so would be a secret nobody finds.
-						const copyId = done.createEl("button", { text: "Copy id" });
+						const copyId = done.createEl("button", { text: "Copy ID" });
 						copyId.addEventListener("click", () => {
 							// NOT `delivered()`: the upload above already
 							// delivered this report and called it. Copying the
 							// id is the tester getting a reference back out,
 							// which delivers nothing.
-							void this.copyToClipboard(id, copyId, "Copy id", false);
+							void this.copyToClipboard(id, copyId, "Copy ID", false);
 						});
-						summary?.setText("uploaded");
+						summary?.setText("Uploaded");
 						new Notice(`Handwriting: uploaded - id ${id}`, 10000);
 					}))
 					.catch(() => first(failed));
@@ -249,7 +249,7 @@ export class DiagnosticTextModal extends Modal {
 		// No execCommand fallback: it is deprecated, the directory flags
 		// it, and both real platforms take the clipboard API path (verified
 		// on the ipads 2026-08-26). Anything left over has Save to vault.
-		new Notice("Handwriting: could not copy. Use Save to vault instead.", 8000);
+		new Notice("Handwriting: could not copy. Use save to vault instead.", 8000);
 	}
 
 	/**

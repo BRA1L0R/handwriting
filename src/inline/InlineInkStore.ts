@@ -724,7 +724,7 @@ export class InlineInkStore {
 	 * can carry both, and the session-only branch is only correct when the
 	 * damage is the ONLY reason the write would not land.
 	 *
-	 * `legacy` is reported as blocked alongside them. Astra's 17:22 ruling
+	 * `legacy` is reported as blocked alongside them. The 17:22 ruling
 	 * names future and duplicate explicitly and does not name legacy; it is
 	 * included here because `snapshot()` refuses for it identically, so the
 	 * write dies in exactly the same place - and because a legacy note's

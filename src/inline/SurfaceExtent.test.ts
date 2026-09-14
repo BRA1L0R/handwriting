@@ -37,6 +37,7 @@ import {
 	spacerPosition,
 	surfaceOriginInScroller,
 	writeFrontier,
+	writeFrontierApplies,
 	WRITE_FRONTIER_VIEWPORT_FRACTION,
 	zoomFrontier,
 } from "./SurfaceExtent";
@@ -50,7 +51,7 @@ import css from "../../styles.css?raw";
  */
 function axisRuleBody(sheet: string): string | null {
 	const rule = new RegExp(
-		`\\.markdown-source-view\\.handwriting-page\\s+\\.cm-scroller\\.${HSCROLL_AXIS_CLASS}\\s*\\{([^}]*)\\}`
+		`\\.markdown-source-view\\s+\\.cm-editor\\s+\\.cm-scroller\\.${HSCROLL_AXIS_CLASS}\\s*\\{([^}]*)\\}`
 	);
 	return codeOnly(sheet).match(rule)?.[1] ?? null;
 }
@@ -221,7 +222,7 @@ describe("ScrollAxisGuard", () => {
 	it("styles.css carries the rule the class relies on", () => {
 		// The guard is inert without its stylesheet half; the packager asserts
 		// this too, but a stale styles.css in dev should fail loudly here. The
-		// Handwriting-page ancestor supplies enough specificity without important.
+		// Editor ancestor supplies enough specificity without important.
 		//
 		// The body comes from the cascade, not from the file. A retired copy
 		// above the live rule used to be the one this read.
@@ -235,8 +236,8 @@ describe("ScrollAxisGuard", () => {
 		// Fixtures. Anti-vacuity first, then THE DEFEAT verbatim: a commented
 		// copy ahead of a live rule that has grown !important. Read raw, the
 		// comment answered for the rule and all 33 tests passed.
-		const live = `.markdown-source-view.handwriting-page .cm-scroller.${HSCROLL_AXIS_CLASS} {\n\toverflow-x: auto;\n}\n`;
-		const loud = `.markdown-source-view.handwriting-page .cm-scroller.${HSCROLL_AXIS_CLASS} {\n\toverflow-x: auto !important;\n}\n`;
+		const live = `.markdown-source-view .cm-editor .cm-scroller.${HSCROLL_AXIS_CLASS} {\n\toverflow-x: auto;\n}\n`;
+		const loud = `.markdown-source-view .cm-editor .cm-scroller.${HSCROLL_AXIS_CLASS} {\n\toverflow-x: auto !important;\n}\n`;
 
 		expect(axisRuleBody(live)).toMatch(/overflow-x:\s*auto/);
 		expect(axisRuleBody(`/*\n${live}*/\n`)).toBeNull();
@@ -370,14 +371,99 @@ describe("writeFrontier (room to write at the top - 1.4.6 §5n)", () => {
 	});
 });
 
+describe("writeFrontierApplies (zooming out is a handwriting act)", () => {
+	// The same phone-sized viewport, and the same fold `updateExtent` does:
+	// the write term is writeFrontier when the predicate holds, ZERO_EXTENT
+	// when it does not, and it joins the vertical max.
+	const base = {
+		clientHeight: 700,
+		contentBottom: 400,
+		origin: { top: 0 },
+		fontZoom: 1,
+	};
+	const ink = { x: 0, y: 340 };
+	const zoomTerm = (pinchScale: number) =>
+		zoomFrontier({
+			clientWidth: 800,
+			clientHeight: 700,
+			contentBottom: 400,
+			origin: { left: 0, top: 0 },
+			pinchScale,
+			fontZoom: 1,
+		});
+	const grantY = (writtenOn: boolean, pinchScale: number) => {
+		const write = writeFrontierApplies({ writtenOn, pinchScale })
+			? writeFrontier(base)
+			: ZERO_EXTENT;
+		return Math.max(ink.y, zoomTerm(pinchScale).y, write.y);
+	};
 
-it("rebases camera offsets and resized viewports without blank-space demand",()=>{
+	it("grants an unwritten note the write frontier once the viewport is zoomed out", () => {
+		expect(writeFrontierApplies({ writtenOn: false, pinchScale: 0.5 })).toBe(true);
+		const granted = grantY(false, 0.5);
+		expect(granted).toBeGreaterThan(0);
+		// The value is the write frontier's, not a rounded stand-in for it.
+		expect(granted).toBe(writeFrontier(base).y);
+		expect(granted).toBeGreaterThan(grantY(false, 1));
+	});
+
+	it("grants an unwritten note nothing at 1.0, so a typing-only vault is unchanged", () => {
+		expect(writeFrontierApplies({ writtenOn: false, pinchScale: 1 })).toBe(false);
+		expect(grantY(false, 1)).toBe(Math.max(ink.y, zoomTerm(1).y));
+	});
+
+	it("grants an unwritten note nothing on zoom IN, which zoomFrontier already covers", () => {
+		expect(writeFrontierApplies({ writtenOn: false, pinchScale: 2 })).toBe(false);
+		expect(grantY(false, 2)).toBe(Math.max(ink.y, zoomTerm(2).y));
+	});
+
+	it("still grants a written-on note at every scale, which is the original rule", () => {
+		for (const pinchScale of [0.5, 1, 2]) {
+			expect(writeFrontierApplies({ writtenOn: true, pinchScale })).toBe(true);
+		}
+		expect(grantY(true, 1)).toBe(writeFrontier(base).y);
+	});
+});
+
+
+it("rebases camera offsets and resized viewports with remaining room without new demand",()=>{
  const demand=new ScrollExpansionDemand();
  const room={left:0,top:0,width:640,height:480,edgeX:1280,edgeY:960,origin:{left:0,top:0},fontZoom:1,pinchScale:1};
  demand.sample("note",true,0,0);demand.reserve(room);
  demand.rebase(500,400);demand.sample("note",true,500,400);
- expect(demand.reserve({...room,left:500,top:400,width:32000,height:24000,pinchScale:.02})).toEqual({x:0,y:0});
- demand.sample("note",true,501,401);
- const grown=demand.reserve({...room,left:501,top:401});
+ const resized={...room,left:500,top:400,width:32000,height:24000,edgeX:64000,edgeY:48000,pinchScale:.02};
+ expect(demand.reserve(resized)).toEqual({x:0,y:0});
+ demand.sample("note",true,30000,23000);
+ const grown=demand.reserve({...resized,left:30000,top:23000});
  expect(grown.x).toBeGreaterThan(0);expect(grown.y).toBeGreaterThan(0);
+});
+
+it("restores a native axis stranded by zoom rebase once, then stays still",()=>{
+ const demand=new ScrollExpansionDemand();
+ const room={left:0,top:0,width:640,height:480,edgeX:1280,edgeY:960,origin:{left:40,top:20},fontZoom:2,pinchScale:1};
+ demand.sample("note",true,0,0);demand.reserve(room);demand.rebase(0,0);
+ const resized={...room,width:6400,height:4800,edgeX:6400,edgeY:4800,pinchScale:.1};
+ expect(demand.reserve(resized)).toEqual({x:6380,y:4790});
+ demand.applied(12800,9600);
+ for(let i=0;i<4;i++) { demand.rebase(0,0); expect(demand.reserve({...resized,edgeX:12800,edgeY:9600})).toEqual({x:0,y:0}); }
+});
+
+it("reserves accepted pinch travel before native clamping without reverse or cross-axis growth",()=>{
+ const demand=new ScrollExpansionDemand();
+ const room={left:500,top:300,width:640,height:480,edgeX:1800,edgeY:1400,origin:{left:40,top:20},fontZoom:2,pinchScale:.5};
+ demand.sample("note",true,500,300);demand.reserve(room);demand.rebase(500,300);
+ expect(demand.reserve(room,{left:1600,top:200})).toEqual({x:1420,y:0});
+ demand.applied(2880,1400);demand.rebase(1600,300);
+ expect(demand.reserve({...room,left:1600,edgeX:2880},{left:1200,top:200})).toEqual({x:0,y:0});
+ demand.sample("note",false,1600,300);
+ expect(demand.reserve(room,{left:5000,top:5000})).toBe(ZERO_EXTENT);
+});
+
+it("preserves admitted native demand through band resize and retires it on navigation",()=>{
+ const room={left:0,top:0,width:640,height:480,edgeX:1280,edgeY:960,origin:{left:0,top:0},fontZoom:1,pinchScale:1};
+ for(const mechanical of [false,true]) {
+  const demand=new ScrollExpansionDemand();demand.sample("note",true,0,0);demand.reserve(room);
+  demand.sample("note",true,620,0);demand.rebase(620,0,mechanical);
+  expect(demand.reserve({...room,left:620})).toEqual({x:mechanical?1900:0,y:0});
+ }
 });

@@ -2,8 +2,8 @@
  * Production-route reproduction for a pinch that ends between display frames.
  *
  * This deliberately drives InkOverlayPlugin's real `pinch` callback and the
- * real `flushPinch` / `applyPinchScale` / `settlePinchRaster` methods.  Only
- * the browser frame clock, DOM style sinks, and expensive `handleResize` body
+ * real `flushPinch` / `applyPinchScale` methods. Only
+ * the browser frame clock, DOM style sinks, and final layout transaction
  * are controlled.  No predicate or pinch state transition is copied here.
  *
  * The red case is the ordering at pinch end: the gesture anchor/reference are
@@ -35,7 +35,10 @@ function makeRig() {
 	const cancelAnimationFrame = vi.fn((id: number): void => {
 		frames.delete(id);
 	});
-	const win = { requestAnimationFrame, cancelAnimationFrame };
+	// The preview holds CodeMirror's measure scheduling behind a lost-end timer.
+	const setTimeout = vi.fn((): number => 0);
+	const clearTimeout = vi.fn();
+	const win = { requestAnimationFrame, cancelAnimationFrame, setTimeout, clearTimeout };
 
 	const hostStyles: Record<string, string> = {};
 	const host = { clientWidth: 640, clientHeight: 480,
@@ -57,8 +60,8 @@ function makeRig() {
 
 	const overlay = Object.create(InkOverlayPlugin.prototype) as Fields;
 	const requestMeasure = vi.fn();
-	overlay.view = { dom: host, scrollDOM: scroller, requestMeasure };
-	overlay.container = {};
+	overlay.view = { dom: host, scrollDOM: scroller, requestMeasure, measure: vi.fn() };
+	overlay.container = { setCssStyles: vi.fn() };
  overlay.frame = { locked: false }; overlay.cssScale = 1; overlay.fontZoom = 1;
 	overlay.pinchScaleNow = 1;
 	overlay.pinchRasterScale = 1;
@@ -67,18 +70,24 @@ function makeRig() {
 	overlay.pinchPending = null;
 	overlay.pinchRaf = 0;
 	overlay.pinchScrollAt = 0;
+	// This rig skips the constructor, including its empty preview-layer map.
+	overlay.pinchHiddenCanvases = new Map();
 
-	// `settlePinchRaster` is real.  Its expensive final sink is observed rather
-	// than run because canvas allocation/repaint is outside this reproduction.
+	// The transaction's expensive sinks are observed; the mounted continuous
+	// pinch test separately verifies the real allocation and layout behavior.
 	const handleResize = vi.fn();
 	overlay.handleResize = handleResize;
 	// This test owns coalescing/final raster settlement, not browser layout.
 	// The production transaction and loading guard are exercised mounted.
 	overlay.getNoteViewportState = () => ({ busy: false });
+	overlay.prepareViewportLayout = () => true;
+	overlay.viewportLayout = {width:640,height:480,baseTransform:"none"};
+	overlay.applyViewportBox = (next:number) => host.setCssStyles({transform:`scale(${next})`,transformOrigin:"0 0"});
 	overlay.commitCameraScale = (next: number) => {
 		overlay.pinchScaleNow = next;
 		overlay.cssScale = next;
 		host.setCssStyles({ transform: `scale(${next})`, transformOrigin: "0 0" });
+		handleResize();requestMeasure();
 		return true;
 	};
 
@@ -109,6 +118,25 @@ function makeRig() {
 }
 
 describe("InkOverlay pinch end with a coalesced move still pending", () => {
+	it("the last sample replaces a pending zoom when it returns to the rendered scale", () => {
+		const rig=makeRig(),centroid={x:100,y:80};
+		rig.onPinch("start",1,centroid);
+		rig.onPinch("move",2,centroid);
+		rig.onPinch("move",1,centroid);
+		rig.onPinch("end",1,centroid);
+		expect(rig.scale()).toBe(1);
+		expect(rig.pendingFrames()).toBe(0);
+	});
+	it("settles after returning to the starting scale", () => {
+		const rig=makeRig(),centroid={x:100,y:80};
+		rig.onPinch("start",1,centroid);
+		rig.onPinch("move",2,centroid);rig.runNextFrame();
+		rig.onPinch("move",1,centroid);rig.runNextFrame();
+		rig.onPinch("end",1,centroid);
+		expect(rig.scale()).toBe(1);
+		expect(rig.handleResize).toHaveBeenCalledTimes(1);
+		expect(rig.pendingFrames()).toBe(0);
+	});
 	it("lands the final requested scale and settles exactly once", () => {
 		const rig = makeRig();
 		const centroid = { x: 100, y: 80 };

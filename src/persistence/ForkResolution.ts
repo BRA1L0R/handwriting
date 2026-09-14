@@ -11,7 +11,7 @@ import { recoverExactPage } from "./PageStore";
  * Obsidian will not browse. Preservation without resolution is a safe dead
  * end, and this module is the resolution half.
  *
- * IT IS NOT A MERGE. Astra ruled at 14:15 that an honest user-facing
+ * IT IS NOT A MERGE. Ruled at 14:15 that an honest user-facing
  * fork-resolution decision satisfies convergence and that automatic union is
  * not required; the union design was rejected at 16:35. Nothing here unions,
  * compares geometry, or decides anything on the user's behalf. It reports what
@@ -360,8 +360,7 @@ export async function applyForkDecision(
  * ALAN'S OWN WORDS, APPROVED 2026-09-09.
  *
  * He wrote them live from a rendered presentation of the screen; nothing here
- * was drafted by a builder. THE AUTHORITY IS THE MAILBOX ENTRY, not this
- * comment: `~/.claude/mailbox/queue.md` (mirrored in `lead-engineer.md`),
+ * is not this comment's to change. THE AUTHORITY IS THE RECORDED DECISION,
  * "2026-09-09 10:04 CDT ... ALL TEN FORK-SCREEN STRINGS ARE APPROVED". Read it
  * there before changing any string below.
  *
@@ -382,8 +381,7 @@ export async function applyForkDecision(
  * (2026-09-09 17:14 CDT). The reason bounds it: other messages on the same
  * delete-all command always carried trailing periods and had never been shown
  * to him, so he chose consistency in the direction of RESTORING rather than
- * stripping more. The authority is that 17:14 entry in `queue.md` /
- * `lead-engineer.md` / `astra.md`, not this comment.
+ * stripping more. The authority is that 17:14 decision, not this comment.
  *
  * DO NOT STRIP IT AGAIN ON THE STRENGTH OF THE 17:09 ENTRY. It is still on the
  * record, it still says the opposite, and it was correctly executed at the
