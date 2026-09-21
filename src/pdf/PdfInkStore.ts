@@ -34,6 +34,7 @@ import type {
 } from "../inline/InlineInkStore";
 import type { ExternalAdoptionPrep, PreparedExternalAdoption } from "../persistence/PageStore";
 import { runDetached } from "../util/Detached";
+import { timerHost } from "../util/RuntimeScheduler";
 
 const EMPTY: readonly InkStroke[] = [];
 
@@ -139,6 +140,37 @@ function freshRecord(): PdfRecord {
 export class PdfInkStore {
 	private byId = new Map<string, PdfRecord>();
 	private host: PdfInkHost | null = null;
+
+	/**
+	 * Best-effort unload: wait (bounded) for in-flight sidecar reads. A stroke
+	 * committed during a read parks its persist as a `then` on that read's
+	 * promise, so it reaches the host's `schedule` only once the read lands - a
+	 * store flush that runs first finds nothing to write for it. Waiting on the
+	 * read is enough: the parked `then` runs before this wait resumes, and the
+	 * passes re-check for a read that started meanwhile.
+	 * `InlineInkStore.settle`'s shape and reasons: bounded so a hung read cannot
+	 * wedge shutdown. TRUE only when everything drained. Not crash durability.
+	 */
+	async settle(maxWaitMs = 2000): Promise<boolean> {
+		let expire: (v: boolean) => void = () => {};
+		const deadline = new Promise<boolean>((r) => {
+			expire = r;
+		});
+		const scheduler = timerHost();
+		const timer = scheduler.setTimeout(() => expire(true), maxWaitMs);
+		try {
+			for (let pass = 0; pass < 4; pass++) {
+				const inFlight: Promise<unknown>[] = [];
+				for (const rec of this.byId.values()) if (rec.loadInFlight) inFlight.push(rec.loadInFlight);
+				if (inFlight.length === 0) return true;
+				const timedOut = await Promise.race([Promise.all(inFlight).then(() => false), deadline]);
+				if (timedOut) return false;
+			}
+			return false;
+		} finally {
+			scheduler.clearTimeout(timer);
+		}
+	}
 
 	/** No host = session-memory mode, which is how the tests run it. */
 	attachHost(host: PdfInkHost): void {

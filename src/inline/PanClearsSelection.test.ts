@@ -110,13 +110,12 @@ describe("entering pan mode and the live selection", () => {
 		// Production's DISSOLVE callback walks PDFs only (main.ts, the second
 		// of addStripSurface's callbacks:
 		// `for (const c of this.pdfInk.values()) c.dissolveSelection()`).
-		// The canvas is NOT absent from the registration - the render-settings
-		// callback below it walks HandwritingPageView too - it is absent from
-		// the DISSOLVE branch specifically. So a canvas selection survives into
-		// pan mode and the tip drags instead of panning: the open half of
-		// Alan's own ruling, filed at 1.4.9-design.md §15.11 and deliberately
-		// NOT authorised. The fix is one line in that branch, not a new
-		// registration - which is exactly the overcorrection this note prevents.
+		// The canvas page view used to be the second half of this note: it was
+		// in the registration but not in the DISSOLVE branch, so a selection
+		// there survived into pan mode and the tip dragged instead of panning.
+		// That was the open half of Alan's own ruling (1.4.9-design.md
+		// §15.11), and s197 closed it by deleting the surface. What is left
+		// is the PDF walk above, which is the whole of the branch now.
 		//
 		// The earlier name said "every registered surface", which reads as
 		// coverage of all of them and put a green test over a known gap. A

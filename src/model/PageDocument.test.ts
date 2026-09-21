@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { PageDocument } from "./PageDocument";
 import { parseMarkdownPage } from "./MarkdownPage";
 import { emptyPage, parsePage, serializePage } from "./PageData";
-import { moveObjects } from "../objects/ObjectOps";
 
 const WIDTH = 320;
 
@@ -373,12 +372,9 @@ describe("image identity is independent of the attachment path", () => {
 		expect(doc.imageData("im-b")).toMatchObject({ x: 900, y: 800, width: 50 });
 	});
 
-	it("moves one instance without touching the other", () => {
-		const doc = loadedTwo();
-		moveObjects(doc.page, { strokeIds: [], boxIds: [], imageIds: ["im-a"] }, 25, -10);
-		expect(doc.imageData("im-a")).toMatchObject({ x: 25, y: -10 });
-		expect(doc.imageData("im-b")).toMatchObject({ x: 900, y: 800 });
-	});
+	// The move case that stood here drove `ObjectOps.moveObjects`, which was
+	// the canvas page view's funnel and is deleted in s197. The identity and
+	// geometry claims either side of it are untouched.
 
 	it("deletes one instance and leaves the other", () => {
 		const doc = loadedTwo();

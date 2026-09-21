@@ -56,9 +56,9 @@
  *     than a symbol - an ordering, a coordinate convention, a guard placed
  *     before rather than after an early return - is invisible to a text scan
  *     and needs a behavioural test or a reader.
- *   - anything about the canvas or the pen lab beyond what is asserted. Both
- *     are mostly exemptions here, and an exemption is a claim that a rule does
- *     not apply, never a claim that the surface is right.
+ *   - anything about the pen lab beyond what is asserted. It is mostly
+ *     exemptions here, and an exemption is a claim that a rule does not
+ *     apply, never a claim that the surface is right.
  *
  * The honest summary: this catches a rule that reached one surface and not
  * another, which is the defect that keeps happening. It does not catch a rule
@@ -135,9 +135,9 @@ const RULES: readonly SurfaceRule[] = [
 		// standing when it was found rather than after. Alan hit it by hand on
 		// 2026-09-03 running checklist item 5: hold the side button, touch a
 		// PDF, and the eraser erases while its ring disappears - you are
-		// erasing blind. Note and canvas both drive the ring through the
-		// stroke; the pdf drove it on HOVER only, so its own 1000ms watchdog
-		// took it away the moment the pen was down.
+		// erasing blind. The note drove the ring through the stroke; the pdf
+		// drove it on HOVER only, so its own 1000ms watchdog took it away the
+		// moment the pen was down.
 		//
 		// Not a 1.4.9 regression. `git log -S showEraserCursor` on the pdf
 		// file is EMPTY - it never had it - and the note got it in d862eec,
@@ -155,23 +155,23 @@ const RULES: readonly SurfaceRule[] = [
 		// THE MARKER ITSELF WAS VACUOUS, and stayed that way through the row
 		// above being written. `showEraserCursor(` matches the wrapper's own
 		// DECLARATION - `private showEraserCursor(sample: PenSample): void {`
-		// - on all three surfaces, so deleting every CALL to it and leaving
-		// the empty method declared still satisfied this row: the exact
-		// failure mode the header three paragraphs up says this registry
-		// exists to refuse, reproduced inside the row built to refuse it.
-		// `this.showEraserCursor(` is the fix - every call site on note, pdf
-		// and canvas is written that way (checked: `grep -n
-		// "showEraserCursor(" src/inline/InkOverlay.ts src/pdf/
-		// PdfInkController.ts src/view/HandwritingPageView.ts`, all six call
-		// sites carry the `this.` prefix and none of the three declarations
-		// do) - and it cannot match a declaration, because a method never
+		// - on every surface that carries it, so deleting every CALL to it
+		// and leaving the empty method declared still satisfied this row: the
+		// exact failure mode the header three paragraphs up says this
+		// registry exists to refuse, reproduced inside the row built to
+		// refuse it. `this.showEraserCursor(` is the fix - every call site on
+		// note and pdf is written that way (checked: `grep -n
+		// "showEraserCursor(" src/inline/InkOverlay.ts
+		// src/pdf/PdfInkController.ts`, every call site carries the `this.`
+		// prefix and neither declaration does) - and it cannot match a
+		// declaration, because a method never
 		// calls itself through `this.` in its own signature. Mutation-
 		// verified below the same way d2b6f4a verified the original: deleting
 		// every `this.showEraserCursor(` call on the pdf while leaving the
 		// method declared fails this row now, where it used to pass.
 		rule: "an erasing surface shows what the eraser is about to take",
 		markers: ["this.showEraserCursor("],
-		on: ["note", "pdf", "canvas"],
+		on: ["note", "pdf"],
 		exempt: {
 			penlab:
 				"has no eraser at all - its own header: \"No file, no persistence, no text, no eraser\". It is a probe for the stroke pipeline",
@@ -184,12 +184,11 @@ const RULES: readonly SurfaceRule[] = [
 		},
 	},
 	{
-		// COMPANION to the row above, not a widening of it in place - eraser's
-		// exemptions (canvas ON, penlab/demo exempt) are not this rule's
-		// exemptions (canvas itself is exempt here; see its reason). Folding
-		// the two into one row with a wider `on` would have put canvas back
-		// into the "no ruling" hole this whole file exists to close, since
-		// canvas carries an eraser reticle but not a lasso one.
+		// COMPANION to the row above, not a widening of it in place - the
+		// eraser row's exemptions are not this rule's exemptions, because a
+		// surface can carry an eraser reticle and no lasso one. Folding the
+		// two into one row with a wider `on` would put such a surface back
+		// into the "no ruling" hole this whole file exists to close.
 		//
 		// Three of these rows exist (lasso, pan, space) rather than one with
 		// all three markers OR'd together, on purpose: an OR lets a surface
@@ -227,8 +226,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["this.showLassoCursor("],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas:
-				"has a lasso TOOL (`type Tool` includes it) but no general pen-hover reticle for any tool to give a look to - the only reticle element canvas builds is `eraserEl` (`showEraserCursor`/`hideEraserCursor`), a plain circle used for the eraser alone. A lasso gesture's only on-screen feedback is the loop itself (`tail.drawLasso`), not a mark under the tip before it starts",
 			penlab:
 				"no lasso and no selection of any kind - its own header: \"No file, no persistence, no text, no eraser\". It is a probe for the stroke pipeline",
 			demo: "no TipMode on the site - one tool, chosen by its own buttons, and no eraser, lasso, pan or space",
@@ -242,7 +239,7 @@ const RULES: readonly SurfaceRule[] = [
 		// `.add(PAN_CURSOR_CLASS)`, which was true from hover alone and proved
 		// nothing about the gesture. 1.4.12 took that call site off the note,
 		// and this row carried both spellings for as long as the two surfaces
-		// disagreed - which was exactly as long as reviewer finding F4 was
+		// disagreed - which was exactly as long as the finding was
 		// open ("the pan-drag reticle fix is note-only, the pdf pan still
 		// paints the ring per sample via `showPanCursor` and never wears the
 		// grabbing hand"; 1.4.12-design §11). Both surfaces now carry
@@ -283,8 +280,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["this.beginPanDragCursor("],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas:
-				"no pan MODE at all to hold a reticle for - panning here is a transient gesture (two-finger drag), not a tip state, and `type Tool` has no pan member. The row above's canvas reason (no general reticle) would also apply, but this is the more specific one: there is no mode to show in the first place",
 			penlab: "no tip mode; the lab draws with a fixed nib on purpose",
 			demo: "no TipMode on the site - one tool, chosen by its own buttons, and no eraser, lasso, pan or space",
 			slides:
@@ -300,8 +295,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["this.showSpaceCursor("],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas:
-				"no insert-space mode - a canvas page is fixed size and nothing here moves rows to make room for ink, and `type Tool` has no space member",
 			penlab: "no tip mode; the lab draws with a fixed nib on purpose",
 			demo: "no TipMode on the site - one tool, chosen by its own buttons, and no eraser, lasso, pan or space",
 			slides:
@@ -330,8 +323,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ['pointerType === "mouse" || (pointerType === undefined && this.mouseStroke)'],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas:
-				"has no pen-hover reticle for a watchdog to guard, and no watchdog: the only reticle element it builds is `eraserEl` (a plain circle, shown and hidden by the erase gesture itself at `showEraserCursor`/`hideEraserCursor`), so nothing here is ever left on screen by a hover sample that stopped arriving",
 			penlab:
 				"draws no reticle of any kind - its own header: \"No file, no persistence, no text, no eraser\". It is a probe for the stroke pipeline, and a probe with a fixed nib has no ring to strand",
 			demo: "no reticle on the site: one tool chosen by its own buttons, no hover mark under the pointer, and so no timer that could take one away",
@@ -344,8 +335,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["penContactIntent("],
 		on: ["note", "pdf", "slides"],
 		exempt: {
-			canvas:
-				"no tip mode at all - its own `type Tool` has no `pan` member and it pans by transient gesture, so there is nothing here to arbitrate",
 			penlab: "not user-reachable, and no tip mode; it is a probe for the stroke pipeline",
 			demo: "ships on the website, not in the plugin. One tool, no modes and no eraser, so there is no contact to arbitrate",
 			// FIXED. This row used to carry the only exemption in the file
@@ -369,7 +358,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["stripPenDown("],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas: "constructs no MobileTools strip",
 			penlab: "constructs no MobileTools strip",
 			demo: "constructs no MobileTools strip - the site has no plugin chrome at all",
 			slides:
@@ -381,7 +369,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["stripPenUp("],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas: "constructs no MobileTools strip",
 			penlab: "constructs no MobileTools strip",
 			demo: "constructs no MobileTools strip - the site has no plugin chrome at all",
 			slides:
@@ -411,8 +398,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["abandonActiveStroke("],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas:
-				"a whole-surface view on PointerRouter, which has no abandonActiveStroke: its leaf is not reused for a different document under a live gesture",
 			penlab:
 				"not user-reachable and shows no document, so there is no in-place file switch to strand a contact across",
 			demo: "ships on the website with no router and one document; nothing swaps out from under a stroke",
@@ -428,8 +413,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["focusClaimedPenEditor(", "stripPenFocus("],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas:
-				"its router does not preventDefault the mousedown that focuses a pane, so nothing has to be given back",
 			penlab: "not user-reachable; no keys are bound to it",
 			demo: "no editor and no pane focus to claim; the site is a canvas on a static page",
 			slides:
@@ -446,11 +429,10 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["markPenSeen("],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas: "the strip is not mounted here, so there is no visibility question to answer",
 			penlab: "the strip is not mounted here, and nothing opens it",
 			demo: "no strip to reveal, and no session-scoped pen state on the site",
 			slides:
-				"the strip is not mounted here, so there is no visibility question to answer - the canvas's reason exactly, and for the same structural cause. Worth a reader knowing rather than acting on: the claim is process-global (PenToolsMode.ts), so a pen used only ever on a deck teaches the note surface nothing about itself",
+				"the strip is not mounted here, so there is no visibility question to answer. Worth a reader knowing rather than acting on: the claim is process-global (PenToolsMode.ts), so a pen used only ever on a deck teaches the note surface nothing about itself",
 		},
 	},
 	{
@@ -464,13 +446,11 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["markPenHardwareSeen("],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas:
-				"mounts no strip, so it builds no nib button and has no light for a hardware answer to feed",
 			penlab:
 				"mounts no strip and nothing opens it; its fixed nib is the instrument, not a tool the user picks",
 			demo: "no strip lights to drive; nothing on the site changes when a pen is present",
 			slides:
-				"mounts no strip, so it builds no nib button and has no light for a hardware answer to feed - the canvas's reason. The nib on a deck is read out of the host at each pen-down (`this.host.nib()`) rather than lit on a toolbar of its own",
+				"mounts no strip, so it builds no nib button and has no light for a hardware answer to feed. The nib on a deck is read out of the host at each pen-down (`this.host.nib()`) rather than lit on a toolbar of its own",
 		},
 	},
 	{
@@ -478,7 +458,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ['pointerType === "pen"'],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas: "marks no pen seen - see the row above",
 			penlab: "marks no pen seen - see the row above",
 			demo: "reads `e.pointerType` at pen-down for the mouse device mark, but has no pen-seen claim to gate",
 			// The one surface where this row's marker is PRESENT and the
@@ -504,7 +483,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["pointerRaisesPenTools("],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas: "mounts no strip, so there is no toolbar for a hovering pointer to raise",
 			penlab: "mounts no strip and nothing opens it; no toolbar to raise here either",
 			// Read out of DemoInk.ts rather than assumed from "it's the demo",
 			// which is a category and not a mechanism.
@@ -538,8 +516,6 @@ const RULES: readonly SurfaceRule[] = [
 		on: ["pdf"],
 		exempt: {
 			note: "it owns the OTHER mechanism rather than lacking this one: `instances` and `refreshPenToolsAll` both live in InkOverlay.ts, and every call site in main.ts that moves the mode calls the fan-out on the next line. Subscribing here as well would refresh every open note twice per change",
-			canvas:
-				"mounts no MobileTools strip, so a Pen-toolbar change has nothing on this surface to create or destroy",
 			penlab: "mounts no strip and nothing opens it; there is no toolbar here to show or hide",
 			// Also read out of the file. The demo's tool buttons are static
 			// markup in docs/index.html, found by `boot()` through
@@ -564,7 +540,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["tipMode()"],
 		on: ["note", "pdf", "slides"],
 		exempt: {
-			canvas: "no tip mode - `type Tool` has no `pan` member; it pans by transient gesture",
 			penlab: "no tip mode; the lab draws with a fixed nib on purpose",
 			demo: "no TipMode on the site - one tool, chosen by its own buttons, and no eraser, lasso, pan or space",
 		},
@@ -582,9 +557,7 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ["mouseInkEnabled("],
 		on: ["note", "pdf", "slides"],
 		exempt: {
-			canvas:
-				"Handwriting owns this whole surface, so a mouse draws here unconditionally and there is no setting to honour",
-			penlab: "same as the canvas: the lab surface is ours, and a mouse is a valid input to it",
+			penlab: "the lab surface is ours, and a mouse is a valid input to it",
 			demo: "no settings layer exists on the site, so the accessor cannot reach it; a mouse always inks here by design, which is the point of a demo",
 		},
 	},
@@ -601,10 +574,10 @@ const RULES: readonly SurfaceRule[] = [
 			// short of its own table.
 			//
 			// The marker is not vacuous: `recordEvent("move"` occurs exactly
-			// once in each of note, pdf and canvas, at the call site itself,
-			// never inside a declaration (checked: `grep -n "recordEvent(\"move\""
-			// src/inline/InkOverlay.ts src/pdf/PdfInkController.ts
-			// src/view/HandwritingPageView.ts` - one hit apiece). But a marker
+			// once in each of note and pdf, at the call site itself, never
+			// inside a declaration (checked: `grep -n "recordEvent(\"move\""
+			// src/inline/InkOverlay.ts src/pdf/PdfInkController.ts` - one hit
+			// apiece). But a marker
 			// is still only a presence test, per this file's own header - it
 			// cannot tell a live call from a dead comment quoting it, which is
 			// why note and pdf both narrate this exact fix in prose directly
@@ -615,7 +588,7 @@ const RULES: readonly SurfaceRule[] = [
 			// reverting either surface to `() => {}` turns that call red.
 			rule: "a surface counts its stroke's move events",
 			markers: ['recordEvent("move"'],
-			on: ["note", "pdf", "canvas"],
+			on: ["note", "pdf"],
 			exempt: {
 				// Read out of PenLabView.ts rather than assumed: it is NOT
 				// silent about move events, it just does not route them
@@ -658,7 +631,7 @@ const RULES: readonly SurfaceRule[] = [
 		// the narration.
 		rule: "the tap floor lives at the nib, not at the caller",
 		markers: ["contactHalfWidth("],
-		on: ["note", "pdf", "canvas", "slides"],
+		on: ["note", "pdf", "slides"],
 		exempt: {
 			penlab:
 				"the lab exists so its head and its ribbon CAN disagree - that disagreement is what it is for, and holding it to the shared floor would remove the instrument",
@@ -704,8 +677,6 @@ const RULES: readonly SurfaceRule[] = [
 		],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas:
-				"no TipMode at all - INK_SURFACES marks it honoursTipMode: false, and its own Escape branch (HandwritingPageView.onKeyDown) only clears the lasso selection and the caret; there is no pan/lasso/space mode here for a key to hand back",
 			penlab:
 				"no tip mode; the lab draws with a fixed nib on purpose, and it wires no keydown listener of any kind (grep: zero hits for keydown/KeyDown/Escape in PenLabView.ts)",
 			demo: "no TipMode on the site - one tool, chosen by its own buttons, and no eraser, lasso, pan or space - and it wires no keydown listener of any kind (grep: zero hits for keydown/KeyDown/Escape in DemoInk.ts)",
@@ -745,8 +716,6 @@ const RULES: readonly SurfaceRule[] = [
 		markers: ['k === "c" || k === "x"', 'key === "c" || key === "x"'],
 		on: ["note", "pdf"],
 		exempt: {
-			canvas:
-				"no TipMode and no lasso-to-clipboard path - INK_SURFACES marks it honoursTipMode: false, and its own onKeyDown (HandwritingPageView.ts) only ever branches on undo/redo, Delete/Backspace and Escape; there is no Ctrl+C/X handling of any kind to divide by selection type",
 			penlab:
 				'no lasso and no selection of any kind - its own header: "No file, no persistence, no text, no eraser" - and it wires no keydown listener at all (grep: zero hits for keydown/KeyDown/ctrlKey in PenLabView.ts)',
 			demo: "no TipMode and no lasso on the site - one tool, chosen by its own buttons - and it wires no keydown listener at all (grep: zero hits for keydown/KeyDown/ctrlKey in DemoInk.ts)",
@@ -785,7 +754,7 @@ describe("ink surfaces - the registry describes the tree it claims to", () => {
 	});
 
 	it.each(INK_SURFACES)("$id: mountsStrip matches whether it mentions MobileTools", (surface) => {
-		expect(surfaceText(surface.file).includes("MobileTools")).toBe(surface.mountsStrip);
+		expect(surfaceText(surface.stripFile ?? surface.file).includes("MobileTools")).toBe(surface.mountsStrip);
 	});
 
 	it("the glob found a source tree, not an empty one", () => {
@@ -944,7 +913,7 @@ describe("ink surfaces - visibility and hardware are separate claims", () => {
 		// The witness. Every assertion below is a filter over source lines and
 		// a filter that finds nothing passes; this is the floor that says the
 		// suite is looking at something.
-		expect(stripSurfaces.map((s) => s.id)).toEqual(["note", "pdf"]);
+		expect(stripSurfaces.map((s) => s.id)).toEqual(["note", "pdf", "slides"]);
 	});
 
 	it.each(stripSurfaces)(
@@ -989,7 +958,7 @@ describe("ink surfaces - visibility and hardware are separate claims", () => {
 		).toEqual([]);
 	});
 
-	it("the two strip surfaces gate the same number of hardware claims", () => {
+	it("the strip surfaces gate contact and hover hardware claims", () => {
 		// Contact and hover, on each. Not a style rule - it is the count that
 		// goes wrong when a fix lands on one site and not its twin, which is
 		// the same defect shape one scale down from the one this file exists
@@ -1002,6 +971,7 @@ describe("ink surfaces - visibility and hardware are separate claims", () => {
 		expect(counts).toEqual([
 			{ id: "note", sites: 2 },
 			{ id: "pdf", sites: 2 },
+			{ id: "slides", sites: 2 },
 		]);
 	});
 });
@@ -1015,7 +985,7 @@ describe("ink surfaces - the registry is derived from the tree, not maintained b
 	//
 	// The proof was `DemoInk.ts`. It WAS surface five, it existed the whole
 	// time, and the suite was green. It got added by hand because nothing
-	// failed - the same opt-in blindness that hid the canvas from
+	// failed - the same opt-in blindness that hid a whole surface from
 	// StripPenChrome.test.ts for that file's entire life.
 	const built = Object.keys(ALL_TS)
 		.filter((f) => !f.endsWith(".test.ts") && !f.endsWith(".d.ts"))
@@ -1052,7 +1022,7 @@ describe("ink surfaces - the registry is derived from the tree, not maintained b
 		// a named surface.
 		const mounts = buildsOne.filter((f) => !codeOnly(ALL_TS[f]!).includes("preview: true"));
 		const claimed = INK_SURFACES.filter((s) => s.mountsStrip)
-			.map((s) => s.file)
+			.map((s) => s.stripFile ?? s.file)
 			.sort();
 		expect(mounts).toEqual(claimed);
 		// BOTH ENDS, because an exclusion that excluded nothing would make the

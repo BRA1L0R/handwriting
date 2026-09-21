@@ -38,6 +38,14 @@ import {
 	restorePenHardwareEverSeen,
 } from "./PenToolsMode";
 import {
+	resetNoteZoomControlsForTest,
+	setNoteZoomControlsMode,
+	setZoomBarCanvasEnabled,
+} from "./NoteZoomControlsMode";
+import { MAX_PINCH_SCALE } from "./PinchScale";
+import { setCanvasNoteOverrideForTest, type CanvasNoteOverride } from "./CanvasNoteOverride";
+import { refreshNoteZoomControlsAll } from "./MobileTools";
+import {
 	armMouseInkQuietly,
 	clearToolPicked,
 	consumeMousePutDown,
@@ -175,6 +183,162 @@ const fakeHost = (over: Partial<MobileToolsHost> = {}): MobileToolsHost => ({
 	// strip it was written against. Tests about the phone's strip pass true.
 	hasTouch: () => false,
 	...over,
+});
+
+/** A `noteViewport` fake: before this change, `fakeHost()` above never set
+ * it, so the group had never been built in a unit test. */
+const fakeNoteViewport = (): NonNullable<MobileToolsHost["noteViewport"]> => ({
+	getNoteViewportState: () => ({ zoom: 1, busy: false, fitAvailable: true }),
+	zoomNoteBy: () => true,
+	resetNoteZoom: () => true,
+	fitHandwriting: () => "ok",
+});
+
+// The zoom bar behaves exactly like the pen toolbar: it steps aside while
+// the pen inks (auto), stays permanently on (show), or stays off (hide).
+describe("zoom bar visibility while writing", () => {
+	beforeEach(() => {
+		resetPenToolsForTest();
+		resetNoteZoomControlsForTest();
+	});
+
+	// BASELINE. Everything below is meaningless without this.
+	it("the zoom group is built when noteViewport is set", () => {
+		const pane = new FakeEl("div", new FakeDoc());
+		new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport() }));
+		const group = pane.querySelector(".handwriting-note-viewport-controls");
+		expect(group).not.toBeNull();
+		expect(group!.children.filter(c => c.tag === "button").length).toBe(4);
+	});
+
+	it("the zoom group does not exist without noteViewport", () => {
+		const pane = new FakeEl("div", new FakeDoc());
+		new MobileTools(pane as unknown as HTMLElement, fakeHost());
+		expect(pane.querySelector(".handwriting-note-viewport-controls")).toBeNull();
+	});
+
+	// Step-aside: the zoom group was a sibling `setInking` never touched
+	// before it was wired up.
+	it("auto steps aside with the pen, show never does, hide is always hidden", () => {
+		const pane = new FakeEl("div", new FakeDoc());
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport() }));
+		const group = pane.querySelector(".handwriting-note-viewport-controls")!;
+		strip.setInking(true);
+		expect(group.classes.has("is-inking")).toBe(true);
+		strip.setInking(false);
+		expect(group.classes.has("is-inking")).toBe(false);
+		setNoteZoomControlsMode("show");
+		strip.setInking(true);
+		expect(group.classes.has("is-inking")).toBe(false);
+		setNoteZoomControlsMode("hide");
+		strip.setInking(false);
+		expect(group.classes.has("is-hidden")).toBe(true);
+	});
+
+	// A mode change mid-stroke re-applies immediately, not only on the next
+	// setInking call from a pen edge.
+	it("a mode change while inking re-applies the step-aside", () => {
+		const pane = new FakeEl("div", new FakeDoc());
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport() }));
+		const group = pane.querySelector(".handwriting-note-viewport-controls")!;
+		setNoteZoomControlsMode("show");
+		strip.setInking(true);
+		expect(group.classes.has("is-inking")).toBe(false);
+		setNoteZoomControlsMode("auto");
+		expect(group.classes.has("is-inking")).toBe(true);
+		setNoteZoomControlsMode("show");
+		expect(group.classes.has("is-inking")).toBe(false);
+	});
+
+	it("a stored hide is honoured from the first paint, and a mode change toggles it live", () => {
+		setNoteZoomControlsMode("hide");
+		const pane = new FakeEl("div", new FakeDoc());
+		new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport() }));
+		const group = pane.querySelector(".handwriting-note-viewport-controls")!;
+		expect(group.classes.has("is-hidden")).toBe(true);
+		setNoteZoomControlsMode("auto");
+		expect(group.classes.has("is-hidden")).toBe(false);
+	});
+
+	// PARITY: matched modes behave together, AND each side obeys its OWN
+	// setting independently of the other's - the mixed arms are what
+	// actually prove independence (matched modes alone can't tell "each
+	// follows its own setting" apart from "the two are just tied together").
+	it("the pen strip and the zoom group carry is-inking together in auto, and neither does in show", () => {
+		const pane = new FakeEl("div", new FakeDoc());
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport() }));
+		const stripEl = pane.querySelector(".handwriting-mobile-tools")!;
+		const group = pane.querySelector(".handwriting-note-viewport-controls")!;
+		strip.setInking(true);
+		expect([stripEl.classes.has("is-inking"), group.classes.has("is-inking")]).toEqual([true, true]);
+		strip.setInking(false);
+		setPenToolsMode("show");
+		setNoteZoomControlsMode("show");
+		strip.setInking(true);
+		expect([stripEl.classes.has("is-inking"), group.classes.has("is-inking")]).toEqual([false, false]);
+		strip.setInking(false);
+	});
+
+	it("each side obeys its own mode, independent of the other's", () => {
+		const pane = new FakeEl("div", new FakeDoc());
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport() }));
+		const stripEl = pane.querySelector(".handwriting-mobile-tools")!;
+		const group = pane.querySelector(".handwriting-note-viewport-controls")!;
+		setPenToolsMode("auto");
+		setNoteZoomControlsMode("show");
+		strip.setInking(true);
+		expect(stripEl.classes.has("is-inking"), "pen auto steps aside").toBe(true);
+		expect(group.classes.has("is-inking"), "zoom show never steps aside").toBe(false);
+		strip.setInking(false);
+		setPenToolsMode("show");
+		setNoteZoomControlsMode("auto");
+		strip.setInking(true);
+		expect(stripEl.classes.has("is-inking"), "pen show never steps aside").toBe(false);
+		expect(group.classes.has("is-inking"), "zoom auto steps aside").toBe(true);
+	});
+
+	it("destroy stops the zoom mode watch, exactly like the pen one", () => {
+		const pane = new FakeEl("div", new FakeDoc());
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport() }));
+		strip.destroy();
+		const afterDestroy = vi.spyOn(strip, "setInking");
+		setNoteZoomControlsMode("show");
+		expect(afterDestroy).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * MAXZOOM-6: `refreshNow`'s disable check on the "+" button used to read a
+ * bare `4` (the old 400% ceiling) instead of MAX_PINCH_SCALE, so it would
+ * have disabled the button 200 points early once the pinch ceiling itself
+ * moved to 600%. Red against that literal: at 500% - past the old ceiling,
+ * under the new one - the button must stay enabled; only 600% disables it.
+ */
+describe("zoom bar ceiling at 600%", () => {
+	beforeEach(() => {
+		resetPenToolsForTest();
+		resetNoteZoomControlsForTest();
+	});
+
+	it("the plus button disables at the new ceiling, not at the old 400%, and the readout shows 600%", () => {
+		const pane = new FakeEl("div", new FakeDoc());
+		let zoom = 1;
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({
+			noteViewport: { ...fakeNoteViewport(), getNoteViewportState: () => ({ zoom, busy: false, fitAvailable: true }) },
+		}));
+		const buttons = pane.querySelector(".handwriting-note-viewport-controls")!.children.filter(c => c.tag === "button");
+		const readout = buttons[1]!, plus = buttons[2]!;
+
+		zoom = 5;
+		strip.refreshNow();
+		expect(plus.disabled, "500% is past the old 400% ceiling but under the new one").toBe(false);
+		expect(readout.textContent).toBe("500%");
+
+		zoom = MAX_PINCH_SCALE;
+		strip.refreshNow();
+		expect(plus.disabled, "600% is the new ceiling").toBe(true);
+		expect(readout.textContent).toBe("600%");
+	});
 });
 
 describe("nibIsLit", () => {
@@ -572,6 +736,10 @@ class FakeEl {
 	 * test 2, 2026-09-05 - see "the selection group dims rather than hides"
 	 * below). Kept for whichever button first needs it. */
 	hidden = false;
+	/** Mocks the DOM `disabled` property, same reasoning as `hidden` above:
+	 * the note-viewport buttons write it directly (`button.disabled = ...` in
+	 * `refreshNow`), never through a class. */
+	disabled = false;
 	readonly offsetWidth = 0;
 	readonly offsetLeft = 0;
 	readonly classList = {
@@ -4643,5 +4811,170 @@ describe("MobileTools: dragging the toolbar to an anchor", () => {
 		rig.grip.fire("pointermove", { pointerId: 8, clientX: 400, clientY: 700 });
 		rig.doc.fire("pointerup", { pointerId: 8 });
 		expect(rig.placed, "a secondary contact dragged the toolbar").toEqual([]);
+	});
+});
+
+/**
+ * s137 item 9 and s138: the zoom bar answers to Infinite Canvas as well as to
+ * its own row, and the canvas is per note.
+ *
+ * The strip never reads the setting - it does not import InkOverlay - so the
+ * global arrives through `setZoomBarCanvasEnabled` (main.ts) and the per-note
+ * override through `canvasForNote`, resolved at paint time against the path
+ * the host answers.
+ */
+describe("zoom bar visibility and Infinite Canvas", () => {
+	const fakeOverride = (
+		values: Record<string, boolean>,
+		listeners: ((path: string) => void)[] = []
+	): CanvasNoteOverride =>
+		({
+			canvasForNote: (path: string | null, globalDefault: boolean) =>
+				path !== null && path in values ? values[path]! : globalDefault,
+			onChanged: (listener: (path: string) => void) => {
+				listeners.push(listener);
+				return () => {
+					const i = listeners.indexOf(listener);
+					if (i >= 0) listeners.splice(i, 1);
+				};
+			},
+		}) as unknown as CanvasNoteOverride;
+
+	const zoomGroup = (pane: FakeEl) => pane.querySelector(".handwriting-note-viewport-controls")!;
+
+	beforeEach(() => {
+		resetPenToolsForTest();
+		resetNoteZoomControlsForTest();
+		setCanvasNoteOverrideForTest(null);
+	});
+
+	afterEach(() => {
+		setCanvasNoteOverrideForTest(null);
+	});
+
+	it("canvas off hides the bar from the first paint, even on Show", () => {
+		setNoteZoomControlsMode("show");
+		setZoomBarCanvasEnabled(false);
+		const pane = new FakeEl("div", new FakeDoc());
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport() }));
+		expect(zoomGroup(pane).classes.has("is-hidden")).toBe(true);
+		strip.destroy();
+	});
+
+	it("turning the canvas off and on again moves an open bar both ways", () => {
+		const pane = new FakeEl("div", new FakeDoc());
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport() }));
+		expect(zoomGroup(pane).classes.has("is-hidden")).toBe(false);
+		setZoomBarCanvasEnabled(false);
+		expect(zoomGroup(pane).classes.has("is-hidden")).toBe(true);
+		setZoomBarCanvasEnabled(true);
+		expect(zoomGroup(pane).classes.has("is-hidden")).toBe(false);
+		strip.destroy();
+	});
+
+	it("the user's own Hide survives the canvas coming back on", () => {
+		setNoteZoomControlsMode("hide");
+		const pane = new FakeEl("div", new FakeDoc());
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport() }));
+		setZoomBarCanvasEnabled(false);
+		setZoomBarCanvasEnabled(true);
+		expect(zoomGroup(pane).classes.has("is-hidden")).toBe(true);
+		strip.destroy();
+	});
+
+	it("a note's own override beats the global, in both directions", () => {
+		setCanvasNoteOverrideForTest(fakeOverride({ "on.md": true, "off.md": false }));
+		setZoomBarCanvasEnabled(false);
+		const onPane = new FakeEl("div", new FakeDoc());
+		const onStrip = new MobileTools(onPane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport(), notePath: () => "on.md" }));
+		expect(zoomGroup(onPane).classes.has("is-hidden"), "override on, global off").toBe(false);
+
+		setZoomBarCanvasEnabled(true);
+		const offPane = new FakeEl("div", new FakeDoc());
+		const offStrip = new MobileTools(offPane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport(), notePath: () => "off.md" }));
+		expect(zoomGroup(offPane).classes.has("is-hidden"), "override off, global on").toBe(true);
+		onStrip.destroy();
+		offStrip.destroy();
+	});
+
+	it("two notes open at once, opposite overrides, each bar by its own note", () => {
+		setCanvasNoteOverrideForTest(fakeOverride({ "on.md": true, "off.md": false }));
+		setZoomBarCanvasEnabled(false);
+		const onPane = new FakeEl("div", new FakeDoc());
+		const offPane = new FakeEl("div", new FakeDoc());
+		const onStrip = new MobileTools(onPane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport(), notePath: () => "on.md" }));
+		const offStrip = new MobileTools(offPane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport(), notePath: () => "off.md" }));
+		expect(zoomGroup(onPane).classes.has("is-hidden")).toBe(false);
+		expect(zoomGroup(offPane).classes.has("is-hidden")).toBe(true);
+		onStrip.destroy();
+		offStrip.destroy();
+	});
+
+	it("a note with no override falls back to the global", () => {
+		setCanvasNoteOverrideForTest(fakeOverride({ "other.md": true }));
+		setZoomBarCanvasEnabled(false);
+		const pane = new FakeEl("div", new FakeDoc());
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport(), notePath: () => "plain.md" }));
+		expect(zoomGroup(pane).classes.has("is-hidden")).toBe(true);
+		strip.destroy();
+	});
+
+	it("an override change repaints the strip over THAT note and no other", () => {
+		const listeners: ((path: string) => void)[] = [];
+		const values: Record<string, boolean> = { "mine.md": false, "theirs.md": true };
+		setCanvasNoteOverrideForTest(fakeOverride(values, listeners));
+		const mine = new FakeEl("div", new FakeDoc());
+		const theirs = new FakeEl("div", new FakeDoc());
+		const mineStrip = new MobileTools(mine as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport(), notePath: () => "mine.md" }));
+		const theirsStrip = new MobileTools(theirs as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport(), notePath: () => "theirs.md" }));
+		expect(zoomGroup(mine).classes.has("is-hidden")).toBe(true);
+		expect(zoomGroup(theirs).classes.has("is-hidden")).toBe(false);
+
+		// The user turns this note's canvas on, and theirs.md changes value at
+		// the same moment with no event of its own.
+		values["mine.md"] = true;
+		values["theirs.md"] = false;
+		for (const listener of [...listeners]) listener("mine.md");
+		expect(zoomGroup(mine).classes.has("is-hidden"), "the note that changed").toBe(false);
+		// Nothing told theirs.md's strip: the event named another note. A
+		// strip that repainted here would repaint every open pane on every
+		// frontmatter edit in the vault.
+		expect(zoomGroup(theirs).classes.has("is-hidden"), "the note the event did not name").toBe(false);
+		mineStrip.destroy();
+		theirsStrip.destroy();
+	});
+
+	it("a strip drops its override subscription when it is destroyed", () => {
+		const listeners: ((path: string) => void)[] = [];
+		setCanvasNoteOverrideForTest(fakeOverride({}, listeners));
+		const pane = new FakeEl("div", new FakeDoc());
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport(), notePath: () => "a.md" }));
+		expect(listeners.length).toBe(1);
+		strip.destroy();
+		expect(listeners.length).toBe(0);
+	});
+
+	it("refreshNoteZoomControlsAll pushes into strips built before anyone subscribed", () => {
+		const values: Record<string, boolean> = { "a.md": true };
+		setCanvasNoteOverrideForTest(fakeOverride(values));
+		const pane = new FakeEl("div", new FakeDoc());
+		const strip = new MobileTools(pane as unknown as HTMLElement, fakeHost({ noteViewport: fakeNoteViewport(), notePath: () => "a.md" }));
+		expect(zoomGroup(pane).classes.has("is-hidden")).toBe(false);
+		// The override changed with no announcement at all - the case the
+		// push exists for.
+		values["a.md"] = false;
+		refreshNoteZoomControlsAll();
+		expect(zoomGroup(pane).classes.has("is-hidden")).toBe(true);
+		strip.destroy();
+	});
+
+	// The wiring this module cannot do for itself: the strip has no way to
+	// read the setting, so main.ts must tell it at load AND at every flip of
+	// the row. Both sites, in main.ts's own source.
+	it("main.ts tells the strip about the canvas at load and at the row", () => {
+		const code = codeOnly(mainSrc);
+		expect(code.includes("setZoomBarCanvasEnabled(this.settings.extendCanvasWhileScrolling)"), "at load").toBe(true);
+		expect(code.includes("setZoomBarCanvasEnabled(on)"), "at the row").toBe(true);
+		expect(code.includes("refreshNoteZoomControlsAll()"), "the push").toBe(true);
 	});
 });

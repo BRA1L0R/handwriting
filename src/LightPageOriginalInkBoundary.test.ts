@@ -10,15 +10,15 @@ function rule(selector: string): string {
 	return css.slice(open + 1, close);
 }
 
+/*
+ * The first case here asserted the canvas page's own light paper and its typed
+ * text colour, from `.handwriting-box` and `.handwriting-box.is-editing`. Both
+ * rules were deleted with the view in s197, so the claim has no subject. The
+ * BOUNDARY half - that the white sheet never reached the inline or PDF
+ * surfaces - is the half that still has one, and it is the half that was worth
+ * having: it is what a reader of the deleted rules could have broken.
+ */
 describe("the light page stays inside the dedicated canvas boundary", () => {
-	it("gives the dedicated canvas light paper and readable typed text", () => {
-		expect(rule(".handwriting-root")).toContain("background: #ffffff");
-		expect(rule(".handwriting-box")).toContain("color: #1c1f26");
-		const editing = rule(".handwriting-box.is-editing");
-		expect(editing).toContain("background: #ffffff");
-		expect(editing).toContain("border-color: rgba(28, 31, 38, 0.2)");
-	});
-
 	it("does not turn inline notes or PDF overlays into white sheets", () => {
 		for (const selector of [
 			".markdown-source-view.handwriting-page",
@@ -42,6 +42,6 @@ describe("the obsolete live-adaptation control is gone without migration", () =>
 
 	it("leaves both export controls present", () => {
 		expect(main).toContain('name: "Ink color when exporting"');
-		expect(main).toContain('name: "Ink color when flattening PDFs"');
+		expect(main).toContain('name: "Ink color on PDFs"');
 	});
 });

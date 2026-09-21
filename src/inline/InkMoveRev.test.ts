@@ -6,16 +6,16 @@
  * stroke's identity - StrokeRenderer's ribbon cache - would keep drawing the
  * ink at the position it was dragged FROM. The revision registry is the
  * announcement; these pin that it fires for the strokes that moved and for
- * nobody else, on both funnels into `translateStroke`: the inline store's
- * `moveStrokes` (lasso drag, insert-space drag, and the undo/redo of either)
- * and `ObjectOps.moveObjects` (the page view).
+ * nobody else, on the surviving funnel into `translateStroke`: the inline
+ * store's `moveStrokes` (lasso drag, insert-space drag, and the undo/redo of
+ * either). The second funnel was `ObjectOps.moveObjects`, which belonged to
+ * the canvas page view and went with it in s197.
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { InkStroke } from "../ink/Stroke";
 import { strokeRev } from "../ink/StrokeRev";
 import { PageData, ParseResult, emptyPage } from "../model/PageData";
-import { moveObjects } from "../objects/ObjectOps";
 import { InlineInkHost, InlineInkStore } from "./InlineInkStore";
 
 function stroke(id: string): InkStroke {
@@ -101,17 +101,5 @@ describe("InlineInkStore.moveStrokes bumps the revision", () => {
 		const before = [strokeRev(a!), strokeRev(b!), strokeRev(c!)];
 		store.moveStrokes("note.md", ["ghost"], 5, 5);
 		expect([strokeRev(a!), strokeRev(b!), strokeRev(c!)]).toEqual(before);
-	});
-});
-
-describe("ObjectOps.moveObjects bumps the revision", () => {
-	it("bumps exactly the moved strokes", () => {
-		const page = emptyPage("p1");
-		page.strokes.push(stroke("s1"), stroke("s2"));
-		const [s1, s2] = page.strokes;
-		const before = [strokeRev(s1!), strokeRev(s2!)];
-		moveObjects(page, { strokeIds: ["s1"], boxIds: [], imageIds: [] }, 5, -5);
-		expect(strokeRev(s1!)).toBe(before[0]! + 1);
-		expect(strokeRev(s2!)).toBe(before[1]!);
 	});
 });

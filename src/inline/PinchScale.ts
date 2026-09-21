@@ -19,18 +19,40 @@
 
 import { validCameraScale } from "./ZoomScale";
 
-export const MAX_PINCH_SCALE = 4;
+export const MAX_PINCH_SCALE = 6;
 export const MIN_PINCH_SCALE = 0.1;
+
+/**
+ * s110: HOW FAR PAST THE CAP A LIVE PINCH MAY PAINT, and only a live pinch.
+ *
+ * At the cap today the preview stops painting: the fingers keep spreading and
+ * nothing on screen answers, which reads as the gesture having died rather than
+ * as a limit. The give lets the preview follow past the cap - ceiling
+ * `MAX_PINCH_SCALE * PINCH_GIVE` - and the
+ * lift eases it back to the cap before the single commit, so the limit is felt
+ * rather than hit. ONE constant, both ends, preview only: every committed scale
+ * is still inside the old range, so nothing downstream sees a new number.
+ */
+export const PINCH_GIVE = 1.1;
 
 /**
  * Bound user zoom requests before creating an extreme counter-sized editor.
  *
  * `floor` is the lowest scale this request may reach. A floor can only lower
  * the constant, never raise it.
+ *
+ * `preview` opens the give at both ends (s110). A preview frame is repainted by
+ * the next one and is never committed, so the widened range lives and dies
+ * inside the gesture; the commit path calls this without the flag and keeps the
+ * constants exactly as they were.
  */
-export function clampPinchScale(scale: number, floor = MIN_PINCH_SCALE): number {
- const min = validCameraScale(floor) ? Math.min(MIN_PINCH_SCALE, floor) : MIN_PINCH_SCALE;
- return validCameraScale(scale) ? Math.max(min, Math.min(MAX_PINCH_SCALE, scale)) : 1;
+export function clampPinchScale(scale: number, floor = MIN_PINCH_SCALE, preview = false): number {
+ const ceiling = preview ? MAX_PINCH_SCALE * PINCH_GIVE : MAX_PINCH_SCALE;
+ // The cap side only (s112): the floor is Alan's 10 percent rule and Fit's own territory; a preview
+ // never paints under it. `preview` widens the ceiling alone.
+ const bottom = MIN_PINCH_SCALE;
+ const min = validCameraScale(floor) ? Math.min(bottom, floor) : bottom;
+ return validCameraScale(scale) ? Math.max(min, Math.min(ceiling, scale)) : 1;
 }
 
 /** Intersect one stroke with the reachable right/down surface; never mutate it. */
@@ -74,11 +96,11 @@ export function fitInkBounds(g:{bounds:InkFitBounds|null; viewportWidthScreen:nu
  * ten percent, and from there a gesture may zoom in but not back out, so its
  * own reference scale is the lower bound until a commit reaches the floor.
  */
-export function pinchScale(referenceScale: number, ratio: number, floor = MIN_PINCH_SCALE): number {
+export function pinchScale(referenceScale: number, ratio: number, floor = MIN_PINCH_SCALE, preview = false): number {
 	if (!Number.isFinite(referenceScale) || referenceScale <= 0) return 1;
 	const lower = Math.min(floor, referenceScale);
-	if (!Number.isFinite(ratio) || ratio <= 0) return clampPinchScale(referenceScale, lower);
-	return clampPinchScale(referenceScale * ratio, lower);
+	if (!Number.isFinite(ratio) || ratio <= 0) return clampPinchScale(referenceScale, lower, preview);
+	return clampPinchScale(referenceScale * ratio, lower, preview);
 }
 
 /**

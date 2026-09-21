@@ -901,12 +901,12 @@ export class PageStore {
 	 *
 	 * See hasQueuedWrite above for why a caller must re-ask synchronously.
 	 */
-	private async observeExternalChange(pageId: string): Promise<ExternalChangeObservation> {
+	private async observeExternalChange(pageId: string, includeUntracked = false): Promise<ExternalChangeObservation> {
 		if (this.hasQueuedWrite(pageId)) return "unchanged";
 		const known = this.knownMtime.get(pageId);
 		const knownHash = this.knownHash.get(pageId);
 		const folder = this.folder;
-		if (known === undefined && !this.observedMissing.has(pageId)) return "unchanged";
+		if (known === undefined && !this.observedMissing.has(pageId) && !includeUntracked) return "unchanged";
 		const adapter = this.app.vault.adapter;
 		let observation: ExternalChangeObservation;
 		try {
@@ -970,8 +970,8 @@ export class PageStore {
 		return observation;
 	}
 
-	async externallyChanged(pageId: string): Promise<boolean> {
-		const observation = await this.observeExternalChange(pageId);
+	async externallyChanged(pageId: string, includeUntracked = false): Promise<boolean> {
+		const observation = await this.observeExternalChange(pageId, includeUntracked);
 		this.externalChangeObservations.set(pageId, observation);
 		return observation === "changed";
 	}
@@ -1374,6 +1374,57 @@ export class PageStore {
 		await this.writePending(pageId);
 	}
 
+	/** Schedules waiting on a promise only their caller holds; see `scheduleAfter`. */
+	private deferredSchedules = new Set<Promise<void>>();
+
+	/**
+	 * Run `schedule` (the caller's own `schedule(...)` call, writer included)
+	 * once `after` settles: the canvas view's sidecar, parked behind the
+	 * Markdown save that puts its page id on disk. Tracked here so an unload
+	 * can wait for it (`settleDeferred`) - untracked, `flush()` ran while the
+	 * id save was still going and found nothing queued for the page.
+	 */
+	scheduleAfter(after: Promise<unknown>, schedule: () => void): void {
+		const deferred: Promise<void> = after
+			.then(schedule)
+			.finally(() => this.deferredSchedules.delete(deferred));
+		this.deferredSchedules.add(deferred);
+		runDetached(deferred, "schedule a sidecar after saving its page id");
+	}
+
+	/**
+	 * Best-effort unload: wait (bounded) for every `scheduleAfter` to reach
+	 * `schedule`, so the `flush()` that follows has the batch to write. TRUE
+	 * when all landed, FALSE when the deadline won. Not crash durability.
+	 *
+	 * `PdfInkStore.settle`'s shape, for its reasons: several passes, because a
+	 * schedule registered WHILE this waits would be missed by a single pass;
+	 * and `allSettled`, because one parked schedule that throws must not end
+	 * the wait for the others - `runDetached` reports it, and the rest still
+	 * have to reach the queue before the flush.
+	 */
+	async settleDeferred(maxWaitMs = 2000): Promise<boolean> {
+		let expire: (v: boolean) => void = () => {};
+		const deadline = new Promise<boolean>((r) => {
+			expire = r;
+		});
+		const timer = window.setTimeout(() => expire(true), maxWaitMs);
+		try {
+			for (let pass = 0; pass < 4; pass++) {
+				const inFlight = [...this.deferredSchedules];
+				if (inFlight.length === 0) return true;
+				const timedOut = await Promise.race([
+					Promise.allSettled(inFlight).then(() => false),
+					deadline,
+				]);
+				if (timedOut) return false;
+			}
+			return false;
+		} finally {
+			window.clearTimeout(timer);
+		}
+	}
+
 	/**
 	 * The debounce collapses a batch to its NEWEST state, which is right for
 	 * one writer and is the mechanism of the two-pane loss for two: the second
@@ -1626,7 +1677,7 @@ export class PageStore {
 	async prepareExternalAdoption(
 		pageId: string,
 		outgoing: PageData,
-		expectedSurface: "inline" | "pdf" = "inline"
+		expectedSurface: "inline" | "pdf" | "canvas" = "inline"
 	): Promise<ExternalAdoptionPrep> {
 		const adapter = this.app.vault.adapter;
 		// On the page's own write chain: the artifacts must not interleave with
@@ -1643,10 +1694,19 @@ export class PageStore {
 			const incomingText = await adapter.read(final);
 			const incomingStamp = contentStamp(incomingText);
 			const parsed = parsePage(incomingText, pageId);
+			let surfaceMatches = parsed.data.surface === expectedSurface;
+			if (expectedSurface === "canvas") {
+				try {
+					const raw: unknown = JSON.parse(incomingText);
+					surfaceMatches = !!raw && typeof raw === "object" && !Array.isArray(raw) &&
+						!Object.prototype.hasOwnProperty.call(raw, "surface") &&
+						(raw as { pageId?: unknown }).pageId === pageId;
+				} catch { surfaceMatches = false; }
+			}
 			if (
 				parsed.damaged ||
 				parsed.futureVersion !== undefined ||
-				parsed.data.surface !== expectedSurface
+				!surfaceMatches
 			) {
 				// Damage, a newer schema and a legacy canvas page each have an
 				// existing lock that fails closed, and those locks are better

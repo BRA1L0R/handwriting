@@ -82,7 +82,7 @@ async function harness() {
 		},
 		() => events.push("paint:note"), () => events.push("notify:note"),
 		() => "deck.slides", async () => { events.push("paint:slides"); return true; },
-		{ error: (...args: unknown[]) => errors.push(args) });
+		{ error: (...args: unknown[]) => errors.push(args) }, () => () => true);
 	return { adapter, store, pdfStore, external, events, errors, detachedErrors, surfaces, document,
 		check, originalCheck, reload, reads, queued, schedule, host, pane, a, b, other,
 		fire: () => callback(), settle: () => pending,

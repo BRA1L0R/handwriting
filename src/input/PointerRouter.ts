@@ -1,5 +1,4 @@
-import { Camera } from "../camera/Camera";
-import { Point } from "../camera/coordinates";
+import type { Point } from "../camera/coordinates";
 import { telemetry } from "../diag/Telemetry";
 import { PalmGate } from "./PalmGate";
 
@@ -130,9 +129,17 @@ export function silentLift(sample: { pressure: number; buttons: number }): boole
 const WHEEL_LINE_HEIGHT = 16;
 const ZOOM_WHEEL_SENSITIVITY = 0.0015;
 
+export interface NavigationCamera {
+	readonly zoom: number;
+	panBy(dx: number, dy: number): void;
+	zoomAt(sx: number, sy: number, zoom: number): void;
+	pinch(prevMid: Point, prevDist: number, nextMid: Point, nextDist: number): void;
+}
+
 export class PointerRouter {
+	get hasActiveInput(): boolean { return this.activePenId !== null || this.panPointerId !== null || this.touches.size > 0; }
 	private root: HTMLElement;
-	private camera: Camera;
+	private camera: NavigationCamera;
 	private gate = new PalmGate();
 	private callbacks: RouterCallbacks;
 
@@ -179,7 +186,7 @@ export class PointerRouter {
 	private winEndWin: Window | null = null;
 	private tapCandidates = new Map<number, TapCandidate>();
 
-	constructor(root: HTMLElement, camera: Camera, callbacks: RouterCallbacks) {
+	constructor(root: HTMLElement, camera: NavigationCamera, callbacks: RouterCallbacks) {
 		this.root = root;
 		this.camera = camera;
 		this.callbacks = callbacks;

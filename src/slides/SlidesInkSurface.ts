@@ -1,3 +1,5 @@
+import { SlidesInkHistory } from "./SlidesInkHistory";
+import { isSlidesControl, slideActionAvailable, type SlidesAction, type SlidesActions, type SlidesStatus } from "./SlidesActions";
 import { timerHost } from "../util/RuntimeScheduler";
 /**
  * Slides ink: the pen writes on Obsidian's core Slides presentation, and the
@@ -125,7 +127,7 @@ import { timerHost } from "../util/RuntimeScheduler";
  *     AMENDED 2026-09-05 (device-pixel ceiling). "The transform carries dpr"
  *     was true when the backing store was always `css x devicePixelRatio`.
  *     It is now `css x EFFECTIVE dpr`, where the effective ratio is
- *     `slidesBackingScale` - devicePixelRatio, reduced when three
+ *     `slidesBackingScale` - devicePixelRatio, reduced when four
  *     full-viewport canvases would blow `MAX_BACKING_AREA`. The separation
  *     this rule is about is untouched and is what makes the ceiling safe to
  *     have: the camera still carries k and ONLY k, so a reduced ratio costs
@@ -176,7 +178,7 @@ import {
 	relativeLuminance,
 	setInkThemeOverride,
 } from "../ink/InkTheme";
-import { DEFAULT_PEN, HIGHLIGHTER_PEN, PenStyle } from "../ink/PenStyle";
+import { DEFAULT_PEN, HIGHLIGHTER_ALPHA, HIGHLIGHTER_PEN, PenStyle } from "../ink/PenStyle";
 import { InkStroke, InkTool, newStrokeId } from "../ink/Stroke";
 import { StrokeBuilder } from "../ink/StrokeBuilder";
 import { drawStroke } from "../ink/StrokeRenderer";
@@ -312,6 +314,7 @@ export interface SlideNib {
  * API, so the whole mechanism is constructible in a test.
  */
 export interface SlidesInkHost {
+	mountTools?(parent: HTMLElement, actions: SlidesActions): () => void;
 	/** The presented note's vault path, read once when the deck appears. */
 	activeFilePath(): string | null;
 	/** The note's text, for the section hashes. */
@@ -483,14 +486,15 @@ export function slideCamera(deck: ScreenRect, viewport: ScreenRect, k: number): 
  * SILENTLY: the canvas simply stays blank, with no error to find it by.
  *
  * This surface had no ceiling at all, and it is the one that needs it most:
- * A2 puts all three canvases over the WHOLE viewport, so the largest pane the
- * plugin ever makes is allocated three times. A 5K panel is 14.7M per canvas
+ * A2 puts all four canvases over the WHOLE viewport, so the largest pane the
+ * plugin ever makes is allocated four times. A 5K panel is 14.7M per canvas
  * and a 6K one is 20.4M, past the silent refusal on its own.
  *
  * The note's number is reused rather than a third one invented. It is a
- * per-canvas budget, and three canvases at 10M is 30M device pixels - 120MB at
- * 4 bytes a pixel, inside the ~200MB `MAX_BACKING_AREA` already budgets for
- * the note's set of five, and each canvas comfortably under 16M.
+ * per-canvas budget, and four canvases at 10M is 40M device pixels - 160MB at
+ * 4 bytes a pixel, below the note's five backing stores. This does not bound
+ * the compositor's extra allocations for the opacity group. Each individual
+ * canvas stays comfortably under 16M.
  *
  * The NOTE's `backingScale` is deliberately not called here even though it
  * holds the same constant: its area cap is floored at `d * min(1, scale)`, so
@@ -1836,6 +1840,11 @@ interface DeckGeometry {
 }
 
 interface Layers {
+	/** Opaque highlights and their live stroke share one translucent group. */
+	highlightGroup: HTMLElement;
+	highlight: HTMLCanvasElement;
+	highlightCtx: CanvasRenderingContext2D;
+	wetTool: InkTool;
 	/** Committed ink. Repainted on slide change, load, erase and resize only. */
 	committed: HTMLCanvasElement;
 	ctx: CanvasRenderingContext2D;
@@ -1869,7 +1878,54 @@ interface Layers {
  * are all statements about a live deck, not about a pure function, and the suite
  * runs with no DOM, so the constructor's four arguments ARE the seam.
  */
-export class SlidesDeck {
+export class SlidesDeck implements SlidesActions {
+	private sourceUncertain = false;
+	private actionsReadBlocked = false;
+	private actionRevision = 0;
+	private readonly history = new SlidesInkHistory();
+	private gestureBefore: { index: number; strokes: InkStroke[] } | null = null;
+	private readonly actionListeners = new Set<() => void>();
+	get ownerDocument(): Document { return this.revealEl.ownerDocument; }
+	status(): SlidesStatus {
+		const live = !this.disposed && this._container.isConnected !== false;
+		const index = this.layers?.index ?? -1;
+		return { revision: this.actionRevision, pendingGesture: this.session.phase === "drawing" && this.penStroke, live, mutable: live && index >= 0 && this.loaded && !this.loadInFlight &&
+			!this.claimInFlight && !this.futureLocked && !this.noteMismatch && !!this.path && !this.sourceUncertain && !this.actionsReadBlocked, index,
+			currentCount: this.strokes.get(index)?.length ?? 0, totalCount: this.totalStrokes(),
+			undoLabel: this.history.undoLabel, redoLabel: this.history.redoLabel };
+	}
+	finishGesture(): void { if (!this.disposed) this.endStrokeForSlideChange(); }
+	onChange(fn: () => void): () => void { this.actionListeners.add(fn); return () => { this.actionListeners.delete(fn); }; }
+	private actionsChanged(): void { this.actionRevision++; for (const fn of this.actionListeners) fn(); }
+	run(action: SlidesAction): boolean {
+		if (!this.status().mutable) return false;
+		this.finishGesture();
+		const status = this.status();
+		if (!slideActionAvailable(status, action)) return false;
+		let label: string | null;
+		if (action === "undo" || action === "redo") {
+			label = this.history[action](this.strokes);
+		} else {
+			const indexes = action === "clear-all" ? [...this.strokes.keys()] : [status.index];
+			label = action === "clear-all" ? "Clear all presentation ink" : `Clear ink on slide ${status.index + 1}`;
+			const changes = indexes.map(index => ({ index, before: this.strokes.get(index) ?? [], after: [] }));
+			if (!this.history.record(label, changes)) return false;
+			for (const index of indexes) this.strokes.delete(index);
+		}
+		if (!label) return false;
+		this.repaint();
+		this.persist();
+		this.actionsChanged();
+		this.host.notify(`Handwriting: ${action === "undo" ? "Undid " : action === "redo" ? "Redid " : ""}${label}`);
+		return true;
+	}
+	private recordGesture(label: string): void {
+		const before = this.gestureBefore;
+		this.gestureBefore = null;
+		if (before) this.history.record(`${label} on slide ${before.index + 1}`, [{ index: before.index, before: before.strokes, after: this.strokes.get(before.index) ?? [] }]);
+		this.actionsChanged();
+	}
+
 	/** slide index -> strokes, in deck-logical units. */
 	private readonly strokes = new Map<number, InkStroke[]>();
 	private layers: Layers | null = null;
@@ -2111,6 +2167,8 @@ export class SlidesDeck {
 		// stroke. Start presentation acts on the active file, and by the time
 		// the reader draws, the workspace behind the deck may have moved on.
 		this.path = this.host.activeFilePath();
+		const unmountTools = this.host.mountTools?.(this._container, this);
+		if (unmountTools) this.disposers.push(unmountTools);
 		if (diagnosticsEnabled()) log(`file resolved: ${this.path ?? "none"}`);
 		// Held, not fired and forgotten: a stroke drawn in the load window
 		// parks its write behind this promise, and teardown has to be able to
@@ -2121,6 +2179,7 @@ export class SlidesDeck {
 			})
 			.finally(() => {
 				this.loadInFlight = null;
+				this.actionsChanged();
 			});
 		// Take the keyboard once, at mount, without waiting for a first contact.
 		// Obsidian dispatches its own synthetic `pointerdown` to set Reveal's
@@ -2167,9 +2226,11 @@ export class SlidesDeck {
 		try {
 			const source = await this.host.readSource(path);
 			if (source !== null) sections = splitSlideSections(source);
+			else this.sourceUncertain = true;
 		} catch (err) {
 			// A note we cannot read still takes ink; it just keeps its slides
 			// by index alone until the next presentation reads it.
+			this.sourceUncertain = true;
 			log(`could not read ${path} for section hashes: ${String(err)}`);
 		}
 		if (this.stale()) return;
@@ -2265,8 +2326,12 @@ export class SlidesDeck {
 		try {
 			result = await this.host.loadSidecar(sidecarId);
 		} catch (err) {
+			this.actionsReadBlocked = true;
 			log(`sidecar load failed for ${sidecarId}: ${String(err)}`);
-			return null;
+			// A rejected reload keeps the already adopted model. An initial
+			// rejection has no trusted model and must retain the write lock.
+			if (replaceAdopted) return null;
+			result = { data: emptyPage(sidecarId), recovered: true, damaged: true, problem: String(err) };
 		} finally {
 			// Remember read-window erases even when the read fails, so a retry
 			// cannot bring an erased local stroke back from its saved copy.
@@ -2281,6 +2346,7 @@ export class SlidesDeck {
 		}
 		if (this.stale()) return null;
 		if (!result) {
+			if (replaceAdopted) this.actionsReadBlocked = true;
 			if (diagnosticsEnabled()) log(`sidecar loaded: none (${sidecarId} has no file yet)`);
 			return null;
 		}
@@ -2319,6 +2385,11 @@ export class SlidesDeck {
 					"It is shown here but new ink is not being saved."
 			);
 		}
+		// Close the current gesture against its original model before starting
+		// the authoritative history boundary. Its write remains parked behind
+		// this reload; the merged state below is what finishLoad persists.
+		// Failed/refused reads leave both the gesture and its history intact.
+		if (replaceAdopted && !this.futureLocked) this.endStrokeForSlideChange();
 		// A live reload keeps the displayed ink until this read has succeeded.
 		// Its starting ids also identify any ink erased during the await:
 		// those ids must not be resurrected by the older disk snapshot.
@@ -2344,6 +2415,7 @@ export class SlidesDeck {
 		// device then edited - coming back a second time under the same id.
 		const present = new Set<string>();
 		for (const list of this.strokes.values()) for (const s of list) present.add(s.id);
+		const additions = new Map<number, InkStroke[]>();
 		for (const s of strokes) {
 			if (present.has(s.id) || erased.has(s.id)) continue;
 			const index = slideOfPage(s.page);
@@ -2351,6 +2423,9 @@ export class SlidesDeck {
 			list.push(s);
 			this.strokes.set(index, list);
 			this.adoptedIds.add(s.id);
+			const added = additions.get(index) ?? [];
+			added.push(s);
+			additions.set(index, added);
 		}
 		// §3.6's "keep the index" is two different outcomes and only the log can
 		// tell them apart: ink parked past the end of the deck is invisible and
@@ -2369,6 +2444,18 @@ export class SlidesDeck {
 						`${visible} of them on a slide this deck still shows`
 					: "")
 		);
+		if (replaceAdopted && !this.futureLocked) {
+			this.actionsReadBlocked = false;
+			this.history.clear();
+		} else if (!replaceAdopted) {
+			this.history.rebaseInitial(additions);
+			const gesture = this.gestureBefore;
+			if (gesture) {
+				const ids = new Set(gesture.strokes.map(s => s.id));
+				gesture.strokes.push(...(additions.get(gesture.index) ?? []).filter(s => !ids.has(s.id)));
+			}
+		}
+		this.actionsChanged();
 		this.repaint();
 		// The remap's INPUT, not its output: `stored` is what the deck was
 		// matched against just now, `this.hashes` is what it would be matched
@@ -2466,7 +2553,7 @@ export class SlidesDeck {
 		// zoom IS covered by the observer above, because these canvases are
 		// sized off the viewport and zoom changes the viewport's css size; a
 		// monitor move is not. Same repair, same path: `refresh` re-reads the
-		// ratio and re-sizes all three stores, so this arms nothing parallel.
+		// ratio and re-sizes all four stores, so this arms nothing parallel.
 		this.watchResolution();
 		this.disposers.push(() => this.unwatchResolution());
 
@@ -2573,8 +2660,8 @@ export class SlidesDeck {
 	 * stylus. Alan, 2026-09-08: "oh hell nah that's not ok" / "it must work
 	 * seamlessly".
 	 *
-	 * WHY A `touch-action` ANSWER CANNOT BE SEAMLESS. Measured by the latency
-	 * seat on Chromium 151: `touch-action` is LATCHED AT CONTACT. Set after the
+	 * WHY A `touch-action` ANSWER CANNOT BE SEAMLESS. Measured on Chromium
+	 * 151: `touch-action` is LATCHED AT CONTACT. Set after the
 	 * contact's `touchstart` and the deck scrolls exactly like an unguarded
 	 * control. So the value has to be committed before the pen lands, which is
 	 * why it was unconditional, which is why touch paid for it.
@@ -2676,6 +2763,7 @@ export class SlidesDeck {
 			// on the input path can see this coming.
 			this.endStrokeForSlideChange();
 			l.index = index;
+			this.actionsChanged();
 			if (diagnosticsEnabled()) {
 				log(
 					`slide ${index} now present: repainting ` +
@@ -2727,7 +2815,7 @@ export class SlidesDeck {
 		this.commitStroke(before.pointerId ?? -1, step.end, before.samples);
 	}
 
-	/** Hang the three canvases over the `.reveal` viewport (A2). */
+	/** Hang the ink layers over the `.reveal` viewport (A2). */
 	private mountCanvases(index: number): boolean {
 		const doc = this.revealEl.ownerDocument;
 		const win = doc.defaultView ?? window;
@@ -2749,6 +2837,16 @@ export class SlidesDeck {
 			} as Partial<CSSStyleDeclaration>);
 			return canvas;
 		};
+		// Apply alpha after composing committed, wet and head highlight pixels.
+		// Separate translucent canvases would darken every live crossing/seam.
+		const highlightGroup = this.revealEl.createDiv();
+		highlightGroup.className = "handwriting-slides-highlight-group";
+		Object.assign(highlightGroup.style, {
+			position: "absolute", left: "0", top: "0", width: "100%", height: "100%",
+			pointerEvents: "none", zIndex: "19", opacity: String(HIGHLIGHTER_ALPHA),
+		});
+		const highlight = make("handwriting-slides-highlight", "0");
+		highlightGroup.appendChild(highlight);
 		const committed = make(COMMITTED_CLASS, "20");
 		const wetCanvas = make(WET_CLASS, "21");
 		// Above the wet layer and still below Reveal's controls: the head is
@@ -2793,7 +2891,9 @@ export class SlidesDeck {
 		this.revealEl.appendChild(wetCanvas);
 		this.revealEl.appendChild(tailCanvas);
 		const ctx = committed.getContext("2d");
-		if (!ctx) {
+		const highlightCtx = highlight.getContext("2d");
+		if (!ctx || !highlightCtx) {
+			highlightGroup.remove();
 			committed.remove();
 			wetCanvas.remove();
 			tailCanvas.remove();
@@ -2810,6 +2910,7 @@ export class SlidesDeck {
 			// is no separate finding for it here.
 			tail = new TailRenderer(tailCanvas);
 		} catch (err) {
+			highlightGroup.remove();
 			committed.remove();
 			wetCanvas.remove();
 			tailCanvas.remove();
@@ -2819,6 +2920,10 @@ export class SlidesDeck {
 		wet.smooth = true;
 		wet.shape = true;
 		this.layers = {
+			highlightGroup,
+			highlight,
+			highlightCtx,
+			wetTool: "pen",
 			committed,
 			ctx,
 			wetCanvas,
@@ -2842,7 +2947,7 @@ export class SlidesDeck {
 			const ratio = slidesBackingScale(vw, vh, mountDpr);
 			const mountSize = computeCanvasSize(vw, vh, ratio);
 			log(
-				`mount: three canvases on ${describe(this.revealEl)}, starting on slide ${index}, ` +
+				`mount: four canvases on ${describe(this.revealEl)}, starting on slide ${index}, ` +
 					`wet desynchronized: requested ${wet.requested} actual ${wet.actualDesynchronized}, ` +
 					`backing ${mountSize.backingW}x${mountSize.backingH} at ratio ${ratio.toFixed(3)} ` +
 					`(dpr ${mountDpr}${ratio < mountDpr ? ", capped" : ""}), build ${this.host.buildId}`
@@ -2972,7 +3077,7 @@ export class SlidesDeck {
 	 * It calls `refresh`, the same path the resize listeners and the
 	 * ResizeObserver call. Nothing about a ratio change is special: the css box
 	 * is unchanged, the camera is unchanged (it carries k, A3), and all that is
-	 * wrong is the raster density of three backing stores, which `syncGeometry`
+	 * wrong is the raster density of four backing stores, which `syncGeometry`
 	 * is already the sole owner of.
 	 *
 	 * Guarded on the method existing: this surface's window is a real one in
@@ -3015,7 +3120,7 @@ export class SlidesDeck {
 	 * The context transform carries the EFFECTIVE device-pixel ratio alone; k
 	 * rides in the camera (A3). So the wet layer's css-pixel clears stay honest
 	 * for ink in the letterbox, where the logical coordinates are negative.
-	 * "Effective" because `slidesBackingScale` reduces it when three
+	 * "Effective" because `slidesBackingScale` reduces it when four
 	 * full-viewport stores would blow the area budget - and because it is one
 	 * number used four ways here (css box, backing store, `setTransform`, both
 	 * `applyDpr` calls), a cap can never put the transform out of step with the
@@ -3057,7 +3162,7 @@ export class SlidesDeck {
 		const cssH = `${size.cssH}px`;
 		l.cssWidth = size.cssW;
 		l.cssHeight = size.cssH;
-		for (const canvas of [l.committed, l.wetCanvas, l.tailCanvas]) {
+		for (const canvas of [l.highlight, l.committed, l.wetCanvas, l.tailCanvas]) {
 			if (canvas.style.width !== cssW || canvas.style.height !== cssH) {
 				canvas.style.width = cssW;
 				canvas.style.height = cssH;
@@ -3068,6 +3173,7 @@ export class SlidesDeck {
 			}
 		}
 		l.ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+		l.highlightCtx.setTransform(ratio, 0, 0, ratio, 0, 0);
 		l.wet.applyDpr(ratio);
 		l.tail.applyDpr(ratio);
 		// The deck size the theme actually produced, measured rather than
@@ -3078,8 +3184,8 @@ export class SlidesDeck {
 	}
 
 	/**
-	 * Are the three canvases still children of `.reveal`, and if not, put them
-	 * back.
+	 * Are the ink layers still under their expected parents? Repair any missing
+	 * or reparented layer.
 	 *
 	 * `mountCanvases` used to be unreachable for the life of a presentation:
 	 * `remount` gates it on `!this.layers` and only `dispose` ever nulls that.
@@ -3093,7 +3199,7 @@ export class SlidesDeck {
 	 * deliberately non-subtree (S1), so a rebuild one level in is invisible to
 	 * every signal this file has.
 	 *
-	 * Three property reads, no layout, no allocation, and NOT on the sample
+	 * Parent property reads, no layout, no allocation, and NOT on the sample
 	 * path: the two callers are `syncGeometry` and `repaint`, so this runs once
 	 * per geometry sync and once per committed stroke or erase - never per
 	 * pointer event. That is the cheapest place that still notices within one
@@ -3112,10 +3218,13 @@ export class SlidesDeck {
 	private ensureCanvasesMounted(): boolean {
 		const l = this.layers;
 		if (!l) return false;
+		const liveParent = l.wetTool === "highlighter" ? l.highlightGroup : this.revealEl;
 		if (
+			l.highlightGroup.parentElement === this.revealEl &&
+			l.highlight.parentElement === l.highlightGroup &&
 			l.committed.parentElement === this.revealEl &&
-			l.wetCanvas.parentElement === this.revealEl &&
-			l.tailCanvas.parentElement === this.revealEl
+			l.wetCanvas.parentElement === liveParent &&
+			l.tailCanvas.parentElement === liveParent
 		) {
 			return true;
 		}
@@ -3126,6 +3235,7 @@ export class SlidesDeck {
 		this.remounting = true;
 		try {
 			const index = l.index;
+			l.highlightGroup.remove();
 			l.committed.remove();
 			l.wetCanvas.remove();
 			l.tailCanvas.remove();
@@ -3150,13 +3260,28 @@ export class SlidesDeck {
 		const l = this.layers;
 		if (!l) return;
 		l.ctx.clearRect(0, 0, l.cssWidth || l.committed.width, l.cssHeight || l.committed.height);
+		l.highlightCtx.clearRect(0, 0, l.cssWidth || l.highlight.width, l.cssHeight || l.highlight.height);
 		const cam = this.geometry().camera;
 		for (const s of this.strokes.get(l.index) ?? []) {
-			drawStroke(l.ctx, cam, s, undefined, true);
+			drawStroke(s.tool === "highlighter" ? l.highlightCtx : l.ctx, cam, s, undefined, true);
 		}
 	}
 
+	/** Reuse the live renderers without replaying committed ink per sample. */
+	private dressWet(l: Layers, tool: InkTool): void {
+		if (l.wetTool === tool) return;
+		const parent = tool === "highlighter" ? l.highlightGroup : this.revealEl;
+		parent.appendChild(l.wetCanvas);
+		parent.appendChild(l.tailCanvas);
+		l.wetTool = tool;
+	}
+
 	// ---- input ------------------------------------------------------------
+
+	private controlEvent(ev: Event): boolean {
+		return isSlidesControl(ev.target, this.revealEl) ||
+			(ev.composedPath?.().some(node => isSlidesControl(node, this.revealEl)) ?? false);
+	}
 
 	private claims(ev: PointerEvent): boolean {
 		return claimsContact(ev.pointerType, ev.isPrimary, ev.buttons, mouseInkEnabled());
@@ -3168,6 +3293,8 @@ export class SlidesDeck {
 	 * the contact at all.
 	 */
 	private onGuardedEvent(ev: Event): void {
+		const touchEvent = (ev as PointerEvent).pointerType === "touch" || ev.type.startsWith("touch");
+		if (this.controlEvent(ev) && (!touchEvent || !this.penOwnsGlass(now()))) return;
 		// `pointerType` is a PointerEvent member and this handler takes plain
 		// Events: `click` and the `touch*` three simply do not have one, and
 		// `undefined` is what the predicate's touch rows are written to expect.
@@ -3367,6 +3494,15 @@ export class SlidesDeck {
 	}
 
 	private onPointerDown(ev: PointerEvent): void {
+		if (this.disposed) return;
+		if (this.controlEvent(ev)) {
+			if (ev.pointerType !== "touch") {
+				this.finishGesture();
+				this.dropPenGuard();
+				this.penContactPending = false;
+			}
+			return;
+		}
 		// THE DECISION, RECORDED. This runs before the same contact's
 		// `touchstart`, which is the whole basis of the route - see
 		// `armGestureGuard`. It must be before the claim check, because a pen
@@ -3403,6 +3539,7 @@ export class SlidesDeck {
 			mouseInkEnabled()
 		);
 		this.erasing = erasing;
+		this.gestureBefore = { index: l.index, strokes: (this.strokes.get(l.index) ?? []).slice() };
 		// Once per CONTACT, not per sample: a layout may have moved under the
 		// deck without firing any of the events `refresh` listens for, and the
 		// pen-down is the last moment that is cheap to be sure at.
@@ -3450,6 +3587,7 @@ export class SlidesDeck {
 			return;
 		}
 		const nib = this.host.nib();
+		this.dressWet(l, nib.tool);
 		this.activeStyle = this.style(nib);
 		const { rect, layoutWidth, camera: cam } = this.geometry();
 		const p = mapScreenToSlide(ev.clientX, ev.clientY, rect, layoutWidth, this.samplePoint);
@@ -4129,6 +4267,7 @@ export class SlidesDeck {
 						`deck total ${this.totalStrokes()}`
 				);
 			}
+			this.recordGesture("Erase");
 			this.persist();
 			return;
 		}
@@ -4160,7 +4299,10 @@ export class SlidesDeck {
 					`deck total ${this.totalStrokes()}`
 			);
 		}
-		if (finished.length > 0) this.persist();
+		if (finished.length > 0) {
+			this.recordGesture("Draw");
+			this.persist();
+		}
 	}
 
 	// ---- persistence ------------------------------------------------------
@@ -4246,6 +4388,7 @@ export class SlidesDeck {
 			})
 			.finally(() => {
 				this.claimInFlight = null;
+				this.actionsChanged();
 			});
 	}
 
@@ -4384,8 +4527,10 @@ export class SlidesDeck {
 			.finally(() => {
 				this.loadInFlight = null;
 				if (!this.stale()) this.finishLoad();
+				this.actionsChanged();
 			});
 		this.loadInFlight = loading;
+		this.actionsChanged();
 		await loading;
 		return changed;
 	}
@@ -4435,6 +4580,7 @@ export class SlidesDeck {
 		}
 		this.flushErase();
 		this.disposed = true;
+		this.actionsChanged();
 		this.session = IDLE_SESSION;
 		this.syncHoldTimer();
 		this.clearQuietTimer();
@@ -4511,6 +4657,7 @@ export class SlidesDeck {
 		// null already, and a `null` written over a `null` costs nothing.
 		setInkThemeOverride(null);
 		if (this.layers) {
+			this.layers.highlightGroup.remove();
 			this.layers.committed.remove();
 			this.layers.wetCanvas.remove();
 			this.layers.tailCanvas.remove();
@@ -4518,6 +4665,7 @@ export class SlidesDeck {
 		}
 		this.moveTrace.dispose();
 		for (const d of this.disposers.splice(0)) d();
+		this.actionListeners.clear();
 		// Not while a drain is running: `snapshot()` reads these lists, and
 		// clearing them here is what made the disposed-bails in the claim and
 		// load continuations load-bearing (letting one through would have
@@ -4769,4 +4917,9 @@ export function setSlidesInk(on: boolean, next?: SlidesInkHost): void {
 	observer.observe(doc.body, { childList: true });
 	if (diagnosticsEnabled()) log(`slides ink on; watching body for .slides-container, build ${host.buildId}`);
 	scanForSlides();
+}
+
+/** No underlying note fallback: commands resolve only a live deck in their document. */
+export function activeSlidesActions(doc: Document): SlidesActions | null {
+	return deck?.ownerDocument === doc && deck.status().live ? deck : null;
 }

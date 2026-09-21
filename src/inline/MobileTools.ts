@@ -43,12 +43,23 @@ import { gridColumns, overflowPlan, type OverflowPlan } from "./StripOverflow";
 import { popRightOffset } from "./PopPlacement";
 import { stripClearance } from "./StripClearance";
 import { deviceHasNeverSeenAPen, getPenToolsMode, onPenToolsChanged, penHardwareEverSeen, penHardwareSeen } from "./PenToolsMode";
+import {
+	getNoteZoomControlsMode,
+	getZoomBarCanvasEnabled,
+	noteZoomControlsVisibleWithCanvas,
+	onNoteZoomControlsChanged,
+} from "./NoteZoomControlsMode";
+// The per-note override of Infinite Canvas. Read-only from here: the strip
+// asks what this note's mode is and subscribes to changes; who may write the
+// override is main.ts's business, not the strip's.
+import { canvasForNote, onCanvasOverrideChanged } from "./CanvasNoteOverride";
 import { markMousePutDown, markToolPicked, mouseDrawsFromLitTool, toolIsLit } from "./MouseInk";
 import { penInkEnabled, setPenInk } from "./PenInk";
 import { DEFAULT_PEN, HIGHLIGHTER_PEN } from "../ink/PenStyle";
 import { type InkPreset, presetChips, starReplaces } from "../ink/InkPresets";
 import { describeEl } from "./PenHitProbe";
 import { traceStripClick } from "./InlinePenRouter";
+import { MAX_PINCH_SCALE } from "./PinchScale";
 
 export interface MobileToolsHost {
  noteViewport?: {
@@ -57,6 +68,15 @@ export interface MobileToolsHost {
   resetNoteZoom():boolean;
   fitHandwriting():string;
  };
+
+	/**
+	 * The path of the note this strip is painted over, for the per-note
+	 * Infinite Canvas override (s138). OPTIONAL, and absent means "ask the
+	 * global": a host that does not know its path - the fold-order preview
+	 * strip, the PDF surface - has no per-note override to honour, and
+	 * `canvasForNote(null, global)` already answers the global for it.
+	 */
+	notePath?: () => string | null;
 
 	/** Execute a command by its full id (e.g. "handwriting:inline-tool-pen"). */
 	exec(commandId: string): void;
@@ -954,6 +974,9 @@ export const NEVER_FOLDING_FACES: readonly StripButtonFace[] = BUTTONS.filter(
  * How a strip differs from the one the editor builds. Empty for a real strip.
  */
 export interface MobileToolsOptions {
+	/** Surface capabilities are fixed for one mounted strip. */
+	supportedCommands?: ReadonlySet<string>;
+	additionalButtons?: readonly ButtonSpec[];
 	/**
 	 * A strip built to be LOOKED AT rather than used: the settings tab's
 	 * fold-order preview, and nothing else today.
@@ -1012,6 +1035,21 @@ const liveStrips = new Set<MobileTools>();
 export function setStripFoldOrder(order: readonly string[]): void {
 	foldOrder = normalizeFoldOrder(order);
 	for (const strip of liveStrips) strip.applyFoldOrder();
+}
+
+/**
+ * Push a canvas change into every strip already on screen.
+ *
+ * `setStripFoldOrder`'s shape, for its reason, and needed for the same kind of
+ * change: the global Infinite Canvas row is written in main.ts and the zoom
+ * bar's own mode has a listener while the canvas has none, so without this a
+ * user turning the canvas off would keep a zoom bar until the pane was rebuilt
+ * - the "only applies on restart" defect the override's listener was written
+ * to avoid. The per-note case comes in through each strip's own subscription;
+ * this is the global half.
+ */
+export function refreshNoteZoomControlsAll(): void {
+	for (const strip of liveStrips) strip.refreshNoteZoomControls();
 }
 
 /**
@@ -1122,6 +1160,8 @@ export class MobileTools {
 	private resizeWatch: { disconnect(): void } | null = null;
 	private inking = false;
 	private stopModeWatch: (() => void) | null = null;
+	private stopZoomModeWatch: (() => void) | null = null;
+	private stopCanvasOverrideWatch: (() => void) | null = null;
 	/**
 	 * The corner this strip is parked in, kept because item 5's clearance
 	 * needs to know which way to dodge and `setCorner` otherwise wrote the
@@ -1457,6 +1497,9 @@ export class MobileTools {
     button.addEventListener("click",()=>{action();this.refresh();});
     this.viewportButtons.push(button);
    }
+   // A stored "hide" is honoured from the first paint, not only after the
+   // next mode change.
+   this.applyNoteZoomControlsVisibility();
   }
 
 		// The collapsed form: one small pen button that brings the strip back.
@@ -1598,7 +1641,8 @@ export class MobileTools {
 			ev.preventDefault();
 			this.setCollapsed(true);
 		});
-		for (const spec of BUTTONS) {
+		for (const spec of [...BUTTONS, ...(opts.additionalButtons ?? [])]) {
+			if (opts.supportedCommands && !opts.supportedCommands.has(spec.commandId)) continue;
 			// AHEAD of the divider, so a skipped button that opens a group
 			// cannot leave an orphan divider standing where it was. Neither
 			// of today's two skippable buttons starts a group - Pan sits mid
@@ -2289,6 +2333,22 @@ export class MobileTools {
 		// that are already open. Dropped again in `destroy()`.
 		liveStrips.add(this);
 		if (!preview) this.stopModeWatch = onPenToolsChanged(() => this.setInking(this.inking));
+		// A zoom-bar mode change re-applies the show/hide state and re-runs the
+		// step-aside, so a mode flip mid-stroke lands correctly too.
+		if (!preview) this.stopZoomModeWatch = onNoteZoomControlsChanged(() => {
+			this.applyNoteZoomControlsVisibility();
+			this.setInking(this.inking);
+		});
+		// A per-note override changing is the same event as the mode changing,
+		// for this strip, when it is THIS note that changed. Filtered on the
+		// path: a frontmatter edit in some other note must not repaint every
+		// open strip, and a strip that does not know its own path cannot be
+		// the one the event is about.
+		if (!preview) this.stopCanvasOverrideWatch = onCanvasOverrideChanged(path => {
+			if (this.host.notePath?.() !== path) return;
+			this.applyNoteZoomControlsVisibility();
+			this.setInking(this.inking);
+		});
 		this.layoutOverflow();
 		// Item 5 rides the same two triggers as item 4 - a first pass now, and
 		// the observer below - because they answer the same question about the
@@ -2573,7 +2633,7 @@ export class MobileTools {
 	refreshNow(): void {
   const viewport=this.host.noteViewport?.getNoteViewportState();
   if(viewport) this.viewportButtons.forEach((button,i)=>{
-   button.disabled=viewport.busy || (i===3&&!viewport.fitAvailable) || (i===2&&viewport.zoom>=4);
+   button.disabled=viewport.busy || (i===3&&!viewport.fitAvailable) || (i===2&&viewport.zoom>=MAX_PINCH_SCALE);
    if(i===1) button.textContent=`${Number((viewport.zoom*100).toPrecision(3))}%`;
   });
 
@@ -3042,6 +3102,47 @@ export class MobileTools {
 		const hide = on && getPenToolsMode() === "auto";
 		this.el.toggleClass("is-inking", hide);
 		this.pill.toggleClass("is-inking", hide);
+		// The zoom bar mirrors the same step-aside, on its own mode. Pure class
+		// toggle, no reads - same hot path as the two above.
+		this.viewportControls?.toggleClass("is-inking", on && getNoteZoomControlsMode() === "auto");
+	}
+
+	/**
+	 * "hide" removes the zoom bar from paint AND from the
+	 * accessibility tree/tab order, the same way the pen strip itself is
+	 * removed from both when `penToolsVisible` is false for it (InkOverlay.ts
+	 * :2419's `ensurePenToolsInner`, which does not build/destroys the strip
+	 * outright). That mechanism operates on the WHOLE MobileTools instance,
+	 * which the zoom bar cannot borrow directly - the strip's own buttons
+	 * must keep working in every zoom-bar mode. The `display: none` idiom
+	 * this codebase already uses for an in-place "gone without being
+	 * destroyed" state (styles.css's `.handwriting-mobile-tools.is-collapsed`)
+	 * gives the same real-world outcome at the group's own scope: a
+	 * display:none subtree is out of the tab order and unannounced in every
+	 * browser without any extra aria/tabindex bookkeeping here.
+	 */
+	/**
+	 * Re-ask both halves of the rule and re-run the step-aside, exactly as the
+	 * mode listener does. Public for `refreshNoteZoomControlsAll`.
+	 */
+	refreshNoteZoomControls(): void {
+		this.applyNoteZoomControlsVisibility();
+		this.setInking(this.inking);
+	}
+
+	private applyNoteZoomControlsVisibility(): void {
+		this.viewportControls?.toggleClass("is-hidden", !this.zoomBarWanted());
+	}
+
+	/**
+	 * The user's mode AND this note's canvas. Resolved here, at paint time,
+	 * rather than held in a field: the note under a strip can change without
+	 * the strip being rebuilt, and a cached answer would be the stale-cache
+	 * defect the override's own listener exists to avoid.
+	 */
+	private zoomBarWanted(): boolean {
+		const path = this.host.notePath?.() ?? null;
+		return noteZoomControlsVisibleWithCanvas(getNoteZoomControlsMode(), canvasForNote(path, getZoomBarCanvasEnabled()));
 	}
 
 	/**
@@ -3591,6 +3692,10 @@ export class MobileTools {
 	destroy(): void {
 		this.stopModeWatch?.();
 		this.stopModeWatch = null;
+		this.stopZoomModeWatch?.();
+		this.stopZoomModeWatch = null;
+		this.stopCanvasOverrideWatch?.();
+		this.stopCanvasOverrideWatch = null;
 		this.cancelSliderClose();
 		// Every timer this strip can have armed, cancelled before the elements
 		// they would touch are removed. A strip is destroyed and rebuilt on a

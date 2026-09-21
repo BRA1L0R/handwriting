@@ -26,6 +26,6 @@ const stride = source.slice(strideStart, strideEnd + 2);
 export const installLiveReloadPoll = new Function(
 	"window", "document", "runDetached", "inlineReloadCandidates", "inlineInk",
 	"inkExternallyReloaded", "notifyInkChanged", "slidesReloadCandidate",
-	"reloadSlidesExternal", "console",
+	"reloadSlidesExternal", "console", "captureInlineReloadAdmission",
 	transformSync(`${stride}\n${registration}`, { loader: "ts", target: "es2022" }).code,
 );

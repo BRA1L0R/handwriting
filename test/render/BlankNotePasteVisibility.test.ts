@@ -89,7 +89,10 @@ describe("selection geometry", () => {
 			expectPasted(trace, 0);
 			expect(trace.destinationBefore).toBe(0);
 			expect(trace.loadedBeforePaste).toBe(phase === "loaded");
-			expect(trace.afterPaint.scrollWidth).toBeGreaterThan(trace.afterPaint.clientWidth);
+			// Sideways room only where the ink reaches past the pane's right edge: the tall stroke stays inside the pane's
+			// width and extends only downward, so it gets none; the wide and spanning strokes reach x 1400.
+			if (size === "tall") expect(trace.afterPaint.scrollWidth).toBe(trace.afterPaint.clientWidth);
+			else expect(trace.afterPaint.scrollWidth).toBeGreaterThan(trace.afterPaint.clientWidth);
 			expect(trace.afterPaint.scrollHeight).toBeGreaterThan(trace.afterPaint.clientHeight);
 
 			// Control: the stored stroke is drawable. Once a user scrolls manually,

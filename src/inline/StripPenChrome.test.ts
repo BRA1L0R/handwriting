@@ -13,11 +13,10 @@
  * IT NOW SCANS THE WHOLE SOURCE TREE. It read two named files until 1.4.7,
  * then three; three closed that day's gap and not the SHAPE of it, because a
  * hardcoded list is opt-in and a surface is checked only if somebody
- * remembered to add it. The canvas page view (src/view/HandwritingPageView.ts)
- * was invisible to this guard for its entire life for exactly that reason,
- * and `src/view/PenLabView.ts` - a fourth implementation of the stroke
- * pipeline (1.4.7-design.md C8) - was invisible to it the day the list grew
- * to three. So the default is inverted: every source file is checked, and a
+ * remembered to add it. A whole ink surface was invisible to this guard for
+ * its entire life for exactly that reason, and `src/view/PenLabView.ts` -
+ * another implementation of the stroke pipeline (1.4.7-design.md C8) - was
+ * invisible to it the day the list grew to three. So the default is inverted: every source file is checked, and a
  * file is skipped only by appearing on a NAMED ALLOWLIST below with a reason.
  * A file that must be exempted announces itself; a file nobody remembered is
  * caught rather than silently skipped, and surface number five is caught on
@@ -68,10 +67,10 @@
  * contain `penToolsVisible(` - and it is still opt-out over the whole tree,
  * still allowlisted by name, and still fails on the file rather than on a
  * count. `new MobileTools(` is the trigger because constructing the strip is
- * the act that needs a reason; the canvas view builds a different toolbar
- * object entirely (5e-C.5) and is correctly not caught by it, which is the
- * same reason the import assertion at the bottom of this file covers two
- * surfaces rather than three.
+ * the act that needs a reason; a surface that builds a different toolbar
+ * object entirely (5e-C.5) is correctly not caught by it, which is the same
+ * reason the import assertion at the bottom of this file covers the two
+ * strip-driving surfaces only.
  *
  * `closeInkSliders(` has one legitimate direct call left, in InkOverlay's
  * file-switch reset ("a fresh note starts reading, so the strip starts as
@@ -108,10 +107,9 @@
  * and now stand over this file too.
  *
  * BLANKING IS APPLIED PER ASSERTION, NOT PER FILE, AND THAT IS LOAD-BEARING.
- * Two assertions below deliberately read a COMMENT: the note's file-switch
- * exception and the canvas's caret exemption each pin the sentence stating
- * WHY, so that deleting the reason fails as surely as adding a second call
- * does. Those keep reading `raw()`. Everything asking "is this symbol
+ * One assertion below deliberately reads a COMMENT: the note's file-switch
+ * exception pins the sentence stating WHY, so that deleting the reason fails
+ * as surely as adding a second call does. That one keeps reading `raw()`. Everything asking "is this symbol
  * implemented" reads `code()`. Blanking the whole file would have voided two
  * real assertions while looking like a safety improvement.
  *
@@ -263,10 +261,6 @@ const FOCUS_ALLOWED: Readonly<Record<string, Exemption>> = {
 		max: 2,
 		why: "focusClaimedPenEditor, the note half of the same pair: one module, one call, both note paths route through it. This is a shared claim helper, not a hand-rolled one - the thing this assertion wants surfaces to call. The SECOND is setKeyboardFocus, the pen-off toggle's opposite request (PenInk.ts): turning the pen off focuses the editor inside the strip's click so the soft keyboard rises, which is the feature. Same module on purpose - the sweep exists so a surface cannot hand-roll a focus rule, and InkOverlay.ts calling contentDOM.focus() itself is exactly the shape it forbids",
 	},
-	"/src/view/HandwritingPageView.ts": {
-		max: 1,
-		why: "the mouse-tap caret placement, exempt for the four reasons its own test below spells out and pins by comment. Not a claimed pen gesture and nothing stripped its native focus",
-	},
 	"/src/diag/DiagnosticTextModal.ts": {
 		max: 1,
 		why: "an Obsidian Modal focusing its own text field on open (desktop only, deliberately not on iOS). A modal is not an ink surface: no pen gesture, no PointerRouter, nothing suppressed the native focus this restores",
@@ -274,10 +268,6 @@ const FOCUS_ALLOWED: Readonly<Record<string, Exemption>> = {
 	"/src/main.ts": {
 		max: 1,
 		why: "the delete-all-ink confirm dialog focusing its Cancel button so Enter takes the safe branch. A dialog button, not a surface reclaiming the keyboard after a gesture",
-	},
-	"/src/objects/TextLayer.ts": {
-		max: 1,
-		why: "the text box editor taking the caret when a box opens for editing - the user asked to type, which is the ordinary reason to call focus and the opposite of the pen-gesture case",
 	},
 	"/src/slides/SlidesInkSurface.ts": {
 		max: 1,
@@ -358,17 +348,16 @@ describe("strip pen chrome — one shared place, not two", () => {
 		// files; a hundred is a floor that catches a broken glob without
 		// failing every time a file is added or removed.
 		expect(SOURCES.length).toBeGreaterThan(100);
-		// All four implementations of the stroke pipeline (1.4.7-design.md P1
-		// and C8), named so that the scan losing one is a failure rather than
-		// a quieter test run. PenLabView is here because it is the file that
-		// motivated the inversion: it is a fourth ink surface, it was outside
-		// the three-file list, and it is inside the scan now. It needs no
+		// Every implementation of the stroke pipeline (1.4.7-design.md P1 and
+		// C8), named so that the scan losing one is a failure rather than a
+		// quieter test run. PenLabView is here because it is the file that
+		// motivated the inversion: it is an ink surface, it was outside the
+		// three-file list, and it is inside the scan now. It needs no
 		// exemption today - it contains none of the three needles - and that
 		// is a fact this test re-checks on every run rather than a claim.
 		const paths = SOURCES.map(([path]) => path);
 		expect(paths).toContain("/src/inline/InkOverlay.ts");
 		expect(paths).toContain("/src/pdf/PdfInkController.ts");
-		expect(paths).toContain("/src/view/HandwritingPageView.ts");
 		expect(paths).toContain("/src/view/PenLabView.ts");
 		// And the drop rule dropped something: no test files, no declarations.
 		expect(paths.filter((p) => p.endsWith(".test.ts"))).toEqual([]);
@@ -489,18 +478,6 @@ describe("strip pen chrome — one shared place, not two", () => {
 		);
 	});
 
-	it("the canvas surface drives no strip chrome directly either", () => {
-		// The canvas has no MobileTools at all: its toolbar is a different
-		// object, built inline by buildToolbar and pinned top-left
-		// (1.4.7-design.md 5e-C.5). Zero is therefore both the count it has
-		// today and the count it keeps if a strip is ever given to it, since
-		// the only supported way to drive one is stripPenDown/stripPenUp.
-		// Same assertion the pdf gets, for the same reason.
-		const pageViewSrc = code("/src/view/HandwritingPageView.ts");
-		expect(occurrences(pageViewSrc, "setInking(")).toBe(0);
-		expect(occurrences(pageViewSrc, "closeInkSliders(")).toBe(0);
-	});
-
 	it("no pen-claimed surface reclaims the keyboard by hand", () => {
 		// The fifth divergence. Both PEN-CLAIMED surfaces claim the keyboard
 		// after a gesture the router stripped native focus from, and neither
@@ -510,50 +487,16 @@ describe("strip pen chrome — one shared place, not two", () => {
 		// reappearing in either file is the shape of the bug coming back.
 		expect(occurrences(code("/src/inline/InkOverlay.ts"), ".focus(")).toBe(0);
 		expect(occurrences(code("/src/pdf/PdfInkController.ts"), ".focus(")).toBe(0);
-		// The canvas is NOT held to zero - the next test says which single
-		// call it is allowed, and why. Counted here as well so that a SECOND
-		// focus call on that surface fails even if the exemption below is
-		// edited to match it.
-		expect(occurrences(code("/src/view/HandwritingPageView.ts"), ".focus(")).toBe(1);
-	});
-
-	it("the canvas surface's only focus call is the named caret exception", () => {
-		// A scoped allowance, not a hole: the count above is exact, and the
-		// comment stating the reason is matched here, so deleting the reason
-		// fails this test just as adding a second call fails that one.
-		//
-		// Why it is exempt rather than routed through `stripPenFocus`: that
-		// call is on the MOUSE tap path. `onTap` reaches `setCaret` only for
-		// source === "mouse" - touch returns into `createBox`, and pen contact
-		// goes to `penDown`, which CLEARS the caret - so no claimed pen
-		// gesture is involved and nothing stripped its native focus
-		// (`PointerRouter.mouseDown` preventDefaults the middle-button and
-		// space pans only). Its root also carries tabIndex 0, the opposite of
-		// the tabindex="-1" `armStripPenFocus` exists to set, because a whole
-		// view is a tab stop where an in-editor overlay must not be. And
-		// `stripPenFocus` declines whenever focus is already inside the root,
-		// which is exactly the state after a click on this view's own in-root
-		// toolbar: routing this call through it would place a caret and leave
-		// the keyboard on a button.
-		// `\s*` rather than the `\r?\n\s*` the note exception above uses:
-		// it spans the CRLF and the indent in one class, and still lets
-		// nothing but whitespace sit between the comment and the call.
-		// RAW, and deliberately: this assertion's subject IS the comment. The
-		// exact count in the test above reads code, so the two together say
-		// "one real call, and the reason for it written next to it".
-		expect(raw("/src/view/HandwritingPageView.ts")).toMatch(
-			/\/\/ StripPenChrome\.test\.ts pins this exemption by name\.\s*this\.rootEl\.focus\(\);/
-		);
 	});
 
 	it("both strip-driving surfaces import the shared pair", () => {
-		// Two, not three, and deliberately: `stripPenDown`/`stripPenUp` take a
-		// MobileTools and the canvas has none to hand them (5e-C.5). Requiring
-		// the import there would assert something that is not true of that
-		// surface, which is worse than no guard; the canvas is held to the
-		// zero-direct-calls rule above instead. This one stays named rather
-		// than swept for the same reason: it asserts a PRESENCE, and no scan
-		// can demand every file in the tree import a module.
+		// Two, and deliberately: `stripPenDown`/`stripPenUp` take a
+		// MobileTools, so a surface that builds no strip has none to hand
+		// them (5e-C.5). Requiring the import there would assert something
+		// that is not true of that surface, which is worse than no guard.
+		// This one stays named rather than swept for the same reason: it
+		// asserts a PRESENCE, and no scan can demand every file in the tree
+		// import a module.
 		expect(code("/src/inline/InkOverlay.ts")).toContain('from "./StripPenChrome"');
 		expect(code("/src/pdf/PdfInkController.ts")).toContain('from "../inline/StripPenChrome"');
 	});

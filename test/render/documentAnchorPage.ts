@@ -8,7 +8,7 @@
  * range. None of that is visible without a real CodeMirror, a real scroller and
  * a real MutationObserver, and all of it has already gone wrong once: a probe
  * that wrote `style.top` collapsed scrollTop from 114820 to 9630, twice,
- * independently (L1c first attempt, and a second seat's replication).
+ * independently (L1c first attempt, and a second, independent replication).
  *
  * `scrollColumnAnchorPage.ts` is the fixture for the camera's NUMBERS and is
  * owned by another lane right now. This page is deliberately small and asks

@@ -23,7 +23,7 @@
  *     all would be a drag that scrolls from zero.
  *
  * WHAT IT CANNOT ANSWER: whether the pan FEELS better on Alan's Surface.
- * Nothing here can. What it can say is that the layout flush the reviewer
+ * Nothing here can. What it can say is that the layout flush a review
  * pointed at is not in the move path any more, and that it cannot come back
  * without this failing.
  */

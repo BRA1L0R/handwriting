@@ -125,8 +125,11 @@ const call = (page: Page, fn: string, ...args: unknown[]) => page.evaluate(([f, 
 /** A reading; `backing` false leaves every canvas untouched (no getImageData), for readings taken before a stroke or before a screenshot. */
 const read = (page: Page, points: { label: string; x: number; y: number }[] = [], backing = true) => call(page, "runTileRead", points, backing) as Promise<any>;
 
-/** A fresh page, the layer tree subscribed before the mount, the scene mounted at `zoom` on `pane` (default pane when null), far when asked. */
-async function open(zoom: number, pane: { w: number; h: number } | null, far: number, dpr: number): Promise<Rig> {
+/** A fresh page, the layer tree subscribed before the mount, the scene mounted at `zoom` on `pane` (default pane when null), far when asked.
+ * `forceTransform` stubs `CSS.supports("zoom", ...)` to false before the bundle loads (same technique as `ZoomHostPreexistingZoom.test.ts`), so
+ * the overlay's own `hostZoomSupported()` genuinely takes the fallback path - for proving the engineZoom/hostZoom pin, not for asserting the
+ * fallback's shape (no coverage here, ruling F1). */
+async function open(zoom: number, pane: { w: number; h: number } | null, far: number, dpr: number, forceTransform = false): Promise<Rig> {
 	const w = pane?.w ?? 1397.5, h = pane?.h ?? 800;
 	const page = await browser.newPage({ viewport: { width: Math.ceil(HOST_LEFT + w + 20), height: Math.ceil(h + 100) }, deviceScaleFactor: dpr });
 	const errors: string[] = [];
@@ -134,6 +137,10 @@ async function open(zoom: number, pane: { w: number; h: number } | null, far: nu
 	await page.setContent('<!doctype html><body style="margin:0"></body>');
 	if (farHost()) await page.addStyleTag({ content: readFileSync(process.env.HW_DRAW_HOST_CSS!, "utf8") });
 	await page.addStyleTag({ content: css + readFileSync(fileURLToPath(new URL("./noteViewportCamera.css", import.meta.url)), "utf8") + REAL_OBSIDIAN_CSS });
+	if (forceTransform) await page.evaluate(() => {
+		const real = CSS.supports.bind(CSS);
+		(CSS as unknown as { supports: typeof CSS.supports }).supports = (...a: Parameters<typeof CSS.supports>) => (typeof a[0] === "string" && a[0] === "zoom" ? false : real(...a));
+	});
 	await page.addScriptTag({ content: script });
 	const cdp = await page.context().newCDPSession(page);
 	let layers: Layer[] = [];
@@ -389,6 +396,11 @@ for (const P of PANES) describe.skipIf(!GPU)(`ink tiles at 10% on the ${P.name} 
 	}, 300_000);
 });
 
+// Harness engine supports CSS zoom; hostZoom pinned true; the transform
+// fallback in applyViewportBox has no harness coverage (same pin as
+// ScrollExpansion.test.ts:52-53 / scrollExpansionPage.ts:98). The style/width
+// asserts below are for that one form only, not "host-form-aware" - there is
+// no live branch, because the fallback form is unreachable here.
 /**
  * IDENTITY AWAY FROM THE LIMIT: the unsplit path must be the one that runs.
  * One canvas per layer, the styles the single-canvas box gives, and a fixed
@@ -405,15 +417,51 @@ for (const zoom of [0.2, 1]) it(`IDENTITY at ${zoom * 100}% on the default pane:
 		const rec = { arm: `identity-${zoom}`, cssScale: r.cssScale, canvases: r.canvases.length, tiles: r.tiles.length, styles: r.canvases.map((c: any) => ({ field: c.field, left: c.left, top: c.top, css: c.css, transform: c.transform, origin: c.origin, backing: c.backing })), containerCss: r.containerCss, rasterHashes: hashes, committedHash: committed ? hashes[committed.index] : null, strokes: r.strokes, reallocs: r.reallocs, errors: rig.errors };
 		report.arms.push(rec);
 		expect(rig.errors, `page errors: ${rig.errors.join(" | ")}`).toEqual([]);
-		expect(r.cssScale, `at ${zoom}`).toBeCloseTo(zoom, 6);
+		// The pin, checked before any host-form-specific shape assert below: the
+		// harness engine actually supports css zoom, and the overlay's own gate
+		// agrees. A run where either is false is a different host form (no
+		// coverage here, ruling F1) and the asserts past this point are not
+		// claimed for it - see the file header and the stubbed-engine cell below.
+		expect(r.engineZoom, "the harness engine supports css zoom").toBe(true);
+		expect(r.hostZoom, "the overlay's host-form gate agrees with the engine").toBe(r.engineZoom);
+		// REVISED 2026-09-14 (Z8 class): cssScale is MEASURED BACK on the zoom
+		// host as the container's rect width over its offset width - the rect
+		// is the host's zoomed layout box snapped to 1/64 css px, the offset
+		// width is the unzoomed layout width rounded to an integer, so the
+		// measurement sits within one part in that integer of the request. A
+		// fixed digit count was a claim about the engine's grid, not about what
+		// the commit actually settled at. Same derivation and field as
+		// LagAtLowZoom's :335 fix (fd04036e).
+		expect(r.containerOffsetWidth, "the read carries the container's offset width").toBeGreaterThan(0);
+		expect(Math.abs(r.cssScale - zoom), `at ${zoom} within the measurement's own bound, 2 x ${zoom} / ${r.containerOffsetWidth}`).toBeLessThanOrEqual(2 * zoom / r.containerOffsetWidth);
 		expect(r.strokes, "the shape stored").toBeGreaterThan(0);
 		expect(r.canvases.length, "one canvas per layer, five layers").toBe(5);
 		expect(r.tiles.length, "one tile").toBe(1);
 		for (const c of r.canvases) {
-			expect.soft(c.transform, `${c.field} transform`).toBe(zoom < 1 ? `scale(${1 / zoom})` : "");
+			// Under the zoom host, canvasLayerBox(..., hostZoom=true) returns no
+			// transform and the unscaled band box (ZoomScale.ts, d2c03af1): the
+			// counter-scale shape below was the transform-host's, and that
+			// fallback branch has no coverage in this harness (ruling F1) - it
+			// is unreachable here, not asserted for.
+			expect.soft(c.transform, `${c.field} transform`).toBe("");
 			expect.soft(["", "0px"], `${c.field} left is the single-canvas box's`).toContain(c.left);
 			expect.soft(["", "0px"], `${c.field} top is the single-canvas box's`).toContain(c.top);
-			if (zoom < 1) expect.soft(c.css.w, `${c.field} css width = band layout width x ${zoom}`).toBeCloseTo(r.containerCss.w * zoom, 0);
+			// REVISED 2026-09-14 (D1): compared against `containerOffsetWidth`, the
+			// exact same `container.offsetWidth` production reads as `layoutW`
+			// (InkOverlay.ts:3188), not the separately-measured `containerCss.w` -
+			// so the only real difference left is computeCanvasSize's own backing
+			// rounding (Raster.ts:39-45: cssW = round(cssWidth*backing)/backing).
+			// That identity gives an EXACT bound, 0.5*css.w/backing.w, measured
+			// from this canvas's own actual backing store rather than assumed
+			// from a flat digit count (the old `toBeCloseTo(_, 0)` passed by only
+			// 0.06 px here and can exceed 0.5 at other offsetWidth/backing pairs).
+			if (zoom < 1) {
+				// +1e-9: an exact half-integer tie in cssWidth*backing can resolve
+				// either way in float rounding vs. the bound's own arithmetic: a
+				// closeness claim, not an exactness one (E7).
+				const bound = 0.5 * c.css.w / c.backing.w + 1e-9;
+				expect.soft(Math.abs(c.css.w - r.containerOffsetWidth), `${c.field} css width vs the container's offset width, within the backing-store rounding bound 0.5 * css.w / backing.w (+1e-9 tie slack) = ${bound}`).toBeLessThanOrEqual(bound);
+			}
 		}
 		expect(committed, "the committed canvas is tile 0 of its layer").toBeTruthy();
 		const ctl = control?.arms.find(a => a.arm === rec.arm);
@@ -421,5 +469,31 @@ for (const zoom of [0.2, 1]) it(`IDENTITY at ${zoom * 100}% on the default pane:
 			expect(rec.styles, "the DOM styles equal the control's").toEqual(ctl.styles);
 			expect(rec.committedHash, "the committed raster equals the control's").toBe(ctl.committedHash);
 		}
+	} finally { await close(rig); }
+}, 240_000);
+
+/**
+ * THE PIN CAN FAIL: prove `engineZoom`/`hostZoom` actually catch the wrong
+ * host form, before the shape asserts above ever run into it as 10 confusing
+ * soft reds (5 canvases x transform + css.w). Stubs the engine to disagree
+ * with itself the way `ZoomHostPreexistingZoom.test.ts` does; does not assert
+ * the fallback's own shape (no harness coverage, ruling F1) - only that the
+ * disagreement the pin exists to catch is real and measured, not assumed.
+ */
+it("IDENTITY at 20%: under a stubbed non-zoom engine, the pin catches it before the shape asserts would", async () => {
+	const rig = await open(0.2, null, 0, 2, true);
+	try {
+		const r = await call(rig.page, "runTileDraw", null, 200, 881) as any;
+		expect(rig.errors, `page errors: ${rig.errors.join(" | ")}`).toEqual([]);
+		expect(r.engineZoom, "the stub took: the harness engine no longer reports css zoom support").toBe(false);
+		expect(r.hostZoom, "production's own gate agrees with the stub: it took the transform-fallback path for real").toBe(false);
+		// Downstream of the pin, measured rather than assumed: this is exactly
+		// what would have reddened, one soft assert per canvas per check, had
+		// the pin not stopped the arm first (5 canvases: committedCanvas,
+		// wetCanvas, tailCanvas, highlightCanvas, highlightWetCanvas).
+		const transformMismatches = r.canvases.filter((c: any) => c.transform !== "").length;
+		expect(transformMismatches, "every canvas actually carries the fallback's own scale transform here").toBe(5);
+		const cssMismatches = r.canvases.filter((c: any) => Math.abs(c.css.w - r.containerCss.w) > 0.5).length;
+		expect(cssMismatches, "every canvas's css width is the fallback's counter-sized one here, not the unscaled band box").toBe(5);
 	} finally { await close(rig); }
 }, 240_000);

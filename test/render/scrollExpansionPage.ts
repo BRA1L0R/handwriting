@@ -84,13 +84,18 @@ async function run(on: boolean, seeded: boolean, scale = 1.5) {
 		overlayModule.setInlinePanMode(false);
 		view.dom.style.height = "600px";
 		await settle(8); const resized = snap(); await settle(8); const resizeStill = snap();
+		// The host's own zoom before the pinch writes one: production multiplies it into the zoom it writes.
+		const baseZoom = getComputedStyle(view.dom).zoom;
 		(overlay as any).pinch("start", 1, {x, y});
 		(overlay as any).pinch("move", scale, {x, y});
 		(overlay as any).pinch("end", scale, {x, y});
 		await settle(8); const zoomed = snap(); await settle(8); const zoomStill = snap();
 		// Pinch scroll suppression lasts beyond the first few animation frames.
 		await new Promise(resolve => setTimeout(resolve, 600));
-		const zoomTravel = {scale:(overlay as any).pinchScaleNow,transform:view.dom.style.transform,steps:[] as {axis:string;before:ReturnType<typeof snap>;after:ReturnType<typeof snap>}[]};
+		// The host form the product chose: `zoom` where the engine has it (the transform stays the theme's own, empty here), a scale
+		// transform otherwise. Read from the overlay's own cached gate, and ask the engine directly beside it so a gate that wrongly
+		// falls back where zoom exists goes red at the test's pin instead of passing unnoticed.
+		const zoomTravel = {scale:(overlay as any).pinchScaleNow,transform:view.dom.style.transform,inlineZoom:view.dom.style.zoom,baseZoom,hostZoom:(overlay as any).hostZoomSupported() as boolean,engineZoom:CSS.supports("zoom","0.5"),steps:[] as {axis:string;before:ReturnType<typeof snap>;after:ReturnType<typeof snap>}[]};
 		for (const axis of ["y","y","y","x","x","x"]) {
 			const before = snap();
 			if (axis === "y") scroller.scrollTop = scroller.scrollHeight;

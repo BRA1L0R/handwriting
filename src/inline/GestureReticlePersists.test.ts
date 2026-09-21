@@ -31,7 +31,7 @@
  * further wrong than the last. The ring persisted, and walked away from the
  * nib while it did.
  *
- * So the pan test below pins the OPPOSITE rule (architect, 1.4.12; Alan's to
+ * So the pan test below pins the OPPOSITE rule (1.4.12; Alan's to
  * overturn on screen): the pan drag hides the reticle and wears the grabbing
  * hand instead, the raw batch does not bring it back, and pen-up restores it
  * under the pointer's CURRENT position. The lasso and space tests are

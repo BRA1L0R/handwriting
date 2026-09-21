@@ -30,7 +30,7 @@ vi.mock("obsidian", () => ({
 }));
 
 import { PageStore, PageAdapterLike, contentStamp } from "./PageStore";
-import { FakeAdapter } from "./FakeAdapter";
+import { FakeAdapter, gate } from "./FakeAdapter";
 import {
 	ADOPTION_QUIET_MS,
 	ADOPTION_STILL_FAILING,
@@ -414,7 +414,8 @@ function pollBridge(
 		() => {},
 		() => null,
 		async () => false,
-		{ error: () => {} }
+		{ error: () => {} },
+		(p: string) => paths.includes(p) ? () => paths.includes(p) : null
 	);
 	return {
 		painted,
@@ -434,6 +435,118 @@ beforeEach(() => {
 
 afterEach(() => {
 	vi.useRealTimers();
+});
+
+describe("CALLER ADMISSION", () => {
+	it.each([
+		{ name: "missing", canAdopt: undefined },
+		{ name: "false", canAdopt: () => false },
+		{ name: "throwing", canAdopt: () => { throw new Error("pane is no longer available"); } },
+	])("holds a $name predicate before preservation without changing ink, history or baseline", async ({ canAdopt }) => {
+		const a = await settledDeviceA();
+		const identity = a.ink.captureHistoryIdentity(PATH);
+		const visible = a.ink.strokes(PATH);
+		const incoming = greenReplacement();
+		const writesBefore = fake.writeAttempts;
+		const prepare = vi.spyOn(a.store, "prepareExternalAdoption");
+
+		// Admission is caller-owned: a loaded, writable record alone does not
+		// prove that its pane has no uncommitted interaction.
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const result = canAdopt === undefined
+				? await a.ink.adoptExternal(PATH)
+				: await a.ink.adoptExternal(PATH, canAdopt);
+			expect(result, "unadmitted callers must hold before preservation").toEqual({
+				outcome: "held",
+				changed: false,
+				reason: "admission-changed",
+			});
+			expect(prepare).not.toHaveBeenCalled();
+			expect(fake.writeAttempts).toBe(writesBefore);
+			expect(artifacts()).toEqual([]);
+			expect(a.accepts).toBe(0);
+			expect(a.atAccept).toEqual([]);
+			expect(a.ink.strokes(PATH)).toBe(visible);
+			expect(a.ink.strokes(PATH).map((s) => s.id)).toEqual(["a", "local"]);
+			expect(a.ink.captureHistoryIdentity(PATH)).toBe(identity);
+			expect(a.store.hasQueuedWrite(PAGE_ID)).toBe(false);
+			expect(await a.store.externallyChanged(PAGE_ID)).toBe(true);
+			expect(fake.files.get(LIVE)).toBe(incoming);
+			expect(a.notices).toEqual([]);
+			// Repeated benign admission holds never become preservation warnings.
+			vi.setSystemTime(Date.now() + ADOPTION_QUIET_MS + 1);
+		}
+	});
+
+	it("retains both artifacts when an uncommitted pane becomes busy during preservation, then adopts on a quiet retry", async () => {
+		const reachedIncomingWrite = gate();
+		const resumeIncomingWrite = gate();
+		let paused = false;
+		const adapter = hooked(fake, {
+			beforeWrite: async (path) => {
+				if (paused || !path.endsWith("-incoming.json")) return;
+				paused = true;
+				reachedIncomingWrite.release();
+				await resumeIncomingWrite.promise;
+			},
+		});
+		const a = await settledDeviceA(adapter);
+		const identity = a.ink.captureHistoryIdentity(PATH);
+		const visible = a.ink.strokes(PATH);
+		const incoming = greenReplacement();
+		let quiet = true;
+		const canAdopt = vi.fn(() => quiet);
+		const pending = a.ink.adoptExternal(PATH, canAdopt);
+
+		await reachedIncomingWrite.promise;
+		try {
+			expect(artifacts()).toHaveLength(1);
+			expect(a.accepts).toBe(0);
+			// The pane starts an interaction without committing any store edit.
+			// Every existing record-generation/content guard still sees equality.
+			quiet = false;
+		} finally {
+			resumeIncomingWrite.release();
+		}
+		const held = await pending;
+
+		expect(held, "pane admission must be checked again after preservation I/O").toEqual({
+			outcome: "held",
+			changed: false,
+			reason: "admission-changed",
+		});
+		expect(canAdopt).toHaveBeenCalledTimes(2);
+		expect(a.accepts).toBe(0);
+		expect(a.atAccept).toEqual([]);
+		expect(a.ink.strokes(PATH)).toBe(visible);
+		expect(a.ink.strokes(PATH).map((s) => s.id)).toEqual(["a", "local"]);
+		expect(a.ink.captureHistoryIdentity(PATH)).toBe(identity);
+		expect(a.store.hasQueuedWrite(PAGE_ID)).toBe(false);
+		expect(await a.store.externallyChanged(PAGE_ID)).toBe(true);
+		expect(fake.files.get(LIVE)).toBe(incoming);
+		expect(a.notices).toEqual([]);
+		const preserved = artifacts().map((path) => [path, fake.files.get(path)] as const);
+		expect(preserved).toHaveLength(2);
+		const pair = legs();
+		expect(reopenExact(fake.files.get(pair.outgoing)!).strokes.map((s) => s.id)).toEqual(["a", "local"]);
+		expect(fake.files.get(pair.incoming)).toBe(incoming);
+
+		// Ending the interaction is sufficient; no local edit or new external
+		// revision is needed to release the held adoption.
+		quiet = true;
+		const adopted = await a.ink.adoptExternal(PATH, canAdopt);
+		expect(adopted).toMatchObject({ outcome: "adopted", changed: true });
+		expect(canAdopt).toHaveBeenCalledTimes(4);
+		expect(a.accepts).toBe(1);
+		expect(a.atAccept[0]!.visibleIds).toEqual(["a", "local"]);
+		expect(a.ink.strokes(PATH).map((s) => s.id)).toEqual(["a", "green"]);
+		expect(a.ink.captureHistoryIdentity(PATH)).toBe(identity);
+		expect(a.store.hasQueuedWrite(PAGE_ID)).toBe(false);
+		expect(await a.store.externallyChanged(PAGE_ID)).toBe(false);
+		expect(fake.files.get(LIVE)).toBe(incoming);
+		expect(a.notices).toEqual([]);
+		for (const [path, text] of preserved) expect(fake.files.get(path)).toBe(text);
+	});
 });
 
 describe("UNAVAILABLE PRESERVATION NEVER FALLS THROUGH TO PLAIN RELOAD", () => {
@@ -643,10 +756,10 @@ describe("UNAVAILABLE PRESERVATION NEVER FALLS THROUGH TO PLAIN RELOAD", () => {
 
 	it("reserves unavailable for no record and types an existing record without a snapshot as held", async () => {
 		const a = device(fake, true, {});
-		expect(await a.ink.adoptExternal(PATH)).toEqual({ outcome: "unavailable", changed: false });
+		expect(await a.ink.adoptExternal(PATH, () => true)).toEqual({ outcome: "unavailable", changed: false });
 
 		await a.ink.ensureLoaded(PATH);
-		expect(await a.ink.adoptExternal(PATH)).toEqual({
+		expect(await a.ink.adoptExternal(PATH, () => true)).toEqual({
 			outcome: "held",
 			changed: false,
 			reason: "no-snapshot",
@@ -950,7 +1063,7 @@ describe("FAILURE INJECTION: every failure keeps the ink and moves no baseline",
 		const a = await settledDeviceA(adapter);
 		const identity = a.ink.captureHistoryIdentity(PATH);
 		externalReplacement(["a", "remote"]);
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(result.outcome).toBe("held");
 		expect(artifacts()).toHaveLength(0);
 		await expectHeld(a, identity);
@@ -965,7 +1078,7 @@ describe("FAILURE INJECTION: every failure keeps the ink and moves no baseline",
 		const a = await settledDeviceA(adapter);
 		const identity = a.ink.captureHistoryIdentity(PATH);
 		externalReplacement(["a", "remote"]);
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(result.outcome).toBe("held");
 		// The completed leg of a partial attempt is RETAINED: it is ink, and
 		// this slice adds no cleanup policy.
@@ -985,7 +1098,7 @@ describe("FAILURE INJECTION: every failure keeps the ink and moves no baseline",
 		const identity = a.ink.captureHistoryIdentity(PATH);
 		externalReplacement(["a", "remote"]);
 		armed = true;
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(result.outcome).toBe("held");
 		expect(artifacts()).toHaveLength(0);
 		armed = false;
@@ -995,7 +1108,7 @@ describe("FAILURE INJECTION: every failure keeps the ink and moves no baseline",
 	it("an explicit reload of an incoming revision that will not parse still applies the damage lock", async () => {
 		const a = await settledDeviceA();
 		fake.externalWrite(LIVE, "{ this is not a page");
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		// This direct-store control proves reloadExternal's lock behavior. It is
 		// not authority for the production poll to call that weaker route after
 		// a preserving adoption declines an established record.
@@ -1006,7 +1119,7 @@ describe("FAILURE INJECTION: every failure keeps the ink and moves no baseline",
 		await a.ink.reloadExternal(PATH);
 		expect(a.ink.strokes(PATH).map((s) => s.id)).toEqual(["a", "local"]);
 		expect(a.ink.isDamagedLocked(PATH)).toBe(true);
-		expect(await a.ink.adoptExternal(PATH)).toMatchObject({
+		expect(await a.ink.adoptExternal(PATH, () => true)).toMatchObject({
 			outcome: "held",
 			reason: "existing-lock",
 		});
@@ -1026,7 +1139,7 @@ describe("FAILURE INJECTION: every failure keeps the ink and moves no baseline",
 		const a = await settledDeviceA(adapter);
 		const identity = a.ink.captureHistoryIdentity(PATH);
 		externalReplacement(["a", "remote"]);
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(result.outcome).toBe("held");
 		// THE CAPTURED GENERATION IS STILL PRESERVED - no generation vanishes
 		// merely because an await completed late.
@@ -1063,7 +1176,7 @@ describe("A LOCAL MUTATION DURING PRESERVATION REJECTS THE PREPARATION", () => {
 		const adapter = hooked(fake, hooks(commit));
 		a = await settledDeviceA(adapter);
 		externalReplacement(["a", "remote"]);
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(committed).toBe(true);
 		expect(result.outcome).toBe("held");
 		expect(a.accepts).toBe(0);
@@ -1161,7 +1274,7 @@ describe("A LOCAL MUTATION DURING PRESERVATION REJECTS THE PREPARATION", () => {
 		});
 		const a = await settledDeviceA(adapter);
 		externalReplacement(["a", "remote"]);
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(once).toBe(true);
 		// The list really is identical again - this is not a disguised change.
 		expect(a.ink.strokes(PATH).map((s) => s.id)).toEqual(["a", "local"]);
@@ -1185,7 +1298,7 @@ describe("A LOCAL MUTATION DURING PRESERVATION REJECTS THE PREPARATION", () => {
 		});
 		const a = await settledDeviceA(adapter);
 		externalReplacement(["a", "remote"]);
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(once).toBe(true);
 		expect(result.outcome).toBe("held");
 		expect(a.accepts).toBe(0);
@@ -1207,7 +1320,7 @@ describe("A LOCAL MUTATION DURING PRESERVATION REJECTS THE PREPARATION", () => {
 		});
 		const a = await settledDeviceA(adapter);
 		externalReplacement(["a", "remote"]);
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(moved).toBe(true);
 		expect(result.outcome).toBe("held");
 		expect(a.accepts).toBe(0);
@@ -1247,7 +1360,7 @@ describe("NAMING, COLLISION AND IDEMPOTENCE", () => {
 	it("names both legs with a random token, outside isLiveSidecarName", async () => {
 		const a = await settledDeviceA();
 		externalReplacement(["a", "remote"]);
-		await a.ink.adoptExternal(PATH);
+		await a.ink.adoptExternal(PATH, () => true);
 		const { outgoing, incoming } = legs();
 		expect(outgoing).toMatch(PAIR_NAME);
 		expect(incoming).toMatch(PAIR_NAME);
@@ -1267,7 +1380,7 @@ describe("NAMING, COLLISION AND IDEMPOTENCE", () => {
 		fake.files.set(taken, "an earlier attempt's ink");
 		fake.mtimes.set(taken, ++fake.clock);
 		externalReplacement(["a", "remote"]);
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(result.outcome).toBe("adopted");
 		// The earlier artifact is untouched.
 		expect(fake.files.get(taken)).toBe("an earlier attempt's ink");
@@ -1277,7 +1390,7 @@ describe("NAMING, COLLISION AND IDEMPOTENCE", () => {
 	});
 
 	/**
-	 * Found by Architect1's independent acceptance: the committed collision
+	 * Found by an independent acceptance run: the committed collision
 	 * fixture occupied the OUTGOING name only, so nothing proved the incoming
 	 * leg is probed as well. It is - but that was luck rather than evidence
 	 * until this case existed.
@@ -1289,7 +1402,7 @@ describe("NAMING, COLLISION AND IDEMPOTENCE", () => {
 		fake.files.set(taken, "an earlier attempt's incoming bytes");
 		fake.mtimes.set(taken, ++fake.clock);
 		externalReplacement(["a", "remote"]);
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(result.outcome).toBe("adopted");
 		expect(fake.files.get(taken)).toBe("an earlier attempt's incoming bytes");
 		expect(result.outgoingPath).toContain("44".repeat(8));
@@ -1304,7 +1417,7 @@ describe("NAMING, COLLISION AND IDEMPOTENCE", () => {
 			configurable: true,
 			writable: true,
 		});
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(result.outcome).toBe("held");
 		expect(artifacts()).toHaveLength(0);
 		expect(a.accepts).toBe(0);
@@ -1325,12 +1438,12 @@ describe("NAMING, COLLISION AND IDEMPOTENCE", () => {
 		});
 		const a = await settledDeviceA(adapter);
 		externalReplacement(["a", "remote"]);
-		expect((await a.ink.adoptExternal(PATH)).outcome).toBe("held");
+		expect((await a.ink.adoptExternal(PATH, () => true)).outcome).toBe("held");
 		const afterFirst = artifacts();
 		expect(afterFirst).toHaveLength(2);
 		// Undo the local change so the outgoing revision matches again.
 		a.ink.applyRemove(PATH, ["mid"]);
-		const second = await a.ink.adoptExternal(PATH);
+		const second = await a.ink.adoptExternal(PATH, () => true);
 		expect(second.outcome).toBe("adopted");
 		// SAME pair, not a second copy of the same two revisions.
 		expect(artifacts()).toEqual(afterFirst);
@@ -1341,8 +1454,8 @@ describe("NAMING, COLLISION AND IDEMPOTENCE", () => {
 		const a = await settledDeviceA();
 		externalReplacement(["a", "remote"]);
 		const [first, second] = await Promise.all([
-			a.ink.adoptExternal(PATH),
-			a.ink.adoptExternal(PATH),
+			a.ink.adoptExternal(PATH, () => true),
+			a.ink.adoptExternal(PATH, () => true),
 		]);
 		// One adopts; the other finds the record already moved on.
 		const outcomes = [first.outcome, second.outcome].sort();
@@ -1372,7 +1485,7 @@ describe("NOTIFICATION TIMING", () => {
 		const adapter = hooked(fake, { failWrite: (p) => p.endsWith("-incoming.json") });
 		const a = await settledDeviceA(adapter);
 		externalReplacement(["a", "remote"]);
-		await a.ink.adoptExternal(PATH);
+		await a.ink.adoptExternal(PATH, () => true);
 		expect(a.notices.filter((n) => n.includes("preserved both versions"))).toHaveLength(0);
 	});
 
@@ -1383,16 +1496,16 @@ describe("NOTIFICATION TIMING", () => {
 
 		// Inside the window: three failures, nothing said. This is the sync
 		// client mid-write case, and it is the common one.
-		await a.ink.adoptExternal(PATH);
-		await a.ink.adoptExternal(PATH);
-		await a.ink.adoptExternal(PATH);
+		await a.ink.adoptExternal(PATH, () => true);
+		await a.ink.adoptExternal(PATH, () => true);
+		await a.ink.adoptExternal(PATH, () => true);
 		expect(a.notices).toEqual([]);
 
 		// Past the window: it has stopped being a blip, so it says so - and
 		// then keeps quiet however many more times it fails.
 		vi.setSystemTime(Date.now() + 8_001);
-		await a.ink.adoptExternal(PATH);
-		await a.ink.adoptExternal(PATH);
+		await a.ink.adoptExternal(PATH, () => true);
+		await a.ink.adoptExternal(PATH, () => true);
 		expect(a.notices).toHaveLength(1);
 		// Alan's wording, and the BLANK LINE is part of it rather than
 		// formatting: `blockNotice` in main.ts splits on it to render blocks,
@@ -1413,20 +1526,20 @@ describe("NOTIFICATION TIMING", () => {
 		});
 		const a = await settledDeviceA(adapter);
 		externalReplacement(["a", "remote"]);
-		await a.ink.adoptExternal(PATH);
+		await a.ink.adoptExternal(PATH, () => true);
 		expect(a.notices).toEqual([]);
 
 		vi.setSystemTime(Date.now() + 7_000);
 		failing.on = false;
 		externalReplacement(["a", "remote2"]);
-		await a.ink.adoptExternal(PATH);
+		await a.ink.adoptExternal(PATH, () => true);
 		expect(a.notices).toEqual([]);
 
 		failing.on = true;
 		externalReplacement(["a", "remote3"]);
-		await a.ink.adoptExternal(PATH);
+		await a.ink.adoptExternal(PATH, () => true);
 		vi.setSystemTime(Date.now() + 2_000);
-		await a.ink.adoptExternal(PATH);
+		await a.ink.adoptExternal(PATH, () => true);
 		// 9s since the FIRST failure, but only 2s since the run restarted.
 		expect(a.notices).toEqual([]);
 	});
@@ -1450,7 +1563,7 @@ describe("MISSING CAPABILITY: external replacement never falls back to unpreserv
 		expect(a.ink.strokes(PATH).map((s) => s.id)).toEqual(["a", "local"]);
 
 		externalReplacement(["a", "remote"]);
-		expect(await a.ink.adoptExternal(PATH)).toMatchObject({
+		expect(await a.ink.adoptExternal(PATH, () => true)).toMatchObject({
 			outcome: "held",
 			reason: "missing-capability",
 		});
@@ -1483,8 +1596,8 @@ describe("MISSING CAPABILITY: external replacement never falls back to unpreserv
  * A stroke whose values sit BELOW the persisted codec's resolution. The
  * committed fixture above deliberately used integers and `pressure: 0.5`, which
  * survive `packPointsV2` untouched - so its "one serialize/parse pass preserves
- * every value" calibration was true of that fixture and hid this. Architect1's
- * independent acceptance found it; these are its two reds.
+ * every value" calibration was true of that fixture and hid this. An independent
+ * acceptance run found it; these are its two reds.
  */
 function preciseStroke(id: string): InkStroke {
 	return {
@@ -1565,7 +1678,7 @@ describe("LOSSLESS CAPTURE: the artifact must return what was captured", () => {
 		});
 		const a = await settledPreciseA(adapter);
 		externalReplacement(["a", "remote"]);
-		const result = await a.ink.adoptExternal(PATH);
+		const result = await a.ink.adoptExternal(PATH, () => true);
 		expect(once).toBe(true);
 		// Any mutation across an await invalidates the preparation. There is no
 		// "too small to count" clause, and there must not be one: the record

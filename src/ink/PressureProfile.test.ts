@@ -3,10 +3,11 @@ import { emptyPage, parsePage, serializePage } from "../model/PageData";
 import { DEFAULT_PEN, EXP7_PEN, setPressureSensitivity, widthForPressure } from "./PenStyle";
 import { StrokeBuilder } from "./StrokeBuilder";
 import oracle from "../../test/fixtures/exp7-pen-before-rollback.json";
+import tipOff from "../../test/fixtures/exp7-pen-tip-off.json";
 import { WetInkRenderer } from "./WetInkRenderer";
 import { flattenStroke } from "./Ribbon";
-import { flattenStrokeShaped, IncrementalShaper } from "./InkShape";
-import { ribbonOf } from "./StrokeOutline";
+import { flattenStrokeShaped, IncrementalShaper, PEN_SHAPE, type ShapeParams } from "./InkShape";
+import { EXPORT_PX_PER_WORLD, ribbonOf } from "./StrokeOutline";
 import { strokeWidthPolicy } from "./StrokeWidth";
 import type { InkStroke } from "./Stroke";
 import { computeBBox } from "./Stroke";
@@ -34,7 +35,18 @@ describe("exp7 pressure profile", () => {
 		}
 	});
 
-	it("matches every frozen committed/export/wet/highlighter oracle array", () => {
+	/**
+	 * The frozen arrays are the PRE-1.4.20 TIP TAPER LAW: recovered before the
+	 * rollback, when exp7 pressure ink still eased each end to a floor. Since
+	 * 1.4.20 pressure ink has no geometric tip taper (PressureTipTaper.test.ts),
+	 * so the pressure-on cases are asserted through the `exp7TipTaper` plant that
+	 * restores that law: every frozen byte is still checked. The export array is
+	 * what ribbonOf computed for these shaped strokes, flattenStrokeShaped at the
+	 * export resolution, and ribbonOf itself is tied to the law in force.
+	 * Pressure-off, raw, mouse-smoothed and highlighter arrays are unchanged.
+	 */
+	it("matches every frozen committed/export/wet/highlighter oracle array (pressure-on cases under the pre-1.4.20 tip taper law)", () => {
+		const preTipTaper = { ...PEN_SHAPE, exp7TipTaper: true } as ShapeParams;
 		const closeRibbon = (actual: Array<{ x: number; y: number; hw: number }>, expected: typeof actual) => {
 			expect(actual).toHaveLength(expected.length);
 			for (let i = 0; i < expected.length; i++) {
@@ -47,17 +59,51 @@ describe("exp7 pressure profile", () => {
 			setPressureSensitivity(frozen.pressureOn);
 			const stroke: InkStroke = { ...frozen.stroke, tool: frozen.stroke.tool as "pen", pressureProfile: "exp7" };
 			const style = strokeWidthPolicy({ ...EXP7_PEN, color: stroke.color, baseWidth: stroke.width }, undefined, "exp7").style;
-			closeRibbon(flattenStrokeShaped(stroke.points, style, 1), frozen.screenShapedAtZoom1);
+			const law = frozen.pressureOn ? preTipTaper : PEN_SHAPE;
+			closeRibbon(flattenStrokeShaped(stroke.points, style, 1, law), frozen.screenShapedAtZoom1);
 			closeRibbon(flattenStroke(stroke.points, style, 1, false), frozen.screenRawAtZoom1);
 			closeRibbon(flattenStroke(stroke.points, style, 1, true), frozen.screenMouseSmoothedAtZoom1);
-			closeRibbon(ribbonOf(stroke), frozen.exportRibbon);
+			closeRibbon(flattenStrokeShaped(stroke.points, style, EXPORT_PX_PER_WORLD, law), frozen.exportRibbon);
+			expect(ribbonOf(stroke)).toEqual(flattenStrokeShaped(stroke.points, style, EXPORT_PX_PER_WORLD));
 			closeRibbon(ribbonOf({ ...stroke, tool: "highlighter", width: 16 }), frozen.highlighterExportRibbon);
-			const shaper = new IncrementalShaper();
+			const shaper = new IncrementalShaper(law);
 			shaper.reset(stroke.points[0], style);
 			const wet = [shaper.last(), ...stroke.points.slice(1).map((point) => shaper.push(style, point))];
 			expect(wet.length).toBe(frozen.incrementalHalfWidths.length);
 			for (let i = 0; i < wet.length; i++) expect(wet[i]).toBeCloseTo(frozen.incrementalHalfWidths[i]!, 12);
 		}
+	});
+
+	/**
+	 * The 1.4.20 law's own oracle: the same pressure-on strokes, frozen once from
+	 * the commit that took the geometric tip taper off pressure ink (provenance
+	 * ref), asserted on default params. The before-rollback oracle above keeps the
+	 * pre-1.4.20 law through the plant; this one keeps the law in force.
+	 */
+	it("matches the frozen 1.4.20 tip-off oracle arrays on the law in force", () => {
+		const close = (actual: Array<{ x: number; y: number; hw: number }>, expected: typeof actual) => {
+			expect(actual).toHaveLength(expected.length);
+			for (let i = 0; i < expected.length; i++) {
+				expect(actual[i]!.x).toBeCloseTo(expected[i]!.x, 12);
+				expect(actual[i]!.y).toBeCloseTo(expected[i]!.y, 12);
+				expect(actual[i]!.hw).toBeCloseTo(expected[i]!.hw, 12);
+			}
+		};
+		const pressureOn = oracle.cases.filter((c) => c.pressureOn);
+		expect(tipOff.cases).toHaveLength(pressureOn.length);
+		tipOff.cases.forEach((frozen, k) => {
+			expect(frozen.stroke).toEqual(pressureOn[k]!.stroke);
+			setPressureSensitivity(true);
+			const stroke: InkStroke = { ...frozen.stroke, tool: frozen.stroke.tool as "pen", pressureProfile: "exp7" };
+			const style = strokeWidthPolicy({ ...EXP7_PEN, color: stroke.color, baseWidth: stroke.width }, undefined, "exp7").style;
+			close(flattenStrokeShaped(stroke.points, style, 1), frozen.screenShapedAtZoom1);
+			close(ribbonOf(stroke), frozen.exportRibbon);
+			const shaper = new IncrementalShaper();
+			shaper.reset(stroke.points[0], style);
+			const wet = [shaper.last(), ...stroke.points.slice(1).map((point) => shaper.push(style, point))];
+			expect(wet).toHaveLength(frozen.incrementalHalfWidths.length);
+			for (let i = 0; i < wet.length; i++) expect(wet[i]).toBeCloseTo(frozen.incrementalHalfWidths[i]!, 12);
+		});
 	});
 
 	it("keeps the actual builder/wet consumer on the frozen generation", () => {

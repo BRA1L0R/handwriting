@@ -63,6 +63,12 @@ function makeRig() {
 	overlay.view = { dom: host, scrollDOM: scroller, requestMeasure, measure: vi.fn() };
 	overlay.container = { setCssStyles: vi.fn() };
  overlay.frame = { locked: false }; overlay.cssScale = 1; overlay.fontZoom = 1;
+ // s179: THIS RIG'S SUBJECT IS ZOOM MECHANICS, so its note is a CANVAS note. With the canvas off a
+ // two-finger gesture is not a zoom at all (`pinch` returns on its first line), and a fixture left in
+ // that mode would run none of the code these arms are about while still reporting a result - measured,
+ // the mode gate alone turned several of them green by doing nothing. `canvasMode` is a class field and
+ // `Object.create` runs no field initializers, so it is set here rather than assumed.
+ overlay.canvasMode = true;
 	overlay.pinchScaleNow = 1;
 	overlay.pinchRasterScale = 1;
 	overlay.pinchRefScale = null;

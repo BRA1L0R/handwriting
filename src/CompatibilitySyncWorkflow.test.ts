@@ -16,6 +16,30 @@ import { pdfInkId } from "./pdf/PdfIdentity";
 import { emptyPage, parsePage, serializePage, type PageData } from "./model/PageData";
 import type { InkStroke } from "./ink/Stroke";
 import { installLiveReloadPoll } from "./testUtils/LiveReloadTestHarness";
+import { transformSync } from "esbuild";
+import overlaySource from "./inline/InkOverlay.ts?raw";
+
+// Execute the shipped census/admission functions. Only editor binding metadata
+// is reduced here; mounted gesture/selection behavior is covered by the browser fixture.
+const overlay = overlaySource.replace(/\r\n/g, "\n");
+const candidatesStart = "export interface InlineReloadBinding {";
+const candidatesEnd = "/** Zoom diagnostics";
+expect(overlay.split(candidatesStart)).toHaveLength(2);
+expect(overlay.split(candidatesEnd)).toHaveLength(2);
+const candidatesCode = transformSync(overlay.slice(overlay.indexOf(candidatesStart), overlay.indexOf(candidatesEnd)).replace(/^export /gm, ""),
+  { loader: "ts", target: "es2022" }).code;
+expect(candidatesCode).toContain("reloadBinding()");
+type EditorStandIn = ReturnType<typeof editor>;
+function productionNoteCandidates(editors: EditorStandIn[]) {
+  return new Function("instances", `${candidatesCode}\nreturn {noteCandidates:inlineReloadCandidates,noteAdmission:captureInlineReloadAdmission};`)(editors) as {
+    noteCandidates:()=>string[]; noteAdmission:(path:string)=>(()=>boolean)|null;
+  };
+}
+function editor(path: string, busy = false) {
+  return { path, busy, selected:false, attached:true, attachment:{}, file:{path}, editor:{}, epoch:0,
+    reloadBinding() { return this.attached ? {pane:this,attachment:this.attachment,file:this.file,editor:this.editor,
+      path:this.path,epoch:this.epoch,quiet:!this.busy&&!this.selected} : null; } };
+}
 const { notices } = vi.hoisted(() => ({ notices: [] as string[] }));
 vi.mock("obsidian", async original => ({ ...await original<object>(), Notice: class {
   constructor(message: string) { notices.push(message); }
@@ -89,19 +113,27 @@ async function device(adapter = new SyncAdapter(), raw: unknown = {}, beforeLoad
   return { adapter, plugin, store, ink, pdf, open, clickCompatibility, saved: () => saved };
 }
 type Device = Awaited<ReturnType<typeof device>>;
-function poll(d: Device) {
+// `noteCandidates` stands in for InkOverlay's inlineReloadCandidates (a path is
+// listed when any editor on it reports reloadCandidatePath); `pdfPanes` opens
+// that many PDF panes on the one document, as a split view does.
+function poll(d: Device, opts: { noteCandidates?: () => string[]; noteAdmission?: (path:string)=>(()=>boolean)|null; notePanes?: number; pdfPanes?: number } = {}) {
   let callback!: () => void, pending = Promise.resolve();
   const errors: unknown[] = [];
-  let notePaint = d.ink.strokes(notePath).map(s => s.id);
-  const pane = { idle: true, painted: d.pdf.strokes(pdfId).map(s => s.id), refresh() { this.painted = d.pdf.strokes(pdfId).map(s => s.id); } };
-  const root = { isConnected: true };
-  const state = { store: d.store, pdfStore: d.pdf, pdfInk: new Map([[root, pane]]), pdfIds: new Map([[root, pdfId]]),
+  let notePaint = d.ink.strokes(notePath).map(s => s.id), noteNotifications = 0;
+  const notePaints=Array.from({length:opts.notePanes??1},()=>[...notePaint]);
+  const candidates=opts.noteCandidates??(()=>[notePath]);
+  const panes = Array.from({ length: opts.pdfPanes ?? 1 }, () => ({ idle: true, painted: d.pdf.strokes(pdfId).map(s => s.id),
+    refresh() { this.painted = d.pdf.strokes(pdfId).map(s => s.id); } }));
+  const roots = panes.map(() => ({ isConnected: true }));
+  const state = { store: d.store, pdfStore: d.pdf, pdfInk: new Map(roots.map((root, i) => [root, panes[i]!])),
+    pdfIds: new Map(roots.map(root => [root, pdfId])),
     pollStats: { ticks: 0, hidden: 0, spaced: 0, checks: 0 }, registerInterval() {} };
   installLiveReloadPoll.call(state, { setInterval(fn: () => void) { callback = fn; return 1; } }, { hidden: false },
-    (p: Promise<void>) => { pending = p; }, () => [notePath], d.ink,
-    () => {}, () => { notePaint = d.ink.strokes(notePath).map(s => s.id); },
-    () => null, async () => false, { error: (...args: unknown[]) => errors.push(args) });
-  return { pane, errors, notePaint: () => notePaint, async tick() { callback(); await pending; } };
+    (p: Promise<void>) => { pending = p; }, candidates, d.ink,
+    () => { noteNotifications++; }, () => { notePaint = d.ink.strokes(notePath).map(s => s.id); notePaints.forEach((_,i)=>notePaints[i]=[...notePaint]); },
+    () => null, async () => false, { error: (...args: unknown[]) => errors.push(args) },
+    opts.noteAdmission ?? ((path:string) => () => candidates().includes(path)));
+  return { pane: panes[0]!, panes, errors, notePaints, noteNotifications:()=>noteNotifications, notePaint: () => notePaint, async tick() { callback(); await pending; } };
 }
 function transfer(from: SyncAdapter, to: SyncAdapter) {
   // A synthetic transport carries visible paths, not .handwriting or settings.
@@ -380,5 +412,254 @@ describe("compatibility across two synthetic devices", () => {
     const allBytes = [...files.files.values()].join("\n");
     for (const name of ["local-note", "local-pdf", "note-original", "pdf-original"]) expect(allBytes).toContain(name);
     for (const id of [noteId, pdfId]) expect([...files.files.keys()].filter(path => path.endsWith(`/${id}.json`))).toHaveLength(1);
+  });
+});
+
+/**
+ * 1.4.20 sync regimes for an ALREADY-OPEN note and PDF whose sidecar is replaced
+ * underneath them (Syncthing replaces whole files, sometimes at the same mtime).
+ * Every case ends the same way: settle, flush, then a cold device on the same
+ * bytes. The outcome asserted is ink in the live model, on disk, and after
+ * reopen; nothing asserts that a code path was entered. Synthetic geometry
+ * only. Limits: pane refresh and the inline candidate list are stand-ins (see
+ * `poll`), so the inline gesture gate itself (InkOverlay.reloadCandidatePath)
+ * is not executed here; transport is an in-memory adapter, not a sync service.
+ */
+describe("sync regimes through save and cold reopen", () => {
+  // Read lazily: pdfId is assigned in beforeEach.
+  const both = () => [[noteId, "note"], [pdfId, "pdf"]] as const;
+  function replace(files: SyncAdapter, timing: "same" | "advancing") {
+    if (timing === "same") sameMtimeReplacement(files); else seed(files, "handwriting", "incoming");
+  }
+  function localEdit(d: Device, name: string) {
+    d.ink.commit(notePath, stroke(`note-${name}`));
+    d.pdf.replaceAllLive(pdfId, [...d.pdf.strokes(pdfId), { ...stroke(`pdf-${name}`), page: 1 }]);
+    d.pdf.save(pdfId);
+  }
+  async function reopen(d: Device) {
+    await d.ink.settle(); await d.store.flush();
+    const cold = await device(d.adapter, { inkFolder: "handwriting" }); await cold.open();
+    return cold;
+  }
+  function onlyLive(files: SyncAdapter) {
+    for (const [id] of both()) expect([...files.files.keys()].filter(p => p.endsWith(`/${id}.json`))).toEqual([`handwriting/${id}.json`]);
+  }
+  function kept(files: SyncAdapter, id: string, strokeId: string) {
+    return [...files.files].filter(([p, b]) => p.startsWith(`handwriting/${id}.conflict-`) && b.includes(`"${strokeId}"`)).length;
+  }
+  async function start(timingClock = { now: 0 }) {
+    vi.spyOn(performance, "now").mockImplementation(() => timingClock.now);
+    const files = new SyncAdapter(); documents(files); seed(files, "handwriting");
+    const d = await device(files, { inkFolder: "handwriting" }); await d.open();
+    return { files, d, clock: timingClock };
+  }
+
+  it.each(["advancing", "same"] as const)("(i) quiet pane, %s mtime: both surfaces adopt, keep the outgoing revision, and survive edit and cold reopen", async timing => {
+    const { files, d, clock } = await start(); const p = poll(d);
+    await pollThroughBackoff(p);
+    replace(files, timing); clock.now = 5000; await pollThroughBackoff(p);
+    expect(p.errors).toEqual([]);
+    expect(ids(d)).toEqual([["note-incoming"], ["pdf-incoming"]]);
+    expect(p.notePaint()).toEqual(["note-incoming"]); expect(p.pane.painted).toEqual(["pdf-incoming"]);
+    for (const [id, s] of both()) expect(kept(files, id, `${s}-original`), `${s} outgoing revision kept on disk`).toBeGreaterThan(0);
+    localEdit(d, "later");
+    const cold = await reopen(d);
+    expect(ids(cold)).toEqual([["note-incoming", "note-later"], ["pdf-incoming", "pdf-later"]]);
+    expect(ids(d)).toEqual(ids(cold));
+    onlyLive(files);
+  });
+
+  it.each(["advancing", "same"] as const)("(ii-a) dirty pane, %s mtime: queued local ink stays live, incoming is kept, model equals reopen", async timing => {
+    const { files, d, clock } = await start(); const p = poll(d);
+    await pollThroughBackoff(p);
+    localEdit(d, "local");
+    replace(files, timing); clock.now = 5000; await p.tick();
+    expect(ids(d)).toEqual([["note-original", "note-local"], ["pdf-original", "pdf-local"]]);
+    await d.ink.settle(); await d.store.flush();
+    clock.now = 10000; await pollThroughBackoff(p);
+    const cold = await reopen(d);
+    expect(ids(cold)).toEqual([["note-original", "note-local"], ["pdf-original", "pdf-local"]]);
+    expect(ids(d), "live model must match what reopens").toEqual(ids(cold));
+    for (const [id, s] of both()) expect(kept(files, id, `${s}-incoming`), `${s} incoming revision kept on disk`).toBeGreaterThan(0);
+    onlyLive(files);
+  });
+
+  it("(ii-b) gesture active: adoption waits for pen-up; the gesture's result lands and the incoming revision is kept", async () => {
+    const { files, d, clock } = await start();
+    let gesture = false;
+    const p = poll(d, { noteCandidates: () => gesture ? [] : [notePath] });
+    await pollThroughBackoff(p);
+    gesture = true; p.pane.idle = false;
+    replace(files, "advancing"); clock.now = 5000; await pollThroughBackoff(p); await pollThroughBackoff(p);
+    expect(ids(d)).toEqual([["note-original"], ["pdf-original"]]);
+    expect(p.pane.painted).toEqual(["pdf-original"]);
+    gesture = false; p.pane.idle = true; localEdit(d, "gesture");
+    await d.ink.settle(); await d.store.flush();
+    clock.now = 10000; await pollThroughBackoff(p);
+    const cold = await reopen(d);
+    expect(ids(cold)).toEqual([["note-original", "note-gesture"], ["pdf-original", "pdf-gesture"]]);
+    expect(ids(d)).toEqual(ids(cold));
+    for (const [id, s] of both()) expect(kept(files, id, `${s}-incoming`), `${s} incoming revision kept on disk`).toBeGreaterThan(0);
+    onlyLive(files);
+  });
+
+  it("(iii-a) both panes hold while a sibling is mid-gesture, then converge without a local edit", async () => {
+    const { files, d, clock } = await start();
+    const notePanes = [editor(notePath, true), editor(notePath, false)];
+    const p = poll(d, { pdfPanes:2, notePanes:2, ...productionNoteCandidates(notePanes) });
+    await pollThroughBackoff(p); p.panes[1]!.idle = false;
+    replace(files, "advancing"); clock.now = 5000;
+    await pollThroughBackoff(p); await pollThroughBackoff(p);
+    expect(ids(d), "one quiet sibling cannot admit either shared document").toEqual([["note-original"],["pdf-original"]]);
+    expect(p.noteNotifications()).toBe(0);
+    expect(p.notePaints).toEqual([["note-original"],["note-original"]]);
+    expect(p.panes.map(pane=>pane.painted)).toEqual([["pdf-original"],["pdf-original"]]);
+    expect(await d.store.externallyChanged(noteId), "held incoming baseline stays unaccepted").toBe(true);
+    notePanes[0]!.busy=false; p.panes[1]!.idle=true;
+    clock.now=10000; await pollThroughBackoff(p);
+    expect(ids(d)).toEqual([["note-incoming"],["pdf-incoming"]]);
+    expect(p.notePaints).toEqual([["note-incoming"],["note-incoming"]]);
+    expect(p.panes.map(pane=>pane.painted)).toEqual([["pdf-incoming"],["pdf-incoming"]]);
+    expect(p.noteNotifications()).toBe(1);
+    expect(ids(await reopen(d))).toEqual(ids(d));
+    for(const [id,surface] of both()) expect(kept(files,id,`${surface}-original`)).toBeGreaterThan(0);
+    onlyLive(files);
+  });
+
+  it.each(["pen", "selection"])("stat-await rechecks a sibling's %s before preservation", async change => {
+    const {files,d,clock}=await start(), notePanes=[editor(notePath),editor(notePath)];
+    const p=poll(d,{notePanes:2,...productionNoteCandidates(notePanes)});
+    await pollThroughBackoff(p);replace(files,"advancing");clock.now=5000;
+    const entered=gate(),release=gate(),stat=files.stat.bind(files);let held=false;
+    vi.spyOn(files,"stat").mockImplementation(async path=>{
+      if(!held&&path===`handwriting/${noteId}.json`){held=true;entered.release();await release.promise;}
+      return stat(path);
+    });
+    const adoption=vi.spyOn(d.ink,"adoptExternal");
+    let ticking=Promise.resolve();
+    for(let i=0;i<12&&!held;i++){ticking=p.tick();await Promise.race([ticking,entered.promise]);}
+    expect(held).toBe(true);
+    if(change==="pen")notePanes[1]!.busy=true;else notePanes[1]!.selected=true;
+    release.release();await ticking;
+    expect(adoption).not.toHaveBeenCalled();expect(p.noteNotifications()).toBe(0);
+    expect(ids(d)[0]).toEqual(["note-original"]);
+    expect(await d.store.externallyChanged(noteId)).toBe(true);
+    notePanes[1]!.busy=false;notePanes[1]!.selected=false;
+    clock.now=10000;await pollThroughBackoff(p);
+    expect(p.notePaints).toEqual([["note-incoming"],["note-incoming"]]);
+    expect(p.errors).toEqual([]);
+  });
+
+  it.each(["pen", "selection", "join", "switch", "retire", "replace", "epoch", "page-id", "queued-write"])("preservation-await requalifies %s before accepting the baseline or notifying", async change => {
+    const {files,d,clock}=await start(), notePanes=[editor(notePath),editor(notePath)];
+    const p=poll(d,{notePanes:2,...productionNoteCandidates(notePanes)});
+    await pollThroughBackoff(p);replace(files,"advancing");clock.now=5000;
+    const entered=gate(),release=gate(),write=files.write.bind(files);let held=false;
+    vi.spyOn(files,"write").mockImplementation(async(path,data)=>{
+      if(!held&&path.startsWith(`handwriting/${noteId}.conflict-external-`)){held=true;entered.release();await release.promise;}
+      return write(path,data);
+    });
+    let ticking=Promise.resolve();
+    for(let i=0;i<12&&!held;i++){ticking=p.tick();await Promise.race([ticking,entered.promise]);}
+    expect(held,"real preservation write reached").toBe(true);
+    const sibling=notePanes[1]!;
+    const pageId=vi.spyOn(d.ink,"pageIdOf");
+    if(change==="pen")sibling.busy=true;
+    if(change==="selection")sibling.selected=true;
+    if(change==="join")notePanes.push(editor(notePath));
+    if(change==="switch")sibling.path="Other.md";
+    if(change==="retire")sibling.attached=false;
+    if(change==="replace")sibling.editor={};
+    if(change==="epoch")sibling.epoch++;
+    if(change==="page-id")pageId.mockReturnValue("rebound-note-id");
+    if(change==="queued-write")d.store.schedule(noteId,page(noteId,"inline",["note-original"]));
+    release.release();await ticking;
+    expect(ids(d)[0],"uncommitted gesture/binding change cannot swap shared ink").toEqual(["note-original"]);
+    expect(p.noteNotifications()).toBe(0);expect(p.notePaints).toEqual([["note-original"],["note-original"]]);
+    expect(notices).toEqual([]);
+    if(change==="queued-write"){
+      expect(d.store.hasQueuedWrite(noteId)).toBe(true);
+      await d.store.flush();
+      // The drained local write is its own revision. The next delivered current
+      // remote revision is adopted by the same poll, never a recovery copy.
+      replace(files,"advancing");
+    }else expect(await d.store.externallyChanged(noteId),"hold does not accept incoming baseline").toBe(true);
+    pageId.mockRestore();
+    sibling.busy=false;sibling.selected=false;sibling.path=notePath;sibling.attached=true;
+    clock.now=10000;await pollThroughBackoff(p);
+    expect(p.notePaints).toEqual([["note-incoming"],["note-incoming"]]);expect(p.noteNotifications()).toBe(1);
+    expect(p.errors).toEqual([]);
+  });
+
+  it("(iii-b) a note commit landing while adoption preservation is awaiting is neither dropped nor overwritten", async () => {
+    // Stand-in: panes on one note share one InlineInkStore record, so a second
+    // pane's pen-up is modelled as a direct d.ink.commit during the held
+    // conflict-external write. No second overlay is mounted.
+    const { files, d } = await start();
+    const p = poll(d);
+    await pollThroughBackoff(p);
+    replace(files, "advancing");
+    const entered = gate(), release = gate(); const write = files.write.bind(files);
+    let held = false;
+    vi.spyOn(files, "write").mockImplementation(async (path, data) => {
+      if (!held && path.startsWith(`handwriting/${noteId}.conflict-external-`)) { held = true; entered.release(); await release.promise; }
+      return write(path, data);
+    });
+    let ticking: Promise<void> = Promise.resolve();
+    for (let i = 0; i < 12 && !held; i++) { ticking = p.tick(); await Promise.race([ticking, entered.promise]); }
+    expect(held, "adoption reached preservation").toBe(true);
+    d.ink.commit(notePath, stroke("note-otherpane"));
+    release.release(); await ticking;
+    await d.ink.settle(); await d.store.flush();
+    await pollThroughBackoff(p);
+    d.ink.commit(notePath, stroke("note-after"));
+    const cold = await reopen(d);
+    expect(ids(d)[0], "live model must match what reopens").toEqual(ids(cold)[0]);
+    expect(ids(cold)[0]).toContain("note-otherpane");
+    expect(ids(cold)[0]).toContain("note-after");
+    const bytes = [...files.files.values()].join("\n");
+    for (const s of ["note-original", "note-incoming", "note-otherpane"]) expect(bytes).toContain(`"${s}"`);
+    onlyLive(files);
+  });
+
+  it("(iv) sidecar deleted under an open pane: ink stays on screen and the next save restores it to the visible folder", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { files, d, clock } = await start(); const p = poll(d);
+    await pollThroughBackoff(p);
+    for (const [id] of both()) { files.files.delete(`handwriting/${id}.json`); files.mtimes.delete(`handwriting/${id}.json`); }
+    for (const t of [1000, 6000, 12000]) { clock.now = t; await pollThroughBackoff(p); }
+    expect(ids(d)).toEqual([["note-original"], ["pdf-original"]]);
+    expect(p.notePaint()).toEqual(["note-original"]); expect(p.pane.painted).toEqual(["pdf-original"]);
+    localEdit(d, "later");
+    await d.ink.settle(); await d.store.flush();
+    clock.now = 20000; await pollThroughBackoff(p);
+    const cold = await reopen(d);
+    expect(ids(cold)).toEqual([["note-original", "note-later"], ["pdf-original", "pdf-later"]]);
+    expect(ids(d)).toEqual(ids(cold));
+    onlyLive(files);
+  });
+
+  it.each(["damaged", "future"] as const)("(vi) %s incoming replacement is refused: old ink stays, a later save keeps the exact incoming bytes", async failure => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { files, d, clock } = await start(); const p = poll(d);
+    await pollThroughBackoff(p);
+    seed(files, "handwriting", "incoming");
+    const bad = new Map<string, string>();
+    for (const [id] of both()) {
+      const path = `handwriting/${id}.json`, good = files.files.get(path)!;
+      const bytes = failure === "damaged" ? good.slice(0, Math.floor(good.length / 2)) : JSON.stringify({ ...JSON.parse(good), schemaVersion: 999 });
+      files.externalWrite(path, bytes); bad.set(id, bytes);
+    }
+    clock.now = 5000; await pollThroughBackoff(p);
+    expect(ids(d)).toEqual([["note-original"], ["pdf-original"]]);
+    expect(p.notePaint()).toEqual(["note-original"]); expect(p.pane.painted).toEqual(["pdf-original"]);
+    localEdit(d, "later");
+    await d.ink.settle(); await d.store.flush();
+    clock.now = 10000; await pollThroughBackoff(p);
+    const cold = await reopen(d);
+    expect(ids(cold)).toEqual([["note-original", "note-later"], ["pdf-original", "pdf-later"]]);
+    expect(ids(d)).toEqual(ids(cold));
+    for (const [id] of both()) expect([...files.files.values()].includes(bad.get(id)!), `${id} incoming bytes kept exactly`).toBe(true);
+    onlyLive(files);
   });
 });

@@ -102,6 +102,38 @@ function fakeEl(ownerDocument?: Record<string, unknown>): Record<string, unknown
 	return el;
 }
 
+/**
+ * A fake `view.dom` that SATISFIES `ownsMarkdownEditorRoot` (InkOverlay.ts, the
+ * mount gate). Shared, because every DOM-free rig that calls `mount()` now has
+ * to get past that predicate and the next one should reuse this rather than
+ * rediscover it.
+ *
+ * The gate asks four things, and a fake that answers only the first one is
+ * worse than useless: `closest` returning null refuses the mount outright, and
+ * the arm then fails on the line after. So this answers all four, exactly as
+ * the predicate asks them:
+ *
+ *   1. `dom.closest(".markdown-source-view")` is a root, not null;
+ *   2. that root's `ownerDocument` is the same object as the dom's;
+ *   3. the root's `querySelector(".cm-editor")` is the dom itself;
+ *   4. `dom.parentElement.closest(".cm-editor")` is null, and
+ *      `dom.closest(".table-cell-wrapper, .cm-table-widget")` is null - this
+ *      dom is a note's own editor, not a table cell's.
+ *
+ * Selector strings are matched exactly as the predicate spells them. An
+ * unrecognised selector returns null rather than the root, so a future gate
+ * asking something new fails loudly here instead of being quietly satisfied.
+ */
+function fakeNoteEditorDom(ownerDocument: Record<string, unknown>): Record<string, unknown> {
+	const dom = fakeEl(ownerDocument);
+	const root = fakeEl(ownerDocument);
+	root.querySelector = (selector: string) => (selector === ".cm-editor" ? dom : null);
+	dom.closest = (selector: string) => (selector === ".markdown-source-view" ? root : null);
+	dom.querySelector = () => null;
+	dom.parentElement = { closest: () => null };
+	return dom;
+}
+
 describe("note: onPenMove really calls StrokeMetrics.recordEvent", () => {
 	beforeEach(() => {
 		captured.cb = null;
@@ -119,7 +151,10 @@ describe("note: onPenMove really calls StrokeMetrics.recordEvent", () => {
 	function mountFake(): void {
 		const win = { getComputedStyle: () => ({ position: "relative" }) };
 		const doc = { defaultView: win, body: fakeEl() };
-		const dom = fakeEl(doc);
+		// s181 add. 8: the mount gate (`ownsMarkdownEditorRoot`) now runs before the
+		// router is built, and a bare `fakeEl` has no `closest`, so mount threw
+		// "dom.closest is not a function" before it could capture the router.
+		const dom = fakeNoteEditorDom(doc);
 		const view = {
 			state: { field: () => ({}) }, // truthy, no `.app` - ensurePenTools bails itself
 			dom,

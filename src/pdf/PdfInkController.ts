@@ -35,6 +35,7 @@ import {
 	pointerRaisesPenTools,
 } from "../inline/PenToolsMode";
 import { deviceHasTouch } from "../inline/DeviceInput";
+import { EmptyPageNoticeGate, emptyPageNoticeText, inkChangeRearmsNotice } from "../inline/EmptyPageNotice";
 import {
 	padBBox,
 	pointInBBox,
@@ -55,6 +56,8 @@ import { predictionEinkOn, predictionEnabled } from "../inline/StrokePrediction"
 import { rowsOf, snapLine, strokeIdsBelow } from "../inline/InsertSpace";
 import { copyInk, pasteInk } from "../inline/InkClipboard";
 import { drawStroke, ribbonCacheStats } from "../ink/StrokeRenderer";
+import { withInkDestination } from "../ink/InkTheme";
+import { PdfPageAssumption, pdfPageDestination } from "../ink/InkPdf";
 import { DEFAULT_PEN, HIGHLIGHTER_ALPHA, HIGHLIGHTER_PEN, PenStyle } from "../ink/PenStyle";
 import { getInkColorHex } from "../ink/InkColor";
 import {
@@ -863,6 +866,29 @@ export class PdfInkController {
 	 */
 	private eraseFrom: InkStroke[] | null = null;
 	/**
+	 * "No ink on the page to erase/select", said once per page rather than
+	 * once per contact; the notice is suppressed per page until that page
+	 * gains ink again, ruled 2026-09-14. The SAME gate the
+	 * note surface uses (EmptyPageNotice.ts): that module keys purely on an
+	 * opaque path string plus a tool kind, so a composite key
+	 * `${documentId}#${pageNumber}` (see `emptyPageNoticeKey`) gives per-page
+	 * suppression within one PDF with zero change to the module or to the
+	 * note surface's own (unscoped) keys.
+	 */
+	private readonly emptyPageNotice = new EmptyPageNoticeGate();
+	/**
+	 * Which page numbers currently hold a claimed empty-page episode (erase
+	 * or select, either counts - `forget` clears both together).
+	 * `refresh()` used to walk EVERY page the viewer probe reports, filtering
+	 * document strokes once per page, on every ink change (undo, paste,
+	 * another pane's commit, a sync) - `O(pages x strokes)` on a path that
+	 * previously did no such scan at all, and it called `probe()` (a DOM
+	 * geometry read) even when nothing was claimed. This set is the only
+	 * thing `refresh()` needs to walk: usually empty, at most one entry per
+	 * page a toast has actually fired for.
+	 */
+	private claimedPages = new Set<number>();
+	/**
 	 * Between mount() and unmount(). Gates the sync path, which is the only
 	 * thing here that can BIND: a queued frame or a late refresh() must not
 	 * rebuild a router and its capture listeners on a dead controller.
@@ -928,8 +954,70 @@ export class PdfInkController {
 		 * arrive uncovered and silent. Whoever adds one substitutes the
 		 * sources in main.ts, which is the same line that sets this.
 		 */
-		private syntheticSources: () => boolean = () => false
+		private syntheticSources: () => boolean = () => false,
+		/**
+		 * What the user says this PDF's pages look like: the `inkPdfColorMode`
+		 * setting ("Ink color on PDFs"), which the snip's ink is
+		 * made readable against.
+		 *
+		 * A getter, asked at the moment of each snip and never captured, so a
+		 * change in settings applies to the very next snip. The snip needs an
+		 * ANSWER rather than a look: the page under its ink is the viewer's own
+		 * rendered page, a dark slide as easily as paper, and this file reads
+		 * no pixels. The flatten asks the same setting the same question
+		 * (`pdfPageDestination`). The default is that setting's shipped default.
+		 */
+		private pageAssumption: () => PdfPageAssumption = () => "darken"
 	) {}
+
+	/**
+	 * PAGE-scoped, not document-scoped: a pdf page with no ink of its own can
+	 * never be touched by an erase or lasso gesture even while other pages
+	 * carry ink, so the same episode-key module the note surface uses
+	 * (EmptyPageNotice.ts, which keys purely on an opaque path string) gets a
+	 * composite key here instead of a second gate class or a module change.
+	 *
+	 * `null` when the document is not identified yet, exactly like the note
+	 * surface's own `path` - the gate's `claim` already refuses to speak OR
+	 * record for a null path (`EmptyPageNotice.ts`: "there is no key that
+	 * would later be forgotten"), and an unidentified PDF must keep that
+	 * contract rather than fall back to a key every unidentified document
+	 * would share (`"#3"`, `documentId() ?? ""`) - which would speak once for
+	 * the FIRST unidentified document to touch page 3 and then wrongly stay
+	 * silent for every other one, since they all reduce to the same key.
+	 * (In practice `penDown`'s own `!this.documentId()` guard, above every
+	 * call site below, already returns before this runs; kept anyway so the
+	 * method's own contract does not depend on staying downstream of that
+	 * guard forever.)
+	 */
+	private emptyPageNoticeKey(pageNumber: number): string | null {
+		const id = this.documentId();
+		return id === null ? null : `${id}#${pageNumber}`;
+	}
+
+	/**
+	 * Say `kind`'s empty-page sentence once per page, and forget it the
+	 * moment that page gains ink again; ruled 2026-09-14.
+	 *
+	 * This is a BELT, not the only re-arm: `refresh()` (the ink-changed-
+	 * underneath-us path) already forgets a page the
+	 * instant its ink arrives, even between gestures, which is what makes
+	 * the two surfaces match the note surface's rule EXACTLY (note:
+	 * an earlier version of this comment claimed that on its own, which was
+	 * false - a page that gained ink and lost it again between gestures,
+	 * with `refresh()` never called, would have stayed silently un-armed).
+	 * Kept here too so a gesture that starts on a page `refresh()` never saw
+	 * (no store subscription fired) still self-corrects at the one moment
+	 * this method looks anyway. Emptying a page during THIS call never
+	 * re-arms it either way (`inkChangeRearmsNotice` is true only for "ink").
+	 */
+	private sayIfPageEmpty(pageNumber: number, kind: "erase" | "select"): void {
+		const key = this.emptyPageNoticeKey(pageNumber);
+		const presence = this.strokes(pageNumber).length > 0 ? "ink" : "none";
+		if (key !== null && inkChangeRearmsNotice(presence)) { this.emptyPageNotice.forget(key); this.claimedPages.delete(pageNumber); }
+		const text = emptyPageNoticeText(presence, kind);
+		if (text && this.emptyPageNotice.claim(key, kind)) { this.notify(text); this.claimedPages.add(pageNumber); }
+	}
 
 	/**
 	 * The floating pen strip, on the PDF view.
@@ -1592,6 +1680,11 @@ export class PdfInkController {
 		// wrote, so an interrupted erase was already durable; it has to stay
 		// that way.
 		this.persistLive();
+		// main.ts rebuilds the controller whenever the leaf's file changes
+		// (the comment below), so this one call covers both the note
+		// surface's "file switch" and "teardown" forgetAll() sites.
+		this.emptyPageNotice.forgetAll();
+		this.claimedPages.clear();
 		// Before anything else: a sync already queued for the next frame,
 		// or a refresh() arriving from the store after the pane closed,
 		// would otherwise reach bindTo and install capture listeners and a
@@ -1873,8 +1966,33 @@ export class PdfInkController {
 		this.clearSelection();
 	}
 
-	/** Repaint every live page: the ink changed underneath us. */
+	/**
+	 * Repaint every live page: the ink changed underneath us.
+	 *
+	 * Also the note surface's re-arm point: "a note that gains ink and later loses it elsewhere should speak
+	 * again" (InkOverlay.ts:2280-2288's own words) has to hold here too, not
+	 * only at the next erase/lasso start on that page - a page that gains ink
+	 * and loses it again BETWEEN gestures (undo, another pane, a sync) must
+	 * still be forgotten the moment the ink arrives, or the eraser's later
+	 * verdict on that now-empty page is silently stale.
+	 *
+	 * `refresh()` runs on every undo,
+	 * paste, other-pane commit and sync - walking EVERY probed page and
+	 * filtering the whole document's strokes per page on that path measured
+	 * 7-34 ms at 300-600 pages, on a path that did no such scan before this
+	 * item at all; it also called `probe()` (a DOM geometry read) even when
+	 * nothing was claimed. `claimedPages` is normally empty and at most one
+	 * entry per page a toast has actually fired for, so walking ONLY it -
+	 * never `probe()`, never the other pages - is the whole fix: usually
+	 * zero strokes-filter calls, never more than the claimed count.
+	 */
 	refresh(): void {
+		for (const page of this.claimedPages) {
+			if (this.strokes(page).length === 0) continue; // still empty: stays claimed
+			const key = this.emptyPageNoticeKey(page);
+			if (key !== null) this.emptyPageNotice.forget(key);
+			this.claimedPages.delete(page);
+		}
 		for (const a of this.overlays.values()) a.paintedCount = -1;
 		this.schedule();
 	}
@@ -2111,7 +2229,7 @@ export class PdfInkController {
 		// still costs a timer per move defeats the e-ink point as much as a
 		// visible one would.
 		if (!penReticleEnabled()) return "off";
-		// A PAN DRAG PAINTS NO RETICLE (reviewer F4, 1.4.12-design §11). The
+		// A PAN DRAG PAINTS NO RETICLE (1.4.12-design §11). The
 		// rule and its reasoning are the note surface's own pure function,
 		// `penReticleShown` (PenCursor.ts), called rather than copied: this
 		// surface's whole recurring defect is a ruling that reached one ink
@@ -2498,7 +2616,7 @@ export class PdfInkController {
 	 * over the viewer until the drag ends.
 	 *
 	 * THERE IS NO `showPanCursor` BESIDE `showLassoCursor` AND
-	 * `showSpaceCursor` ANY MORE, and its absence is the point (reviewer F4,
+	 * `showSpaceCursor` ANY MORE, and its absence is the point (see
 	 * 1.4.12-design §11; the note surface made the same swap first, and this
 	 * method is deliberately its twin down to the name). Those two exist
 	 * because a lasso and a space gesture want the ring KEPT ALIVE through a
@@ -2863,11 +2981,9 @@ export class PdfInkController {
 			// page with no ink of its own can never be touched by this
 			// gesture even while other pages carry ink. Checking the document
 			// list here would stay silent on exactly that page. Same lesson
-			// insert-space paid hardware time to learn, said once at the
-			// moment the gesture finds nothing on this page.
-			if (this.strokes(box.pageNumber).length === 0) {
-				this.notify("Handwriting: no ink on the page to erase");
-			}
+			// insert-space paid hardware time to learn, said once per page
+			// (ruled 2026-09-14) rather than once per contact.
+			this.sayIfPageEmpty(box.pageNumber, "erase");
 			this.metrics.begin("pdf-erase", performance.now());
 			this.metricsLive = true;
 			this.startFrameTicker();
@@ -3607,10 +3723,9 @@ export class PdfInkController {
 		this.lassoPts = [{ x: p.x, y: p.y }];
 		// Page-scoped, same reasoning as the erase branch: a fresh loop on a
 		// page with no ink of its own can never select anything, whatever
-		// shape it ends up drawing, even while other pages carry ink.
-		if (this.strokes(box.pageNumber).length === 0) {
-			this.notify("Handwriting: no ink on the page to select");
-		}
+		// shape it ends up drawing, even while other pages carry ink. Said
+		// once per page (ruled 2026-09-14), not per contact.
+		this.sayIfPageEmpty(box.pageNumber, "select");
 	}
 
 	private lassoMove(box: PageBox, scale: number, sample: PenSample, scroller: HTMLElement): void {
@@ -3731,7 +3846,17 @@ export class PdfInkController {
 				);
 			}
 			ctx.setTransform(1, 0, 0, 1, -vp.x0 * vp.scale, -vp.y0 * vp.scale);
-			this.drawCommitted(ctx, { x: 0, y: 0, zoom: vp.scale }, this.strokes(page));
+			// Painted for the page the user declares, which is what "Ink color
+			// when exporting" promises of a snip; "keep" is a null destination
+			// and leaves the stored colour. The scope wraps this one synchronous
+			// call and ends before the encode: the destination is module-wide
+			// and `drawCommitted` is also the overlay's painter, so a scope left
+			// open across the await would give a live repaint in that gap the
+			// snip's colours.
+			const strokes = this.strokes(page);
+			withInkDestination(pdfPageDestination(this.pageAssumption()), () =>
+				this.drawCommitted(ctx, { x: 0, y: 0, zoom: vp.scale }, strokes)
+			);
 			const blob = await new Promise<Blob | null>((resolve) => out.toBlob(resolve, "image/png"));
 			if (!blob) return { ok: false, reason: "the image could not be encoded" };
 			return { ok: true, bytes: new Uint8Array(await blob.arrayBuffer()), pageNumber: page };

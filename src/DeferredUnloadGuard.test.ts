@@ -95,7 +95,9 @@ describe("deferred onLayoutReady callbacks check unloaded", () => {
 		// registration gone - which is what it is - rather than a registration
 		// this guard keeps counting.
 		expect(occurrences(mainCode, "onLayoutReady(")).toBe(occurrences(mainCode, DEFER));
-		expect(occurrences(mainCode, DEFER)).toBe(4);
+		// Three since s197: the fourth deferral was the canvas page's
+		// frontmatter routing, and it went with the view.
+		expect(occurrences(mainCode, DEFER)).toBe(3);
 	});
 
 	it("every deferred callback opens with the unloaded guard", () => {

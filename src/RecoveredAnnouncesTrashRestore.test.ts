@@ -21,11 +21,12 @@ vi.mock("obsidian", async (importOriginal) => {
 import { installFakeWindow } from "../test/routerHarness";
 installFakeWindow();
 
+import { Notice } from "obsidian";
 import { PageStore } from "./persistence/PageStore";
 import { FakeAdapter, gate } from "./persistence/FakeAdapter";
 import { emptyPage, serializePage } from "./model/PageData";
 import { bindRecoveryNotices } from "./main";
-import { HandwritingPageView } from "./view/HandwritingPageView";
+import { inlineInk } from "./inline/InkOverlay";
 import type { InkStroke } from "./ink/Stroke";
 
 /**
@@ -33,29 +34,29 @@ import type { InkStroke } from "./ink/Stroke";
  * CALLER - not modelled, not read off the source.
  *
  * The store raises `onInkTrashRestored`; the plugin's binding is the SOLE
- * SPEAKER for that event on every surface. The canvas view separately owns a
- * bare interrupted-save notice, and a trash restore used to fall into it as
- * well, so the reader was told the wrong event twice.
+ * SPEAKER for that event on every surface.
  *
  * WHAT THESE CASES DRIVE. The real `PageStore` over a real adapter, the real
  * `bindRecoveryNotices` from `main.ts` (the same function `onload` calls), and
- * the real `HandwritingPageView.loadPage`. The only things stubbed are the
- * view's RENDER SINKS - the two layers, the repaint and the status line - which
- * exist only after `onOpen` has a DOM. Every decision under test is production
- * code; nothing here re-implements a predicate or a sentence.
+ * the real inline surface: `inlineInk.ensureLoaded`, whose host `loadSidecar`
+ * is `store.load`, exactly as `main.ts` wires it. Every decision under test is
+ * production code; nothing here re-implements a predicate or a sentence.
  *
  * `fromInkTrash` IS PROVENANCE, NOT A COMPLETED RESTORE. It is also set on the
  * failed-restore return, where the rename did not happen and no callback is
  * raised - that case must claim neither a restoration nor an interrupted save,
  * and the case below pins exactly that.
  *
- * THE CANVAS HALF IS IN, UNDER A PER-ACTION EXCEPTION. The one-line
- * discriminator at `HandwritingPageView.ts:478` lives in a FROZEN file; Alan
- * authorised that single line and the matching fingerprint update in the same
- * commit, and the freeze STAYS ON for anything else. Before it, a trash restore
- * emitted two notices - the correct one and the canvas's wrong one - which is
- * exactly the red the acceptance case below still produces if that condition is
- * reverted.
+ * THE CANVAS HALF IS GONE WITH THE CANVAS PAGE (s197). These cases used to be
+ * driven through the deleted canvas page view's `loadPage`, and the doubling
+ * they guarded against was that view's own bare interrupted-save notice, firing
+ * for an event
+ * the store had already announced. The view, its notice and its
+ * `&& !result.fromInkTrash` discriminator were deleted with the surface, so
+ * that second speaker no longer exists to be re-introduced. What remains, and
+ * is driven here, is the store-and-binding half: one event, one sentence, one
+ * notice, and the surface adding nothing of its own. Two claims that could only
+ * be shown through the view are listed by name in the s197 RESULT.md.
  */
 
 const PAGE_ID = "recovered-trash-restore";
@@ -124,15 +125,29 @@ function stroke(id: string): InkStroke {
 }
 
 function sidecarText(): string {
-	const page = emptyPage(PAGE_ID);
+	// `surface: "inline"`, and load-bearing: a sidecar without it is a
+	// canvas page era file, and the inline surface refuses to adopt one
+	// (`adoptSidecar`'s legacy lock). The note under test here is an
+	// ordinary one, so its sidecar says so.
+	const page = { ...emptyPage(PAGE_ID), surface: "inline" as const };
 	page.strokes.push(stroke("s0"));
 	return serializePage(page);
 }
 
+/** A different note path per open: the inline store keeps one record per path. */
+let opens = 0;
+const freshPath = () => `Recovered-${++opens}.md`;
+
 /**
- * A store with the REAL production notice bindings installed, and a real
- * canvas view wired to it. `noteNameFor` is resolved from the EVENT's pageId,
- * never from an active leaf, which is what the contract requires.
+ * A store with the REAL production notice bindings installed, and the real
+ * inline surface reading through it. `noteNameFor` is resolved from the
+ * EVENT's pageId, never from an active leaf, which is what the contract
+ * requires.
+ *
+ * The host is the wiring `main.ts` gives `inlineInk.attachHost`, narrowed to
+ * the members a read reaches: the page id comes from the note's metadata and
+ * the sidecar read is `store.load`. Nothing here decides anything - every
+ * recovery decision is inside the store, and every sentence inside the binding.
  */
 function rig(seed: (adapter: ListingAdapter) => void) {
 	const adapter = new ListingAdapter();
@@ -140,27 +155,30 @@ function rig(seed: (adapter: ListingAdapter) => void) {
 	const store = new PageStore({ vault: { adapter } });
 	bindRecoveryNotices(store, (pageId) => (pageId === PAGE_ID ? NOTE_LABEL : `other:${pageId}`));
 
-	const host = {
-		store,
-		getCamera: () => undefined,
-		setCamera: () => {},
-		settings: { inkSmoothing: false },
-		canvasIntent: new Set<string>(),
-	};
-	const view = new HandwritingPageView({} as never, host as never);
-	const raw = view as unknown as Record<string, unknown>;
-	// The render sinks only, which `onOpen` would have built from a DOM.
-	raw.textLayer = { setAll() {}, setCamera() {} };
-	raw.imageLayer = { setAll() {} };
-	raw.requestRender = () => {};
-	raw.updateStatus = () => {};
-	(raw.doc as { pageId: string }).pageId = PAGE_ID;
+	inlineInk.attachHost({
+		readPageId: () => PAGE_ID,
+		claimId: async () => ({ pageId: PAGE_ID }),
+		loadSidecar: (pageId) => store.load(pageId),
+		scheduleSidecar: (pageId, page) => store.schedule(pageId, page),
+		// main.ts sends this to `blockNotice`, which shows a Notice. Counted
+		// with the rest: a recovery sentence from the surface is a second
+		// speaker, which is exactly what these cases forbid.
+		notify: (message) => {
+			new Notice(message);
+		},
+	});
 
-	const inner = view as unknown as {
-		loadPage(blocks: unknown[], embeds: unknown[]): Promise<void>;
-		loadToken: number;
+	return {
+		adapter,
+		store,
+		/** One editor opening one note: the real inline read of this page. */
+		open: async () => {
+			const path = freshPath();
+			await inlineInk.ensureLoaded(path);
+			return path;
+		},
+		strokeIds: (path: string) => inlineInk.strokes(path).map((s) => s.id),
 	};
-	return { adapter, store, view, inner, open: () => inner.loadPage([], []) };
 }
 
 const seedTrash = (a: ListingAdapter) =>
@@ -177,7 +195,6 @@ const seedClean = (a: ListingAdapter) => a.externalWrite(`${HOME}/${PAGE_ID}.jso
 const TRASH_SENTENCE = `Handwriting restored the ink on “${NOTE_LABEL}” from trash. the file is at ${HOME}/${PAGE_ID}.json`;
 
 const isTrashNotice = (m: string) => m.includes("from trash");
-const isBareInterrupted = (m: string) => m === "Handwriting recovered this note's ink from an interrupted save. Nothing was lost.";
 const isCorruptPromotion = (m: string) => m.includes("The unreadable file is kept as");
 
 beforeEach(() => {
@@ -192,7 +209,7 @@ describe("a trash restore, driven through the real caller", () => {
 	// every count below is meaningless.
 	it("the harness holds: the real loadPage runs, the ink comes back, nothing throws", async () => {
 		const { open, adapter } = rig(seedTrash);
-		await expect(open()).resolves.toBeUndefined();
+		await expect(open()).resolves.toBeTruthy();
 
 		// The ink is on disk at the live path, restored by a rename.
 		const live = await adapter.read(`${HOME}/${PAGE_ID}.json`);
@@ -213,18 +230,16 @@ describe("a trash restore, driven through the real caller", () => {
 	/**
 	 * THE ACCEPTANCE CASE. Exactly one notice belongs to one restoration.
 	 *
-	 * THIS IS THE FUNCTIONAL RED: remove `&& !result.fromInkTrash` from the
-	 * canvas condition and this counts TWO, because the view's bare
-	 * interrupted-save branch fires for the same event the store already
-	 * announced. It is a count over real emitted notices - not a fingerprint,
-	 * not a copied predicate, and not a thrown fixture.
+	 * A count over real emitted notices - not a fingerprint, not a copied
+	 * predicate, not a thrown fixture. It reds if the store raises twice for
+	 * one restoration, if the binding speaks on a path that is not one, or if
+	 * the inline surface starts announcing recoveries of its own.
 	 */
-	it("ONE notice per restoration, and no bare-interrupted or corrupt notice", async () => {
+	it("ONE notice per restoration, and no corrupt-promotion notice", async () => {
 		const { open } = rig(seedTrash);
 		await open();
 
 		expect(notices.messages).toHaveLength(1);
-		expect(notices.messages.filter(isBareInterrupted)).toEqual([]);
 		expect(notices.messages.filter(isCorruptPromotion)).toEqual([]);
 	});
 
@@ -239,11 +254,13 @@ describe("a trash restore, driven through the real caller", () => {
 describe("the events that must NOT be swept up with it", () => {
 	// Without this, "exactly one notice" could be satisfied by suppressing
 	// every recovery notice there is.
-	it("CONTROL: a bare interrupted-save recovery still announces itself", async () => {
+	// The bare interrupted-save recovery: a .tmp beside no live sidecar. The
+	// store recovers it; only the deleted canvas page view ever announced it, so
+	// after s197 the recovery is silent and no trash notice may appear either.
+	it("CONTROL: a bare interrupted-save recovery claims no trash restore", async () => {
 		const { open } = rig(seedBareInterrupted);
 		await open();
 
-		expect(notices.messages.filter(isBareInterrupted)).toHaveLength(1);
 		expect(notices.messages.filter(isTrashNotice)).toEqual([]);
 	});
 
@@ -289,34 +306,21 @@ describe("repeat behaviour: once per restoration, and never a permanent silence"
 		expect(notices.messages.filter(isTrashNotice)).toHaveLength(2);
 	});
 
-	it("a superseded load emits nothing: the token guard wins the race", async () => {
-		const { open, inner } = rig(seedTrash);
-		const inFlight = open();
-		// Another page won the race while the store read was pending.
-		inner.loadToken++;
-		await inFlight;
-
-		// The store event still spoke - it belongs to the restoration, not to
-		// this view - but the superseded view added no second notice of its own.
-		expect(notices.messages.filter(isBareInterrupted)).toEqual([]);
-		expect(notices.messages.filter(isTrashNotice)).toHaveLength(1);
-	});
-
 	it("overlapping opens complete one trash restore without losing the live ink", async () => {
-		const { open, adapter, view } = rig(seedTrash);
+		const { open, adapter, strokeIds } = rig(seedTrash);
 		const held = adapter.holdFirstTrashRestoreRename();
 		const firstOpen = open();
 		await held.reached;
 
-		// A second real loadPage reaches the shared store/page while the first
-		// actual restore rename is still held. It wins the rename and the view.
+		// A second real editor read reaches the shared store while the first
+		// actual restore rename is still held.
 		const secondOpen = open();
 		try {
-			await expect(secondOpen).resolves.toBeUndefined();
+			await expect(secondOpen).resolves.toBeTruthy();
 		} finally {
 			held.release();
 		}
-		await expect(Promise.all([firstOpen, secondOpen])).resolves.toEqual([undefined, undefined]);
+		const paths = await Promise.all([firstOpen, secondOpen]);
 
 		expect(
 			adapter.log.filter(
@@ -326,13 +330,16 @@ describe("repeat behaviour: once per restoration, and never a permanent silence"
 			)
 		).toHaveLength(1);
 		expect(notices.messages).toEqual([TRASH_SENTENCE]);
-		expect(notices.messages.filter(isBareInterrupted)).toEqual([]);
 		expect(notices.messages.filter(isCorruptPromotion)).toEqual([]);
 
 		const live = await adapter.read(`${HOME}/${PAGE_ID}.json`);
 		expect(JSON.parse(live).strokes.map((s: { id: string }) => s.id)).toEqual(["s0"]);
-		const loaded = view as unknown as { doc: { strokes: InkStroke[] } };
-		expect(loaded.doc.strokes.map((s) => s.id)).toEqual(["s0"]);
+		// And the next editor to open the note reads the restored ink, not an
+		// empty page. (What the two RACING readers hold is deliberately not
+		// asserted: each read its own copy at a different point in the
+		// rename, which is the store's business and not this file's claim.)
+		expect(paths).toHaveLength(2);
+		expect(strokeIds(await open())).toEqual(["s0"]);
 	});
 });
 
@@ -346,8 +353,7 @@ describe("a FAILED restoration claims nothing", () => {
 
 		// No callback was raised, so nothing may claim a restoration...
 		expect(notices.messages.filter(isTrashNotice)).toEqual([]);
-		// ...and it must not be announced as an interrupted save either.
-		expect(notices.messages.filter(isBareInterrupted)).toEqual([]);
+		// ...and it must not be announced as a corrupt-file promotion either.
 		expect(notices.messages.filter(isCorruptPromotion)).toEqual([]);
 
 		// The ink is where it was: still in the trash, no live copy invented.
@@ -361,8 +367,8 @@ describe("a FAILED restoration claims nothing", () => {
 		const store = new PageStore({ vault: { adapter } });
 		const result = await store.load(PAGE_ID);
 
-		// Provenance, not a completed restore: this is what keeps the canvas
-		// branch from claiming an interrupted save for it.
+		// Provenance, not a completed restore: a surface that read this result
+		// learns the ink came from the trash and that nothing was restored.
 		expect(result!.fromInkTrash).toBe(true);
 		expect(result!.recovered).toBe(true);
 	});

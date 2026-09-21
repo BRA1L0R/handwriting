@@ -83,6 +83,7 @@ export interface InlineInkHost {
  */
 export type ExternalAdoptionHeldReason =
 	| "missing-capability"
+	| "admission-changed"
 	| "unsettled"
 	| "existing-lock"
 	| "no-snapshot"
@@ -117,6 +118,16 @@ const ADOPTION_UNAVAILABLE: ExternalAdoptionResult = { outcome: "unavailable", c
 
 function adoptionHeld(reason: ExternalAdoptionHeldReason): ExternalAdoptionResult {
 	return { outcome: "held", changed: false, reason };
+}
+
+/** Only a current, synchronous caller qualification can authorize adoption. */
+function admissionAllowed(canAdopt: (() => boolean) | undefined): boolean {
+	try {
+		return canAdopt?.() === true;
+	} catch {
+		// An unavailable pane binding is a hold, never authority to replace ink.
+		return false;
+	}
 }
 
 /**
@@ -1171,7 +1182,7 @@ export class InlineInkStore {
 	 * the artifacts already written are kept, and current ink, base, local
 	 * mutation markers and history are exactly as they were.
 	 */
-	async adoptExternal(path: string): Promise<ExternalAdoptionResult> {
+	async adoptExternal(path: string, canAdopt?: () => boolean): Promise<ExternalAdoptionResult> {
 		const rec = this.byPath.get(path);
 		const host = this.host;
 		if (!rec) return ADOPTION_UNAVAILABLE;
@@ -1187,6 +1198,9 @@ export class InlineInkStore {
 		if (rec.damagedLocked || rec.legacyLocked || rec.futureLocked || rec.duplicateLocked) {
 			return adoptionHeld("existing-lock");
 		}
+		// The caller owns pane gestures, selections and queued-write eligibility.
+		// Missing qualification holds too; record stability cannot prove them.
+		if (!admissionAllowed(canAdopt)) return adoptionHeld("admission-changed");
 		const id = rec.pageId;
 		const outgoing = this.snapshot(rec);
 		if (!id || !outgoing) return adoptionHeld("no-snapshot");
@@ -1275,6 +1289,9 @@ export class InlineInkStore {
 		// that by construction rather than by an inventory of callers.
 		const current = this.snapshot(rec);
 		if (!current || JSON.stringify(current) !== capturedJson) return adoptionHeld("unsettled");
+		// Preservation awaited: an uncommitted gesture can start without changing
+		// the record. Recheck the caller immediately before acknowledging bytes.
+		if (!admissionAllowed(canAdopt)) return adoptionHeld("admission-changed");
 		accept(prep.prepared);
 		// The existing clean-adoption semantics: the incoming revision becomes
 		// the base and the visible ink. No union of missing ids - that is the

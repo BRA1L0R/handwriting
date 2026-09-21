@@ -1,17 +1,21 @@
 /**
- * B1 — CANVAS DATA LOSS, REPRODUCED. One `PageStore`, two `PageDocument`s, one
- * pageId. A reproduction only: nothing here is fixed, and one test is knowingly
- * red (see THE KNOWN-FAILING IDIOM below).
+ * B1 — TWO IN-PROCESS WRITERS, ONE PAGE ID. One `PageStore`, two pages composed
+ * independently from the same bytes, one pageId.
  *
- * THE ARRANGEMENT IS THE SHIPPED TOPOLOGY, not an invented wiring. `main.ts`
- * builds ONE `PageStore` and hands it to every view through
- * `HandwritingHost.store`, while each `HandwritingPageView` holds its OWN
- * `PageDocument` (its `doc` field, replaced in `openFrom`/`clear`). So the
- * canvas shares the WRITER and not the MODEL — unlike notes (`InlineInkStore`)
- * and PDFs (`PdfInkStore`), which share the strokes themselves. Two panes on one
- * canvas page therefore both reach `store.schedule(pageId, ownPage)` with their
- * own composed page, and `PageStore.schedule` does `pending.set(pageId, data)`:
- * last writer wins, and the loser's strokes are gone.
+ * THE ARRANGEMENT IS A SHIPPED ONE, not an invented wiring. `main.ts` builds
+ * ONE `PageStore` and hands it to every surface. A surface that shares its
+ * model — notes (`InlineInkStore`) and PDFs (`PdfInkStore`) share the strokes
+ * themselves — has one writer per page id and cannot collide with itself. A
+ * surface that shares the WRITER and not the MODEL composes its own page per
+ * holder, and two holders then both reach `store.schedule(pageId, ownPage)`
+ * while `PageStore.schedule` does `pending.set(pageId, data)`: last writer
+ * wins, and the loser's strokes are gone. That is the collision reproduced and
+ * fixed here, and it is the store's rule, not any one surface's.
+ *
+ * WHERE THIS CAME FROM. The case was found on the canvas page view, which held
+ * one document per pane. That view was deleted in s197. The store rule it
+ * exposed is untouched and is what these cases drive; the one claim that could
+ * only be made about the view is listed by name in the s197 RESULT.md.
  *
  * THE GUARD IS THE MECHANISM, NOT A MITIGATION. `writeNow`'s external-revision
  * guard computes `external` from `st.mtime !== knownMtime`, then compares
@@ -23,19 +27,15 @@
  * writer IS the same session. It answers its own question correctly and the
  * wrong question silently.
  *
- * WHAT THIS FILE PROVES, AND WHAT IT DOES NOT. It proves that the
- * store-and-document layer loses data when driven this way: a second document
- * scheduling its own page under the same id destroys the first document's
- * strokes, with no conflict copy, no callback and no error. It does NOT prove
- * that Obsidian instantiates two `HandwritingPageView`s for one file in a split.
- * That is well supported by `onLoadFile`'s leaf-reuse handling, but it is a
- * claim about the host, and nothing here establishes it. `HandwritingPageView`
- * is not practically constructible in a test (canvases, a `PointerRouter`, a
- * `TextLayer`), so no call below routes through the view; instead every call is
- * one the view makes verbatim — `store.load` then `applySidecar` on open
- * (`loadPage`), and `page.strokes.push(...)` then
- * `store.schedule(this.pageId, this.page)` on a stroke (`saveSpatial` →
- * `scheduleSidecar`).
+ * WHAT THIS FILE PROVES, AND WHAT IT DOES NOT. It proves what the store does
+ * when two identified writers save one page id: without the fix the second
+ * one's save destroys the first's strokes, with no conflict copy, no callback
+ * and no error; with it the store reads the live file back and unions them. It
+ * does NOT prove that any particular surface really opens two holders on one
+ * file — that is a claim about a host, and nothing here establishes it. Each
+ * holder below does exactly what a surface does: `store.load` on open, then
+ * `page.strokes.push(...)` and `store.schedule(pageId, page, writer)` on a
+ * stroke.
  *
  * THE SEED IS LOAD-BEARING — THOUGH NOT FOR THE REASON THE DESIGN PREDICTED.
  * Every scenario starts with one write from this same store, settled, so
@@ -83,18 +83,17 @@ vi.mock("obsidian", () => ({
 
 import { PageStore, PageWriter, newPageWriter } from "./PageStore";
 import { FakeAdapter } from "./FakeAdapter";
-import { PageDocument } from "../model/PageDocument";
 import { PageData, emptyPage } from "../model/PageData";
 import type { InkStroke } from "../ink/Stroke";
-import viewSource from "../view/HandwritingPageView.ts?raw";
+import mainSource from "../main.ts?raw";
 import { codeOnly } from "../CodeOnly";
 
 /**
- * The canvas view's CODE, without the canvas view's prose.
+ * The shipped surface's CODE, without the shipped surface's prose.
  *
- * The last test in this file reads the shipped view as source text, and its
- * own comment says it took "the `?raw` idiom StripPenChrome.test.ts
- * established" - it inherited the idiom and it inherited the hole with it. A
+ * The last test in this file reads production source as text, and its own
+ * comment says it took "the `?raw` idiom StripPenChrome.test.ts established" -
+ * it inherited the idiom and it inherited the hole with it. A
  * file read as text is a document: it carries the schedule calls and the
  * paragraphs about the schedule calls, and a regex cannot tell them apart.
  *
@@ -111,9 +110,12 @@ import { codeOnly } from "../CodeOnly";
  * Counting code can only find FEWER call sites, so no real site stops being
  * checked; what stops being counted is a call that was only ever a sentence.
  */
-const viewCode = codeOnly(viewSource);
+const mainCode = codeOnly(mainSource);
 
-/** Every schedule/saveNow call in a piece of view source, comments excluded. */
+/** The writer token `startSlidesInk` makes once, quoted as production spells it. */
+const SLIDES_WRITER = 'newPageWriter("slides")';
+
+/** Every schedule/saveNow call in a piece of source, comments excluded. */
 function scheduleCalls(src: string): string[] {
 	return codeOnly(src).match(/store\.(?:schedule|saveNow)\([^)]*\)/g) ?? [];
 }
@@ -121,28 +123,11 @@ function scheduleCalls(src: string): string[] {
 const PAGE_ID = "p1";
 const FINAL = ".handwriting/p1.json";
 const TMP_WRITE = "write .handwriting/p1.json.tmp";
-const WIDTH = 320;
 
 /** Stroke ids, chosen so a raw `toContain` on the serialized sidecar is unambiguous. */
 const SEED_INK = "seed-stroke";
 const A_INK = "pane-A-stroke";
 const B_INK = "pane-B-stroke";
-
-/** A canvas page as it sits on disk: no `surface` field (absent = free world space). */
-function markdown(): string {
-	return [
-		"---",
-		"handwriting: page",
-		"handwriting-version: 1",
-		`handwriting-page-id: ${PAGE_ID}`,
-		"---",
-		"",
-		"<!-- handwriting:textbox id=tb-1 -->",
-		"first",
-		"<!-- /handwriting:textbox -->",
-		"",
-	].join("\n");
-}
 
 function strokeNamed(id: string): InkStroke {
 	return {
@@ -194,30 +179,31 @@ async function seed(): Promise<void> {
 }
 
 /**
- * One open pane: its own `PageDocument`, and its own writer identity.
+ * One open holder: its own page, and its own writer identity.
  *
- * The identity is the FIX's half of the shipped topology, and is passed here
- * for the same reason `HandwritingPageView` passes it - one token per view, for
- * the life of the view. Without it the store has nothing to tell two panes
- * apart with: `knownMtime`/`knownHash` are one pair per pageId and `store.load`
- * stamps them too, so pane B's OPEN below re-stamps the store exactly as pane
- * A's write did. That the shipped view really passes one is asserted
- * separately, from its source, in "the shipped canvas view carries a writer
- * identity" below - otherwise this file could go green over a plugin whose view
- * had never been fixed.
+ * The identity is the FIX's half, and is passed here for the same reason a
+ * surface passes it - one token per holder, for the life of the holder.
+ * Without it the store has nothing to tell two holders apart with:
+ * `knownMtime`/`knownHash` are one pair per pageId and `store.load` stamps
+ * them too, so holder B's OPEN below re-stamps the store exactly as holder A's
+ * write did. That a shipped surface really passes one is asserted separately,
+ * from production source, in "the shipped surface carries a writer identity"
+ * below - otherwise this file could go green over a plugin whose surfaces had
+ * never been fixed.
  */
 interface Pane {
-	doc: PageDocument;
+	page: PageData;
 	writer: PageWriter;
 }
 
-/** What a view does on open: `store.load`, then `applySidecar` (`loadPage`). */
+/**
+ * What a surface does on open: `store.load`. Each call parses the file again,
+ * so the two holders below hold the same bytes as two separate models - which
+ * is the arrangement under test, not a convenience.
+ */
 async function openPane(): Promise<Pane> {
-	const doc = new PageDocument();
-	const parsed = doc.loadMarkdown(markdown());
-	const result = await store.load(doc.pageId);
-	doc.applySidecar(result?.data, parsed.blocks, parsed.images, WIDTH);
-	return { doc, writer: newPageWriter("pane") };
+	const result = await store.load(PAGE_ID);
+	return { page: result?.data ?? emptyPage(PAGE_ID), writer: newPageWriter("pane") };
 }
 
 /**
@@ -251,25 +237,24 @@ async function collide(regime: Regime): Promise<Collision> {
 	const conflictCalls: string[] = [];
 	store.onConflict = (_id, keptAs) => conflictCalls.push(keptAs);
 
-	// Two views of one file. Same store, one `PageDocument` each.
+	// Two holders of one file. Same store, one page each.
 	const paneA = await openPane();
 	const paneB = await openPane();
 
 	// A draws. Push BEFORE scheduling: `pending` keeps this very array.
-	paneA.doc.page.strokes.push(strokeNamed(A_INK));
-	store.schedule(paneA.doc.pageId, paneA.doc.page, paneA.writer);
+	paneA.page.strokes.push(strokeNamed(A_INK));
+	store.schedule(PAGE_ID, paneA.page, paneA.writer);
 
 	if (regime === "separated") await settle();
 	else await vi.advanceTimersByTimeAsync(100);
 	const afterA = fake.files.get(FINAL);
 
-	// B writes, carrying B's own page — which never saw A's stroke. In the
-	// shipped plugin this needs no drawing in B at all: Obsidian's text push
-	// reaches every open view and the reconcile branch ends in `saveSpatial()`
-	// whenever containers changed. A stroke is simply the shortest way to make
-	// B's page differ here.
-	paneB.doc.page.strokes.push(strokeNamed(B_INK));
-	store.schedule(paneB.doc.pageId, paneB.doc.page, paneB.writer);
+	// B writes, carrying B's own page — which never saw A's stroke. In a
+	// shipped surface this needs no drawing in B at all: any edit that reaches
+	// every open holder ends in a save. A stroke is simply the shortest way to
+	// make B's page differ here.
+	paneB.page.strokes.push(strokeNamed(B_INK));
+	store.schedule(PAGE_ID, paneB.page, paneB.writer);
 	await settle();
 
 	return {
@@ -282,7 +267,7 @@ async function collide(regime: Regime): Promise<Collision> {
 	};
 }
 
-describe("one store, two documents, one pageId — the shipped canvas topology", () => {
+describe("one store, two holders, one pageId — two in-process writers", () => {
 	it("the harness holds: both panes load the seeded ink, and A's write lands on disk", async () => {
 		// This is the setup proof for the `it.fails` below, kept in its own
 		// green test on purpose: `it.fails` passes on ANY error, so a harness
@@ -292,17 +277,15 @@ describe("one store, two documents, one pageId — the shipped canvas topology",
 
 		const paneA = await openPane();
 		const paneB = await openPane();
-		expect(paneA.doc.pageId).toBe(PAGE_ID);
-		expect(paneB.doc.pageId).toBe(PAGE_ID);
 		// Separate models: the same bytes parsed twice, not one shared array.
-		expect(paneA.doc.page).not.toBe(paneB.doc.page);
+		expect(paneA.page).not.toBe(paneB.page);
 		// And separate identities, which is what the store now reconciles on.
 		expect(paneA.writer).not.toBe(paneB.writer);
-		expect(paneA.doc.strokes.map((s) => s.id)).toEqual([SEED_INK]);
-		expect(paneB.doc.strokes.map((s) => s.id)).toEqual([SEED_INK]);
+		expect(paneA.page.strokes.map((s) => s.id)).toEqual([SEED_INK]);
+		expect(paneB.page.strokes.map((s) => s.id)).toEqual([SEED_INK]);
 
-		paneA.doc.page.strokes.push(strokeNamed(A_INK));
-		store.schedule(paneA.doc.pageId, paneA.doc.page, paneA.writer);
+		paneA.page.strokes.push(strokeNamed(A_INK));
+		store.schedule(PAGE_ID, paneA.page, paneA.writer);
 		await settle();
 		expect(fake.files.get(FINAL)).toContain(A_INK);
 	});
@@ -325,8 +308,8 @@ describe("one store, two documents, one pageId — the shipped canvas topology",
 		// A drew is dropped.
 		//
 		// This was `it.fails` from d6094dd until the fix landed, and it is the
-		// acceptance criterion for B1. If it ever reads `it.fails` again, the
-		// canvas is losing ink.
+		// acceptance criterion for B1. If it ever reads `it.fails` again, a
+		// two-holder surface is losing ink.
 		expect(c.afterB).toContain(A_INK);
 	});
 
@@ -451,9 +434,9 @@ describe("the reconcile is per WRITER, and only ever adds", () => {
 		// Pinned rather than left to be discovered. Two panes, no shared model
 		// and no version vector, so "deleted" and "never seen" are the same
 		// page to the store, and the union resolves both toward keeping the
-		// ink. Pane A erases s2 and saves; pane B still shows s2 (there is no
-		// cross-pane fan-out on the canvas, which is this same defect) and
-		// saves; s2 comes back.
+		// ink. Holder A erases s2 and saves; holder B still shows s2 (a surface
+		// with no cross-holder fan-out, which is this same defect) and saves;
+		// s2 comes back.
 		//
 		// Not a regression: the UNFIXED code resurrects it too, because B's
 		// page still carries it and B's page becomes the file wholesale. The
@@ -471,24 +454,25 @@ describe("the reconcile is per WRITER, and only ever adds", () => {
 		expect(fake.files.get(FINAL)).toContain("s2");
 	});
 
-	it("the shipped canvas view carries a writer identity at every schedule site", async () => {
+	it("the shipped surface carries a writer identity at every schedule site", async () => {
 		// THE GAP THIS CLOSES. Every test above hands the store an identity of
-		// its own making, because `HandwritingPageView` is not constructible
-		// here (canvases, a `PointerRouter`, a `TextLayer`). So they would all
-		// stay green over a plugin whose view still called `schedule` with two
-		// arguments - the fix would be present in the store and absent from the
-		// only surface that needs it. Read from the view's source instead, in
-		// the `?raw` idiom StripPenChrome.test.ts established - but from its
-		// CODE, not its text. See the note on `viewCode` at the top of this
-		// file: read raw, this assertion was satisfied by two comments over a
-		// view that had stopped scheduling altogether.
-		expect(viewCode).toContain("newPageWriter(");
-		const calls = scheduleCalls(viewSource);
-		// Anti-vacuity: the view really does schedule sidecars, so a rename or
-		// a refactor that voided this regex fails here rather than silently
+		// its own making, so they would all stay green over a plugin whose
+		// surfaces still called `schedule` with two arguments - the fix would
+		// be present in the store and absent from the surface that needs it.
+		// Slides is that surface after s197: one deck, its own composed page
+		// per sidecar id, and a writer token made once in `startSlidesInk`.
+		// Read from production source instead, in the `?raw` idiom
+		// StripPenChrome.test.ts established - but from its CODE, not its
+		// text. See the note on `mainCode` at the top of this file: read raw,
+		// this assertion was satisfied by comments over a surface that had
+		// stopped scheduling altogether.
+		expect(mainCode).toContain(SLIDES_WRITER);
+		const calls = scheduleCalls(mainSource).filter((c) => c.includes("sidecarId"));
+		// Anti-vacuity: the surface really does schedule sidecars, so a rename
+		// or a refactor that voided this regex fails here rather than silently
 		// asserting nothing. This is the half comments used to prop up.
 		expect(calls.length).toBeGreaterThanOrEqual(2);
-		expect(calls.filter((c) => !c.includes("this.writer"))).toEqual([]);
+		expect(calls.filter((c) => !c.includes("writer"))).toEqual([]);
 	});
 });
 
@@ -496,7 +480,7 @@ describe("the reconcile is per WRITER, and only ever adds", () => {
  * Fixtures over the scanner, so the assertion above is evidence rather than a
  * coincidence, and so the defeat is pinned in a form nobody has to reconstruct.
  */
-describe("the view scan reads schedule calls, not sentences about them", () => {
+describe("the source scan reads schedule calls, not sentences about them", () => {
 	const REAL = "\t\tthis.host.store.schedule(this.pageId, this.page, this.writer);\r\n";
 
 	it("finds a real schedule call and keeps its arguments", () => {
@@ -517,7 +501,7 @@ describe("the view scan reads schedule calls, not sentences about them", () => {
 	});
 
 	it("does NOT let a doc comment supply the writer field either", () => {
-		const explained = "\t/**\r\n\t * Every save goes through newPageWriter(\"canvas-page-view\").\r\n\t */\r\n";
+		const explained = `\t/**\r\n\t * Every save goes through ${SLIDES_WRITER}.\r\n\t */\r\n`;
 		expect(codeOnly(explained)).not.toContain("newPageWriter(");
 	});
 });

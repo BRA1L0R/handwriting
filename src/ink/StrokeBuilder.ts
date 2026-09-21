@@ -7,11 +7,33 @@ import type { StrokeWidthMode, PressureProfile } from "./StrokeWidth";
  * then recover without another pointerdown. Those coordinates are release
  * travel, not ink. The two pressure bands provide hysteresis; the time and
  * distance gates keep a brief light-pressure wobble in the stroke.
+ *
+ * Pressure cannot tell release travel from a deliberate light glide: Alan's
+ * in-contact glide (trace d1c16bdb) went down to 0.0039, below the release
+ * values the filter was written against. Duration can. A light run is release
+ * travel only while its light samples span at most RELEASE_MAX_MS; a longer
+ * run is writing and stays in the stroke whole, unsplit, mid-stroke or at the
+ * end.
  */
 const RELEASE_PRESSURE_MAX = 0.025;
 const CONFIDENT_CONTACT_PRESSURE = 0.08;
 const RELEASE_MIN_MS = 8;
 const RELEASE_MIN_TRAVEL = 3;
+/**
+ * The longest light run still read as release travel, timed from the run's
+ * FIRST light sample to its last: a still hold at confident pressure before
+ * the run is not part of it (the builder accepts no sample while the pen is
+ * still, so an edge-inclusive time would count the hold). RELEASE_MIN_MS keeps
+ * its edge-inclusive measure.
+ *
+ * 50, on these measurements:
+ * - Alan's kept glide spans 188 ms;
+ * - the fixture's release runs span 0-22 ms (synthetic, no captured release);
+ * - 1285 real samples on Orion hold no light run at a stroke end (a real lift
+ *   is one sample under 12 ms);
+ * - a real lift-and-hop on the Surface holds no light sample at all.
+ */
+export const RELEASE_MAX_MS = 50;
 
 /**
  * Accumulates world-space samples for the stroke currently being written.
@@ -182,7 +204,18 @@ export class StrokeBuilder {
 			const releaseEdge = Math.max(groupStart, gapStart - 1);
 			const duration = this.points[gapEnd]!.t - this.points[releaseEdge]!.t;
 			const travel = this.pathLength(releaseEdge, gapEnd);
-			const provenRelease = duration >= RELEASE_MIN_MS && travel >= RELEASE_MIN_TRAVEL;
+			// The light run's own span. A terminal gap can end in samples above
+			// the release band that never reach confident contact; they ride with
+			// the run, but its span stops at its last light sample.
+			let lastLight = gapEnd;
+			while (lastLight > gapStart && this.points[lastLight]!.pressure > RELEASE_PRESSURE_MAX) lastLight--;
+			const lightSpan = this.points[lastLight]!.t - this.points[gapStart]!.t;
+			// Longer than a bounce, a light run is writing: not release, so it
+			// stays in this group.
+			const provenRelease =
+				duration >= RELEASE_MIN_MS &&
+				travel >= RELEASE_MIN_TRAVEL &&
+				lightSpan <= RELEASE_MAX_MS;
 
 			if (!provenRelease) {
 				if (recoveryConfirmed < 0) break;

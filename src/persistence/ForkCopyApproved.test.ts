@@ -9,8 +9,8 @@ import { FORK_COPY_PLACEHOLDER } from "./ForkResolution";
  * unapproved string cannot reach a release build unnoticed". NOTHING ENFORCED
  * THAT. No test asserted the marker, the build config did not scan for it, and
  * `ForkResolution.test.ts` pins behaviour and never touches copy. The marker
- * was a convention read by people, not a gate - reported by the seat that
- * wrote the docstring, against its own work.
+ * was a convention read by people, not a gate - reported by whoever wrote
+ * the docstring, against their own work.
  *
  * The consequence was not hypothetical. Slot 6 was to keep its drafted wording
  * "as-is", and nothing would have stopped the literal text

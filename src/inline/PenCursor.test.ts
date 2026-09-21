@@ -315,7 +315,7 @@ describe("the pan drag's move handler positions nothing, and the hand is on the 
 		// the scanner and the ruling both live in this file and this project's
 		// most expensive recurring defect is a ruling that reached one ink
 		// surface and not another - which is exactly what happened to this
-		// one. Reviewer finding F4, 1.4.12-design §11: "the pan-drag reticle
+		// one. 1.4.12-design §11: "the pan-drag reticle
 		// fix is note-only, the pdf pan still paints the ring per sample via
 		// `showPanCursor` and never wears the grabbing hand".
 		//

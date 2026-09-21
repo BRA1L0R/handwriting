@@ -107,10 +107,85 @@ interface MeasureHold {
  * where the scroll takes whole pixels and the fraction stays as pan.
  */
 const PAN_MIN_VISIBLE_PX = 24;
+/**
+ * s110: A DRAG, NOT A ZOOM. The give is a pan claim, and a preview frame that is changing the scale must
+ * keep the note under the focal point with no bound at all - that is what the settle-only bound exists for
+ * and what the earlier attempt at this broke (3884c642, "take the preview clamp back out, it breaks the
+ * focal hold"). A frame counts as a drag while the scale is within this of where the gesture started.
+ */
+const PAN_DRAG_SCALE_EPS = 0.05;
+/**
+ * s128: the scale has held when it is within this of the scale PAN_DRAG_WINDOW frames ago. Measured: a
+ * zoom the rig ramps at 0.31 percent a frame (RllColumnFocalHold, 85 percent with travel) moves 2.5
+ * percent over eight frames and must keep its focal hold; a spread held by two fingers moves well under
+ * 0.8 percent over eight. The window is the lead a drag gets before the band engages.
+ */
+const PAN_DRAG_FRAME_EPS = 0.008;
+const PAN_DRAG_WINDOW = 8;
+/**
+ * Box comparisons under this are not a fit or a miss, just layout rounding: a
+ * column that fits leaves a fraction of a pixel behind on some zooms, and a
+ * fraction is not something a pan can be spent into. Measured on the render
+ * fixture: the scroller's remaining range is 0 at 100% in both
+ * readable-line-length states and 0 at 150% with readable line length on (the
+ * 700 px column still fits the 1397.5 px pane), 466 at 150% with it off.
+ */
+const PAN_FIT_SLACK_PX = 1;
+/**
+ * A settle counts as a ZOOM, for the fitting clamp, only when it commits a
+ * scale outside this band of the scale its gesture began at. A two-finger drag
+ * is never a pure translation on a real screen: once the fingers have moved
+ * past the router's 12 px pinch slop and the gesture is live, their spread keeps
+ * wandering, a scale drift of 1-12% (a drift smaller than the slop never starts
+ * the gesture at all). A drag that ends at 1.03 or 1.12 of its start is still a
+ * drag, and it keeps the pan contract - the page stays where the fingers left
+ * it. An in-then-out pinch that comes back near its start is the same case.
+ */
+const PAN_SETTLE_ZOOM_BAND = { below: 0.8, above: 1.25 };
+/**
+ * THE OVERSCROLL BOUNCE. Where the settle of a zoom clamps a
+ * page that hung off the pane back inside it (panAxisWindow), the correction
+ * used to arrive in one frame: the page jumped. It now plays out as a visual
+ * offset that starts at the overshoot, where the last preview frame left the
+ * page, and eases to zero, so the page springs back onto the pane.
+ *
+ * VISUAL ONLY. The settle writes its clamped rest into `viewportPan` exactly
+ * as before, on the settle's own frame, and the bounce never touches it: the
+ * offset rides on top in panX/panY, which every pan write reads (the text's
+ * sizer, the ink layer, the paper), so ink, paper and text move as one. It
+ * eases out and ends at zero - no momentum, nothing re-enters - and any input
+ * that maps a point (a pen down, a new pinch, a wheel, a touch) takes the
+ * page to its rest first.
+ *
+ * HALF A SECOND, matched to OneNote's overscroll as Alan filmed it (release to
+ * rest about 0.53 s at 15 fps, one ease, never past the rest). It was 180 ms; if
+ * that feels slow on the device, this one number sets it back.
+ */
+const OVERSCROLL_BOUNCE_MS = 500;
+/** A correction smaller than this, in painted px, is not animated: it cannot be seen, and a settle stands within it. */
+const OVERSCROLL_BOUNCE_MIN_PX = 2;
+/**
+ * THE GIVE AT AN END, painted px before the external scale: about an inch, the distance
+ * Alan asked for ("give a little, then spring back"). A drag or a fling that runs out of
+ * page may hold it this far past the end and no further; the lift eases it back through
+ * the bounce above. Multiplied by the external scale at the point of use, so the give is
+ * an inch of GLASS whatever the pane is scaled to. The s103 constant A.
+ *
+ * ONE CONSTANT FOR BOTH LANES since s110: the fling's give at an end and the give a two-finger drag
+ * preview gets past its bound are the same quantity, so the drag band reads this and no second copy
+ * exists. Alan's reference for the drag half is about 90 px dragging down at 72%. A first guess, to
+ * be tuned on the device, not a measured constant.
+ */
+const OVERSCROLL_GIVE_PX = 96;
 
 interface PinchConstraintGeometry {
 	left: number; top: number; paneWidth: number; paneHeight: number;
+	/** The painted scrollbar in SCREEN px, measured at the last settle. Not predictable from the
+	 *  host-local width - see applyViewportBox. Already in the consumer's units: do not scale it. */
+	gutterScreen: number;
 	width: number; height: number; external: number; x: boolean; y: boolean;
+	/** The PAGE's own box on x, without the room Infinite Canvas has granted beside it: what "does it fit the pane" must ask. */
+	pageWidth: number;
 	/** Zero-native-scroll content-box inset, including its normal title/padding. */
 	naturalLeft: number | null;
 	naturalTop: number | null;
@@ -269,7 +344,9 @@ import { DWELL_MS, snapStroke } from "../ink/ShapeSnap";
 import { beginUndoWindow, discardUndoTrace, isUndoRedoKey, registerUndoTraceView, unregisterUndoTraceView } from "../diag/UndoHistoryTrace";
 
 const sessionStartMs = Date.now();
-import { anchoredScroll, pinchScale, fitInkBounds, clampToReachable, MIN_PINCH_SCALE, MAX_VIEWPORT_LAYOUT, type InkFitBounds } from "./PinchScale";
+import { anchoredScroll, pinchScale, fitInkBounds, clampToReachable, MIN_PINCH_SCALE, MAX_PINCH_SCALE, PINCH_GIVE, MAX_VIEWPORT_LAYOUT, type InkFitBounds } from "./PinchScale";
+import { WheelZoomRun, WHEEL_ZOOM_QUIET_MS } from "./WheelZoom";
+import { canvasForNote, onCanvasOverrideChanged } from "./CanvasNoteOverride";
 import { ERASER_CURSOR_CLASS } from "./PenCursor";
 import { DEFAULT_ERASER_RADIUS_PX, clampEraserRadius } from "../ink/EraserSize";
 import {
@@ -292,8 +369,10 @@ import { armMouseInkQuietly, markToolPicked, mouseInkEnabled, toolPickedHere } f
 import { penInkEnabled } from "./PenInk";
 import { fingerInkEligible } from "./FingerInk";
 import { describeEl, setHitProbeContext } from "./PenHitProbe";
-import { Extent, inkFrontier, isScrollableOverflow, ScrollAxisGuard, ScrollExpansionDemand, spacerPosition, surfaceExtents, surfaceOriginInScroller, writeFrontier, writeFrontierApplies, ZERO_EXTENT, zoomFrontier } from "./SurfaceExtent";
+import { Extent, inkClaimX, inkFrontier, isScrollableOverflow, onScreenFloorX, ScrollAxisGuard, ScrollExpansionDemand, SHRINK_SCROLL_IDLE_MS, shrunkAxis, spacerPosition, surfaceExtents, surfaceOriginInScroller, writeFrontier, writeFrontierApplies, ZERO_EXTENT, zoomFrontier } from "./SurfaceExtent";
 import { ProbeBox, capturePresented, parseHexColor, regionCensus } from "./PresentProbe";
+import { paperPlan, type PaperPlan } from "./PaperPlan";
+import { copyPreviewPaperBackground, foldIntoPitch, fractionOf, previewPaperCopyable, previewPaperPhase, previewPaperPitch, type PreviewPaperEnd, type PreviewPaperSource } from "./PaperPan";
 import {
 	bboxVisibleInViewport,
 	scrollProbeCommit,
@@ -304,6 +383,9 @@ import {
 	scrollProbeScroll,
 	scrollProbeWheel,
 } from "./ScrollProbe";
+
+/** The paper properties the overlay plans; see updatePaperSpacing. */
+const PAPER_PROPERTIES = ["--handwriting-paper-pitch", "--handwriting-paper-rule", "--handwriting-paper-dot", "--handwriting-paper-phase", "--handwriting-paper-phase-x"] as const;
 
 /**
  * Ink on the ordinary Obsidian editor.
@@ -849,8 +931,19 @@ let scrollExpansionEnabled = false;
 export function setScrollExpansionEnabled(on: boolean): void {
 	if (on === scrollExpansionEnabled) return;
 	scrollExpansionEnabled = on;
+	// Off: the room scrolling demanded is no longer asked for, so every note's
+	// sideways grant comes back down to what its ink needs (shrinkSideways).
+	if (!on) surfaceExtents.oweShrinkXEverywhere();
+	// s137: the mode IS the gate for the ctrl+wheel zoom, so turning it off
+	// mid-run leaves a preview up with nothing left to end it. End it here, on
+	// its own anchor, before the mode changes anything else.
+	if (!on) for (const overlay of instances) overlay.endWheelZoomRun();
+	// s137/s138: the global is only the DEFAULT now; each note answers for itself (a frontmatter
+	// override, src/inline/CanvasNoteOverride.ts). Every mounted note re-reads its own answer and
+	// applies it: momentum, the wheel zoom, and a zoomed note landing back at 100 percent when its
+	// canvas goes off.
 	for (const overlay of instances) {
-		overlay.setCanvasMomentumDisabled(on);
+		overlay.applyCanvasMode();
 		overlay.scheduleRepaint("scroll-expansion-setting");
 	}
 }
@@ -1120,14 +1213,48 @@ export function inkExternallyReloaded(path: string): void {
 	for (const p of instances) p.noteExternallyReloaded(path);
 }
 
-/** Paths whose editors are quiet enough to adopt an external reload. */
-export function inlineReloadCandidates(): string[] {
-	const out = new Set<string>();
-	for (const p of instances) {
-		const path = p.reloadCandidatePath();
-		if (path) out.add(path);
+export interface InlineReloadBinding {
+	pane: object;
+	attachment: object;
+	epoch: number;
+	file: object;
+	editor: object | undefined;
+	path: string;
+	quiet: boolean;
+}
+
+/** Census includes busy bindings; a quiet sibling cannot hide one. */
+export function inlineReloadBindings(): InlineReloadBinding[] {
+	const bindings: InlineReloadBinding[] = [];
+	for (const pane of instances) {
+		const binding = pane.reloadBinding();
+		if (binding) bindings.push(binding);
 	}
-	return [...out];
+	return bindings;
+}
+
+/** A note is eligible only when every attached pane on it is quiet. */
+export function inlineReloadCandidates(): string[] {
+	const quietByPath = new Map<string, boolean>();
+	for (const binding of inlineReloadBindings()) {
+		quietByPath.set(binding.path, (quietByPath.get(binding.path) ?? true) && binding.quiet);
+	}
+	return [...quietByPath].filter(([, quiet]) => quiet).map(([path]) => path);
+}
+
+/** The same cohort must remain attached, bound to this document, and quiet. */
+export function captureInlineReloadAdmission(path: string): (() => boolean) | null {
+	const bindings = () => inlineReloadBindings().filter(binding => binding.path === path);
+	const expected = bindings();
+	if (!expected.length || expected.some(binding => !binding.quiet)) return null;
+	return () => {
+		const current = bindings();
+		return current.length === expected.length && expected.every((before, index) => {
+			const now = current[index];
+			return !!now && now.quiet && now.pane === before.pane && now.attachment === before.attachment &&
+				now.epoch === before.epoch && now.file === before.file && now.editor === before.editor;
+		});
+	};
 }
 
 /** Zoom diagnostics for every live editor. Run at 100% and at zoom, then diff. */
@@ -1504,6 +1631,20 @@ export class InkOverlayPlugin {
 	private presentProbePending = false;
 	private scrollFn: (() => void) | null = null;
 	private wheelFn: ((e: WheelEvent) => void) | null = null;
+	/** s136: the non-passive ctrl+wheel listener that zooms the note. Separate from `wheelFn`, which stays diagnostic-only and passive. */
+	private ctrlWheelFn: ((e: WheelEvent) => void) | null = null;
+	private wheelZoomRun = new WheelZoomRun();
+	/**
+	 * s137 (Alan, 2026-09-20): INFINITE CANVAS IS THE MODE, PER NOTE. True when this note is a canvas:
+	 * its own frontmatter choice if it has one, else the global setting. Cached here and re-read by
+	 * `applyCanvasMode` (mount, the global toggle, an override change), so the per-frame paths read a
+	 * field and pay nothing. With it false the note is stock Obsidian: no pinch zoom, no wheel zoom,
+	 * no zoom bar, no edge give; the scroller does what it does in any other note.
+	 */
+	private canvasMode = scrollExpansionEnabled;
+	private offCanvasOverride: (() => void) | null = null;
+	/** The pending quiet-time check for a live wheel zoom run; 0 when none is armed. */
+	private wheelZoomTimer = 0;
 	private hostPositionPatched = false;
 	/** The element chromeHost() made positioned, so teardown can undo it. */
 	private chromeHostPatched: HTMLElement | null = null;
@@ -1516,10 +1657,32 @@ export class InkOverlayPlugin {
 	private axisGuard = new ScrollAxisGuard();
 	/** The ink frontier per note, so a scroll repaint stops re-walking it. §5g/G1. */
 	private frontierCache = new FrontierCache();
+	/**
+	 * THE INK'S OWN REACH on x, note px, cached for the settle's width tests to read as a field.
+	 * Written where the extent pass already holds it; the events that move it - a stroke committed, an
+	 * erase, a note loaded - are the same ones that run that pass, so the worst case is one pass old.
+	 * Not read through `inlineInk.strokes()` per call: that is O(1) normally but FILTERS the stroke
+	 * list while a note reloads (InlineInkStore.ts:414-420), a walk that scales with note length.
+	 */
+	private pageInkX = 0;
 	/** Unsubscribes the frontier cache from ink-changed events. */
 	private offInkChanged: (() => void) | null = null;
 	/** What updateExtent last acted on; equal inputs mean equal output. */
 	private lastExtentInputs: ExtentInputs | null = null;
+	/** The ink frontier's x the last extent pass saw per note, to notice ink leaving. */
+	private extentFrontierSeen = new Map<string, number>();
+	/** The generation of each note's due shrink this editor has already taken a step on. */
+	private shrinkStepped = new Map<string, number>();
+	/** Takes a held shrink's next step once a scroll has gone quiet (SHRINK_SCROLL_IDLE_MS). */
+	private shrinkIdleTimer: number | null = null;
+	/** Each note's x-grant shrink count at this editor's last extent pass, so the band hears of a shrink made anywhere. */
+	private shrinksSeen = new Map<string, number>();
+	/** What this editor showed sideways at its last extent pass: a shrink made in any editor keeps it on screen. */
+	private sidewaysView: { path: string; scrollLeft: number; clientWidth: number; originLeft: number; fontZoom: number } | null = null;
+	/** The scroller's width measured without the band, for the next band sync only. */
+	private bandFreeScrollWidth: number | null = null;
+	/** Set by a scale commit: the next extent pass releases the band's margin, whether or not a grant shrank. */
+	private bandMarginReleasePending = false;
 	private scrollExpansion: ScrollExpansionDemand | null = null;
 	/** The `.markdown-source-view` ancestor carrying the `handwriting-page` class. */
 	private pageClassHost: HTMLElement | null = null;
@@ -1552,6 +1715,13 @@ export class InkOverlayPlugin {
 	private resizeOutOfUpdateRaf = 0;
 	/** The router's ratio at which `rebasePinch` re-anchored; its later ratios divide by it. */
 	private pinchRatioBase = 1;
+	/**
+	 * s110, line 6: THE LIFT PAST THE CAP. A live pinch may paint past MAX_PINCH_SCALE (and under
+	 * MIN_PINCH_SCALE) by PINCH_GIVE, preview only; at the lift the preview is driven back to the cap
+	 * over OVERSCROLL_BOUNCE_MS on the bounce's own curve and only then settles, once, inside the
+	 * committed range. `stepping` marks the ease's own frames, which enter `pinch` as moves.
+	 */
+	private pinchGive: { from: number; to: number; startedAt: number; raf: number; centroid: { x: number; y: number }; stepping: boolean; scrollLeft: number; scrollTop: number; paused: boolean } | null = null;
 	/** The router's last raw move ratio, for `rebasePinch`. */
 	private pinchLastRatio = 1;
 	/** Hides a reticle left behind by a pen that never sent pointerleave. */
@@ -1610,6 +1780,46 @@ export class InkOverlayPlugin {
 	 * its way onto the elements, which live INSIDE the scaled host.
 	 */
 	private viewportPan = { x: 0, y: 0 };
+	/**
+	 * s121 add. 5(b): WHERE THE PAN STOOD WHEN THE GESTURE BEGAN, painted px. The give band may stop a frame
+	 * carrying the page FURTHER out than its room, and it may never drag a page that was already resting
+	 * outside that room back in - a zoom-button commit leaves the page on a legitimate position and the next
+	 * touch must not spring. Captured with the anchor, read by the band, written nowhere else.
+	 */
+	private pinchStartPan = { x: 0, y: 0 };
+	/**
+	 * s128: THE BAND WATCHES THE GESTURE FRAME BY FRAME. `history` holds the last PAN_DRAG_WINDOW preview
+	 * scales (the scale has held when the newest is within PAN_DRAG_FRAME_EPS of the oldest), and `lastPan`
+	 * the pan the last frame committed. A drag after a real zoom used to escape the band for the rest of the gesture (the gate
+	 * compared against the gesture's START scale, and a pinch in the middle of the pane then a drag to
+	 * the bottom right walked the page out as if Infinite Canvas were on - Alan, device, 2026-09-19). Now
+	 * the band engages once the scale has held over the window, and it engages WITHOUT A JUMP: it never
+	 * pulls the page back in, it only refuses further outward travel, so a page a zoom left past its room
+	 * stops where it stands and the lift's ease brings it home.
+	 */
+	private pinchBand = { history: [] as number[], lastPan: { x: 0, y: 0 } };
+	/** The overscroll bounce's visual offset on top of `viewportPan`, painted px; zero whenever no bounce is playing. */
+	private bounceOffset = { x: 0, y: 0 };
+	/**
+	 * ONE SETTLE OWES AN EASE, and it is the pinch's own. Measured at f7e76419: THREE settling
+	 * `anchorPanTo` calls follow every lift - `commitCameraScale` <- `applyPinchScale`, then
+	 * `applyPinchScale` alone, then `Object.write` <- `EditorView.measure` - and only the first arrives
+	 * with the preview's own pan. The other two saw `pan` already at `cx` and re-ran the same ease from
+	 * a position the page had already left.
+	 */
+	private previewSettleOwed = false;
+	/** Where the page was painted inside its pane on the last preview frame, for the settle's ease to measure against. */
+	private previewPaintedBlank: { x: number; y: number } | null = null;
+	/** The bounce playing now: the settle that started it, where it started, its frame request. */
+	private bounceState: { hold: object; fromX: number; fromY: number; startedAt: number; raf: number } | null = null;
+	/** The settle that has had its bounce, playing or over, until that settle retires: one bounce per settle. */
+	private bouncedHold: object | null = null;
+	/** s97 add. 67: the last settle's bound geometry, for `overscrollBounceReadout`. Written at the bound, never read by production. */
+	private boundReadout = { floorX: 0, floorY: 0, bx: 0, width: 0, rawX: 0, cx: 0, rawY: 0, cy: 0,
+		// s150 add. 2, read-only: the drag-frame gate's own inputs, so a fixture can say WHY a frame was or
+		// was not bounded rather than infer it from the position it ended on.
+		dragFrame: false, neverZoomed: false, steady: false, next: 0, fromScale: 0, fromScaleValid: false,
+		restCeilX: 0, startX: 0, startY: 0, lastX: 0, lastY: 0, bounded: false, settling: false };
 	/** Pan already drawn into the raster, in host-layout pixels. */
 	private rasterPan = { x: 0, y: 0 };
 	private cameraOriginY: CameraOriginY | null = null;
@@ -1655,6 +1865,19 @@ export class InkOverlayPlugin {
 	 * path `deferPinchRaster` exists to keep free of them.
 	 */
 	private previewHostOrigin = { left: 0, top: 0, valid: false };
+	/**
+	 * The note origin the paper's phase is planned from, in the gradient's layout
+	 * px, as updateExtent last computed it (null before the first).
+	 */
+	private paperOriginLayout: number | null = null;
+	/** The text column's left edge the paper's vertical rules and dots are planned from, in the gradient's layout px. */
+	private paperOriginLeft: number | null = null;
+	/** The editor text's font size the paper was last planned at, as the refresh path or the camera sync read it. */
+	private paperFontPx = Number.NaN;
+	/** The zoom at rest right after a release (the external scale alone), until the refresh path measures one. */
+	private paperRestZoom = Number.NaN;
+	/** The paper values the overlay itself last wrote, so a takeover can tell its own plan from the host's. */
+	private paperWritten = new Map<string, string>();
 	/** The column in host-local px as of the last preview frame's one read. */
 	private previewColumnLocal: number | null = null;
 	/** `.cm-sizer`, cached: `writeViewportPan` runs once per preview frame. */
@@ -1676,6 +1899,18 @@ export class InkOverlayPlugin {
 	private pinchRasterScale = 1;
 	/** Host-local px the preview raster is currently translated by. See applyPreviewInkOffset. */
 	private previewInkOffset = 0;
+	/**
+	 * Host-local px the preview raster is moved DOWN by because a block above
+	 * the content changed height during the gesture (a title that rewraps as the
+	 * pinch narrows the host). See observeAboveContent.
+	 */
+	private previewInkOffsetY = 0;
+	/** Watches the blocks above `.cm-contentContainer` in the sizer; see observeAboveContent. */
+	private aboveContentObserver: ResizeObserver | null = null;
+	/** Last delivered border-box height per watched block, host-local px. */
+	private aboveContentHeights = new WeakMap<Element, number>();
+	/** Height changes applied to a preview raster, counted: one per rewrap, never one per frame. */
+	private aboveContentShifts = 0;
 	/**
 	 * Where the column was, in HOST-LOCAL px, when the committed raster was
 	 * last drawn. Null when there is nothing measured to compare against.
@@ -1742,8 +1977,10 @@ export class InkOverlayPlugin {
  private viewportStyleObserver: MutationObserver | null = null;
  private viewportStyleFrame = 0;
  private viewportStyleStamp = "";
+ /** Camera commits in progress, plus a settle measure's write while it re-anchors; commitCameraScale carries a pending settle only at depth 1. */
+ private commitDepth = 0;
  private viewportStyleDirty: {path:string|null;container:HTMLElement|null} | null = null;
- private viewportLayout: {parent:HTMLElement; paneWidth:number; paneHeight:number; externalScale:number; baseTransform:string; baseZoom:number; zoomVerified?:boolean; width:number; height:number; column:number; left:string; right:string; columnLocal:number|null; styles:Map<string,{value:string;priority:string}>} | null = null;
+ private viewportLayout: {parent:HTMLElement; paneWidth:number; paneHeight:number; externalScale:number; gutterScreen:number; baseTransform:string; baseZoom:number; zoomVerified?:boolean; width:number; height:number; column:number; columnBox:number; gutterX:number; sizerColumn:boolean; columnInset:boolean; ownLines:boolean; left:string; right:string; columnLocal:number|null; columnAuto:{lineWidth:number;fixed:number;scrollbar:number}|null; styles:Map<string,{value:string;priority:string}>} | null = null;
  /** `CSS.supports("zoom", "0.5")`, asked once per overlay. See `hostZoomSupported`. */
  private hostZoomSupport: boolean | null = null;
  /**
@@ -1821,6 +2058,8 @@ export class InkOverlayPlugin {
 	// paint present while the glass is blank = presentation/compositor.
 	/** The file this editor was last showing. Ink isolation depends on it. */
 	private lastPath: string | null = null;
+	private reloadBindingEpoch = 0;
+	private reloadCameraSettlement: number | null = null;
 	private undoIdentity: object | null = null;
 	private undoIdentityStale = false;
 	/**
@@ -1909,11 +2148,27 @@ export class InkOverlayPlugin {
 		return this.view.dom.ownerDocument.defaultView ?? window;
 	}
 
+	/** Table-cell editors inherit the note owner, but never own its ink surface. */
+	private ownsMarkdownEditorRoot(): boolean {
+		const dom = this.view.dom;
+		const root = dom.closest(".markdown-source-view");
+		// Read live DOM in this view's document, including while detached. The
+		// host removes a cell editor's own source-view class before initializing
+		// it; after attachment, the parent's source view must not qualify it.
+		return root !== null && root.ownerDocument === dom.ownerDocument
+			&& (root === dom || root.querySelector(".cm-editor") === dom)
+			&& !dom.parentElement?.closest(".cm-editor")
+			&& !dom.closest(".table-cell-wrapper, .cm-table-widget");
+	}
+
 	mount(): void {
 		if (this.container || !enabled) return;
 		this.retiring = false;
 		// Not a file-backed markdown editor (e.g. a bare CM instance): stay inert.
 		if (this.view.state.field(editorInfoField, false) === undefined) return;
+		if (!this.ownsMarkdownEditorRoot()) return;
+		this.invalidateReloadBindings(this.lastPath, this.filePath());
+		this.reloadCameraSettlement = null;
 
 		const host = this.view.dom;
 		if (this.winRef.getComputedStyle(host).position === "static") {
@@ -2059,8 +2314,16 @@ export class InkOverlayPlugin {
 			container,
 			{
 				onPenDown: (s, ev) => this.penDown(s, ev),
-				onViewportInput: () => { this.retirePanSettle(); },
+				// Every contact (pen, finger or mouse) lands here first, a pen-down included: a preview paper riding a bounce comes down.
+				// s110: a give still easing back to the cap is NOT finished here - a two-finger contact takes the
+				// zoom over from the scale on screen (pinch "start"), which is what keeps the page from jumping.
+				onViewportInput: () => { if (!this.pinchPreview) this.endPreviewPaper("input"); this.cancelOverscrollBounce(); this.retirePanSettle("viewport input"); },
 				onBeforePenDown: () => {
+					// s115 (Alan, "fix it"): a pen landing on a zoom still easing PAUSES the ease where it stands - nothing
+					// moves under the pen, the stroke is mapped through the live preview - and pen-up resumes it to the cap.
+					if (this.pinchGive) this.pausePinchGive();
+					// No sample is mapped through a bounce: the page goes to its rest before the contact is read.
+					this.cancelOverscrollBounce();
 					this.restorePinchLayers();
 					if (this.rasterPanNeedsBake()) this.repaint();
 				},
@@ -2088,12 +2351,23 @@ export class InkOverlayPlugin {
 				// than with no pointer at all.
 				onHandOnGlass: () => this.hidePenCursor(),
 				onPinch: (phase, ratio, centroid) => this.pinch(phase, ratio, centroid),
+				// THE GIVE BELONGS TO INFINITE CANVAS (s135, Alan: the bounce shows you cannot
+				// go further, and the lack of it shows the direction is infinite). With the canvas
+				// off the note scrolls like any other Obsidian note and answers zero, which also
+				// switches off the router's edge re-arm (s128) - both predicates read this number.
+				// With it on, the page's OWN top and left are real ends and give; the far ends are
+				// room, and the ceiling-only clamps below are what keep the give off them.
+				overscrollAllowancePx: () =>
+					this.canvasMode ? OVERSCROLL_GIVE_PX * (this.viewportLayout?.externalScale ?? 1) : 0,
+				onOverscrollPull: (x, y) => this.holdOverscrollGive(x, y),
+				onOverscrollRelease: () => this.releaseOverscrollGive(),
 				onPenRaw: (samples, ev) => this.penRaw(samples, ev),
 				onPenMove: (_ev, count) => metrics.recordEvent("move", count, 0, false),
 				// The lift event is PASSED ON - see `penUp`'s own header. The
 				// pan branch reads the pointer's position off it to put the
 				// reticle back where the hand actually is.
 				onPenUp: (ev) => this.penUp(ev),
+				onAllContactsLifted: () => this.resumeStrandedPan(),
 				// Ordinary-note iPhone only. The predicate is read at contact,
 				// after a toolbar command has explicitly picked the current nib.
 				// PDF supplies no callback, so its touch behavior cannot widen.
@@ -2107,6 +2381,11 @@ export class InkOverlayPlugin {
 						tool: inlineTool,
 					}),
 				onFingerInkCancelled: () => this.cancelFingerInkForPinch(),
+				// s185: a two-finger gesture is only ours while the Infinite Canvas is on. With it off the
+				// overlay already ignores every pinch phase (s137), and this is what stops the router
+				// claiming the contacts in the first place, so the host's own pinch is what the note gets.
+				// PDF supplies no callback and keeps the router's existing behaviour.
+				pinchZoom: () => this.canvasMode,
 			// PEN OFF (PenInk.ts, design §5): the note surface is the only
 			// one that answers this. Off means the router claims nothing, so
 			// the pen is a native pointer here - taps place the caret and
@@ -2144,12 +2423,12 @@ export class InkOverlayPlugin {
 			// Subtract only the pan still carried by the layer's transform.
 			// Settled pan is already represented by the raster camera.
 			() => {
-				this.rasterInputPan.x = this.inkPanX(); this.rasterInputPan.y = this.inkPanY();
+				this.rasterInputPan.x = this.inkInputPanX(); this.rasterInputPan.y = this.inkInputPanY();
 				return this.rasterInputPan;
 			}
 		);
 
-		this.router.setCanvasMomentumDisabled(scrollExpansionEnabled);
+		this.router.setCanvasMomentumDisabled(this.canvasMode);
 		this.resizeObserver = new ResizeObserver(() => this.handleResize());
 		this.resizeObserver.observe(host);
 		this.contentResizeObserver = new ResizeObserver(() => {
@@ -2175,8 +2454,8 @@ export class InkOverlayPlugin {
 			if (!this.container) return null;
 			const rect = this.container.getBoundingClientRect();
 			const w = this.camera.screenToWorld(
-				visualToNote(clientX - rect.left - this.inkPanX(), this.cssScale),
-				visualToNote(clientY - rect.top - this.inkPanY(), this.cssScale)
+				visualToNote(clientX - rect.left - this.inkInputPanX(), this.cssScale),
+				visualToNote(clientY - rect.top - this.inkInputPanY(), this.cssScale)
 			);
 			const path = this.filePath();
 			const granted = path ? surfaceExtents.get(path) : ZERO_EXTENT;
@@ -2204,6 +2483,10 @@ export class InkOverlayPlugin {
 			const scroller = this.view.scrollDOM;
 			const scrollLeft = scroller.scrollLeft;
 			const scrollTop = scroller.scrollTop;
+			// The preview paper is outside the scroller: a scroll while it is up moves the text, so it takes the scroll too.
+			if (this.previewPaperEl && (scrollLeft !== this.paperScrollLeft || scrollTop !== this.paperScrollTop)) {
+				this.paperScrollLeft = scrollLeft; this.paperScrollTop = scrollTop; this.writePaperPan();
+			}
 			// The overlay is inside the scroller now, so its client rect moves
 			// with every scroll - and the router caches that rect to map
 			// pointer coordinates. It used to be safe to cache across scrolls
@@ -2219,7 +2502,7 @@ export class InkOverlayPlugin {
 			// Only producer readbacks may compensate a settle. An unmatched
 			// scroll belongs to navigation, including programmatic scrolling.
 			const hold = this.panAnchorHold;
-			if (hold && (scrollLeft !== hold.left || scrollTop !== hold.top)) this.retirePanSettle();
+			if (hold && (scrollLeft !== hold.left || scrollTop !== hold.top)) this.retirePanSettle("a scroll off the settle target");
 			if (!during) this.router?.refreshRect();
 			if (diagnosticsEnabled()) {
 				scrollProbeScroll(scrollLeft, scrollTop, during);
@@ -2241,7 +2524,8 @@ export class InkOverlayPlugin {
 			// happens to the gesture.
 			if (performance.now() - this.pinchScrollAt < PINCH_SCROLL_QUIET_MS) return;
 			const path = this.filePath();
-			if (path) this.scrollExpansion?.sample(path, scrollExpansionEnabled, scrollLeft, scrollTop);
+			if (path) this.scrollExpansion?.sample(path, this.canvasMode, scrollLeft, scrollTop);
+			if (path && surfaceExtents.owesShrinkX(path)) this.shrinkWhenScrollIsQuiet();
 			this.scheduleRepaint("scroll");
 		};
 		this.view.scrollDOM.addEventListener("scroll", this.scrollFn, { passive: true });
@@ -2250,7 +2534,22 @@ export class InkOverlayPlugin {
 		// touch pointers. Passive + capture: sees everything, changes nothing.
 		// Wholly diagnostic, so the whole body is behind the switch (RC4).
 		this.wheelFn = (e: WheelEvent) => {
-			this.retirePanSettle();
+			if (!this.pinchPreview) this.endPreviewPaper("input");
+			// s97 add. 3/5 (Alan: "a scroll should perform the elastic bounce/settle"): A WHEEL OR TOUCHPAD
+			// SCROLL NO LONGER KILLS AN EASE THAT IS ALREADY PLAYING. This called cancelOverscrollBounce(),
+			// which puts the offset on 0 in ONE frame. Measured mid-ease with 153.8 px still owed, the frame
+			// series after a wheel was [153.8, 0, 0, ...]: the whole correction closed as a single step, so the
+			// page arrived by a jump and the ease the contract promises stopped happening. With the call gone
+			// the same drive reads [0, 32.4, 14.4, 13.1, 12.1, 20.9, 9, 8.1, ...] decaying to zero.
+			// The ease is a transform on the page and a wheel moves the scroller: they do not contend.
+			// PEN DOWN STILL CANCELS: that path is onViewportInput (:2225), untouched, pinned by
+			// OverscrollBounce.test.ts "PEN DOWN MID-BOUNCE" - a contact must be read against the page where it
+			// rests, which is not the same question as a scroll passing over a playing ease.
+			// NOTHING IS OWED AT THE END OF A SCROLL RUN ITSELF: scrollFn (:2359) never writes viewportPan and
+			// the native scroller clamps scrollLeft/scrollTop at zero, so no wheel, touchpad or one-finger touch
+			// scroll can leave the canvas's left or top edge inside the pane. Read recorded in
+			// slate-artifacts/1.4.20/overscroll-topleft/ENGINEER-scroll-read.md.
+			this.retirePanSettle("wheel");
 			if (!diagnosticsEnabled()) return;
 			scrollProbeWheel(
 				e,
@@ -2263,6 +2562,16 @@ export class InkOverlayPlugin {
 			capture: true,
 			passive: true,
 		});
+		// s136: THE SECOND WHEEL LISTENER, AND THE ONLY NON-PASSIVE ONE. The
+		// diagnostic tap above cannot take this job: it is registered passive,
+		// so it may not `preventDefault`, and Obsidian's quick font size is
+		// exactly what has to be prevented. Registered after it so the probe
+		// still records every wheel event, including the ones zoomed here.
+		this.ctrlWheelFn = (e: WheelEvent) => this.wheelZoom(e);
+		this.view.scrollDOM.addEventListener("wheel", this.ctrlWheelFn, {
+			capture: true,
+			passive: false,
+		});
 		this.watchResolution();
 		// Every committed mutation that reaches an event drops the cached
 		// frontier for that note; the two that do not (erase, lasso move)
@@ -2271,6 +2580,10 @@ export class InkOverlayPlugin {
 		// spent: ink arriving (or the last of it leaving) is exactly the event
 		// that makes the sentence worth saying again. Same subscription, so
 		// the two cannot drift apart over which notes they heard about.
+		// s137: this note's own canvas answer, and a re-apply whenever its frontmatter choice moves.
+		this.canvasMode = canvasForNote(this.filePath(), scrollExpansionEnabled);
+		this.router?.setCanvasMomentumDisabled(this.canvasMode);
+		this.offCanvasOverride = onCanvasOverrideChanged((p) => { if (p === this.filePath()) this.applyCanvasMode(); });
 		this.offInkChanged = onInkChanged((p) => {
 			this.frontierCache.invalidate(p);
 			// ...but ONLY when ink ARRIVED. The sentence above said "or the
@@ -2290,6 +2603,83 @@ export class InkOverlayPlugin {
 		this.lastPath = this.filePath();
 		this.updateHandwritingPageClass();
 		this.loadInk(this.lastPath);
+	}
+
+	/**
+	 * s136: ONE CTRL+WHEEL EVENT, DRIVEN THROUGH THE PINCH PATH.
+	 *
+	 * A precision touchpad's pinch arrives here on Windows - Chromium reports
+	 * it as a wheel with `ctrlKey`, the same shape a mouse's ctrl+wheel has -
+	 * and Obsidian's quick font size is the handler that used to consume it.
+	 * Every frame goes through `pinch`, so the floor, the 400% cap and its
+	 * give, the focal hold about the cursor, the constraint reducer and the
+	 * single settle at the end are the same ones two fingers on glass get.
+	 * Nothing about the zoom is decided here; only whether this event is ours.
+	 * s137: ours means Infinite Canvas is on. See the gate below.
+	 */
+	private wheelZoom(e: WheelEvent): void {
+		// s137 (Alan, 04:3xZ): THE MODE IS THE GATE, not a setting of its own.
+		// With Infinite Canvas off this listener does nothing at all - the event
+		// is not prevented and Obsidian's quick font size nudge works as it does
+		// today. Canvas on is the mode where a note is a surface you move around
+		// in, which is the mode where zooming it about the cursor is the answer.
+		if (!this.canvasMode) return;
+		// metaKey for a mac trackpad, where Electron reports a pinch the same
+		// way but the modifier a user holds for a deliberate wheel zoom is cmd.
+		if (!e.ctrlKey && !e.metaKey) return;
+		if (this.retiring) return;
+		// Never zoom out from under a stroke in flight. The router's own wheel
+		// path makes the same refusal (PointerRouter :657).
+		if (this.router?.isStroking) return;
+		// Both, and in this order: `preventDefault` is what stops Obsidian's
+		// font zoom and the browser's own page zoom, `stopPropagation` keeps
+		// the event from any handler deeper in the tree. Neither is possible
+		// from a passive listener, which is why this one is not passive.
+		e.preventDefault();
+		e.stopPropagation();
+		for (const step of this.wheelZoomRun.feed({
+			deltaY: e.deltaY,
+			deltaMode: e.deltaMode,
+			x: e.clientX,
+			y: e.clientY,
+			t: performance.now(),
+		})) {
+			this.pinch(step.phase, step.ratio, step.centroid);
+		}
+		this.armWheelZoomQuiet();
+	}
+
+	/**
+	 * A wheel run has no lift, so the end is a quiet time. One timer at a time:
+	 * each event re-asks, and a timer that fires while the run is still live
+	 * (an event landed after it was armed) re-arms rather than ending early.
+	 */
+	private armWheelZoomQuiet(): void {
+		if (this.wheelZoomTimer !== 0) return;
+		this.wheelZoomTimer = this.winRef.setTimeout(() => {
+			this.wheelZoomTimer = 0;
+			const end = this.wheelZoomRun.endIfQuiet(performance.now());
+			if (end) {
+				this.pinch(end.phase, end.ratio, end.centroid);
+				return;
+			}
+			if (this.wheelZoomRun.isLive) this.armWheelZoomQuiet();
+		}, WHEEL_ZOOM_QUIET_MS);
+	}
+
+	/**
+	 * Infinite Canvas went off with a run in flight. End it where it stands:
+	 * the preview is up, and nothing else will ever come to take it down.
+	 */
+	endWheelZoomRun(): void {
+		if (!this.wheelZoomRun.isLive) return;
+		const centroid = this.wheelZoomRun.centroid;
+		this.wheelZoomRun.cancel();
+		if (this.wheelZoomTimer !== 0) {
+			this.winRef.clearTimeout(this.wheelZoomTimer);
+			this.wheelZoomTimer = 0;
+		}
+		this.pinch("end", 1, centroid);
 	}
 
 	/**
@@ -2455,6 +2845,9 @@ export class InkOverlayPlugin {
     resetNoteZoom:()=>this.resetNoteZoom(),
     fitHandwriting:()=>this.fitHandwriting(),
    },
+   // s138: the strip asks for ITS note, so two notes side by side with opposite canvas choices each
+   // get their own zoom bar answer instead of sharing the active overlay's.
+   notePath:()=>this.filePath(),
 			exec: (id) => {
 				{
 					// "editor:undo" and "editor:redo" are NOT Obsidian
@@ -2591,7 +2984,11 @@ export class InkOverlayPlugin {
 
 	unmount(): void {
 		this.retiring = true;
-		this.retirePanSettle();
+		this.endPreviewPaper("unmount");
+		this.cancelOverscrollBounce();
+		this.retirePanSettle("unmount");
+		this.invalidateReloadBindings(this.lastPath, this.filePath());
+		this.reloadCameraSettlement = null;
 		if (diagnosticsEnabled() && this.undoIdentity) discardUndoTrace(this.undoIdentity);
 		this.router?.dispose();
 		this.router = null;
@@ -2606,13 +3003,30 @@ export class InkOverlayPlugin {
 			this.view.scrollDOM.removeEventListener("scroll", this.scrollFn);
 			this.scrollFn = null;
 		}
+		if (this.shrinkIdleTimer !== null) {
+			this.winRef.clearTimeout(this.shrinkIdleTimer);
+			this.shrinkIdleTimer = null;
+		}
 		if (this.wheelFn) {
 			this.view.scrollDOM.removeEventListener("wheel", this.wheelFn, { capture: true });
 			this.wheelFn = null;
 		}
+		if (this.ctrlWheelFn) {
+			this.view.scrollDOM.removeEventListener("wheel", this.ctrlWheelFn, { capture: true });
+			this.ctrlWheelFn = null;
+		}
+		if (this.wheelZoomTimer !== 0) {
+			this.winRef.clearTimeout(this.wheelZoomTimer);
+			this.wheelZoomTimer = 0;
+		}
+		// No end step on the way out: the overlay is going, and `pinch` refuses
+		// once `retiring` is set anyway.
+		this.wheelZoomRun.cancel();
 		this.unwatchResolution();
 		this.offInkChanged?.();
 		this.offInkChanged = null;
+		this.offCanvasOverride?.();
+		this.offCanvasOverride = null;
 		this.lastExtentInputs = null;
 		this.cameraOriginY = null;
 		setHitProbeContext(null);
@@ -2620,6 +3034,8 @@ export class InkOverlayPlugin {
 		this.spacer = null;
 		this.spacerLeft = Number.NaN;
 		this.spacerTop = Number.NaN;
+		this.removeGridPaperBox();
+		this.stopPaperKindWatch();
 		this.view.scrollDOM.classList.remove("handwriting-hscroll");
 		this.metadataObserver?.disconnect();
 		this.metadataObserver = null;
@@ -2646,6 +3062,8 @@ export class InkOverlayPlugin {
 		this.container = null;
 		this.inkLayer = null;
 		this.band = null;
+		// A give easing past teardown would drive pinch frames against a dead overlay.
+		if (this.pinchGive) { if (this.pinchGive.raf !== 0) this.winRef.cancelAnimationFrame(this.pinchGive.raf); this.pinchGive = null; }
 		// A pinch frame outliving the overlay would touch a torn-down editor.
 		if (this.pinchRaf !== 0) {
 			this.winRef.cancelAnimationFrame(this.pinchRaf);
@@ -2724,8 +3142,14 @@ export class InkOverlayPlugin {
 	}
 
 	private updateInner(u: ViewUpdate): void {
+		// Attachment/reparenting can change ownership without changing the file.
+		// Retire a surface that lost its root; a later valid update can remount it.
+		if (!this.ownsMarkdownEditorRoot()) {
+			if (this.container) this.unmount();
+			return;
+		}
 		const hold = this.panAnchorHold;
-		if (hold && u.transactions.some(tr => tr.docChanged || tr.selection || tr.scrollIntoView || tr.effects.some(effect => !hold.issuance.includes(effect)))) this.retirePanSettle();
+		if (hold && u.transactions.some(tr => tr.docChanged || tr.selection || tr.scrollIntoView || tr.effects.some(effect => !hold.issuance.includes(effect)))) this.retirePanSettle("a transaction the settle did not issue");
 		if(u.docChanged)this.clearSpaceFeedback();
 		if (!this.container) {
 			if (enabled) this.mount();
@@ -2752,7 +3176,11 @@ export class InkOverlayPlugin {
 
 		const path = this.filePath();
 		if (path !== this.lastPath) {
+			this.endPreviewPaper("note-switch");
+			this.cancelOverscrollBounce();
 			this.cameraOriginY = null;
+			this.invalidateReloadBindings(this.lastPath, path);
+			this.reloadCameraSettlement = null;
 			if (diagnosticsEnabled() && this.undoIdentity) {
 				discardUndoTrace(this.undoIdentity);
 				unregisterUndoTraceView(this.view.dom);
@@ -2763,6 +3191,10 @@ export class InkOverlayPlugin {
 				this.undoIdentityStale = true;
 			}
    this.restoreViewportLayout();
+   // The release took the paper off; the note that now opens paints with its
+   // at-rest paper from its first frame, re-planned here from the last text
+   // size and origin (updateExtent moves the phase if this note's origin differs).
+   this.updatePaperSpacing();
    this.pinchScaleNow=1; this.zoomFloor=MIN_PINCH_SCALE; this.pinchRasterScale=1; this.rasterColumnLocal=null; this.previewAnchorStale=false;
    this.pinchPending=null; this.pinchAnchor=null; this.pinchRefScale=null;
    this.view.scrollDOM.scrollLeft=0; this.view.scrollDOM.scrollTop=0;
@@ -2849,7 +3281,7 @@ export class InkOverlayPlugin {
 	}
 
 	handleKeyDown(event: KeyboardEvent): boolean {
-		this.retirePanSettle();
+		this.retirePanSettle("keyboard");
 		const undoKind = diagnosticsEnabled() ? isUndoRedoKey(event) : null;
 		if (undoKind) {
 			if (this.undoIdentityStale) {
@@ -3005,10 +3437,30 @@ export class InkOverlayPlugin {
 		this.scheduleRepaint("external-reload");
 	}
 
-	/** This editor's path, when no gesture is active (the reload poll gate). */
+	private invalidateReloadBindings(...paths: (string | null)[]): void {
+		// Invalidate existing captures even if a sibling joins and leaves before
+		// the await completes. No retained path registry or new timer is needed.
+		for (const pane of instances) {
+			if (pane === this || (pane.container && paths.includes(pane.filePath()))) pane.reloadBindingEpoch++;
+		}
+	}
+
+	/** Binding identity is available independently of this pane's busy state. */
+	reloadBinding(): InlineReloadBinding | null {
+		if (!this.container?.isConnected || !this.view.dom.isConnected) return null;
+		const info = this.view.state.field(editorInfoField, false);
+		if (!info?.file?.path) return null;
+		return { pane: this, attachment: this.container, epoch: this.reloadBindingEpoch, file: info.file,
+			editor: info.editor, path: info.file.path,
+			quiet: this.builder === null && this.mode === "ink" && this.selection.isEmpty &&
+				!this.router?.isStroking && !this.router?.hasActiveNavigation && this.pinchRefScale === null &&
+				!this.pinchPreview && this.pinchPending === null && this.pinchRaf === 0 && this.reloadCameraSettlement === null };
+	}
+
+	/** This editor's path, when no ink gesture or retained selection is active. */
 	reloadCandidatePath(): string | null {
-		if (this.builder !== null || this.mode !== "ink") return null;
-		return this.filePath();
+		const binding = this.reloadBinding();
+		return binding?.quiet ? binding.path : null;
 	}
 
 	/** The live overlay container, for the census's ghost detection. */
@@ -3071,14 +3523,10 @@ export class InkOverlayPlugin {
     // Preserve native scroll across this temporary unscaled-width layout.
     const savedLeft=this.view.scrollDOM.scrollLeft,savedTop=this.view.scrollDOM.scrollTop;
         layout.width=width;layout.height=height;layout.paneWidth=layout.parent.clientWidth;layout.paneHeight=layout.parent.clientHeight;
-    const host=this.view.dom;
-    host.classList.remove("handwriting-note-viewport");
-    host.setCssStyles({width:`${width}px`,height:`${height}px`});
-    const style=this.winRef.getComputedStyle(this.view.contentDOM);
-    const column=this.view.contentDOM.offsetWidth;
-    if(column>0){layout.column=column;layout.left=style.marginLeft;layout.right=style.marginRight;}
-    const natural=contentOrigin(this.view.contentDOM);
-    layout.columnLocal=this.ownedColumnLayoutLeft(natural.line) ?? (natural.left===null?null:(natural.left-this.panX()-host.getBoundingClientRect().left)/this.cssScale+this.view.scrollDOM.scrollLeft);
+    const natural=this.measureNaturalColumn({width,height});
+    if(natural.column>0){layout.column=natural.column;layout.columnBox=natural.columnBox;layout.gutterX=natural.gutterX;layout.sizerColumn=natural.sizerColumn;layout.columnInset=natural.columnInset;layout.ownLines=natural.ownLines;layout.left=natural.left;layout.right=natural.right;}
+    layout.columnLocal=natural.columnLocal;
+    layout.columnAuto=natural.columnAuto;
     // Hidden editors release their backings and invalidate geometry. Restore
     // the full physical viewport before navigation can reject that stale state,
     // then let the common resize path measure and rebuild the visible surface.
@@ -3093,7 +3541,7 @@ export class InkOverlayPlugin {
 		if (this.pinchPreview) return;
 		this.clearSnapPreview();
 		if (!this.container) return;
-		if (scrollExpansionEnabled) this.lastExtentInputs = null;
+		if (this.canvasMode) this.lastExtentInputs = null;
 		// The container no longer inherits the editor's box, so its size is
 		// whatever syncBand last wrote. Resize it FIRST or every measurement
 		// below - including the zero-size check that releases the backings in
@@ -3183,6 +3631,10 @@ export class InkOverlayPlugin {
    if(this.viewportLayout && Math.abs(measuredCssScale/this.pinchScaleNow-this.viewportLayout.externalScale)>SCALE_EPSILON) this.viewportLayout.externalScale=measuredCssScale/this.pinchScaleNow;
 			this.fontZoom = measuredFontZoom;
 			this.scale = this.cssScale * this.fontZoom;
+			// The paper follows the text's size as just read, and the thickness the
+			// scale just measured.
+			this.paperFontPx = fontPx;
+			this.paperRestZoom = Number.NaN;
 			this.updatePaperSpacing();
 		}
 		const layoutW = this.container.offsetWidth || rect.width;
@@ -3615,6 +4067,10 @@ export class InkOverlayPlugin {
 		if (fontStr !== undefined && fontStr !== this.lastSyncFontStr) {
 			this.lastSyncFontStr = fontStr;
 			this.fontZoom = fontZoomFactor(Number.parseFloat(fontStr), this.refFontPx);
+			// The paper too, on the same change and no other: this is the one
+			// place a font change lands without the refresh path.
+			this.paperFontPx = Number.parseFloat(fontStr);
+			this.updatePaperSpacing();
 		}
 		// Unconditionally, not inside the epsilon branch above: the font zoom
 		// can move on a frame where the css scale did not, and leaving
@@ -4364,6 +4820,9 @@ export class InkOverlayPlugin {
 	 * the re-placement is a separate call the twin does not make.
 	 */
 	private anchorCameraY(overlayTop: number): { layout: number; rung: number; impliedTop: number } | null {
+		// Z10: on a css-zoom host `anchorTop` is already exact, and the ladder is
+		// what moves the camera. See `anchorTopExactOnZoomHost`.
+		if (this.anchorTopExactOnZoomHost(overlayTop)) return null;
 		const held = documentAnchorLadder(this.view);
 		if (!held) return null;
 		// The wrapper sits at `.cm-content`'s BORDER-BOX top, so the document's
@@ -4381,6 +4840,62 @@ export class InkOverlayPlugin {
 		const layout = cameraOriginYLayout(rungTopLayout, overlayTop, rungRectTop, this.panY(), this.cssScale, padding);
 		if (layout === null) return null;
 		return { layout, rung: k, impliedTop: impliedDocumentTop(rungTopLayout, rungRectTop, this.cssScale, padding) };
+	}
+
+	/**
+	 * Z10: WHERE THE LADDER IS THE DEFECT, NOT THE CURE.
+	 *
+	 * The ladder exists because a large rect is rounded at its magnitude: on the
+	 * transform host `.cm-content`'s top is a float32 far from the screen, and
+	 * that rounding moved the camera every frame. On a css-zoom host the same
+	 * rect is not rounded at all. Blink stores zoomed positions as LayoutUnits
+	 * (1/64 of a layout-zoom px) and the web-exposed scroll offset is a whole
+	 * px, so the rect top is an exact dyadic value that float32 carries without
+	 * loss - and `anchorTop` is exact.
+	 *
+	 * The ladder, on that host, is not. The rung's zoomed top is TRUNCATED to
+	 * 1/64 (`LayoutUnit(float)`), so its implied document top is off by the
+	 * dropped part, plus `rungTop x (zoom - cssScale)` where the measured scale
+	 * is itself a truncated width over an integer offsetWidth. At adoption
+	 * `gateAnchorParity` sees that difference, refuses the ladder, the next sync
+	 * falls back to `anchorTop`, and the camera moves back: two camera-only
+	 * whole-world redraws per refusal (LagAtLowZoom's far and fractional arms;
+	 * recorded per sync in `test/render/z10Recorder.ts`).
+	 *
+	 * So the ladder is bypassed exactly where `anchorTop` is exact, and nowhere
+	 * else - everywhere else the ladder path runs as it did:
+	 *  - the host form in force is css zoom, with no transform of its own, and
+	 *    the measured scale is the host's zoom and nothing more. An ancestor
+	 *    transform would put a non-dyadic factor into the rect; the measured
+	 *    quotient is within 2/offsetWidth of the product when it is only the
+	 *    width's own truncation (the fd04036e bound);
+	 *  - the layout zoom factor is 1 or 2. Page zoom and display scaling enter
+	 *    Blink as a layout zoom factor the rect is divided by; at 1.25 the rect
+	 *    reads 11468.7998046875 where 1 and 2 read 11468.796875 (measured,
+	 *    real device scale factor). `devicePixelRatio` is how that factor is
+	 *    seen from here;
+	 *  - the coordinate is inside float32's exact range at that grid:
+	 *    24 bits of mantissa over a 1/(64 x dpr) px grid is 2^18 / dpr px.
+	 */
+	private anchorTopExactOnZoomHost(overlayTop: number): boolean {
+		const layout = this.viewportLayout;
+		if (!layout || !this.container || !this.hostZoomSupported()) return false;
+		if (layout.baseTransform !== "none" && layout.baseTransform !== "") return false;
+		if (this.dpr !== 1 && this.dpr !== 2) return false;
+		const width = this.container.offsetWidth;
+		const own = layout.baseZoom * this.pinchScaleNow;
+		if (!(width > 0) || !(own > 0) || !Number.isFinite(this.cssScale)) return false;
+		if (Math.abs(this.cssScale / own - 1) > 2 / width) return false;
+		return Math.abs(this.view.scrollDOM.scrollTop * this.cssScale) + Math.abs(overlayTop) < this.zoomRectExactLimit() / this.dpr;
+	}
+
+	/**
+	 * float32's exact range for a 1/64 px grid, in zoomed px. A method rather
+	 * than a constant so a render cell can plant a lower limit on the prototype
+	 * and read the ladder path take over above it.
+	 */
+	private zoomRectExactLimit(): number {
+		return 2 ** 18;
 	}
 
 	/** One scroll-probe row per acquisition: everything the mapping read. */
@@ -4450,6 +4965,15 @@ export class InkOverlayPlugin {
 		// all its dispatches have returned, whichever branch they took.
 		// Shared with the pdf surface (StripPenChrome.ts, §5o).
 		stripPenUp(this.mobileTools);
+		// s107 (Alan, via Architect ruling): nothing moves unless the page is past its edge, then it eases
+		// back - no infinite blank standing forever. A pen that catches a bounce mid-flight and draws holds
+		// the page still for the stroke (the fold, unchanged); after it lifts, a page still standing past
+		// its bound resumes the same way the touch side does. A page already inside its room has nowhere to
+		// ease to, so this is a no-op for it - OverscrollBounce.test.ts's "PEN DOWN MID-BOUNCE" row now
+		// asserts both regimes.
+		this.resumeStrandedPan();
+		// s115: a give paused for the stroke eases on to the cap now that the pen is up.
+		if (this.pinchGive?.paused) this.resumePinchGive();
 		if (this.mode === "pan") {
 			// The mode goes back FIRST, before the reticle is restored below:
 			// `showPenCursor` refuses to paint while `mode` says a pan drag is
@@ -5107,14 +5631,32 @@ export class InkOverlayPlugin {
 		centroid: { x: number; y: number }
 	): void {
 		if (this.retiring) return;
+		// s137: with the canvas off a two-finger gesture is not a zoom. Every phase is ignored here, so
+		// no preview starts, nothing settles and nothing is left pending; the router keeps its own
+		// touch bookkeeping (two fingers still count as two) and the page does not move.
+		if (!this.canvasMode) return;
 		// The router's ratios are relative to ITS gesture start. A preview the
 		// watchdog settled in place re-anchors mid-gesture (`rebasePinch`), so
 		// from then on they divide by the ratio at which that happened.
+		// A lift's give still easing back to the cap: its own frames come through here as moves. A new
+		// pinch engaging mid-ease TAKES THE ZOOM OVER from the scale on screen: the ease is dropped, nothing
+		// settles, and the gesture starts with the preview still up (the same shape as a pinch that never
+		// lifted), so the page does not move under the fingers; its own lift eases past-cap scale back
+		// again. A second end while it eases finishes in place.
+		if (this.pinchGive && !this.pinchGive.stepping) {
+			if (phase === "move") return;
+			if (phase === "end") { this.finishPinchGive(); return; }
+			const give = this.pinchGive;
+			if (give.raf !== 0) { this.winRef.cancelAnimationFrame(give.raf); give.raf = 0; }
+			this.pinchGive = null;
+		}
 		if (phase === "start") { this.pinchRatioBase = 1; this.pinchLastRatio = 1; }
 		else if (phase === "move") { this.pinchLastRatio = ratio; ratio = ratio / (this.pinchRatioBase || 1); }
 		if (phase === "start") {
 			if(this.getNoteViewportState().busy) return;
-			this.retirePanSettle();
+			// A new gesture anchors on the page where it rests, not on a bounce passing through.
+			this.cancelOverscrollBounce();
+			this.retirePanSettle("a new pinch");
 			this.hideBlankPinchLayers();
 			// Invalidate an earlier navigation's pending measure write.
 			this.viewportGeneration++;
@@ -5135,6 +5677,9 @@ export class InkOverlayPlugin {
 			const columnLocal = this.columnLocalAt(this.pinchScaleNow);
 			const origin = this.previewHostOrigin;
 			const contentTopLocal = this.contentTopLocalAt(this.pinchScaleNow);
+			this.pinchStartPan.x = this.viewportPan?.x ?? 0; this.pinchStartPan.y = this.viewportPan?.y ?? 0;
+			this.pinchBand.history.length = 0;
+			this.pinchBand.lastPan.x = this.pinchStartPan.x; this.pinchBand.lastPan.y = this.pinchStartPan.y;
 			this.pinchAnchor = {
 				scrollLeft: scroller.scrollLeft,
 				scrollTop: scroller.scrollTop,
@@ -5163,11 +5708,23 @@ export class InkOverlayPlugin {
 		const constraint = anchor?.constraint;
 		const targetMoved = !!anchor && Number.isFinite(centroid.x) && Number.isFinite(centroid.y) &&
 			(centroid.x !== (constraint?.clientX ?? anchor.targetX ?? anchor.focalX) || centroid.y !== (constraint?.clientY ?? anchor.targetY ?? anchor.focalY));
-		const next = phase === "end" ? this.pinchPending?.next ?? this.pinchScaleNow : pinchScale(this.pinchRefScale ?? this.pinchScaleNow, ratio, this.zoomFloor);
+		// s110: a live frame may reach past the cap by PINCH_GIVE (preview only); the lift below eases it back.
+		let next = phase === "end" ? this.pinchPending?.next ?? this.pinchScaleNow : pinchScale(this.pinchRefScale ?? this.pinchScaleNow, ratio, this.zoomFloor, true);
+		if (phase === "end" && anchor && this.pinchRefScale !== null && this.pinchGive === null) {
+			// The scale the old lift would have settled at: the same clamp, without the give.
+			const cap = pinchScale(this.pinchRefScale, next / this.pinchRefScale, this.zoomFloor);
+			if (Number.isFinite(cap) && Math.abs(cap - next) > 1e-9) {
+				// Painted past the cap: ease the preview back to it over the bounce's half second, then settle there.
+				if (this.pinchPreview) { this.startPinchGive(next, cap, centroid); return; }
+				// Nothing painted past the cap yet (the lift beat the frame): settle inside the range, as before.
+				this.pinchPending = { next: cap };
+				next = cap;
+			}
+		}
 		if (anchor && Number.isFinite(centroid.x) && Number.isFinite(centroid.y)) {
 			if (constraint) { constraint.clientX = centroid.x; constraint.clientY = centroid.y; }
 			else { anchor.targetX = centroid.x; anchor.targetY = centroid.y; }
-			this.reducePinchConstraint(next);
+			this.reducePinchConstraint(next, phase === "end");
 		}
 		if (phase === "end") {
 			if (targetMoved && this.pinchPending === null) this.pinchPending = { next: this.pinchScaleNow };
@@ -5187,6 +5744,11 @@ export class InkOverlayPlugin {
 				this.pinchRefScale = null;
 				this.pinchAnchor = null;
 				this.pinchPreview = false;
+				// A preview that ended without its settle (cancelled, refused, or thrown) takes its paper down here.
+				if (!this.previewPaperHandoff) this.endPreviewPaper("cancel");
+				this.previewPaperHandoff = false;
+				// A cancelled preview drops the snap's residual it was carrying.
+				if (this.paperPanWritten) this.writePaperPan();
 				this.releaseMeasures();
 				if (this.viewportStyleDirty) this.scheduleViewportStyleRefresh();
 			}
@@ -5213,14 +5775,21 @@ export class InkOverlayPlugin {
 		constraint.geometry = null;
 		if (!layout || !origin?.valid || !this.panSizer()) return;
 		const path = this.filePath(), extent = path ? surfaceExtents.get(path) : { x: 0, y: 0 };
-		const width = Math.max(layout.column, extent.x * this.fontZoom);
+		const width = Math.max(layout.columnBox, extent.x * this.fontZoom);
 		const height = Math.max(this.view.contentHeight, extent.y * this.fontZoom);
 		const naturalLeft = columnLocal === null ? null : columnLocal + this.view.scrollDOM.scrollLeft * layout.externalScale;
 		const naturalTop = contentTopLocal === null ? null : contentTopLocal + this.view.scrollDOM.scrollTop * layout.externalScale;
-		if (![origin.left, origin.top, layout.paneWidth, layout.paneHeight, width, height, layout.externalScale].every(Number.isFinite) ||
-			layout.paneWidth <= 0 || layout.paneHeight <= 0 || !validCameraScale(layout.externalScale) || width < 0 || height < 0) return;
-		constraint.geometry = { left: origin.left, top: origin.top, paneWidth: layout.paneWidth, paneHeight: layout.paneHeight,
-			width, height, external: layout.externalScale, x: naturalLeft !== null && Number.isFinite(naturalLeft), naturalLeft,
+		if (![origin.left, origin.top, layout.width, layout.paneHeight, layout.gutterScreen, width, height, layout.externalScale].every(Number.isFinite) ||
+			layout.width <= 0 || layout.paneHeight <= 0 || layout.gutterScreen < 0 || !validCameraScale(layout.externalScale) || width < 0 || height < 0) return;
+		// PREVIEW-TOUCHING (refreshPinchConstraint, called at :5618). `layout.width` (computed style, fractional)
+		// rather than `layout.paneWidth` (parent.clientWidth, integer): measured 1397.5 against the scroller's own
+		// 1397.48 screen px, and paneWidth - width is 0.5 on all 2333 frames s86 sampled. The gutter is carried
+		// through MEASURED and in screen px, so the consumer subtracts it without applying a scale of its own.
+		constraint.geometry = { left: origin.left, top: origin.top, paneWidth: layout.width, paneHeight: layout.paneHeight, gutterScreen: layout.gutterScreen,
+			// `width` is the page OR the room Infinite Canvas has granted around it, whichever is larger. That is
+			// the right quantity for an overlap bound and the wrong one for "does the page fit the pane", so the
+			// page's own box travels beside it. See the fit test in `reducePinchConstraint`.
+			width, pageWidth: this.pageContentWidth(), height, external: layout.externalScale, x: naturalLeft !== null && Number.isFinite(naturalLeft), naturalLeft,
 			y: naturalTop !== null && Number.isFinite(naturalTop), naturalTop };
 	}
 
@@ -5230,7 +5799,7 @@ export class InkOverlayPlugin {
 	 * A new snapshot reconciles the accepted target once; it cannot reconstruct
 	 * unobserved intermediate layout changes. Settle receives only the final target.
 	 */
-	private reducePinchConstraint(next: number): void {
+	private reducePinchConstraint(next: number, settling: boolean): void {
 		const anchor = this.pinchAnchor, constraint = anchor?.constraint;
 		if (!anchor || !constraint) return;
 		const geometry = constraint.geometry, layout = this.viewportLayout;
@@ -5239,15 +5808,50 @@ export class InkOverlayPlugin {
 			validCameraScale(next, layout.width, layout.height) &&
 			[layout.width / next, layout.height / next].every(n => Number.isFinite(n) && n >= 0 && n <= MAX_VIEWPORT_LAYOUT)) {
 			const axis = (client: number, offset: number, focal: number, host: number, local: number | null,
-				origin: number, pane: number, extent: number, measured: boolean, naturalInset?: number | null): number => {
+				origin: number, pane: number, gutter: number, extent: number, measured: boolean, naturalInset?: number | null, inset = false,
+				/** The PAGE's own box on this axis. Defaults to `extent`, so an axis that does not distinguish them is unchanged. */
+				pageExtent = extent): number => {
 				if (local === null || !measured) return offset;
 				const q = (focal - host) / anchor.fromScale - local;
-				const visible = Math.max(0, pane * geometry.external - PAN_MIN_VISIBLE_PX);
+				// `gutter` arrives already in screen px (measured at the last settle), so it is subtracted after the
+				// pane is scaled and is NOT multiplied by `next` - the defect this replaces was a scale applied to a
+				// quantity that had already been measured in the target units.
+				const span = pane * geometry.external - gutter;
+				const visible = Math.max(0, span - PAN_MIN_VISIBLE_PX);
 				const size = extent * next * geometry.external;
-				const lower = scrollExpansionEnabled && naturalInset != null
+				const lower = this.canvasMode && naturalInset != null
 					? origin + (q + naturalInset) * next - MAX_VIEWPORT_LAYOUT * next * geometry.external
 					: origin + q * next + (size > 0 ? PAN_MIN_VISIBLE_PX - size : -visible);
-				const upper = origin + q * next + (naturalInset == null ? visible : naturalInset * next);
+				// The same raised edge as anchorPanTo's: a column inset that fits may be carried as far right as the pane's edge.
+				//
+				// ASKED OF THE PAGE, NOT OF THE ROOM BESIDE IT. With Infinite Canvas on, `size` is the granted
+				// canvas, it never fits the pane, and the target was pinned to the column's natural inset on
+				// every preview frame - which walks away from the fingers by exactly the displacement the scroll
+				// was expected to absorb later, and no preview frame writes the scroll. Measured on the focal arm
+				// zooming out from 1 to 0.25, Readable line length on: the target went 1243.31, 1086.09, 928.88,
+				// 824.06 against a finger that never moved from 1348.12, and froze at 824.06 once the granted
+				// extent ran out. `anchorPanTo` then had nothing to do - the note was already at the target - so
+				// it wrote no pan at all and the column slid out from under the fingers, 786.09 px by the settle.
+				// The SAME column with the setting off keeps target == focal on every frame and holds the point
+				// to 0.00 px. The page fits the pane in both; only the blank beside it differs.
+				const pageSize = pageExtent * next * geometry.external;
+				const fits = inset && naturalInset != null && pageSize > 0 && pageSize <= span + PAN_FIT_SLACK_PX;
+				// NO WIDTH TEST, AND NO INSET PIN, WHILE THE FINGERS ARE DOWN. A preview frame's one job is
+				// to keep the note under them; bounds belong at the settle, which knows the true width and
+				// can ease to it. This clamp WAS the Family C defect at its source: pinned to the column's
+				// natural inset, the target walked away from the finger by exactly the displacement the
+				// scroll was expected to absorb later - measured 1243.31, 1086.09, 928.88, 824.06 against a
+				// finger that never moved from 1348.12 - and no preview frame writes the scroll. A live
+				// frame is now held only by what keeps the note visible.
+				// AND NO SETTLE CLAMP UNDER INFINITE CANVAS EITHER (s78): there the settle's target IS where
+				// the fingers left it, so clamping the target to the column's natural inset moves the page
+				// exactly as the preview clamp used to. Measured with this clamp still applied at the
+				// settle: the preview held the note to 0 on every frame, then `anchorPanTo` was handed a
+				// pan of 907.69 and computed a wanted pan of -0.00, because the note was already sitting
+				// on the clamped target - so it dropped the whole hold and the page jumped 907.69 px. The
+				// pan was never refused; the target had already moved.
+				const upper = origin + q * next + (!settling || this.canvasMode || naturalInset == null ? visible
+					: fits ? Math.max(naturalInset * next, span - pageSize) : naturalInset * next);
 				const requested = client + offset;
 				if (![lower, upper, requested].every(Number.isFinite)) return offset;
 				// Natural left/top origins win if a tiny note cannot supply the
@@ -5257,9 +5861,9 @@ export class InkOverlayPlugin {
 				return accepted === requested ? offset : accepted - client;
 			};
 			constraint.offsetX = axis(constraint.clientX, constraint.offsetX, anchor.focalX, anchor.hostLeft, anchor.columnLocal,
-				geometry.left, geometry.paneWidth, geometry.width, geometry.x, geometry.naturalLeft);
+				geometry.left, geometry.paneWidth, geometry.gutterScreen, geometry.width, geometry.x, geometry.naturalLeft, layout.columnInset, geometry.pageWidth);
 			constraint.offsetY = axis(constraint.clientY, constraint.offsetY, anchor.focalY, anchor.hostTop, anchor.contentTopLocal,
-				geometry.top, geometry.paneHeight, geometry.height, geometry.y, geometry.naturalTop);
+				geometry.top, geometry.paneHeight, 0, geometry.height, geometry.y, geometry.naturalTop);
 		}
 		anchor.targetX = constraint.clientX + constraint.offsetX;
 		anchor.targetY = constraint.clientY + constraint.offsetY;
@@ -5320,6 +5924,24 @@ export class InkOverlayPlugin {
 			// settled frame standing exactly where the last preview frame stood.
 			const effScale = external * next;
 			const pan = this.previewPanEngaged ? this.viewportPan : null;
+			// WHERE THE PAGE WAS PAINTED, captured here and nowhere later [s97 add. 16(3)]. The settle owes
+			// the ease the distance from the last preview frame's painted position to where the page lands,
+			// and this is the last point at which that position can be read: measured, the blank reads
+			// +15.00 here, 79.00 by `reanchorPan`'s entry with the sizer's transform BYTE-IDENTICAL, so it
+			// is the scroll commit in between that moves the edge, not the preview coming off. Capturing
+			// while the transform is still on is necessary and not sufficient; it must be before that
+			// commit, which is here [Engineer, s97-trace-0918T045211Z, EDGE-CAPTURES].
+			// One forced layout per settle, never per preview frame.
+			// INFINITE CANVAS OFF ONLY [s97 add. 20]. The thirteen expanded-right-viewport arms that guard
+			// committed ink are all Infinite-Canvas-ON, and the true-travel ease displaces ink on five of
+			// them: the ease moves the page by its offset while the ink's baked raster does not follow
+			// (`inkPanX()` is `panX() - rasterPan.x * cssScale`). With the setting on, the settle keeps the
+			// correction it has always had; making the ink mapping ride the ease there is owed.
+			// s189 [Architect ruling, on Alan's "i want it all in 1.4.20"]: THE CAPTURE RUNS UNDER THE CANVAS TOO.
+			// s97 add. 20 took this branch canvas-off only because the ease moves the page while the ink's baked
+			// raster does not follow it. That left the canvas lift with no true-travel measurement, so the whole
+			// correction landed in the commit's own turn (s188, measured 26.33 px of text moving in one frame).
+			this.previewPaintedBlank = this.settleBlank();
 			const spendable = !!pan && Number.isFinite(effScale) && effScale > 0;
 			let nextLeft = spendable && Number.isFinite(pan.x)
 				? Math.max(0, anchor.scrollLeft - pan.x / effScale)
@@ -5338,12 +5960,20 @@ export class InkOverlayPlugin {
 				const result = (origin + (q + inset) * next - target) / effScale;
 				return Number.isFinite(result) ? Math.max(0, Math.min(MAX_VIEWPORT_LAYOUT, result)) : null;
 			};
-			const left = scrollExpansionEnabled && geometry ? offset(anchor.focalX, anchor.hostLeft, anchor.columnLocal,
+			const left = this.canvasMode && geometry ? offset(anchor.focalX, anchor.hostLeft, anchor.columnLocal,
 				anchor.targetX ?? anchor.focalX, geometry.left, geometry.naturalLeft, geometry.x) : null;
-			const top = scrollExpansionEnabled && geometry ? offset(anchor.focalY, anchor.hostTop, anchor.contentTopLocal,
+			const top = this.canvasMode && geometry ? offset(anchor.focalY, anchor.hostTop, anchor.contentTopLocal,
 				anchor.targetY ?? anchor.focalY, geometry.top, geometry.naturalTop, geometry.y) : null;
 			if (left !== null) nextLeft = left;
 			if (top !== null) nextTop = top;
+			// A column inset that fits the pane settles on its rest, which anchorPanTo carries as pan, never as scroll:
+			// spending the gesture's pan here granted sideways room the column does not need (measured 200 px after a
+			// 25% -> 100% round trip) and left the scroll standing against an equal and opposite pan.
+			// s97 add. 50(b): Infinite Canvas ON only. Off, this zeroed a bound gesture's own clamped
+			// residue (:5673-5686) before it could reach the ease, which is the 832 px regression.
+			if (this.canvasMode && this.columnFitsPane(next, effScale)) nextLeft = 0;
+			// This settle, and only this one, closes a preview this gesture painted.
+			this.previewSettleOwed = true;
 			this.pinchPreview = false;
 			this.releaseMeasures();
 			this.clearDeferredRepaint();
@@ -5354,7 +5984,7 @@ export class InkOverlayPlugin {
 			// Keep authority through geometry convergence and the owned scroll
 			// request's consumption. New input or navigation retires it first.
 			this.panAnchorHold = this.panSizer() ? {
-				expansion: scrollExpansionEnabled && (left !== null || top !== null) ? {
+				expansion: this.canvasMode && (left !== null || top !== null) ? {
 					left: left ?? this.view.scrollDOM.scrollLeft, top: top ?? this.view.scrollDOM.scrollTop,
 				} : null,
 				focalX: anchor.focalX, focalY: anchor.focalY, targetX: anchor.targetX, targetY: anchor.targetY,
@@ -5365,17 +5995,28 @@ export class InkOverlayPlugin {
 				left: this.view.scrollDOM.scrollLeft, top: this.view.scrollDOM.scrollTop, ready: false, outcome: "pending", attempts: 0, request: null, issuance: [],
 			} : null;
 			// The final transaction establishes the range before its scroll writes.
-			const committed = this.commitCameraScale(next, {left:nextLeft,top:nextTop}, this.panAnchorHold);
+			// Its commit ends the preview; the preview paper stays up until this settle decides below.
+			this.previewPaperSettling = true;
+			let committed = false;
+			try { committed = this.commitCameraScale(next, {left:nextLeft,top:nextTop}, this.panAnchorHold); } finally { this.previewPaperSettling = false; }
 			// A REFUSED SETTLE IS AN EXIT PATH. Nothing downstream is going to
 			// re-derive this pan, so it must not be left on the children with
 			// no gesture tracking it.
-			if (!committed) { this.retirePanSettle(); this.clearViewportPan(); return; }
+			if (!committed) { this.endPreviewPaper("cancel"); this.retirePanSettle("the settle commit was refused"); this.clearViewportPan(); return; }
 			this.pinchRasterScale = next;
 			this.setViewportScroll(nextLeft,nextTop);
 			this.reanchorPan();
+			// The preview paper comes down with the settle - unless a bounce is already playing, which happens when this
+			// settle's own commit started one: then the element rides it, re-copied here at the settled zoom. A bounce begun
+			// later, by the hold's measure or a convergence pass, puts its own element up (startOverscrollBounce), so
+			// nothing here has to guess whether one is still coming.
+			this.previewPaperHandoff = true;
+			if (this.bounceState) this.rebasePreviewPaper();
+			else this.endPreviewPaper("settle");
 		} else {
 			const effective = external * next;
-			if (this.frame.locked || this.scaleGeometryValid === false || next > 4 ||
+			// s110: the preview's ceiling is the given one; the commit guard (commitCameraScale) keeps the bare cap.
+			if (this.frame.locked || this.scaleGeometryValid === false || next > MAX_PINCH_SCALE * PINCH_GIVE ||
 				!validCameraScale(next) || !validCameraScale(effective) || !this.prepareViewportLayout()) return;
 			const layout = this.viewportLayout!;
 			// The scroll target is no longer in this guard because a preview
@@ -5396,6 +6037,11 @@ export class InkOverlayPlugin {
 				this.captureRasterColumn(this.pinchScaleNow);
 				this.previewAnchorStale = false;
 			}
+			// A new gesture cancels any ease the previous lift never collected.
+			this.previewSettleOwed = false;
+			this.previewPaintedBlank = null;
+			// The paper leaves the scroller for its preview element on the first frame, before this frame's box write.
+			if (!this.pinchPreview) this.beginPreviewPaper();
 			this.pinchPreview = true;
 			this.pinchScrollAt = performance.now();
 			this.pinchScaleNow = next;
@@ -5404,7 +6050,9 @@ export class InkOverlayPlugin {
 			this.router?.cameraTransformChanged();
 			// Keep the scroller's physical viewport fixed while magnifying its
 			// contents. Reuse the raster; observers cannot allocate it mid-move.
-			this.applyViewportBox(next);
+			// The preview paper's own write is deferred to anchorPanTo below, which runs synchronously before
+			// paint, in this same task - so this call's old-pan/new-scale write of it would never be seen.
+			this.applyViewportBox(next, true);
 			// THIS FRAME'S READS ONLY. Both are filled by the single
 			// `columnLocalAt` below; clearing them first is what stops
 			// `anchorPanTo` anchoring against a rect from an earlier frame on a
@@ -5422,11 +6070,19 @@ export class InkOverlayPlugin {
 			// direction and costs no layout of its own; the settle above turns
 			// as much of it as the surface allows back into scroll.
 			const contentTopLocal = this.contentTopLocalAt(next);
+			// Deferred, same reason as applyViewportBox above: anchorPanTo below is this frame's one real write of
+			// the preview paper, synchronous and before paint. Two more immediate writers ahead of it - this one
+			// and applyViewportBox's - were what actually produced three records for one frame's reposition.
+			this.measurePreviewPaperBox(true);
 			// Reconcile only the latest accepted target against this fresh geometry.
 			// Earlier inputs were reduced against their own snapshot, not replayed.
 			this.refreshPinchConstraint(this.previewColumnLocal, contentTopLocal);
-			this.reducePinchConstraint(next);
+			this.reducePinchConstraint(next, false);
 			this.anchorPanTo(next, anchor, this.previewColumnLocal, contentTopLocal);
+			// anchorPanTo has early returns ahead of its own tail (the flush that normally clears this flag); on a
+			// frame that takes one, the deferred re-stamp above would otherwise go unpainted - exactly the frame at
+			// the previous scale's quotient the re-stamp exists to prevent. No-op when anchorPanTo already wrote.
+			if (this.previewPaperBoxDirty) { this.writePaperPan(); this.previewPaperBoxDirty = false; }
 		}
 		this.refreshPenCursor();
 		// Stamp AFTER the writes: the scroll events they queue are the ones
@@ -5484,20 +6140,42 @@ export class InkOverlayPlugin {
 
 	/** The live focal pan on x, in painted px. Zero when there is none. */
 	private panX(): number {
-		const pan = this.viewportPan;
-		return pan && Number.isFinite(pan.x) ? pan.x : 0;
+		const bounce = this.bounceOffset;
+		return this.restPanX() + (bounce && Number.isFinite(bounce.x) ? bounce.x : 0);
 	}
 	/** The live focal pan on y, in painted px. Zero when there is none. */
 	private panY(): number {
+		const bounce = this.bounceOffset;
+		return this.restPanY() + (bounce && Number.isFinite(bounce.y) ? bounce.y : 0);
+	}
+	/** s97 add. 52: the far end's floor, negative where the page is bigger than its room (room - extent), 0 where it fits. */
+	private panFloor(room: number, extent: number): number {
+		return Math.min(0, room - extent);
+	}
+	/** The pan without a playing overscroll bounce: where the page rests. */
+	private restPanX(): number {
+		const pan = this.viewportPan;
+		return pan && Number.isFinite(pan.x) ? pan.x : 0;
+	}
+	private restPanY(): number {
 		const pan = this.viewportPan;
 		return pan && Number.isFinite(pan.y) ? pan.y : 0;
 	}
 	/** Only the pan not already represented by the raster camera moves pixels. */
 	private inkPanX(): number { return this.panX() - (this.rasterPan?.x ?? 0) * this.cssScale; }
 	private inkPanY(): number { return this.panY() - (this.rasterPan?.y ?? 0) * this.cssScale; }
+	/**
+	 * s121 add. 2: WHERE THE INK IS PAINTED, for a pen sample. The ink layer's transform carries one more term
+	 * than the pan: the preview offset (column re-centring under a live pinch preview, note px), which the pen's
+	 * client point must also be read against or a stroke drawn under a live preview lands off by exactly that
+	 * offset (measured: 115 note px, x only, on a paused cap ease). Zero outside a preview, so the settled path
+	 * is byte-identical.
+	 */
+	private inkInputPanX(): number { return this.inkPanX() + this.previewInkOffset * this.cssScale; }
+	private inkInputPanY(): number { return this.inkPanY() + (this.previewInkOffsetY || 0) * this.cssScale; }
 	private rasterPanNeedsBake(): boolean {
 		return !this.frame.locked && this.builder === null && !this.pinchPreview && Number.isFinite(this.cssScale) && this.cssScale > 0 &&
-			((this.rasterPan?.x ?? 0) !== this.panX() / this.cssScale || (this.rasterPan?.y ?? 0) !== this.panY() / this.cssScale);
+			((this.rasterPan?.x ?? 0) !== this.restPanX() / this.cssScale || (this.rasterPan?.y ?? 0) !== this.restPanY() / this.cssScale);
 	}
 	private hideBlankPinchLayers(): void {
 		this.restorePinchLayers();
@@ -5612,7 +6290,11 @@ export class InkOverlayPlugin {
 	 * frame those targets have to be right in is the one with no pan in it.
 	 */
 	private documentTopUnpanned(): number {
-		return this.view.documentTop - this.panY();
+		// anchorTop, not `view.documentTop`: CodeMirror scales the padding it adds by the scale it last MEASURED, and it
+		// only measures content with a size. An empty note's content box is 0 wide, so there the padding stayed at its
+		// 100 percent value and every settle off 100 percent planned the paper's phase (and Fit's reachable edge)
+		// padding x (1/k - 1) layout px off the text. anchorTop is what the ink camera already uses.
+		return anchorTop(this.view, this.contentStyle?.paddingTop, this.cssScale) - this.panY();
 	}
 
 	/** Latch where the column was when the raster now on screen was drawn. */
@@ -5697,7 +6379,7 @@ export class InkOverlayPlugin {
 		// `columnLocalAt` reads host-local px, which fall as the scroller
 		// scrolls right; the layer this offset is written to sits inside the
 		// scroller and has already moved by exactly that scroll. Measured on
-		// the pixel arm (fleet 3, 2026-09-13): with Readable line length on, a
+		// the pixel arm (2026-09-13): with Readable line length on, a
 		// zoom-out preview that moved scrollLeft 93 -> 52 -> 0 wrote +41 and
 		// +52 layer px here and the committed ink sat that far right of its
 		// text until the next repaint. Adding the scroll change since the latch
@@ -5750,7 +6432,7 @@ export class InkOverlayPlugin {
 		const k = this.cssScale;
 		const s = Number.isFinite(k) && k > 0 ? 1 / k : 0;
 		const x = this.previewInkOffset + this.panX() * s - (this.rasterPan?.x ?? 0);
-		const y = this.panY() * s - (this.rasterPan?.y ?? 0);
+		const y = (this.previewInkOffsetY || 0) + this.panY() * s - (this.rasterPan?.y ?? 0);
 		layer.style.transform = x === 0 && y === 0 ? "" : `translate(${x}px,${y}px)`;
 	}
 
@@ -5781,13 +6463,394 @@ export class InkOverlayPlugin {
 	 * with the band carrying it: the focal drift went from 2.25/3.14 to
 	 * 11.86/16.02/4.11 against a 2px threshold.
 	 */
-	private writeViewportPan(): void {
+	private writeViewportPan(deferPaper = false): void {
 		const k = this.cssScale;
 		const s = Number.isFinite(k) && k > 0 ? 1 / k : 0;
 		const x = this.panX() * s, y = this.panY() * s;
 		const sizer = this.panSizer();
 		if (sizer?.style) sizer.style.transform = x === 0 && y === 0 ? "" : `translate(${x}px,${y}px)`;
+		// The sizer and ink layer above are stamped either way - a caller that defers the paper still needs the
+		// scale it just changed reflected on those. Only the preview paper's own write can wait for anchorPanTo,
+		// which runs synchronously before paint on the one caller that passes true (the live pinch frame).
+		if (deferPaper) this.previewPaperBoxDirty = true;
+		else this.writePaperPan();
 		this.writeInkLayerTransform();
+	}
+
+	/** The title rewrap the paper has taken during this preview, layout px; spent where the origin is re-measured. */
+	private paperRewrapY = 0;
+	/** How far the text column has re-centred since the gesture began, painted px; spent where the origin is re-measured. */
+	private paperColumnDrift = 0;
+	/** The pan values last written on the scroller, so a frame that changes nothing writes nothing. */
+	private paperPanWritten: { x: string; y: string } | null = null;
+	/**
+	 * How far the at-rest plan put the paper off the text to land it on the device px grid, layout px, per axis: the
+	 * written phase less the text's own. The snap is an at-rest guarantee; a preview carries it back out, so the paper
+	 * tracks the text through the gesture and lands on the new grid at the settle.
+	 */
+	private paperSnapResidual = { x: 0, y: 0 };
+	/**
+	 * THE PREVIEW PAPER: while a preview lives (and through the bounce its settle starts), the paper is this element under
+	 * the scroller, moved by a transform, instead of the scroller's own background moved through its stops. A transform is
+	 * composited; a stop moved by a pan re-rasters the whole background on every frame of a two-finger drag. Null at rest.
+	 */
+	private previewPaperEl: HTMLElement | null = null;
+	/** The pitch the element was copied at, layout px: its fold and its margin. */
+	private previewPaperPitch = 0;
+	/** The phases the element's copy carries, layout px (0 where the host's are not px): what its rounding lands on the grid. */
+	private previewPaperPhaseX = 0;
+	private previewPaperPhaseY = 0;
+	/** The scroller's padding box inside the host, layout px, before the margin: where the element's box is measured from. */
+	private previewPaperBox: { top: number; right: number; bottom: number; left: number } | null = null;
+	/** The device px per layout px the element was last placed at: a zoom frame with no pan still re-places it. */
+	private previewPaperKd = 0;
+	/**
+	 * `applyViewportBox`'s own scale-change repaint of the preview paper, recorded but not yet written: on the live
+	 * preview frame it defers to `anchorPanTo`, which runs synchronously afterward, before paint, and is this
+	 * frame's one real write of the element - so the deferred one paints nothing extra, it just cleared the guard.
+	 */
+	private previewPaperBoxDirty = false;
+	/** The inset and transform last written on the element, so a frame that changes neither writes nothing. */
+	private previewPaperInset = "";
+	private previewPaperTransform = "";
+	/** The scroll the element's offset was last derived at, layout px; NaN until one is read. */
+	private paperScrollLeft = Number.NaN;
+	private paperScrollTop = Number.NaN;
+	/** Set by the settle once it has taken the preview paper down or handed it to a bounce, so the gesture's end does not do it again. */
+	private previewPaperHandoff = false;
+	/** True only across the settle's own commit, which ends a preview without taking the preview paper down. */
+	private previewPaperSettling = false;
+	/** The path that last took the preview paper down, and how many times it has been put up: read by fixtures only. */
+	private previewPaperEnded: PreviewPaperEnd | null = null;
+	private previewPaperSwaps = 0;
+
+	/**
+	 * s192: GRID PAPER'S SECOND BOX. Under grid paper the scroller paints the horizontal rules and this element,
+	 * its first child, paints the vertical ones - one repeating gradient each, because two on one large box lose
+	 * the first layer's rules as the box grows (s192 add. 5). Null under every other paper, and under none.
+	 */
+	private paperGridBox: HTMLElement | null = null;
+	/**
+	 * What tells this overlay the paper CHANGED. Nothing did before: the paper is the stylesheet's, and a class or a
+	 * note's attribute needed no code to take effect. The box does, so two narrow watches - the body's own class (the
+	 * global paper, the cycle command) and the `data-handwriting-paper` attribute anywhere (a note's own choice, which
+	 * NotePaper writes on the leaf container). Deliberately NOT a class watch with `subtree`, which would fire on
+	 * every `cm-activeLine` toggle - a callback per cursor move.
+	 */
+	private paperKindWatch: MutationObserver[] = [];
+	private paperKindFrame: number | null = null;
+	/** The box's written size, `w,h` in layout px, and its written pan: neither is written again unchanged. */
+	private paperGridBoxSize: string | null = null;
+	private paperGridBoxPanX = "";
+
+	/**
+	 * THE PAPER MOVES AS ONE WITH THE TEXT. The paper is the scroller's own
+	 * background, and the scroller is the one element the pan may not move, so
+	 * the translate `.cm-sizer` was just given is handed to the background as two
+	 * registered, non-inherited properties the gradient stops (lines, grid) and
+	 * the dot tile position (dots) read. Same units as the sizer's translate: the
+	 * scroller's layout px, inside the zoom host. Two things move the text against
+	 * the scroller during a preview that the pan does not carry, and the paper
+	 * takes both: a title rewrap above the content (y) and the column re-centring
+	 * under Readable line length (x). Two style writes when the values change,
+	 * none when they do not, no read; zero removes them.
+	 */
+	private writePaperPan(): void {
+		const scroller = this.view?.scrollDOM;
+		if (!scroller?.style) return;
+		const k = this.cssScale;
+		const s = Number.isFinite(k) && k > 0 ? 1 / k : 0;
+		const carry = this.pinchPreview ? this.paperSnapResidual : null;
+		const x = (this.panX() + this.paperColumnDrift) * s - (carry?.x ?? 0), y = this.panY() * s + this.paperRewrapY - (carry?.y ?? 0);
+		// While the preview paper is up it carries the pan, and the scroller's pan properties stay off.
+		if (this.previewPaperEl) { this.movePreviewPaper(x, y); return; }
+		// Folded by the pitch this overlay planned; a pitch the host owns is not known here, so its values go unfolded.
+		const pitch = Number.parseFloat(this.paperWritten?.get("--handwriting-paper-pitch") ?? "");
+		const ax = x === 0 ? "" : `${foldIntoPitch(x, pitch)}px`, ay = y === 0 ? "" : `${foldIntoPitch(y, pitch)}px`;
+		const last = this.paperPanWritten;
+		if (last ? last.x === ax && last.y === ay : !ax && !ay) return;
+		if (ax) scroller.style.setProperty("--handwriting-paper-pan-x", ax); else scroller.style.removeProperty("--handwriting-paper-pan-x");
+		if (ay) scroller.style.setProperty("--handwriting-paper-pan-y", ay); else scroller.style.removeProperty("--handwriting-paper-pan-y");
+		this.paperPanWritten = ax || ay ? { x: ax, y: ay } : null;
+		// s192: the grid's vertical box reads its own copy - the property is registered `inherits: false`, so the
+		// scroller's does not reach a child. Same value, same call, so both axes move on the same frame.
+		this.writeGridBoxPan(ax);
+	}
+
+	/**
+	 * PUT THE PREVIEW PAPER UP, on a preview's first frame: an element about a pitch (see movePreviewPaper) beyond the scroller's
+	 * padding box on every side, under the scroller in the host, carrying the scroller's own resolved background.
+	 *
+	 * COPIED, NOT RE-DERIVED. The scroller's computed image, size, position, repeat and colour are what every stylesheet
+	 * rule (global paper, a note's override, a theme) resolved to, so `none` shows nothing and a note's own tile survives
+	 * a global one. The pan properties come off FIRST: the computed stops carry phase plus pan, and the element's transform
+	 * carries the pan, so a copy taken with them on would move the paper by a standing pan twice.
+	 *
+	 * NOT PUT UP, and the scroller's own route carries the note: no paper; a layer that is not a gradient attached `local`
+	 * (not the paper's); a pitch that is not a px length (the property is not registered, so a theme's `2.5rem` computes
+	 * to the text "2.5rem", which is not a pitch); a scroller that is not left-to-right, whose scroll origin is not the
+	 * one the offset below is derived for.
+	 *
+	 * One forced style read per gesture; the preview frame before it has already flushed layout.
+	 */
+	private beginPreviewPaper(): void {
+		const host = this.view?.dom, scroller = this.view?.scrollDOM;
+		if (this.previewPaperEl || !host?.style || !scroller?.style || scroller.parentElement !== host || !this.winRef?.getComputedStyle) return;
+		// Live: every read below resolves the style as it stands at that read.
+		const cs = this.winRef.getComputedStyle(scroller);
+		const pitch = previewPaperPitch(cs);
+		if (pitch === null || cs.direction !== "ltr" || !previewPaperCopyable(cs, pitch)) return;
+		// s192: under grid the vertical rules live on their own box inside the scroller, so the copy takes that
+		// layer too - the preview paints both axes on one pane-sized box, which is the shape measured clean.
+		const grid = this.gridBoxPaperStyle(pitch);
+		if (this.paperGridBox && !grid) return;
+		this.clearScrollerPan(scroller);
+		// OFF THE PAGE, and that is the whole point of the global helper here rather than `host.createDiv`: the
+		// element takes its nine background properties below, and on an element already in the page each one is a
+		// style write inside the preview frame - PaperZoomHost ZERO WRITES reads 11 that way against its cap of 2.
+		// `insertBefore` adopts it into the host's document at the end of this call, as the native form did.
+		const el = createDiv({ cls: "handwriting-paper-preview" });
+		copyPreviewPaperBackground(el, cs, grid);
+		this.previewPaperEl = el;
+		this.previewPaperPitch = pitch;
+		this.previewPaperPhaseX = previewPaperPhase(cs, "--handwriting-paper-phase-x");
+		this.previewPaperPhaseY = previewPaperPhase(cs, "--handwriting-paper-phase");
+		this.previewPaperInset = "";
+		this.previewPaperTransform = "";
+		this.paperScrollLeft = scroller.scrollLeft;
+		this.paperScrollTop = scroller.scrollTop;
+		this.measurePreviewPaperBox();
+		host.insertBefore(el, scroller);
+		scroller.classList.add("handwriting-paper-previewing");
+		this.previewPaperSwaps++;
+		this.writePaperPan();
+	}
+
+	/** The grid box's own horizontal pan, written only when it changes; "" removes it. */
+	private writeGridBoxPan(ax: string): void {
+		const box = this.paperGridBox;
+		if (!box?.style || ax === this.paperGridBoxPanX) return;
+		if (ax) box.style.setProperty("--handwriting-paper-pan-x", ax); else box.style.removeProperty("--handwriting-paper-pan-x");
+		this.paperGridBoxPanX = ax;
+	}
+
+	/**
+	 * s192: THE GRID'S VERTICAL BOX, made, sized or taken away. Grid paper only: the stylesheet states
+	 * `--handwriting-paper-grid` on the scroller for every paper kind, so a note's own choice beats a global one by
+	 * the ordinary cascade and this reads the answer rather than re-deriving it.
+	 *
+	 * THE SIZE IS THE CONTENT AND THE GRANTED EXTENT, never `scrollWidth` or `scrollHeight`: the box is inside the
+	 * scroller, so a size taken from the scroll range would feed the range it was taken from and grow on every pass.
+	 * The sizer's own box is the content; the extent spacer's position is what this overlay has granted beyond it;
+	 * the client box covers a note shorter than its pane. Nothing here can make the scroller scroll further than the
+	 * spacer already does.
+	 *
+	 * NOT ON A PREVIEW FRAME, and nothing calls it on one: while a preview lives the paper is the preview element,
+	 * which carries both axes itself, and this box is quiet under the previewing class. So a pinch adds no read and
+	 * no write here. A scroll adds none either: scrolling changes neither the content nor the grant.
+	 */
+	/** One frame's worth of the watch's work, however many mutations arrived. */
+	private watchPaperKind(): void {
+		const doc = this.view?.dom?.ownerDocument;
+		if (this.paperKindWatch.length || !doc?.body || typeof MutationObserver === "undefined") return;
+		// IN THE MUTATION'S OWN TASK, not on the next frame: the scroller gives up its vertical layer under the class
+		// this call adds, so a frame between the paper changing and the box arriving would paint the whole grid on the
+		// scroller and then split it - a visible double step, and a state the paper cells read as the wrong image. A
+		// paper change is rare (a command, the picker, a note switch), so the style read it costs is not a hot path.
+		const queue = (): void => { this.syncGridPaperBox(); };
+		const body = new MutationObserver(queue);
+		body.observe(doc.body, { attributes: true, attributeFilter: ["class"] });
+		const note = new MutationObserver(queue);
+		note.observe(doc.body, { attributes: true, attributeFilter: ["data-handwriting-paper"], subtree: true });
+		this.paperKindWatch = [body, note];
+	}
+
+	private syncGridPaperBox(): void {
+		const scroller = this.view?.scrollDOM;
+		if (!scroller?.isConnected) { this.removeGridPaperBox(); return; }
+		if (this.pinchPreview || !this.winRef?.getComputedStyle) return;
+		this.watchPaperKind();
+		const wanted = this.winRef.getComputedStyle(scroller).getPropertyValue("--handwriting-paper-grid").trim() === "1";
+		if (!wanted) { this.removeGridPaperBox(); return; }
+		if (!this.paperGridBox) {
+			// The same patch the extent spacer makes, for the same reason: an absolutely placed child of a static
+			// scroller would take its place from the pane instead.
+			if (this.winRef.getComputedStyle(scroller).position === "static") {
+				scroller.setCssStyles({ position: "relative" });
+				this.scrollPositionPatched = true;
+			}
+			// `createDiv` appends, so the box is moved to the front in the same task: it is the scroller's FIRST child
+			// on every frame that paints, and absolute from its first, so the append itself adds nothing to the flow.
+			const box = scroller.createDiv({ cls: "handwriting-paper-grid-column" });
+			scroller.insertBefore(box, scroller.firstChild);
+			// s192 add. 6, FAIL SAFE: the stylesheet paints both axes on the scroller by default, because the box is
+			// this overlay's and a grid scroller without one would otherwise show lined paper. The scroller gives up its
+			// vertical layer only under this class, added in the SAME call that puts the box in the page and removed in
+			// the same call that takes it out, so no frame paints the axis twice and none paints it not at all.
+			scroller.classList.add("handwriting-paper-grid-split");
+			this.paperGridBox = box;
+			this.paperGridBoxSize = null;
+			this.paperGridBoxPanX = "";
+			const pan = this.paperPanWritten;
+			if (pan?.x) this.writeGridBoxPan(pan.x);
+		}
+		const sizer = scroller.firstElementChild === this.paperGridBox ? this.paperGridBox.nextElementSibling : scroller.firstElementChild;
+		const contentW = sizer instanceof HTMLElement ? sizer.offsetLeft + sizer.offsetWidth : 0;
+		const contentH = sizer instanceof HTMLElement ? sizer.offsetTop + sizer.offsetHeight : 0;
+		const grantedW = Number.isFinite(this.spacerLeft) ? this.spacerLeft + 1 : 0;
+		const grantedH = Number.isFinite(this.spacerTop) ? this.spacerTop + 1 : 0;
+		const w = Math.max(scroller.clientWidth, contentW, grantedW);
+		const h = Math.max(scroller.clientHeight, contentH, grantedH);
+		const size = `${w},${h}`;
+		if (size === this.paperGridBoxSize) return;
+		this.paperGridBoxSize = size;
+		this.paperGridBox.setCssStyles({ width: `${w}px`, height: `${h}px` });
+	}
+
+	/** The box goes: paper switched away from grid, a note switch, a release. Its own state goes with it. */
+	private removeGridPaperBox(): void {
+		if (!this.paperGridBox) return;
+		// The class goes first and in this same task: the scroller is painting one axis while the box paints the
+		// other, so the box may not leave before the scroller has taken its own layer back.
+		this.paperGridBox.parentElement?.classList.remove("handwriting-paper-grid-split");
+		this.paperGridBox.remove();
+		this.paperGridBox = null;
+		this.paperGridBoxSize = null;
+		this.paperGridBoxPanX = "";
+	}
+
+	/** The release: the watch and its owed frame go with the box. */
+	private stopPaperKindWatch(): void {
+		for (const observer of this.paperKindWatch) observer.disconnect();
+		this.paperKindWatch = [];
+		if (this.paperKindFrame !== null) { this.winRef?.cancelAnimationFrame?.(this.paperKindFrame); this.paperKindFrame = null; }
+	}
+
+	/** The scroller's pan properties off, each only if it is set: a removal of nothing is still a style call. */
+	private clearScrollerPan(scroller: HTMLElement): void {
+		if (scroller.style.getPropertyValue("--handwriting-paper-pan-x")) scroller.style.removeProperty("--handwriting-paper-pan-x");
+		if (scroller.style.getPropertyValue("--handwriting-paper-pan-y")) scroller.style.removeProperty("--handwriting-paper-pan-y");
+		this.paperPanWritten = null;
+	}
+
+	/**
+	 * s192: the grid box's own resolved background, for a preview copy, or null when there is no box or its layer is
+	 * not the paper this overlay planned. The previewing class is not on yet at this read (begin) or is taken off
+	 * around it (rebase), exactly as the scroller's own copy is taken.
+	 */
+	private gridBoxPaperStyle(pitch: number): PreviewPaperSource | null {
+		const box = this.paperGridBox;
+		if (!box?.isConnected || !this.winRef?.getComputedStyle) return null;
+		const cs = this.winRef.getComputedStyle(box);
+		return previewPaperCopyable({ backgroundImage: cs.backgroundImage, backgroundAttachment: "local", backgroundSize: cs.backgroundSize }, pitch) ? cs : null;
+	}
+
+	/**
+	 * The scroller's padding box inside the host, as insets, layout px. Insets rather than a size: the counter-sized host
+	 * of a zoom preview, and a pane resize, move the host's edges and the scroller's together, and the element follows
+	 * both without a write. Re-read on each preview frame where the column is read, so a change in what sits between the
+	 * host and the scroller is followed too; the frame has already flushed its layout, so the reads force none.
+	 */
+	private measurePreviewPaperBox(deferPaper = false): void {
+		const host = this.view?.dom, scroller = this.view?.scrollDOM;
+		if (!this.previewPaperEl || !host || !scroller) return;
+		const top = scroller.offsetTop + scroller.clientTop, left = scroller.offsetLeft + scroller.clientLeft;
+		const right = host.clientWidth - (left + scroller.clientWidth), bottom = host.clientHeight - (top + scroller.clientHeight);
+		const box = this.previewPaperBox, kd = this.cssScale * (this.dpr || 1);
+		if (box && box.top === top && box.right === right && box.bottom === bottom && box.left === left && kd === this.previewPaperKd) return;
+		this.previewPaperBox = { top, right, bottom, left };
+		this.previewPaperKd = kd;
+		if (deferPaper) { this.previewPaperBoxDirty = true; return; }
+		this.writePaperPan();
+	}
+
+	/**
+	 * THE PREVIEW PAPER'S PLACE for the pan `x`, `y` (layout px, as the scroller's pan properties would take it).
+	 *
+	 * The scroller's background is attached `local`: a stop at `phase + n x pitch` sits at `pan - scroll` in the
+	 * scroller's box. The element's copy draws the stop at `phase + n x pitch` from its own edge, which is `margin` above
+	 * and left of that box, so its offset is `pan - scroll + margin`, folded into one pitch (a repeating pattern moved by a
+	 * pitch is the same pattern) and then placed on the device px grid.
+	 *
+	 * FOLD FIRST, THEN ROUND. A composited layer at a fractional device px is resampled, and a one-device-px rule becomes
+	 * two half rows. Where the pitch is not a whole number of device px (28 layout px at 30 percent and DPR 2 is 16.8), a
+	 * fold after the rounding would take a fractional device px back off.
+	 *
+	 * WHAT IS ROUNDED IS WHERE THE RULES LAND, not the offset alone: the copy's phase was put on the device px grid of the
+	 * zoom it was planned at, and mid-zoom it is off this zoom's grid by a fraction, so the offset takes that fraction back
+	 * out. The rules then land on whole device px (hard) at most half a device px from the text, the nearest whole px to
+	 * the text's own place, which is where the settle's snap puts them: the lift moves them by nothing. On a drag the
+	 * fraction is 0 and the offset itself is whole.
+	 *
+	 * The margin is a pitch rounded up to whole device px, plus one, so a rounded offset never uncovers the edge.
+	 */
+	private movePreviewPaper(x: number, y: number): void {
+		const el = this.previewPaperEl, box = this.previewPaperBox, pitch = this.previewPaperPitch;
+		const kd = this.cssScale * (this.dpr || 1);
+		if (!el || !box || !(pitch > 0) || !(Number.isFinite(kd) && kd > 0)) return;
+		const margin = (Math.ceil(pitch * kd - 1e-6) + 1) / kd;
+		const inset = `${box.top - margin}px ${box.right - margin}px ${box.bottom - margin}px ${box.left - margin}px`;
+		if (inset !== this.previewPaperInset) { el.style.inset = inset; this.previewPaperInset = inset; }
+		const scroller = this.view?.scrollDOM;
+		if (!Number.isFinite(this.paperScrollLeft) || !Number.isFinite(this.paperScrollTop)) { this.paperScrollLeft = scroller?.scrollLeft ?? 0; this.paperScrollTop = scroller?.scrollTop ?? 0; }
+		const fx = fractionOf(this.previewPaperPhaseX * kd), fy = fractionOf(this.previewPaperPhaseY * kd);
+		const tx = (Math.round(foldIntoPitch(x - this.paperScrollLeft + margin, pitch) * kd + fx) - fx) / kd;
+		const ty = (Math.round(foldIntoPitch(y - this.paperScrollTop + margin, pitch) * kd + fy) - fy) / kd;
+		const transform = `translate(${tx}px, ${ty}px)`;
+		if (transform !== this.previewPaperTransform) { el.style.transform = transform; this.previewPaperTransform = transform; }
+	}
+
+	/**
+	 * A SETTLE THAT STARTS A BOUNCE keeps the preview paper up, but the settle has re-planned the paper at the new zoom
+	 * (a rule floored to a device px, a phase on the new device px grid) and spent the pan into the scroll. The copy is
+	 * taken again from the scroller, with the suppressing class off for the one read, and the offset re-derived from the
+	 * settled scroll, all in the settle's own task, so no frame paints the old zoom's rules.
+	 */
+	private rebasePreviewPaper(): void {
+		const el = this.previewPaperEl, scroller = this.view?.scrollDOM;
+		if (!el || !scroller?.style || !this.winRef?.getComputedStyle) return;
+		scroller.classList.remove("handwriting-paper-previewing");
+		this.clearScrollerPan(scroller);
+		const cs = this.winRef.getComputedStyle(scroller);
+		const pitch = previewPaperPitch(cs);
+		const grid = pitch === null ? null : this.gridBoxPaperStyle(pitch);
+		const copyable = pitch !== null && previewPaperCopyable(cs, pitch) && !(this.paperGridBox && !grid);
+		if (copyable) copyPreviewPaperBackground(el, cs, grid);
+		scroller.classList.add("handwriting-paper-previewing");
+		if (!copyable) { this.endPreviewPaper("settle"); return; }
+		this.previewPaperPitch = pitch;
+		this.previewPaperPhaseX = previewPaperPhase(cs, "--handwriting-paper-phase-x");
+		this.previewPaperPhaseY = previewPaperPhase(cs, "--handwriting-paper-phase");
+		this.paperScrollLeft = scroller.scrollLeft;
+		this.paperScrollTop = scroller.scrollTop;
+		this.previewPaperBox = null;
+		this.measurePreviewPaperBox();
+	}
+
+	/**
+	 * TAKE THE PREVIEW PAPER DOWN: the one place it comes down, whichever path ends its life. The scroller's paper comes
+	 * back in the same task, its pan properties rewritten from the pan in force, so no frame shows neither or both.
+	 */
+	private endPreviewPaper(reason: PreviewPaperEnd): void {
+		const el = this.previewPaperEl;
+		if (!el) return;
+		this.previewPaperEl = null;
+		this.previewPaperBox = null;
+		this.previewPaperInset = "";
+		this.previewPaperTransform = "";
+		this.paperScrollLeft = Number.NaN;
+		this.paperScrollTop = Number.NaN;
+		this.previewPaperEnded = reason;
+		el.remove();
+		this.view?.scrollDOM?.classList.remove("handwriting-paper-previewing");
+		this.paperPanWritten = null;
+		this.writePaperPan();
+	}
+
+	/** The preview paper as it stands, read-only, for a fixture that has to see it rather than infer it from pixels. */
+	previewPaperReadout(): { present: boolean; held: boolean; swaps: number; ended: PreviewPaperEnd | null; pitch: number; inset: string; transform: string } {
+		return { present: !!this.previewPaperEl?.isConnected, held: !!this.previewPaperEl, swaps: this.previewPaperSwaps, ended: this.previewPaperEnded,
+			pitch: this.previewPaperEl ? this.previewPaperPitch : 0, inset: this.previewPaperInset, transform: this.previewPaperTransform };
 	}
 
 	/** `.cm-sizer`, found once and re-found only if it leaves the document. */
@@ -5801,9 +6864,72 @@ export class InkOverlayPlugin {
 
 	/** Drop the preview offset; the committed raster is drawn on the column. */
 	private clearPreviewInkOffset(): void {
-		if (this.previewInkOffset === 0) return;
+		if (this.previewInkOffset === 0 && !this.previewInkOffsetY) return;
 		this.previewInkOffset = 0;
+		this.previewInkOffsetY = 0;
 		this.writeInkLayerTransform();
+	}
+
+	/**
+	 * THE CONTENT'S TOP MOVES WHEN A BLOCK ABOVE IT REWRAPS, and a pinch preview
+	 * does not look. During a live pinch `syncCamera` and the camera re-read are
+	 * deferred (deferPinchRaster) and the committed raster is reused, so the ink
+	 * keeps the content top it was drawn at. The inline title (and properties)
+	 * sit in `.cm-sizer` above `.cm-contentContainer`, in normal flow: the pinch
+	 * narrows the host, the title gains or loses a line, and every text line
+	 * moves by that line's height at once while the ink does not - 25 note px
+	 * per title line in the fixture, until the gesture ends.
+	 *
+	 * NO READ PER FRAME. A ResizeObserver delivers each watched block's new
+	 * border-box size after the layout that changed it, before paint, with no
+	 * forced layout of its own; a delivered HEIGHT difference is added to the
+	 * preview raster's vertical offset through the one transform writer. The
+	 * delivery is per frame, not per rewrap: the observer fires whenever the
+	 * box changes, width included, and a pinch narrows the title on every
+	 * frame. Measured on the render fixture (Readable line length off): 30
+	 * callbacks over a 30-frame pinch, 0.2 ms of callback time in total, none
+	 * during the settle. The callback only compares heights, so the transform
+	 * write happens once per rewrap (2 in a gesture that rewraps twice).
+	 * Outside a preview the new height is recorded and nothing moves: the
+	 * ordinary camera path already reads the content's top.
+	 *
+	 * RECONCILED WHERE THE COLUMN OFFSET IS: the settle and a mid-gesture
+	 * repaint redraw the raster against the moved content and clear both
+	 * offsets together (clearPreviewInkOffset).
+	 *
+	 * The blocks are the sizer's children before the content container, taken
+	 * at takeover; a block added later (properties appearing) is picked up at
+	 * the next takeover, and until then a rewrap inside it is the old behaviour.
+	 */
+	private observeAboveContent(): void {
+		if (this.aboveContentObserver || typeof ResizeObserver !== "function") return;
+		const sizer = this.panSizer();
+		const container = this.view?.contentDOM?.parentElement;
+		if (!sizer || !container || container.parentElement !== sizer) return;
+		const blocks: Element[] = [];
+		for (let el = sizer.firstElementChild; el && el !== container; el = el.nextElementSibling) blocks.push(el);
+		if (!blocks.length) return;
+		this.aboveContentHeights = new WeakMap();
+		const observer = new ResizeObserver(entries => {
+			let dH = 0;
+			for (const entry of entries) {
+				const box = entry.borderBoxSize?.[0];
+				const height = box ? box.blockSize : entry.contentRect.height;
+				const before = this.aboveContentHeights.get(entry.target);
+				this.aboveContentHeights.set(entry.target, height);
+				if (before !== undefined) dH += height - before;
+			}
+			if (dH === 0 || !this.pinchPreview) return;
+			this.previewInkOffsetY = (this.previewInkOffsetY || 0) + dH;
+			this.aboveContentShifts = (this.aboveContentShifts || 0) + 1;
+			this.writeInkLayerTransform();
+			// The paper moves with the text too, on its own account: its shift is spent where the origin is next
+			// re-measured (capturePaperOrigin), not where the ink's raster is redrawn.
+			this.paperRewrapY += dH;
+			this.writePaperPan();
+		});
+		for (const block of blocks) observer.observe(block);
+		this.aboveContentObserver = observer;
 	}
 
 	/**
@@ -5833,7 +6959,11 @@ export class InkOverlayPlugin {
 		next: number,
 		a: { focalX: number; focalY: number; targetX?: number; targetY?: number; hostLeft: number; hostTop: number; columnLocal: number | null; contentTopLocal: number | null; fromScale: number; scrollTop: number },
 		columnLocal: number | null,
-		contentTopLocal?: number | null
+		contentTopLocal?: number | null,
+		/** Only the settle of a gesture that changed the scale asks for the fitting bound; a preview frame must keep the note under the focal point. */
+		settleBound = false,
+		/** Every settle, drag or zoom (the settle runs with the preview down): a centred column that fits goes back to its rest (columnRestPan). */
+		settling = !this.pinchPreview
 	): void {
 		if (!validCameraScale(next) || !validCameraScale(a.fromScale)) return;
 		// NO SIZER, NO PAN. The text half of the pan goes on `.cm-sizer`; a
@@ -5885,6 +7015,16 @@ export class InkOverlayPlugin {
 		const x = columnLocal === null || a.columnLocal === null
 			? pan.x
 			: (a.targetX ?? a.focalX) - (origin.left + (columnLocal + ((a.focalX - a.hostLeft) / a.fromScale - a.columnLocal)) * next);
+		// THE PAPER'S SHARE OF THE COLUMN'S RE-CENTRING. `x` holds the text column under the fingers, so while the column
+		// re-centres inside the host (Readable line length under a zoom-in) the text moves against the scroller by exactly
+		// that re-centring, in the painted px this formula uses, and the paper, which lives on the scroller, moves with
+		// it. Preview frames only: the settle re-measures the origin instead (capturePaperOrigin).
+		let paperDriftMoved = false;
+		if (this.pinchPreview) {
+			const drift = columnLocal === null || a.columnLocal === null ? 0 : (columnLocal - a.columnLocal) * next;
+			paperDriftMoved = Number.isFinite(drift) && drift !== this.paperColumnDrift;
+			if (paperDriftMoved) this.paperColumnDrift = drift;
+		}
 		// KEEP THE NOTE ON THE PANE. The translate has no clamp of its own and
 		// the scroller does not move with it, so an unbounded pan can carry the
 		// whole note off screen with nothing to bring it back.
@@ -5898,7 +7038,7 @@ export class InkOverlayPlugin {
 		// covering it. A symmetric pane-sized clamp broke the next zoom there.
 		const left = columnLocal === null ? 0 : columnLocal * next;
 		const top = contentTopLocal == null ? 0 : contentTopLocal * next;
-		const width = Math.max(layout?.column ?? 0, extent.x * this.fontZoom) * effective;
+		const width = Math.max(layout?.columnBox ?? 0, extent.x * this.fontZoom) * effective;
 		const height = Math.max(this.view.contentHeight, extent.y * this.fontZoom) * effective;
 		const minX = width > 0 ? PAN_MIN_VISIBLE_PX - left - width : -bx;
 		const minY = height > 0 ? PAN_MIN_VISIBLE_PX - top - height : -by;
@@ -5906,18 +7046,845 @@ export class InkOverlayPlugin {
 		// the content stays at its natural inset, including column/title margins.
 		// Use the same origin-first precedence as the ordered input reducer.
 		const nativeLeft = this.view.scrollDOM.scrollLeft, nativeTop = this.view.scrollDOM.scrollTop;
-		const cx = columnLocal !== null && Number.isFinite(nativeLeft)
-			? Math.min(nativeLeft * effective, Math.max(scrollExpansionEnabled ? (nativeLeft - MAX_VIEWPORT_LAYOUT) * effective : minX, x)) : pan.x;
-		const cy = contentTopLocal != null && Number.isFinite(nativeTop)
-			? Math.min(nativeTop * effective, Math.max(scrollExpansionEnabled ? (nativeTop - MAX_VIEWPORT_LAYOUT) * effective : minY, y)) : pan.y;
+		// The preview paper's offset is taken against this scroll (zooming out clamps it); the read is this frame's already.
+		if (this.previewPaperEl) { this.paperScrollLeft = nativeLeft; this.paperScrollTop = nativeTop; }
+		// The scroller's CONTENT box: the page is laid out inside it, and the scrollbar is not room the column may use.
+		// PREVIEW-TOUCHING (anchorPanTo, called at :5620 inside the preview frame body), so this reads the
+		// LAST STORED gutterScreen. Staleness bound: one gesture - it is refreshed at every settle, and a
+		// gesture's previews sit between two settles. Preview carries no width test since 24649b64, so the
+		// pan window is the only consumer of this span here.
+		const spanX = layout ? layout.width * layout.externalScale - layout.gutterScreen : NaN;
+		// EXCEPT A COLUMN INSET THAT FITS. With Readable line length on, the blank either side of the column is the setting's
+		// centring, not the note's origin edge, and the column's margin is frozen in host px (styles.css, the note viewport's
+		// sizer), so at scroll zero the cap above anchored every zoom-out at the pane's left edge: the column slid out from
+		// under the fingers while they were down, measured 524 px at 25% about the pane's centre. Where the column fits the
+		// pane, the pan may carry it right as far as the pane's own edge - the settle's fitting window - so the fingers keep
+		// it. Readable line length off has no inset (columnRestPan is null) and keeps the cap.
+		// THE KEY IS THE FIT, not how a theme spells its column: where the page's own box sits inside the pane, the blank
+		// beside it is the room a readable width leaves and the pan may carry the page right as far as the pane's edge.
+		// SUPERSEDED BY s97 (Alan, direct: "just get rid of the settle. page is where you leave it"). The
+		// settle no longer has a rest to return to, so `rest`/`columnRestPan` and the `fitsX` room-beside-
+		// the-column question they were asked with are both gone from this path. `columnRestPan` itself
+		// stays: the scroll-zero path above still reads it.
+		// THE SAME QUESTION, ASKED AGAIN ONE STEP LATER. `reducePinchConstraint` frees the target; this bound
+		// then decides whether the pan may reach it. `width` is the page OR the room Infinite Canvas has
+		// granted around it, whichever is larger - right for the overlap bound above, wrong here - so with
+		// the setting on `fitsX` went false and the ceiling collapsed to the scroller's own position, which
+		// is 0 because no preview frame writes the scroll. Freeing the target alone does nothing: measured,
+		// reverting this line while keeping the constraint fix put all eight frames back, the full 786.09 px.
+		// Both terms are the same mistake about the same quantity, one step apart.
+		const pageX = this.pageContentWidth() * effective;
+		const fitsPageX = (layout?.columnInset ?? false) && pageX > 0 && Number.isFinite(spanX) && pageX <= spanX + PAN_FIT_SLACK_PX;
+		// PREVIEW AND SETTLE ALIKE. The settle was left on `fitsX` on the understanding that the commit
+		// would convert the pan into scroll, so a refused ceiling there cost nothing. It does not: at the
+		// commit the conversion wants scrollLeft -3144.375 from a scroller sitting at 0, because the pan
+		// carried the page RIGHT and the scroll that would hold it is BELOW zero - a direction that does
+		// not exist. `maxScrollLeft` is 0 at that moment (the 4796 in the frame sample is read after the
+		// commit re-grants extent), so there is no range in any direction to spend it into either.
+		//
+		// The refused remainder is meant to come back as pan here, and this bound is what threw it away:
+		// measured at the settle, x wanted 786.09, `fitsX` false on width 2496 against span 1383, ceiling
+		// 0, pan 0 - the page dropped the whole hold in one frame. The page's own box is 175. The setting-
+		// off arm, asking the same question of the same page, carries 267.66 against a ceiling of 604.26
+		// and eases onto its rest.
+		//
+		// `restX` deliberately still reads `fitsX`: whether a page with room granted beside it returns to
+		// the centred rest is Alan's open question, and `columnRestPan` is null in that regime anyway.
+		// This changes what the settle may HOLD, not where it decides to land.
+		// SETTLE ONLY. While the fingers are down there is no ceiling at all: the preview pays in pan
+		// whatever the page's width, and the settle - which is where this bound belongs - eases to a
+		// position it computes from the true content box. Measured with a ceiling still in the preview
+		// path on an inked note: 7 frames off, up to 925.95 px, because a page wider than the pane was
+		// refused the pan and nothing else carries it mid-gesture.
+		const carriesX = fitsPageX;
+		const carryWidth = pageX;
+		// UNDER INFINITE CANVAS THE SETTLE'S TARGET IS B CLAMPED TO THE WORLD (s78 as s79(1)(b) reads it):
+		// the page stays where the fingers left it, and the one thing it may not keep is blank to the LEFT
+		// of its own natural margin. Infinite Canvas grants room to the right and below - room the user is
+		// entitled to - and nothing is ever granted left of the natural margin, so blank there is not canvas.
+		//
+		// This ceiling was +Infinity here, which is what left 200 px of margin standing on the pane after
+		// the page had settled: measured at e27fbcf0, zoom-out-settled and reachable-settled both 200.00 on
+		// corner / Readable line length on / Infinite Canvas on, and the same shape on every setting-on cell
+		// of the family. With the setting OFF no *-settled row was ever red, which is the asymmetry that
+		// names the cause: the clamp is missing on one side of a boolean, not wrong everywhere.
+		//
+		// THE EDGE HALF ONLY, never the centring half. The ceiling is the natural margin itself, so the ease
+		// travels the MINIMUM distance that closes the exposure and stops there; a page that settles inside
+		// the world is not touched, which is what keeps B. The fitting window's re-centring stays off under
+		// the setting - that is what jumped an inked note 907.69 px when it was applied here, and it is a
+		// different question from the edge.
+		//
+		// Y already reads exactly this way one line below, unconditionally, and no *-settled row on the Y
+		// axis was ever red. X is now the same shape.
+		//
+		// With the setting OFF the ceiling is the no-room law and stays: the page eases back to the
+		// position the bounds allow, which is what ships today.
+		const rightX = !settling ? Number.POSITIVE_INFINITY
+			: this.canvasMode ? nativeLeft * effective
+			: carriesX ? Math.max(nativeLeft * effective, -left + Math.max(0, spanX - carryWidth)) : nativeLeft * effective;
+		// Y TAKES THE SAME SHAPE, and the reason the older note here gave for exempting it does not survive the
+		// measurement. That note said a hold carried down through the preview came back as a jump at the lift, so
+		// y kept its cap on every frame. The jump it describes is not the cap's absence - it is the cap's
+		// correction never reaching the ease, which is fixed one screen below. With the correction delivered, the
+		// preview may hold the page under the fingers on y exactly as it does on x, and the settle closes it.
+		// Measured at 678b74e2 on an Infinite-Canvas-on cell, fingers down: y = 450.000 asked, nativeTop * effective
+		// = 0.000, rawY = 0.000. The cap ate the whole request on every preview frame, which is why the page did not
+		// move vertically at all and `reverse-75` read 0 instead of -75.
+		const bottomY = !settling ? Number.POSITIVE_INFINITY : nativeTop * effective;
+		// THE POSITION BEFORE THE EDGE CAP, kept on both axes because the ease needs it. The difference between it
+		// and the committed pan IS the correction the edge applied, and that difference is what the bounce travels.
+		const uncappedX = columnLocal !== null && Number.isFinite(nativeLeft)
+			? Math.max(this.canvasMode ? (nativeLeft - MAX_VIEWPORT_LAYOUT) * effective : minX, x) : pan.x;
+		const uncappedY = contentTopLocal != null && Number.isFinite(nativeTop)
+			? Math.max(this.canvasMode ? (nativeTop - MAX_VIEWPORT_LAYOUT) * effective : minY, y) : pan.y;
+		const rawX = columnLocal !== null && Number.isFinite(nativeLeft) ? Math.min(rightX, uncappedX) : pan.x;
+		const rawY = contentTopLocal != null && Number.isFinite(nativeTop) ? Math.min(bottomY, uncappedY) : pan.y;
+		// THE SETTLE'S TARGET, and only it: where the page fits the viewport on an axis, the pan it lands on is held to
+		// the TIGHTER of what this bound already allows and the page's own box inside the pane (panAxisWindow). The
+		// gesture's own frames are not touched - the note stays under the focal point while the fingers are down.
+		// SEVENTH SITE, and the last of them: the settle's pan window. It is the third clamp on the same
+		// frame, and under Infinite Canvas it is off for the same reason as the other two - there the
+		// settle's target IS where the fingers left it (s78), so nothing may pull the page off it.
+		// Measured on a fresh note, setting on, Readable line length off: the pan needed to hold the
+		// fingers was 786.09, nothing else clamped it, and this window cut it to 615.01 - exactly the
+		// 171.08 px the page missed B by. Routing it through the page box instead of the granted extent
+		// fixed that arm and broke two others, because with ink the page box is nearly the whole span
+		// and the window then closed to ~27 px: B went to -925.94 with the page easing 24.16 px after
+		// the lift. The width was never the question on this path; the SETTING is.
+		//
+		// s97: THE WINDOW IS GONE WITH THE SETTLE. Its two jobs were the fitting clamp, which Alan removed
+		// outright, and the near-side bound, which add. 1 kept and which `-left`/`-top` state directly below
+		// without a fits test and without a max side. `panAxisWindow` itself stays: `panFitReadout` and the
+		// preview paths still read it.
+		// s97: THE ONE BOUND ALAN KEPT, and nothing else. "Bounded by the top and left" (add. 1): the
+		// drawing canvas's own left and top edge may not come to rest inside the pane. No rest, no fitting
+		// clamp, no margin payment, nothing at the right or bottom, in every regime (add. 3).
+		//
+		// A CEILING ON THE PAN, not a floor, and the ceiling is the HOST'S OWN LAYOUT: pan 0. Positive pan
+		// carries the page right of where the layout puts it, which is the blank Alan's bound forbids;
+		// negative pan is the hang past the pane, which he allows. So `Math.min(raw, 0)` per axis.
+		//
+		// NOT `-left`, which is the PANE edge [Architect, s97 add. 1 bound reference]. With Readable line
+		// length on, `left = columnLocal * next` is the column's native margin and is positive, so a bound
+		// at `-left` would drag the column out of its margin and onto the pane edge at every lift - Alan's
+		// "jumps left". With the setting off `left` is 0 and the two forms are the same expression.
+		//
+		// SETTLE ONLY, on `settling` - the gate `rawX`/`rawY` themselves take through `rightX`/`bottomY`.
+		// `settleBound` is narrower, true only for the lift of a gesture that changed the scale, and the
+		// bound is owed at every settle. A preview frame keeps the note under the fingers, untouched.
+		const bounded = settling && columnLocal !== null && contentTopLocal != null;
+		// s97 add. 52: THE FAR END EASES BACK, "like OneNote's bounce back" (Alan direct). A page
+		// pushed past the far end of its room stays where the fingers left it at the lift, then
+		// eases back until it is within its room - the ceiling above is unchanged, the bound is now
+		// two-sided. floor = 0 where the page fits its room already (Infinite Canvas off, room is
+		// bx/by against the page's own width/height); floor = room - extent, negative, where the
+		// page is bigger than its room, so the far edge may still come to rest flush with the pane.
+		// add. 54: IC on keeps 3578f29e's own ceiling-only bound, byte-identical. IC off only, the floor.
+		const floorX = this.panFloor(bx, width);
+		const floorY = this.panFloor(by, height);
+		// s97 add. 67, read-only: the bound's own numbers, so a cell can derive the rest add. 52 line 4
+		// puts the page on instead of pinning a measured constant. Four property writes, no read.
+		this.boundReadout.floorX = floorX; this.boundReadout.floorY = floorY;
+		this.boundReadout.bx = bx; this.boundReadout.width = width;
+		// s110: THE PREVIEW GETS THE SAME BOUND, PLUS THE GIVE. Measured at 4e4738f8 on this file's two
+		// allowance rows: a preview frame had no near-side bound of any kind, so the committed pan WAS the
+		// geometric ask - drift 0.00, margin 0.00 and raw == ask on all 60 preview frames of both arms, the
+		// page following the fingers to -391.55 and 381.60 against a floor of -50.49 and a ceiling of 0.
+		// Alan's contract is that it stops: the same two-sided bound the settle takes, widened by the give,
+		// so the page passes its room by the allowance and no further, and the lift's existing bounce eases
+		// that give back to the bound itself.
+		//
+		// A DRAG ONLY, and Infinite Canvas off only. A frame that is changing the scale keeps the note under
+		// the focal point with no bound - `PAN_DRAG_SCALE_EPS` is what separates the two, and skipping that
+		// gate is what broke the focal hold at 3884c642. With Infinite Canvas on the preview stays exactly as
+		// it was, for the same reason the settle's floor is off there (add. 54): the page is where the fingers
+		// left it and nothing may pull it off that.
+		const give = OVERSCROLL_GIVE_PX * (layout?.externalScale ?? 1);
+		// s128: a frame is a drag frame when the scale has held over the last PAN_DRAG_WINDOW frames (within
+		// PAN_DRAG_FRAME_EPS of the scale that many frames ago), whatever the gesture did before. A zoom, even a
+		// slow one, moves more than that over the window and keeps the note under the focal point with no
+		// bound; a held spread does not.
+		let steady = false;
+		if (!settling) {
+			const h = this.pinchBand.history;
+			if (h.length === PAN_DRAG_WINDOW) steady = validCameraScale(h[0]!) && Math.abs(next / h[0]! - 1) < PAN_DRAG_FRAME_EPS;
+			h.push(next);
+			if (h.length > PAN_DRAG_WINDOW) h.shift();
+		}
+		// A gesture that has never zoomed (within PAN_DRAG_SCALE_EPS of its start) is a drag from its first frame,
+		// as before; the window is what catches a drag AFTER a zoom in the same gesture.
+		const neverZoomed = validCameraScale(a.fromScale) && Math.abs(next / a.fromScale - 1) < PAN_DRAG_SCALE_EPS;
+		// s135/s150: a drag frame in EITHER mode; the bound it takes below is what the mode decides.
+		const dragFrame = !settling && Number.isFinite(give) &&
+			columnLocal !== null && contentTopLocal != null && (neverZoomed || steady);
+		// s110 add. 3(2): THE X CEILING IS THE COLUMN'S OWN REST, not 0. With Readable line length on and a
+		// column that fits, the settle leaves the page on a centred rest whose pan is not zero, and a ceiling
+		// of 0 + give pulls that legitimate rest back and hands the difference to the bounce - measured as the
+		// "next touch does not bounce" cell of RllColumnFocalHold going red, a file that is 24/24 green
+		// without this band. `columnRestPan` is arithmetic on this path, no forced read on a preview frame,
+		// and is null everywhere the rest is 0, so the `?? 0` is the old form unchanged. Computed on a drag
+		// frame only, so a zoom frame pays nothing.
+		const restCeilX = dragFrame ? (this.columnRestPan(next, effective) ?? 0) : 0;
+		// s121 add. 5(b): THE BAND STOPS TRAVEL, IT NEVER MOVES A RESTING PAGE. Measured after a zoom-button
+		// commit to 50% with Readable line length on: viewportPan.x was 0 and the next touch still bounced,
+		// because the ceiling clamped a frame the page was already legally sitting on. Widening each end to
+		// the pan the GESTURE started from fixes that without a new quantity: a page resting outside its room
+		// keeps its position, and a frame may still never carry it further out than the give allows.
+		const startX = Number.isFinite(this.pinchStartPan.x) ? this.pinchStartPan.x : 0;
+		const startY = Number.isFinite(this.pinchStartPan.y) ? this.pinchStartPan.y : 0;
+		// s128: the band's edges are widened to where the page ALREADY stands (the last frame's pan), so
+		// engaging mid-gesture moves nothing; travel back inside the band is always allowed.
+		const lastX = this.pinchBand.lastPan.x, lastY = this.pinchBand.lastPan.y;
+		// s135: CEILING SIDE ONLY. The band's floor term was the far end's give, and in canvas mode the far
+		// side is room the page grows into, not a boundary - measured, the grow rule keeps headroom ahead of
+		// the frontier on both axes, so there is nothing there to spring back from. The ceiling side is the
+		// page's own origin edge, which the direction check measured as the POSITIVE side (a finger dragging
+		// right at scrollLeft 0 pulls +96).
+		// s150: CANVAS OFF TAKES THE PLAIN BOUND ON A DRAG FRAME, floor and ceiling, no give. Leaving the
+		// preview unbounded there drifted the page 21.21 px past the fingers on a fitting page (measured, every
+		// travel, ScrollColumnAnchorPinch tiny arm), and stock scrolling is exactly "the page never moves where
+		// the fingers did not ask". A bound that stops at the edge also leaves the settle nothing to close.
+		const plainX = Math.max(floorX, Math.min(rawX, 0)), plainY = Math.max(floorY, Math.min(rawY, 0));
+		// A NON-DRAG FRAME IS UNTOUCHED IN BOTH MODES: a zoom frame keeps the note under the focal point and
+		// carries no bound of its own, which is what the focal-hold cells measure.
+		const cx = bounded ? (this.canvasMode ? Math.min(rawX, 0) : plainX)
+			: dragFrame ? (this.canvasMode ? Math.min(rawX, Math.max(Math.max(restCeilX, startX) + give, lastX)) : plainX)
+			: rawX;
+		const cy = bounded ? (this.canvasMode ? Math.min(rawY, 0) : plainY)
+			: dragFrame ? (this.canvasMode ? Math.min(rawY, Math.max(Math.max(0, startY) + give, lastY)) : plainY)
+			: rawY;
+		if (!settling) { this.pinchBand.lastPan.x = cx; this.pinchBand.lastPan.y = cy; }
+		this.boundReadout.rawX = rawX; this.boundReadout.cx = cx; this.boundReadout.rawY = rawY; this.boundReadout.cy = cy;
+		this.boundReadout.dragFrame = dragFrame; this.boundReadout.neverZoomed = neverZoomed; this.boundReadout.steady = steady;
+		this.boundReadout.next = next; this.boundReadout.fromScale = a.fromScale; this.boundReadout.fromScaleValid = validCameraScale(a.fromScale);
+		this.boundReadout.restCeilX = restCeilX; this.boundReadout.startX = startX; this.boundReadout.startY = startY;
+		this.boundReadout.lastX = lastX; this.boundReadout.lastY = lastY; this.boundReadout.bounded = bounded; this.boundReadout.settling = settling;
+		if (bounded) {
+			this.notePanBound(cx !== rawX, rawX, cx);
+			this.notePanBound(cy !== rawY, rawY, cy);
+		}
 		if (!Number.isFinite(cx) || !Number.isFinite(cy)) return;
 		this.previewPanEngaged = true;
-		if (cx === pan.x && cy === pan.y) return;
+		// The clamp's correction becomes the bounce: the page starts where the gesture left it and eases onto its rest.
+		// EVERY CORRECTION ON THE AXIS, not only the window's. The edge cap (`rightX`, `bottomY`) also moves the
+		// committed pan, and its correction was not handed over - so at the lift the page did not ease closed, it
+		// SNAPPED. Measured at 678b74e2 on an Infinite-Canvas-on cell at the lift: x = 200.000 asked, rightX = 0,
+		// cx = 0.000, and the bounce was handed 0.000 - the whole 200 px closed in one frame. On the screen that is
+		// 200 px of blank held open while the fingers are down and then swallowed in a single frame at the lift,
+		// where s79(1)(b)/(c) says the page holds under the fingers and eases closed.
+		// Measuring the correction from the position BEFORE the cap covers both: where only the window moved the
+		// pan, `uncapped` equals `raw` and this is the old expression; where the edge moved it, the edge's share is
+		// now included; where nothing moved it, the difference is zero and no bounce starts.
+		// ANY SETTLE WITH A CORRECTION EASES. The gate this replaces was `settleBound || restX` - the fitting
+		// window, or the rest. Both are real reasons to ease and neither is the only one: the edge caps
+		// (`rightX`, `bottomY`) also move the committed pan, and on a drag settle they are the ONLY thing that
+		// moves it, so those arms were refused the call outright. Measured on an Infinite-Canvas-on cell with
+		// the corrections already delivered: `repeat-0-lift` and `reachable-lift` ran with settling true,
+		// settleBound false, a correction of 450.00 and 200.00 waiting, and no bounce started - the page closed
+		// the whole distance in one frame, while `zoom-out-lift` (settleBound true) eased.
+		// s79(1)(b) draws no line between a drag's settle and a zoom's settle, so neither does this.
+		// `settleBound` keeps its own meaning - the fitting window - and is untouched.
+		// PREVIEW FRAMES ARE NOT TOUCHED: off the settle both caps are +Infinity and both rests are off, so
+		// every correction below is zero and this cannot fire while the fingers are down.
+		// THE EDGE CAP'S SHARE IS NOT HANDED TO THE EASE. Measuring the correction from the position
+		// BEFORE the cap displaced the ink: six `draws across the expanded right viewport` cells stored
+		// strokes up to 652.331 px from the pen, and on `scroll-fast` and `scroll-zero` that distance was
+		// EXACTLY the correction handed to this call - 652.331 against hypot(544.000, 360.000) and
+		// 374.401 against hypot(224.000, 300.000), both to the digit. A term-by-term read of the mapping
+		// at every pointer event found no displaced term to fix instead: pan, rest, bounce, raster and
+		// ink pan were all zero and constant while the error stood. So the edge's share comes back out,
+		// the window's and the rest's stay, and the edge close is a same-frame write again - the same
+		// shape it already has with Infinite Canvas off.
+		// THE FLAG STILL APPLIES, on its own merits: only the settle that closes a preview may ease at
+		// all, so the second and third settling passes for one lift write their target instead of
+		// re-running the ease from a position the page has left.
+		const owesPreviewEase = settling && this.previewSettleOwed;
+		if (settling) this.previewSettleOwed = false;
+		// s97: the correction is whatever the one bound actually moved, and the ease fires when there is
+		// one. The old gate read `restX || windowX.fits` - proxies for "something might have moved" - and
+		// started a bounce on `settleBound` alone, which under s97 is an ease with nothing to correct.
+		// THE CORRECTION IS THE DISTANCE THE PAGE ACTUALLY TRAVELLED, painted px against the scroller.
+		// Three earlier shapes failed on the quantity: `rawX - cx` hands over only what the bound moved
+		// and leaves the rest to the commit, a 15 px jump at the lift; `pan.x - cx` hands over a PAN
+		// number, 98 where the page moves 15 px on screen; and a painted read taken HERE reads 79 or 0,
+		// because the scroll has already been spent by the time this runs. The painted position comes
+		// from the capture at the settle-close path instead, and the landed position is read here.
+		//
+		// SAME TASK: the write, the second read and the ease, with no await and no animation frame
+		// between them, so nothing paints at the landed position before the offset is set.
+		const paintedBefore = owesPreviewEase ? this.previewPaintedBlank : null;
+		this.previewPaintedBlank = null;
+		// IC on keeps 3578f29e's own gate, consumption and early bounce start, byte-identical.
+		// IC off: add. 56 - starting a bounce here on the bound's share alone, before `landed` can be
+		// read below, is what made the later carry read a position the running ease already hid (the
+		// paper arm). The IC-off ease is deferred whole to the merged call after the pan write.
+		const legacyX = this.canvasMode && !paintedBefore && owesPreviewEase && cx !== rawX ? rawX - cx : 0;
+		const legacyY = this.canvasMode && !paintedBefore && owesPreviewEase && cy !== rawY ? rawY - cy : 0;
+		const legacyBounced = (legacyX !== 0 || legacyY !== 0) && this.startOverscrollBounce(a, legacyX, legacyY);
+		// s97 add. 58: a settle whose bound target already equals the standing pan still owes the
+		// ease for whatever the scroll commit moved - the second settle of a round trip lands here
+		// with cx === pan.x and an owed capture. Returning there dropped that ease. The pan write
+		// below is the only thing this return saves, so with a capture owed it is skipped instead.
+		if (cx === pan.x && cy === pan.y && !(paintedBefore && !this.canvasMode)) {
+			if (legacyBounced) this.writeViewportPan();
+			else if (paperDriftMoved || this.previewPaperBoxDirty) this.writePaperPan();
+			this.previewPaperBoxDirty = false;
+			return;
+		}
 		// Mutated, not replaced: this runs once per preview frame, and a fresh
 		// object per frame is an allocation on the one path the pinch deferral
 		// exists to keep free of them.
 		pan.x = cx; pan.y = cy;
 		this.writeViewportPan();
+		this.previewPaperBoxDirty = false;
+		if (!paintedBefore) return;
+		const landed = this.settleBlank();
+		if (this.canvasMode) {
+			// IC on only, byte-identical to 3578f29e.
+			const correctionX = paintedBefore.x - landed.x, correctionY = paintedBefore.y - landed.y;
+			if ((correctionX !== 0 || correctionY !== 0) && this.startOverscrollBounce(a, correctionX, correctionY, true)) this.writeViewportPan();
+			return;
+		}
+		// s97 add. 58: IC off - the ease is the carry ALONE. `landed` is read here, after the pan
+		// write and before any ease is live, so `paintedBefore - landed` is already the WHOLE distance
+		// the commit moved the page, the bound's own share included. Adding `rawX - cx` on top counted
+		// that share twice: measured on EDGE INSIDE THE PANE (LEFT), carry 34 against a travel of 34,
+		// share 19, ease started at 53 (s98-engineer-write/trace-edge-0918T164835Z). Standing pan is
+		// `cx` alone, already written above; nothing is added to pan directly (add. 55's error).
+		const easeX = paintedBefore.x - landed.x;
+		const easeY = paintedBefore.y - landed.y;
+		if ((easeX !== 0 || easeY !== 0) && this.startOverscrollBounce(a, easeX, easeY)) this.writeViewportPan();
+	}
+
+	/**
+	 * THE WINDOW A SETTLED PAN MAY SIT IN on one axis, as offsets from the
+	 * position the content sits at with no pan (its leading edge against the
+	 * viewport's).
+	 *
+	 * A pinch holds the note with a translate because above the scale the
+	 * content fits at, the scroller's range runs out before the gesture does.
+	 * The bound on that translate is the note's VISIBLE OVERLAP: drag until only
+	 * 24 px of the note is left on the pane. That is right for a page bigger
+	 * than its viewport, and wrong for a page smaller than it - there the same
+	 * rule lets a gesture leave the whole note hanging off the pane's edge with
+	 * nothing to bring it back, because at that scale there is no scroll range
+	 * to undo it either. What the user saw: pinch in, pinch back out somewhere
+	 * else, and at 100% the note sits off to the left with its first characters
+	 * past the edge until a Fit, a zoom button or a file switch (measured:
+	 * 226.67 px past it with readable line length off).
+	 *
+	 * ONLY A SETTLE THAT CHANGED THE SCALE IS BOUND BY THIS. While the fingers
+	 * are down the note stays under the focal point - that is the gesture's
+	 * contract and it is pinned by its own cells - so the preview's pan and the
+	 * ordered constraint reducer are left alone. The settle of a zoom already
+	 * moves the frame it commits; clamping its TARGET means the correction rides
+	 * that motion instead of arriving as a jump after it. A pure two-finger pan
+	 * has no such motion to ride: a page dragged past the pane's edge stays
+	 * where the fingers left it, as it always has, and a clamp there would be a
+	 * spring-back on the most common gesture (800 px, measured, before this
+	 * condition). "Changed the scale" is a band, not equality
+	 * (PAN_SETTLE_ZOOM_BAND): a drag whose spread drifted, and an in-then-out
+	 * pinch that comes back near its start, both read as pans and are not
+	 * clamped.
+	 */
+	/**
+	 * THE PAGE'S BLANK INSIDE ITS PANE, painted px, both axes from one read pair. Positive means the
+	 * canvas's edge sits inside the pane, which is the case s97 addendum 1 corrects. Against the
+	 * SCROLLER and not the viewport: the settle writes scroll as well as pan, so an absolute rect moves
+	 * by the scroll too and reports a distance the page never travelled. The sizer is not read - the
+	 * intermediates carry their own offsets [Engineer, ENGINEER-add16-edge-source.md].
+	 */
+	private settleBlank(): { x: number; y: number } {
+		const content = this.view.contentDOM.getBoundingClientRect(), scroller = this.view.scrollDOM.getBoundingClientRect();
+		return { x: content.left - scroller.left, y: content.top - scroller.top };
+	}
+
+	private panAxisWindow(size: number, span: number): { fits: boolean; min: number; max: number } {
+		if (!(Number.isFinite(size) && Number.isFinite(span))) return { fits: false, min: -MAX_VIEWPORT_LAYOUT, max: MAX_VIEWPORT_LAYOUT };
+		if (size > 0 && size <= span + PAN_FIT_SLACK_PX) return { fits: true, min: 0, max: Math.max(0, span - size) };
+		const visible = Math.max(0, span - PAN_MIN_VISIBLE_PX);
+		return { fits: false, min: size > 0 ? PAN_MIN_VISIBLE_PX - size : -visible, max: visible };
+	}
+
+	/**
+	 * THE PAGE'S CONTENT BOX on x, note px: the text column, or the ink, whichever reaches further
+	 * (add. 10). Every SETTLE-TIME width test reads this and nothing else. No preview-time test reads
+	 * any width at all - while the fingers are down the note is held, and bounds belong at the settle.
+	 *
+	 * NOT the granted extent. `surfaceExtents` is grown from the ink claim OR the zoom and scroll
+	 * grants, whichever is largest, then quantised up to a 256 px block: measured, an ink frontier of
+	 * 10116 is stored as 10496. A fit test reading that asks "is there room beside the page", which is
+	 * a different question - at k = 0.134 it called a 1355.54 px page non-fitting in a 1383 px span and
+	 * left it 309.06 px off its own rest.
+	 *
+	 * ONE FUNCTION, SIX CALLERS, deliberately. The first cut of this fix wrote the page's box at two
+	 * sites by hand and left four more reading the conflated field; two had to be found by
+	 * instrumenting, and one of those - the site that SPENDS the rest - disagreed with the site that
+	 * COMPUTES it about whether a rest existed at all.
+	 */
+	private pageContentWidth(): number {
+		return Math.max(this.viewportLayout?.columnBox ?? 0, this.pageInkX * this.fontZoom);
+	}
+
+	/**
+	 * THE MARGIN THE PAGE ACTUALLY SITS AT at scale `next`, host-local: what the box write asked for, after the
+	 * stylesheet clamps it against the auto term. NOT the custom property, which is written unclamped - measured on a
+	 * tiny note at 10% with Readable line length off, the property reads 6907.03 and the page sits at 6562.5, and it is
+	 * this one that carries the page.
+	 *
+	 * One expression, two readers that must agree or the page pays twice: `columnRestPan` turns the part the layout did
+	 * not take into a pan, and the box write records it so the next resting frame can tell that the law moved under it.
+	 */
+	private appliedColumnMargin(next: number): number {
+		const layout = this.viewportLayout, auto = layout?.columnAuto;
+		if (!layout || layout.columnLocal === null) return 0;
+		const want = Math.max(0, this.columnRestMargin ?? layout.columnLocal);
+		return (layout.sizerColumn || layout.ownLines) && auto
+			? Math.max(0, Math.min(Math.max(0, (layout.width / next - auto.fixed - (this.hostZoomSupported() ? auto.scrollbar / next : auto.scrollbar) - auto.lineWidth) / 2), want))
+			: want;
+	}
+
+	/**
+	 * THE CENTRING, RECOMPUTED AGAINST THE GRANT THIS COMMIT JUST MADE, with whatever the page was actually showing
+	 * booked as a debt for the scroll below to pay.
+	 *
+	 * `applyViewportBox` runs before `updateExtent`, so the margin it wrote was computed from the granted extent as it
+	 * stood at the top of the commit. Under Infinite Canvas the extent then grows - measured 3072 -> 22528 on a tiny
+	 * note at 10% - which leaves a centring that was correct when written and is stale by the end of the same commit.
+	 * Nothing withdrew it there, so the page went on standing centred until the NEXT commit of any kind recomputed it
+	 * and dropped it: measured 536.70 px on a bare commit at the same scale, no gesture behind it at all. That is the
+	 * defect: it snaps on any commit rather than only at a lift. Not the device report about ink separating from
+	 * text - this is page and column POSITION, and the anchor holds through it.
+	 *
+	 * Done BEFORE the frame is presented, so the stale value is never shown and there is usually nothing to pay. The
+	 * debt is measured against what the page WAS showing - the previous commit's settled margin - and never against the
+	 * stale write this call replaces, which the page never presented.
+	 */
+	private restColumnAgainstCurrentGrant(next: number, effective: number): void {
+		const layout = this.viewportLayout;
+		if (!layout || this.pinchPreview || layout.columnLocal === null) return;
+		this.columnRestMargin = !layout.sizerColumn ? null : this.columnRestCentred(next, layout.externalScale * next);
+		const settled = this.appliedColumnMargin(next), shown = this.restingColumnMargin;
+		const host = this.view.dom, value = `${Math.max(0, this.columnRestMargin ?? (layout.sizerColumn || layout.ownLines ? layout.columnLocal : 0))}px`;
+		if (host.style.getPropertyValue("--handwriting-column-margin-left") !== value) host.style.setProperty("--handwriting-column-margin-left", value);
+		this.restingColumnMargin = settled;
+		if (shown === null || settled === shown) return;
+		this.columnMarginDebt += (shown - settled) * effective;
+	}
+
+	/**
+	 * THE MARGIN DEBT, PAID IN THIS COMMIT'S OWN SCROLL TARGET. Scroll and not pan, at a commit: a pan parked here is
+	 * indistinguishable from the gesture residue `commitCameraScale` clears on any later commit carrying a scroll
+	 * target, it cannot be reached at all by a commit with no gesture behind it (Fit, the zoom buttons, Ctrl+scroll
+	 * establish no pan anchor hold), and a standing pan at rest costs on every path that assumes none.
+	 *
+	 * A positive debt owes the page a move RIGHT, which is a scroll LEFT, and the room for it is the scroll already
+	 * taken. A negative debt owes a move left, and its room is the range past it. Anything the range cannot cover stays
+	 * owed rather than being silently dropped, so a later commit with room pays the remainder.
+	 */
+	private columnMarginDebtScrollLeft(effective: number, left: number): number {
+		const debt = this.columnMarginDebt;
+		if (!debt || !Number.isFinite(left) || !(effective > 0)) return left;
+		const scroller = this.view.scrollDOM, want = -debt / effective;
+		const room = want > 0 ? Math.max(0, scroller.scrollWidth - scroller.clientWidth - left) : left;
+		const by = want > 0 ? Math.min(room, want) : -Math.min(room, -want);
+		if (!Number.isFinite(by) || by === 0) return left;
+		this.columnMarginDebt = debt + by * effective;
+		return left + by;
+	}
+
+	/**
+	 * THE PAN THAT PUTS A READABLE-LINE-LENGTH COLUMN AT ITS REST at scale
+	 * `next`, painted px from where it sits with no pan and no scroll; null when
+	 * the column has no inset to rest in.
+	 *
+	 * The rest is centred, which is what the setting means at every zoom. The
+	 * layout does not centre it below 100%: the sizer's margin is
+	 * `clamp(0, auto, frozen)` (styles.css, the note viewport's sizer), the frozen
+	 * term holding the 100% margin in host px so that a margin re-centring by 1/k
+	 * cannot open a blank band Infinite Canvas would scroll into. The difference
+	 * between the centring the engine would give this column and the margin the
+	 * clamp applies is carried as pan instead; above 100% the auto term already
+	 * wins and this is 0. Arithmetic only, from the inputs `applyViewportBox`
+	 * writes the auto term from, so a preview frame reads nothing for it.
+	 *
+	 * Keyed on the column itself, not the setting's class: its inset must BE the
+	 * centring, a margin within a px of half the room beside the column at 100%.
+	 * Null for a frozen margin of zero (Readable line length off), no measured
+	 * inputs, a column as wide as the scroller's content (a pane narrower than the
+	 * line), and an inset that is not centred (a theme's or a note's own left
+	 * margin), which keeps its natural inset as before.
+	 * Null too where the page does not fit the pane at this scale - the column, or
+	 * ink granted room past it - since there the scroll is the rest, as it was.
+	 */
+	private columnRestPan(next: number, effective: number): number | null {
+		const centred = this.columnRestCentred(next, effective);
+		const layout = this.viewportLayout;
+		if (centred === null || !layout || layout.columnLocal === null) return null;
+		// A THEME THAT CENTRES ITS OWN LINES is its own rest: with the freeze lifted, the column sits where the theme centres
+		// it at this zoom, so there is nothing for the overlay to add - not a margin, not a translate.
+		//
+		// KNOWN, WITH ITS NUMBER, and not fixed here: the theme centres the LINE, and it knows nothing about ink granted
+		// room past the column, so where a note has some the theme's centring carries it out of the pane. Measured on Fit
+		// with a stroke 3000 note px past the column under Minimal: the ink's right edge lands 16.31 px past the pane's
+		// (1713.81 against 1697.5). Correcting it needs a carrier a no-gesture commit does not have - Fit takes no settle
+		// and establishes no pan anchor, and the sizer margin is not the column's place under this theme - so it is a
+		// resting translate, which is the cost this candidate exists to remove. Pinned as KNOWN in the cell, for the
+		// line's architect to rule on. Under Obsidian's own theme the centring is taken over the page's whole box, ink
+		// included, and the ink stays inside the pane as it always did.
+		if (layout.ownLines) return 0;
+		// WHERE THE COLUMN ALREADY IS at pan zero, as a host-local margin. Where the sizer carries the column this is the
+		// margin the stylesheet resolves - the one this frame wrote, clamped against the auto term - as before. Where it
+		// does not (Minimal: a full-width sizer with the LINE centred inside it) the sizer's margin is not the column's
+		// place at all, and the column sits at its own measured inset instead. Arithmetic either way: no forced read on a
+		// preview frame, which is the reason this is not simply re-measured here.
+		const rest = (centred - this.appliedColumnMargin(next)) * effective;
+		return Number.isFinite(rest) ? rest : null;
+	}
+
+	/**
+	 * THIS COMMIT'S SCROLL TARGET, WITH THE PAGE BOX PULLED BACK INSIDE THE PANE under a theme that centres its own
+	 * lines. Returns `left` unchanged everywhere else, which is every path on Obsidian's own theme.
+	 *
+	 * Part 21 Edge 2's contract is that the PAGE BOX - the column plus whatever room ink has been granted past it -
+	 * stays inside the pane at every commit. Obsidian's own theme meets it through the sizer margin, which
+	 * `columnRestCentred` sizes over the whole box. A theme that centres its own LINES meets it for an ordinary note
+	 * and breaks it for a note with far ink: the theme knows only the line, so it centres as if the page ended at the
+	 * column and carries the ink out of the pane with it - measured on Fit with a stroke 3000 note px past the column
+	 * under Minimal, 16 to 24 px past the pane's right edge.
+	 *
+	 * `own` below is where the theme puts the page's left edge: half the room beside the COLUMN's box, which is all it
+	 * knows. From there the box's right edge is `own + width`, and whatever that is past the pane, measured from the
+	 * scroll this commit is about to take, is the debt. THE MINIMUM, not a re-centring: centring the box instead moved
+	 * the page 247 px where 16 were owed. An ordinary note has `width` equal to the column's own box, which makes the
+	 * overflow negative and the debt zero, so an ordinary page is never scrolled by this.
+	 *
+	 * PAID IN SCROLL, in this commit's own scroll target, and never as a pan. A pan parked here is indistinguishable
+	 * from the gesture residue `commitCameraScale` clears on any later commit carrying a scroll target, which made an
+	 * earlier attempt at this intermittent (the same fixture read 0.81, 8.81 and 16.31 px). Scroll survives, and the
+	 * room is there by construction: ink granted room past the column IS scrollable range - measured 471 local px on
+	 * the arm that needs it, against the ~66 local px it asks for.
+	 *
+	 * Measured from `left` rather than from the live scroll, so this is idempotent: a commit re-running against an
+	 * already-corrected page computes a debt of zero rather than paying it twice.
+	 */
+	private ownLinesPageBoxScrollLeft(next: number, effective: number, left: number): number {
+		const layout = this.viewportLayout;
+		if (!layout || !layout.ownLines || !(effective > 0) || !Number.isFinite(left)) return left;
+		const width = this.pageContentWidth() * effective;
+		const span = layout.width * layout.externalScale - layout.gutterScreen;
+		// The same fit gate `columnRestCentred` takes: where the page does NOT fit the pane the scroll is already the
+		// rest, as it always was, and this owes nothing.
+		if (!(width > 0 && width <= span + PAN_FIT_SLACK_PX)) return left;
+		// s184: the line inset is frozen at its 100% value (styles.css own-lines rule), so the column sits at that inset,
+		// clamped by the theme's auto term above 100%, and no longer at the centre of the widened box.
+		const own = Math.max(0, this.appliedColumnMargin(next) * effective);
+		const overflow = own + width - span - left * effective;
+		if (!Number.isFinite(overflow) || !(overflow > PAN_FIT_SLACK_PX)) return left;
+		const scroller = this.view.scrollDOM;
+		const room = Math.max(0, scroller.scrollWidth - scroller.clientWidth - left);
+		const by = Math.min(room, overflow / effective);
+		return by > 0 ? left + by : left;
+	}
+
+	/**
+	 * WHERE A CENTRED COLUMN RESTS at scale `next`, as a host-local margin, or null when this column has no rest (the
+	 * guards are the ones above). `applyViewportBox` writes it as the sizer's margin at rest, so the resting page needs no
+	 * pan; `columnRestPan` reads it too, and returns the difference the layout has not taken.
+	 */
+	/**
+	 * s121 add. 6: THE FIT QUESTION SURVIVES THE CENTRED REST. Two settle sites asked "does the column have a
+	 * rest to sit in" by testing `columnRestPan !== null`, and used the answer for something else: a page that
+	 * fits the pane never settles onto a sideways SCROLL (its place is the margin, and a scroll left standing
+	 * displaces it by its whole width - measured at :8622, 57 px of column off the pane). With the centred rest
+	 * gone that answer went false everywhere, and the 25 -> 100 round trip missed the text by 1079 px.
+	 * The predicate is the fit half of what columnRestCentred used to compute, and only that.
+	 */
+	private columnFitsPane(next: number, effective: number): boolean {
+		const layout = this.viewportLayout;
+		if (!layout || !layout.columnInset || !(next > 0) || !(effective > 0)) return false;
+		if (this.canvasMode) return false;
+		const width = this.pageContentWidth() * effective;
+		const span = layout.width * layout.externalScale - layout.gutterScreen;
+		return width > 0 && width <= span + PAN_FIT_SLACK_PX;
+	}
+
+	private columnRestCentred(_next: number, _effective: number): number | null {
+		// s121, ALAN DIRECT, AND IT RETIRES THIS QUANTITY: "I don't want it to center anywhere."
+		// s107(5) is the contract - Readable line length moves the LEFT BOUND to the column's border and does
+		// nothing else; the viewport is otherwise Obsidian's own, and zoomed out the note sits top-left. The
+		// plugin never adds a centring rest under either setting, so there is nothing here to compute.
+		//
+		// WHAT IT USED TO DO, kept because the numbers are the reason it is gone: it centred the page in the
+		// room beside it and returned that as a HOST-LOCAL margin, so the value grew as the zoom fell.
+		// Measured on Alan's device (Orion, fresh Untitled, Readable line length OFF, opened at 100% and
+		// pinched to 10%): --handwriting-column-margin-left written at 4292.70px, the sizer 432.46 px right of
+		// the scroller, "Untitled" mid-top. Measured in the rig on a theme-narrow column, setting off: 6588.50px.
+		// It read `layout.columnInset` to decide there was a column to centre, and that flag is true of any page
+		// that fits its scroller - which at 10% is every page.
+		//
+		// THE COLUMN'S OWN PLACE IS UNTOUCHED. With the setting on, `columnRestMargin` now falls through to
+		// `columnLocal` - Obsidian's own margin for the readable column - so the column still sits where
+		// Obsidian puts it and the left bound still lands on its border. We simply stop adding anything.
+		return null;
+	}
+
+	/**
+	 * The margin a RESTING frame gives a centred column, or null while a gesture is live (the pan holds it then) and for
+	 * every column that has no rest. Set on each commit before `applyViewportBox` writes the box; cleared for preview
+	 * frames, which keep the frozen margin so no layout moves under the fingers.
+	 */
+	private columnRestMargin: number | null = null;
+
+	/** The resolved margin the last RESTING frame left the page at, host-local. Null until the first one. */
+	private restingColumnMargin: number | null = null;
+
+	/**
+	 * Screen px the page is owed because a RESTING commit moved the margin under it. A regime change - the page ceasing
+	 * to fit the pane, so the centring is withdrawn - is a change of law, not of position, and the page may not move on
+	 * its own for it. Accrued at the box write and paid by the settle in the same commit.
+	 */
+	private columnMarginDebt = 0;
+
+	/** Counted whenever the settle's clamp moved a pan on a FITTING axis, with the largest correction so far. */
+	private panBoundHits = 0;
+	private panBoundMaxPx = 0;
+	/**
+	 * Start the bounce for the settle `hold`, from the overshoot `dx`/`dy` (the
+	 * clamp's correction, painted px, requested minus accepted). A settle
+	 * re-anchoring itself on a later frame does not bounce again, whether its
+	 * bounce is still playing or has ended: that would put the page back at the
+	 * overshoot.
+	 *
+	 * Per axis, and not where Infinite Canvas is on in that direction: a page
+	 * pushed left or up shows the room scrolling would grow into there, so there
+	 * is no boundary to bounce off (the correction then lands as it always did).
+	 * A page pushed right or down shows the note's origin edge, which Infinite
+	 * Canvas never extends past, so it bounces either way.
+	 */
+	/**
+	 * The page is being held past an end by the finger. Painted here, live, on the same
+	 * offset the bounce uses - `panX`/`panY` already add it, so one write shows it on the
+	 * sizer, the paper and the ink together and nothing else has to learn about it.
+	 *
+	 * The scroller's own offset is not touched: the router kept it inside its range, and
+	 * this give is visual for as long as the hand holds it.
+	 *
+	 * s189 (Alan 2026-09-21, the slide ships in 1.4.20): `travelled` marks a correction that is the page's own MEASURED
+	 * travel across the commit (painted before minus landed), not a bound's share. The direction rule above is about a
+	 * bound with nothing to bounce off; measured travel is a move the viewer would otherwise see land in one frame
+	 * whichever way it points (measured: a held-out page let go at scrollLeft 500 closed 154 px leftward-signed in the
+	 * lift's own frame), so it is eased in both directions. Callers that pass a bound's share keep the rule.
+	 */
+	private holdOverscrollGive(x: number, y: number): void {
+		const offset = this.bounceOffset;
+		if (!offset) return;
+		// A give that arrives mid-bounce replaces it: the finger is back on the glass and
+		// owns the page again.
+		if (this.bounceState) this.cancelOverscrollBounce();
+		// s132: THE GIVE IS MEASURED FROM THE REST, NOT FROM WHERE THE FINGER LANDED. The cancel above
+		// folds what the spring still owed into the standing pan (add. 66, so the page does not jump
+		// under the finger), and the router's pull starts from zero on every gesture. Painted as it
+		// arrived, the page then stood the allowance PAST that fold - and a hand that grabbed early in
+		// each spring and pulled again walked the page out by nearly the allowance per grab (Alan,
+		// device, 2026-09-20: "repeatedly left scroll, lift, left scroll" goes way out of bounds).
+		// So the pull is applied to the page's standing overshoot past its bound - the same bound the
+		// lift's resume measures against - and the total is held to the allowance: a page already
+		// standing out is pulled no further than the allowance itself, a pull back inward is
+		// carried in full, and a page inside its bound gives exactly as before.
+		const pan = this.viewportPan, px = pan?.x ?? 0, py = pan?.y ?? 0;
+		const give = OVERSCROLL_GIVE_PX * (this.viewportLayout?.externalScale ?? 1);
+		const standX = px - (this.canvasMode ? Math.min(px, 0) : Math.max(this.boundReadout.floorX, Math.min(px, 0)));
+		const standY = py - (this.canvasMode ? Math.min(py, 0) : Math.max(this.boundReadout.floorY, Math.min(py, 0)));
+		// s135: THE ORIGIN SIDE ONLY, and never past the allowance. The lower bound is 0, not -give: a
+		// negative total is the page held past a FAR end, which in canvas mode is room rather than a
+		// boundary, so a step refused there paints no pull. The upper bound is s132's, unchanged.
+		const gx = Number.isFinite(give) ? Math.max(0, Math.min(give, standX + x)) - standX : x;
+		const gy = Number.isFinite(give) ? Math.max(0, Math.min(give, standY + y)) - standY : y;
+		if (offset.x === gx && offset.y === gy) return;
+		if (offset.x === 0 && offset.y === 0) this.beginPreviewPaper();
+		offset.x = gx;
+		offset.y = gy;
+		this.writeViewportPan();
+	}
+
+	/** The hand is off: send the give home through the one return the lift already has. */
+	private releaseOverscrollGive(): void {
+		const offset = this.bounceOffset;
+		if (!offset) return;
+		const x = offset.x, y = offset.y;
+		// s132: A RELEASE WITH NOTHING HELD STILL SENDS A STANDING PAGE HOME. With the give measured
+		// from the rest, a finger that lands on a page already standing the allowance past its end
+		// holds nothing (its pull adds no offset), and its lift used to return here at once - the page
+		// then stayed out until the next contact. The resume below measures the way home from the
+		// standing pan and is a no-op when nothing is owed, so it is the right call either way.
+		// ONE RETURN MECHANISM. The give goes back through `resumeStrandedPan`, the same
+		// method a lift already uses for a pan left standing, rather than starting a bounce
+		// of its own. That method measures the way home from the STANDING pan, and the give
+		// is not in the standing pan - it is in this offset - so fold it in first. A bare
+		// hand-off finds no distance to cover, does nothing, and leaves the page held out
+		// past the end.
+		offset.x = 0;
+		offset.y = 0;
+		const pan = this.viewportPan;
+		pan.x += x;
+		pan.y += y;
+		if (this.resumeStrandedPan()) return;
+		// s132: nothing was held and nothing is owed (or a spring already running carries it): leave
+		// the page and its paper exactly as they are.
+		if (x === 0 && y === 0) return;
+		// It would not take it: a bounce already running, a preview holding the frame, or a
+		// give too small to animate. Put the page back on the bound and take the preview
+		// paper down - what a refused bounce did here before.
+		pan.x -= x;
+		pan.y -= y;
+		this.endPreviewPaper("bounce-end");
+		this.writeViewportPan();
+	}
+
+	private startOverscrollBounce(hold: object, dx: number, dy: number, travelled = false): boolean {
+		const offset = this.bounceOffset;
+		// The unit fixtures drive the settle against partial objects built with Object.create: no class fields, no bounce.
+		if (!offset || this.bouncedHold === hold) return false;
+		// s189: A LEFTWARD OR UPWARD EASE SHOWS THE INK RASTER'S FAR EDGE. The ink canvases ride the page by the same
+		// offset, and they cover the pane plus the band margin and no more (measured: 185 to 200 px spare at rest; an
+		// offset of -326 left 141 px of the pane's right with no ink raster while the ease played). So measured travel in
+		// that direction is eased only as far as the raster already covers; past that it lands in the commit's frame,
+		// as it did before s189. One rect pair, at the settle only, and only when such a correction exists.
+		let coverX = Infinity, coverY = Infinity;
+		if (travelled && this.canvasMode && (dx < 0 || dy < 0)) {
+			const ink = this.committedCanvas?.getBoundingClientRect?.(), pane = this.view?.scrollDOM?.getBoundingClientRect?.();
+			coverX = ink && pane ? Math.max(0, ink.right - pane.right) : 0;
+			coverY = ink && pane ? Math.max(0, ink.bottom - pane.bottom) : 0;
+		}
+		const bx = Math.abs(dx) >= OVERSCROLL_BOUNCE_MIN_PX && !(this.canvasMode && dx < 0 && (!travelled || -dx > coverX)) ? dx : 0;
+		const by = Math.abs(dy) >= OVERSCROLL_BOUNCE_MIN_PX && !(this.canvasMode && dy < 0 && (!travelled || -dy > coverY)) ? dy : 0;
+		if (bx === 0 && by === 0) return false;
+		this.cancelOverscrollBounce();
+		this.bouncedHold = hold;
+		offset.x = bx; offset.y = by;
+		// THE BOUNCE MOVES THE PAGE, so it moves the paper the way a preview does: on the element, by a transform, not by
+		// re-rastering the scroller's background every frame. The copy is taken here, after the settle, so it is the
+		// settled zoom's rules the bounce carries. Its last frame takes the element down again.
+		this.beginPreviewPaper();
+		const state = { hold, fromX: bx, fromY: by, startedAt: performance.now(), raf: 0 };
+		this.bounceState = state;
+		const step = (now: number): void => {
+			if (this.bounceState !== state) return;
+			const t = Math.min(1, Math.max(0, (now - state.startedAt) / OVERSCROLL_BOUNCE_MS));
+			// Ease out: fast off the overshoot, settling gently onto the rest, never past it.
+			const left = t >= 1 ? 0 : (1 - t) ** 3;
+			// Exactly zero at the end, not the -0 a negative overshoot times zero leaves.
+			offset.x = left === 0 ? 0 : bx * left; offset.y = left === 0 ? 0 : by * left;
+			this.writeViewportPan();
+			// The page is at its rest: a preview paper that rode the bounce comes down on this frame.
+			if (t >= 1) { this.bounceState = null; this.endPreviewPaper("bounce-end"); return; }
+			state.raf = this.winRef.requestAnimationFrame(step);
+		};
+		state.raf = this.winRef.requestAnimationFrame(step);
+		scrollProbeExtent(`overscroll bounce from ${bx.toFixed(2)},${by.toFixed(2)} px`);
+		return true;
+	}
+
+	/** Put the page on its rest now, ending a bounce wherever it is: before an input is mapped, a new gesture, a teardown. */
+	private cancelOverscrollBounce(): void {
+		const offset = this.bounceOffset, state = this.bounceState;
+		if (!offset || (!state && offset.x === 0 && offset.y === 0)) return;
+		if (state?.raf) this.winRef.cancelAnimationFrame(state.raf);
+		this.bounceState = null;
+		// s97 add. 66: A CANCELLED EASE LEAVES THE PAGE WHERE IT IS. What the viewer sees is
+		// `pan + offset`, so zeroing the offset on its own drops the page by whatever the ease still had
+		// to run - measured, the seed release arrived at -225.20 and -244.50 against the -300.00 it owed,
+		// and on that arm no ease ever reached its last frame because the next gesture cancels it. The
+		// remainder folds into the pan here, which moves nothing on screen and leaves the page under the
+		// fingers that grabbed it. Every cancel site inherits it.
+		// add. 54: Infinite Canvas ON keeps 3578f29e's drop, byte-identical.
+		// s97 add. 70 (Alan direct, "yes fix it"): BOTH SETTINGS. The fold is what keeps a page from
+		// jumping when an ease is cut, and that is as true with Infinite Canvas on as off; add. 54's
+		// byte-identical rule is relaxed for this one site by his word. Everything else on the IC-on
+		// path stays 3578f29e.
+		if (offset.x !== 0 || offset.y !== 0) {
+			this.viewportPan.x += offset.x; this.viewportPan.y += offset.y;
+		}
+		offset.x = 0; offset.y = 0;
+		this.writeViewportPan();
+	}
+
+	/**
+	 * EVERY CONTACT IS GONE AND NOTHING CLAIMED THE VIEWPORT. A tap, a palm or a pen stroke calls
+	 * `onViewportInput` at its own pointerdown (InlinePenRouter.pointerDown, before it knows what the
+	 * contact is), which cancels a playing ease; add.66's fold leaves the difference sitting in
+	 * `viewportPan` rather than dropping it, so the page is exactly where it was, just no longer easing
+	 * anywhere. A real gesture's own settle already drives the page to its rest before this fires, so in
+	 * that case there is nothing left to do here - this only ever finds work behind a contact that owned
+	 * nothing. The rest is not always 0: a page bigger than its room keeps the far-end floor (add. 52),
+	 * read off the last settle's own numbers (`boundReadout`, no scale change since) rather than
+	 * recomputed here. Park the standing pan at that bound and ease the difference back in as the bounce
+	 * offset, so the page keeps painting exactly where it stood and glides on from there.
+	 */
+	private resumeStrandedPan(): boolean {
+		if (this.bounceState || this.pinchPreview || this.frame.locked) return false;
+		const pan = this.viewportPan;
+		// The bound the last settle left standing, at the scale still in force (no zoom since): a ceiling of 0
+		// always, and IC off only, a floor too (add. 52) - byte-identical to 3578f29e with it on (add. 54).
+		const targetX = this.canvasMode ? Math.min(pan.x, 0) : Math.max(this.boundReadout.floorX, Math.min(pan.x, 0));
+		const targetY = this.canvasMode ? Math.min(pan.y, 0) : Math.max(this.boundReadout.floorY, Math.min(pan.y, 0));
+		const dx = pan.x - targetX, dy = pan.y - targetY;
+		if (dx === 0 && dy === 0) return false;
+		pan.x = targetX; pan.y = targetY;
+		if (!this.startOverscrollBounce({}, dx, dy)) { pan.x += dx; pan.y += dy; return false; }
+		this.writeViewportPan();
+		return true;
+	}
+
+	/** The bounce as it stands, read-only, for a fixture that has to see it rather than infer it from positions. */
+	overscrollBounceReadout(): { active: boolean; x: number; y: number; fromX: number; fromY: number; startedAt: number | null; restX: number; restY: number;
+		floorX: number; floorY: number; bx: number; width: number; rawX: number; cx: number; rawY: number; cy: number } {
+		const s = this.bounceState;
+		return { active: !!s, x: this.bounceOffset.x, y: this.bounceOffset.y, fromX: s?.fromX ?? 0, fromY: s?.fromY ?? 0, startedAt: s?.startedAt ?? null,
+			restX: this.restPanX(), restY: this.restPanY(),
+			// s97 add. 67: the bound's own geometry from the last settle.
+			floorX: this.boundReadout.floorX, floorY: this.boundReadout.floorY, bx: this.boundReadout.bx, width: this.boundReadout.width,
+			rawX: this.boundReadout.rawX, cx: this.boundReadout.cx, rawY: this.boundReadout.rawY, cy: this.boundReadout.cy };
+	}
+
+	private notePanBound(fits: boolean, requested: number, accepted: number): void {
+		if (!fits || !(Number.isFinite(requested) && Number.isFinite(accepted)) || accepted === requested) return;
+		this.panBoundHits++;
+		const by = Math.abs(accepted - requested);
+		if (by > this.panBoundMaxPx) this.panBoundMaxPx = by;
+	}
+
+	/**
+	 * The fit quantities the settle bounds by, read-only, for a fixture that has
+	 * to check its own regime against the code's rather than re-derive it from
+	 * the DOM. Sizes are painted px at the scale in force.
+	 */
+	/** s150 add. 2, read-only: the drag-frame gate's inputs on the last preview frame. */
+	dragGateReadout(): { dragFrame: boolean; neverZoomed: boolean; steady: boolean; next: number; fromScale: number; fromScaleValid: boolean;
+		rawX: number; cx: number; rawY: number; cy: number; restCeilX: number; startX: number; startY: number; lastX: number; lastY: number;
+		bounded: boolean; settling: boolean; floorX: number; floorY: number } {
+		const b = this.boundReadout;
+		return { dragFrame: b.dragFrame, neverZoomed: b.neverZoomed, steady: b.steady, next: b.next, fromScale: b.fromScale,
+			fromScaleValid: b.fromScaleValid, rawX: b.rawX, cx: b.cx, rawY: b.rawY, cy: b.cy, restCeilX: b.restCeilX,
+			startX: b.startX, startY: b.startY, lastX: b.lastX, lastY: b.lastY, bounded: b.bounded, settling: b.settling,
+			floorX: b.floorX, floorY: b.floorY };
+	}
+
+	panFitReadout(): { fitsX: boolean; fitsY: boolean; contentX: number; contentY: number; viewportX: number; viewportY: number; boundHits: number; boundMaxPx: number } {
+		const layout = this.viewportLayout;
+		const path = this.filePath(), extent = (path ? surfaceExtents.get(path) : null) ?? { x: 0, y: 0 };
+		const effective = layout ? this.pinchScaleNow * layout.externalScale : this.pinchScaleNow;
+		// THE SAME QUANTITY THE PREDICATE TAKES. A readout that answers "does it fit" from a different
+		// width than the code does agrees with the product exactly until the two definitions diverge,
+		// which is the case this whole fix is about - and a fixture reading it would inherit the lie.
+		const contentX = this.pageContentWidth() * effective;
+		const contentY = Math.max(this.view?.contentHeight ?? 0, extent.y * this.fontZoom) * effective;
+		const viewportX = layout ? layout.width * layout.externalScale - layout.gutterScreen : 0;
+		const viewportY = layout ? layout.paneHeight * layout.externalScale : 0;
+		return { fitsX: this.panAxisWindow(contentX, viewportX).fits, fitsY: this.panAxisWindow(contentY, viewportY).fits,
+			contentX, contentY, viewportX, viewportY, boundHits: this.panBoundHits, boundMaxPx: this.panBoundMaxPx };
 	}
 
 	/**
@@ -5935,7 +7902,7 @@ export class InkOverlayPlugin {
 	private reanchorPan(): void {
 		const hold = this.panAnchorHold;
 		if (!hold) return;
-		if (!this.ownsPanSettle(hold)) { if (this.panAnchorHold === hold) this.retirePanSettle(); return; }
+		if (!this.ownsPanSettle(hold)) { if (this.panAnchorHold === hold) this.retirePanSettle("ownership lost before the anchor pan"); return; }
 		// Read the owned column without its pan. Subtracting a full-precision
 		// pan from the browser's rounded transformed rect feeds a small error
 		// back into every iteration and can prevent exact convergence.
@@ -5952,7 +7919,9 @@ export class InkOverlayPlugin {
 			local = column === null ? null : (column - host.left) / hold.toScale;
 			top = (content.top - host.top) / hold.toScale;
 		} finally { sizer.style.transform = transform; }
-		this.anchorPanTo(hold.toScale, hold, local, top);
+		const ratio = hold.toScale / hold.fromScale;
+		const zoomed = Number.isFinite(ratio) && (ratio < PAN_SETTLE_ZOOM_BAND.below || ratio > PAN_SETTLE_ZOOM_BAND.above);
+		this.anchorPanTo(hold.toScale, hold, local, top, zoomed);
 		hold.left = this.view.scrollDOM.scrollLeft; hold.top = this.view.scrollDOM.scrollTop;
 	}
 
@@ -5991,20 +7960,26 @@ export class InkOverlayPlugin {
 	 */
 	consumeViewportScroll(range: SelectionRange): boolean {
 		const owner = this.scrollRangeOwners.get(range);
-		if (!owner) { this.retirePanSettle(); return false; }
+		if (!owner) { this.retirePanSettle("a scroll request the overlay did not issue"); return false; }
 		const hold = this.panAnchorHold;
 		if (hold === owner) {
 			if (!this.ownsPanSettle(hold) || this.view.scrollDOM.scrollLeft !== hold.left || this.view.scrollDOM.scrollTop !== hold.top) hold.outcome = "cancelled";
 			else if (!hold.ready) { hold.outcome = "failed"; console.warn("Pinch settlement consumed before convergence"); }
 			else hold.outcome = "converged";
-			this.retirePanSettle();
+			this.retirePanSettle("consumed");
 		}
 		return true;
 	}
 
-	private retirePanSettle(): void {
+	/** `reason` names the caller; a hold retired while still pending is logged
+	 * with it through the scroll probe, so a cancelled settle is never silent. */
+	private retirePanSettle(reason: string): void {
 		const hold = this.panAnchorHold;
-		if (hold?.outcome === "pending") hold.outcome = "cancelled";
+		if (this.bouncedHold === hold) this.bouncedHold = null;
+		if (hold?.outcome === "pending") {
+			hold.outcome = "cancelled";
+			scrollProbeExtent(`settle hold cancelled while pending: ${reason}`);
+		}
 		this.panAnchorHold = null;
 	}
 
@@ -6016,9 +7991,10 @@ export class InkOverlayPlugin {
 
 	/** Take the pan off the children; every exit from a gesture lands here. */
 	private clearViewportPan(): void {
+		this.cancelOverscrollBounce();
 		this.restorePinchLayers();
 		this.previewPanEngaged = false;
-		this.retirePanSettle();
+		this.retirePanSettle("the pan was cleared");
 		this.previewColumnLocal = null;
 		if (this.previewHostOrigin) this.previewHostOrigin.valid = false;
 		const pan = this.viewportPan;
@@ -6270,6 +8246,8 @@ export class InkOverlayPlugin {
 	 * replaces.
 	 */
 	private rebasePinch(): void {
+		// s110: a give easing back at the watchdog's deadline finishes in place; no fingers are on the glass to re-anchor.
+		if (this.pinchGive) { this.finishPinchGive(); return; }
 		const anchor = this.pinchAnchor;
 		if (!this.pinchPreview || !anchor || this.pinchRefScale === null || this.retiring) { this.releaseMeasures(); return; }
 		// THE RAW CLIENT CENTROID, not the accepted target: `pinch` takes the
@@ -6285,6 +8263,77 @@ export class InkOverlayPlugin {
 		this.pinchRatioBase = base;
 	}
 
+	/**
+	 * s110, line 6: the fingers lifted with the preview past the cap. Drive the SAME preview path from
+	 * the overshoot back to the cap on the bounce's curve, one move per frame, then lift for real at the
+	 * cap. No second scale in flight, no per-frame commit: each frame is a preview frame exactly like
+	 * a slow pinch, and the single settle runs at `to`, inside the committed range.
+	 */
+	private startPinchGive(from: number, to: number, centroid: { x: number; y: number }): void {
+		if (this.pinchRaf !== 0) { this.winRef.cancelAnimationFrame(this.pinchRaf); this.pinchRaf = 0; }
+		const sd = this.view.scrollDOM;
+		const give = { from, to, startedAt: performance.now(), raf: 0, centroid: { x: centroid.x, y: centroid.y }, stepping: false, scrollLeft: sd.scrollLeft, scrollTop: sd.scrollTop, paused: false };
+		this.pinchGive = give;
+		give.raf = this.winRef.requestAnimationFrame(() => this.pinchGiveStep(give));
+	}
+
+	/** One tick of the give: the eased scale for this instant, painted, and the next tick requested. */
+	private pinchGiveStep(give: NonNullable<InkOverlayPlugin["pinchGive"]>): void {
+		if (this.pinchGive !== give || give.paused) return;
+		give.raf = 0;
+		const t = Math.min(1, Math.max(0, (performance.now() - give.startedAt) / OVERSCROLL_BOUNCE_MS));
+		if (t >= 1) { this.finishPinchGive(); return; }
+		// Ease out, the bounce's own curve: fast off the overshoot, gently onto the cap, never past it.
+		this.pinchGiveFrame(give.to + (give.from - give.to) * (1 - t) ** 3, give);
+		if (this.pinchGive === give && !give.paused) give.raf = this.winRef.requestAnimationFrame(() => this.pinchGiveStep(give));
+	}
+
+	/** s115: hold the ease where it stands for a pen stroke; the preview stays up at this scale, nothing moves. */
+	private pausePinchGive(): void {
+		const give = this.pinchGive;
+		if (!give || give.paused) return;
+		if (give.raf !== 0) { this.winRef.cancelAnimationFrame(give.raf); give.raf = 0; }
+		give.paused = true;
+	}
+
+	/** s115: after the stroke, ease on from the scale on screen to the cap over a fresh half second. */
+	private resumePinchGive(): void {
+		const give = this.pinchGive;
+		if (!give || !give.paused) return;
+		give.paused = false;
+		give.from = this.pinchScaleNow;
+		give.startedAt = performance.now();
+		if (Math.abs(give.from - give.to) < 1e-9) { this.finishPinchGive(); return; }
+		give.raf = this.winRef.requestAnimationFrame(() => this.pinchGiveStep(give));
+	}
+
+	/** One frame of the give: a move at `scale` through `pinch`, painted now rather than on the frame it would request. */
+	private pinchGiveFrame(scale: number, give: NonNullable<InkOverlayPlugin["pinchGive"]>): void {
+		const ref = this.pinchRefScale ?? this.pinchScaleNow;
+		if (!Number.isFinite(ref) || ref <= 0) return;
+		give.stepping = true;
+		try {
+			// `pinch` divides a move's ratio by `pinchRatioBase`; hand it the ratio that lands on `scale`.
+			this.pinch("move", (scale / ref) * (this.pinchRatioBase || 1), give.centroid);
+			if (this.pinchRaf !== 0) { this.winRef.cancelAnimationFrame(this.pinchRaf); this.pinchRaf = 0; this.flushPinch(false); }
+		} finally { give.stepping = false; }
+	}
+
+	/** End the give now: the settle runs at the cap, the way the lift would have without it. */
+	private finishPinchGive(): void {
+		const give = this.pinchGive;
+		if (!give) return;
+		if (give.raf !== 0) { this.winRef.cancelAnimationFrame(give.raf); give.raf = 0; }
+		this.pinchGive = null;
+		if (this.retiring) return;
+		// A scroll that ran under the ease (one finger, a wheel) moved the scroller; the settle anchors on the
+		// gesture's start scroll, so that movement is folded into the anchor or the settle would take it back.
+		const a = this.pinchAnchor, sd = this.view.scrollDOM;
+		if (a) { a.scrollLeft += sd.scrollLeft - give.scrollLeft; a.scrollTop += sd.scrollTop - give.scrollTop; }
+		this.pinchPending = { next: give.to };
+		this.pinch("end", 1, give.centroid);
+	}
+
 	private deferPinchRaster(): boolean {
 		// Match the scroll handler's bounded suppression: a lost end event must
 		// never suppress future geometry work for the lifetime of the editor.
@@ -6294,6 +8343,8 @@ export class InkOverlayPlugin {
 
  private restoreViewportLayout():void {
   this.pinchPreview=false;
+  // Before the no-layout return: an unmount at rest leaves nothing behind either.
+  this.clearOwnPaperVars();
   // Reached from update() on a file switch, inside CodeMirror's own update:
   // the make-up measure waits a frame (a synchronous one would nest).
   this.releaseMeasures(true);
@@ -6302,13 +8353,17 @@ export class InkOverlayPlugin {
   this.rasterColumnLocal=null; this.previewAnchorStale=false; this.clearDeferredRepaint();
   this.viewportGeneration++;
   this.viewportPaneObserver?.disconnect();this.viewportPaneObserver=null;
+  this.aboveContentObserver?.disconnect();this.aboveContentObserver=null;
   this.viewportStyleObserver?.disconnect();this.viewportStyleObserver=null;
   this.viewportStyleDirty=null;
   if(this.viewportStyleFrame){this.winRef.cancelAnimationFrame(this.viewportStyleFrame);this.viewportStyleFrame=0;}
   const layout=this.viewportLayout;
   if(!layout) return;
+  // At rest after the release the zoom is the external scale alone; the
+  // measured cssScale still holds the gesture's until the next refresh.
+  this.paperRestZoom=layout.externalScale;
   const host=this.view.dom;
-  host.classList.remove("handwriting-note-viewport");
+  host.classList.remove("handwriting-note-viewport","handwriting-note-viewport-own-lines");
   layout.parent.classList.remove("handwriting-note-viewport-pane");
   for(const [name,saved] of layout.styles) {
    if(saved.value) host.style.setProperty(name,saved.value,saved.priority); else host.style.removeProperty(name);
@@ -6332,15 +8387,40 @@ export class InkOverlayPlugin {
    // saved inline value, so a later capture sees the theme's again.
    // Not a finite positive number - `normal`, or a rig with no `zoom` at
    // all - is a factor of 1, which writes exactly what it wrote before.
-   const names=["width","height","transform","transform-origin","zoom","--handwriting-note-column-width","--handwriting-note-column-margin-left","--handwriting-note-column-margin-right","--handwriting-column-margin-left","--handwriting-paper-pitch","--handwriting-paper-rule"];
-   const style=this.winRef.getComputedStyle(this.view.contentDOM);
-   this.viewportLayout={parent,paneWidth:parent.clientWidth,paneHeight:parent.clientHeight,externalScale:this.cssScale/this.pinchScaleNow,baseTransform:this.winRef.getComputedStyle(host).transform,baseZoom:(()=>{const z=Number.parseFloat(this.winRef.getComputedStyle(host).zoom);return Number.isFinite(z)&&z>0?z:1;})(),width:Number.parseFloat(this.winRef.getComputedStyle(host).width)||host.clientWidth,height:Number.parseFloat(this.winRef.getComputedStyle(host).height)||host.clientHeight,column:this.view.contentDOM.offsetWidth,left:style.marginLeft,right:style.marginRight,columnLocal:(()=>{const x=this.columnLocalAt(this.pinchScaleNow);return x===null?null:x/(this.cssScale/this.pinchScaleNow)+this.view.scrollDOM.scrollLeft;})(),styles:new Map(names.map(n=>[n,{value:host.style.getPropertyValue(n),priority:host.style.getPropertyPriority(n)}]))};
+   const names=["width","height","transform","transform-origin","zoom","--handwriting-note-column-width","--handwriting-note-column-margin-left","--handwriting-note-column-margin-right","--handwriting-column-margin-left","--handwriting-column-auto-left","--handwriting-paper-pitch","--handwriting-paper-rule","--handwriting-paper-dot","--handwriting-paper-phase","--handwriting-paper-phase-x"];
+   const layout:NonNullable<InkOverlayPlugin["viewportLayout"]>={parent,paneWidth:parent.clientWidth,paneHeight:parent.clientHeight,externalScale:this.cssScale/this.pinchScaleNow,baseTransform:this.winRef.getComputedStyle(host).transform,baseZoom:(()=>{const z=Number.parseFloat(this.winRef.getComputedStyle(host).zoom);return Number.isFinite(z)&&z>0?z:1;})(),width:Number.parseFloat(this.winRef.getComputedStyle(host).width)||host.clientWidth,height:Number.parseFloat(this.winRef.getComputedStyle(host).height)||host.clientHeight,column:0,columnBox:0,gutterX:0,gutterScreen:0,sizerColumn:false,columnInset:false,ownLines:false,left:"",right:"",columnLocal:null,columnAuto:null,styles:new Map(names.map(n=>[n,{value:host.style.getPropertyValue(n),priority:host.style.getPropertyPriority(n)}]))};
+   this.viewportLayout=layout;
+   {
+    const sc0=this.view.scrollDOM,r0=sc0.getBoundingClientRect();
+    const st0=this.winRef.getComputedStyle(sc0);
+    const bx0=(Number.parseFloat(st0.borderLeftWidth)||0)+(Number.parseFloat(st0.borderRightWidth)||0);
+    const gl0=Math.max(0,sc0.offsetWidth-sc0.clientWidth-bx0);
+    const gs0=sc0.offsetWidth>0&&r0.width>0?gl0*r0.width/sc0.offsetWidth:0;
+    if(Number.isFinite(gs0)&&gs0>=0)layout.gutterScreen=gs0;
+   }
+   // Paper values that are the overlay's own at-rest plan are not the host's
+   // to be given back: a release takes them off (clearOwnPaperVars) and the
+   // paper is planned at rest again, rather than replaying a plan made before
+   // the gesture. A host's own inline value (a theme's,
+   // or one set with a priority) is still restored as it was found.
+   for(const name of PAPER_PROPERTIES){const saved=layout.styles.get(name);if(saved?.value&&!saved.priority&&saved.value===this.paperWritten?.get(name))layout.styles.delete(name);}
+   // The same measurement a resize and a theme refresh take, so the frozen
+   // value they compare against was read in the same basis. The saved styles
+   // above are captured first: the measurement writes the host's box.
+   const natural=this.measureNaturalColumn(null);
+   layout.column=natural.column;layout.columnBox=natural.columnBox;layout.gutterX=natural.gutterX;layout.sizerColumn=natural.sizerColumn;layout.columnInset=natural.columnInset;layout.ownLines=natural.ownLines;layout.left=natural.left;layout.right=natural.right;layout.columnLocal=natural.columnLocal;layout.columnAuto=natural.columnAuto;
   }
+  this.observeAboveContent();
   if(!this.viewportPaneObserver) {
    this.viewportPaneObserver=new ResizeObserver(()=>this.handleResize());
    this.viewportPaneObserver.observe(parent);
    const doc=host.ownerDocument;
-   const stamp=()=>[doc.documentElement.className,doc.documentElement.getAttribute("style"),doc.body.className,doc.body.getAttribute("style"),parent.className.replace(/handwriting-note-viewport-pane/g,""),parent.getAttribute("style")].join("|");
+   // The pane's class TOKENS minus the overlay's own, never its class string:
+   // removing the token from the string left a trailing space, so the first
+   // owned box write changed the stamp and scheduled a refresh after every
+   // takeover - a forced layout, and a re-commit that could retire a pending
+   // settle. Tokens compare the same however the list was edited.
+   const stamp=()=>[doc.documentElement.className,doc.documentElement.getAttribute("style"),doc.body.className,doc.body.getAttribute("style"),Array.from(parent.classList).filter(token=>token!=="handwriting-note-viewport-pane").join(" "),parent.getAttribute("style")].join("|");
    this.viewportStyleStamp=stamp();
    this.viewportStyleObserver=new MutationObserver(records=>{
     const next=stamp();
@@ -6374,20 +8454,153 @@ export class InkOverlayPlugin {
  private refreshViewportColumn():boolean {
   const layout=this.viewportLayout;
   if(!layout||this.frame.locked||!this.container)return false;
-  const host=this.view.dom,scroller=this.view.scrollDOM;
+  const scroller=this.view.scrollDOM;
   const savedLeft=scroller.scrollLeft,savedTop=scroller.scrollTop;
-  host.classList.remove("handwriting-note-viewport");
-  host.setCssStyles({width:`${layout.width}px`,height:`${layout.height}px`});
-  const style=this.winRef.getComputedStyle(this.view.contentDOM);
-  const column=this.view.contentDOM.offsetWidth,left=style.marginLeft,right=style.marginRight;
-  const natural=contentOrigin(this.view.contentDOM);
-  const columnLocal=this.ownedColumnLayoutLeft(natural.line) ?? (natural.left===null?null:(natural.left-this.panX()-host.getBoundingClientRect().left)/this.cssScale+scroller.scrollLeft);
-  const changed=column!==layout.column||left!==layout.left||right!==layout.right||columnLocal!==layout.columnLocal;
-  if(column>0&&changed){layout.column=column;layout.left=left;layout.right=right;layout.columnLocal=columnLocal;}
+  const {column,columnBox,gutterX,sizerColumn,columnInset,ownLines,left,right,columnLocal,columnAuto}=this.measureNaturalColumn({width:layout.width,height:layout.height});
+  // columnBox and sizerColumn are in the compare because a theme change can move the column without moving `.cm-content`
+  // - that is exactly what Minimal does, and it is why neither the ResizeObserver nor the content-origin compare fired.
+  const changed=column!==layout.column||columnBox!==layout.columnBox||sizerColumn!==layout.sizerColumn||columnInset!==layout.columnInset||ownLines!==layout.ownLines||left!==layout.left||right!==layout.right||columnLocal!==layout.columnLocal;
+  if(column>0&&changed){layout.column=column;layout.columnBox=columnBox;layout.gutterX=gutterX;layout.sizerColumn=sizerColumn;layout.columnInset=columnInset;layout.ownLines=ownLines;layout.left=left;layout.right=right;layout.columnLocal=columnLocal;}
+  // A theme change is the one way `--file-line-width` moves at a constant pane
+  // size, so the auto term's inputs are re-read in the same unowned layout.
+  if(column>0)layout.columnAuto=columnAuto;
   this.applyViewportBox(this.pinchScaleNow);
   scroller.scrollLeft=savedLeft;scroller.scrollTop=savedTop;
   if(column>0&&changed)this.commitCameraScale(this.pinchScaleNow, undefined, undefined, true);
   return column>0;
+ }
+
+ /**
+  * THE NATURAL COLUMN, MEASURED AT UNITY: the one measurement takeover, a pane
+  * resize and a theme refresh all take, so the frozen column they compare is
+  * always read in the same basis. Ownership comes off first - the class, and
+  * with a `box` the host's box at that local size and its `zoom` back to the
+  * value the host had before the overlay (the saved inline one, or none). The
+  * zoom is the part the class cannot take off: on the transform host the shrink
+  * lifted with the class, but on the zoom host it is an inline style, and a
+  * column measured under it resolves the theme's auto margin in a mixed basis
+  * (7.5 local px short at k .5, frozen, then a hop at the next pinch end).
+  * Nothing is restored here: every caller ends in `applyViewportBox`, which
+  * writes class, box and zoom back, and writes the layout fields BEFORE it so no
+  * measured value is stored while the plugin's zoom is on the host.
+  * `box` null is takeover: nothing of the overlay's is on the host yet and its
+  * own box is left alone.
+  * With the zoom off, the rect fallback divides by the external scale alone;
+  * the transform fallback still carries its scale inline, as it always did.
+  */
+ /**
+  * THE COLUMN, MEASURED, and three numbers no stylesheet decides.
+  *
+  * `columnBox` is the TEXT COLUMN's width, read off the LINE BOX - the element `contentOrigin` already picks for the
+  * column's LEFT - rather than off `.cm-content`. That element is the column only under a theme that caps and centres
+  * it, which is Obsidian's own; Minimal forces `.cm-content` and `.cm-sizer` to full width and gives the LINE the
+  * readable width (theme.css:1852-1867), so `column` there is the whole pane and reads "this page cannot fit" at every
+  * zoom. Measured: default 700 in a 1383 content box at inset 341.25; Minimal 648 in 1383 at 367.25; the setting off
+  * 1383 in 1383. Same note, same pane.
+  *
+  * `gutterX` is the vertical scrollbar, in painted px. The pane is the scroller's BORDER box and the page is laid out
+  * inside its CONTENT box, narrower by this. Fifteen px, and leaving it out put every centred rest half a gutter right
+  * of where the engine's own centring puts the column - 7.75 px, at every zoom, on both themes.
+  *
+  * `sizerColumn` says whether the SIZER is the thing that carries the column's inset, which is the only case where
+  * freezing the sizer's margin restates where the column already was. Measured unowned: Obsidian's own theme puts the
+  * sizer at 341 with the column at 341.25 - the same place. Minimal puts it at 0, full width.
+  */
+ private measureNaturalColumn(box:{width:number;height:number}|null):{column:number;columnBox:number;gutterX:number;sizerColumn:boolean;columnInset:boolean;ownLines:boolean;left:string;right:string;columnLocal:number|null;columnAuto:{lineWidth:number;fixed:number;scrollbar:number}|null} {
+  const layout=this.viewportLayout!,host=this.view.dom,scroller=this.view.scrollDOM;
+  if(box) {
+   host.classList.remove("handwriting-note-viewport");
+   host.setCssStyles({width:`${box.width}px`,height:`${box.height}px`});
+   const saved=layout.styles.get("zoom");
+   if(saved?.value)host.style.setProperty("zoom",saved.value,saved.priority);else host.style.removeProperty("zoom");
+  }
+  const style=this.winRef.getComputedStyle(this.view.contentDOM);
+  const sizer=this.panSizer();
+  const column=this.view.contentDOM.offsetWidth;
+  const natural=contentOrigin(this.view.contentDOM);
+  const rectScale=!box||this.hostZoomSupported()?this.cssScale/this.pinchScaleNow:this.cssScale;
+  const hostRect=host.getBoundingClientRect();
+  // Takeover's read used to be `columnLocalAt`, which leaves the host's painted
+  // origin for the gesture's later reads; kept, so a takeover inside a gesture
+  // hands the same origin on. Resize and refresh never wrote it.
+  if(!box&&this.previewHostOrigin){this.previewHostOrigin.left=hostRect.left;this.previewHostOrigin.top=hostRect.top;this.previewHostOrigin.valid=true;}
+  // TAKEOVER READS THE RECT, as it always did. The margin walk sums the owned
+  // tree's resolved margins, and before the first owned write the sizer's
+  // theme `margin-left: auto` can read 0px while the sizer sits at its centred
+  // offset: measured 0px against offsetLeft 341 at scroll 4000 on a 10838 px
+  // extent, which froze the column at 0 and made the first refresh "change"
+  // it to 341.25 - a re-commit and an 85 px hop at 25 percent.
+  const columnLocal=(box?this.ownedColumnLayoutLeft(natural.line):null) ?? (natural.left===null?null:(natural.left-this.panX()-hostRect.left)/rectScale+scroller.scrollLeft);
+  // No extra forced read: the scan above already laid all of this out.
+  const lineBox=natural.line instanceof HTMLElement?natural.line.offsetWidth:0;
+  const sr=scroller.getBoundingClientRect(),ss=this.winRef.getComputedStyle(scroller);
+  const border=(Number.parseFloat(ss.borderLeftWidth)||0)+(Number.parseFloat(ss.borderRightWidth)||0);
+  const gutterLocal=Math.max(0,scroller.offsetWidth-scroller.clientWidth-border);
+  const gutterX=scroller.offsetWidth>0&&sr.width>0?gutterLocal*sr.width/scroller.offsetWidth:0;
+  const sizerLeft=sizer?sizer.offsetLeft:null;
+  const sizerColumn=columnLocal!==null&&sizerLeft!==null&&Math.abs(sizerLeft-columnLocal)<=PAN_FIT_SLACK_PX;
+  // IS THERE A READABLE COLUMN HERE AT ALL: the page is NARROWER than the scroller's content box in its own natural
+  // layout. This is not the old `|columnLocal - beside/2| <= 1` gate coming back - that one asked `.cm-content`, which is
+  // why it read "no column" under a theme that centres its lines. This asks the measured column, and it is the half of
+  // the question the fit cannot answer: with Readable line length OFF the page is 1383 local px at EVERY zoom, so below
+  // 100% it fits the pane with room to spare and a fit-only test engages on it - measured, a 524.06 px preview pan at
+  // 25% and the settle 345.75 px off the note's origin edge, on a setting that is meant to be untouched. Measured
+  // natural widths: default 700 in 1383, Minimal 648 in 1383, setting off 1383 in 1383.
+  const columnBoxLocal=lineBox>0?lineBox:column;
+  const columnInset=columnBoxLocal>0&&scroller.clientWidth>0&&columnBoxLocal<=scroller.clientWidth-PAN_FIT_SLACK_PX;
+  // DOES THE THEME CENTRE ITS OWN LINES: there is a readable column, it is inset, and the SIZER is not what puts it there
+  // - the sizer sits at the scroller's left edge while the line does not. Minimal, measured unowned: sizer offsetLeft 0,
+  // line inset 367.25, column 648 in 1383. Obsidian's own theme fails it (sizer 341 = the inset) and keeps the freeze;
+  // Readable line length off fails it (no inset). Under it `applyViewportBox` does not freeze `.cm-content`'s width.
+  const ownLines=columnInset&&sizerLeft!==null&&Math.abs(sizerLeft)<=PAN_FIT_SLACK_PX&&columnLocal!==null&&columnLocal>PAN_FIT_SLACK_PX;
+  return {column,columnBox:columnBoxLocal,gutterX:Number.isFinite(gutterX)?gutterX:0,sizerColumn,columnInset,ownLines,left:style.marginLeft,right:style.marginRight,columnLocal,columnAuto:this.measureColumnAuto(box?box.width:layout.width,ownLines?columnBoxLocal:null)};
+ }
+
+ /**
+  * The inputs of Readable line length's auto-centring term, read in an
+  * UNOWNED layout (takeover, a pane resize, a theme refresh), so that
+  * `applyViewportBox` can write the term as a number on every frame with no
+  * read of its own. The stylesheet used to compute it as
+  * `(100% - var(--file-line-width)) / 2`; under the zoom host the engine
+  * resolves that `100%` in a mixed basis (the scroller's width with its
+  * scrollbar counted in screen px), so the term shrank with k and won the
+  * clamp against the frozen column: a column 7.5 (1/k - 1) local px left of
+  * where it was, and a hop of that size when a pinch settled.
+  *
+  * `hostWidth` is the host's local width in this layout. Read only through
+  * `measureNaturalColumn`, so the plugin's zoom is never on the host here and
+  * local px are the host's own. Returns:
+  * - `lineWidth`: `--file-line-width` when it is plain px (the old rule's own
+  *   term), else the sizer's computed `max-width` in px;
+  * - `fixed`: what the host holds beside the scroller's content box that does
+  *   NOT scale - everything outside the scroller, plus its border and padding;
+  * - `scrollbar`: the scrollbar at the host's own size (`offsetWidth -
+  *   clientWidth - borders`, an integer difference, exact for an integer
+  *   scrollbar). Under css zoom it keeps this screen size, which is why
+  *   `applyViewportBox` divides it by the zoom.
+  * Null when the line width is not px: `applyViewportBox` then leaves the
+  * property unset and the stylesheet's percentage fallback applies, as before.
+  * NOT COVERED: a scrollbar that appears or disappears with k (a note short
+  * enough to stop overflowing at some scale) keeps the value read here until
+  * the next resize or theme refresh.
+  */
+ private measureColumnAuto(hostWidth:number,ownLineBox:number|null=null):{lineWidth:number;fixed:number;scrollbar:number}|null {
+  const host=this.view.dom,scroller=this.view.scrollDOM,sizer=this.panSizer();
+  // A unit rig's stand-in DOM has no rects: no inputs, the stylesheet fallback.
+  if(!sizer||!(hostWidth>0)||typeof host.getBoundingClientRect!=="function"||typeof scroller?.getBoundingClientRect!=="function")return null;
+  const px=(value:string|undefined):number|null=>{const m=/^\s*(\d*\.?\d+)px\s*$/.exec(value??"");return m?Number(m[1]):null;};
+  const sizerStyle=this.winRef.getComputedStyle(sizer);
+  // s184: a theme that centres its own lines sizes them itself (Minimal: 648 for a --file-line-width of 700), so the
+  // auto term takes the measured line box there; with 700 it read 26 px short of the natural inset at 100%.
+  const lineWidth=(ownLineBox!==null&&ownLineBox>0?ownLineBox:null)??px(sizerStyle.getPropertyValue?.("--file-line-width"))??px(sizerStyle.maxWidth);
+  const hostRect=host.getBoundingClientRect().width;
+  if(lineWidth===null||!(hostRect>0))return null;
+  const s=this.winRef.getComputedStyle(scroller);
+  const edge=(Number.parseFloat(s.borderLeftWidth)||0)+(Number.parseFloat(s.borderRightWidth)||0)+(Number.parseFloat(s.paddingLeft)||0)+(Number.parseFloat(s.paddingRight)||0);
+  // Screen rects in one ratio: the scroller's border box in host-local px.
+  const scrollerLocal=scroller.getBoundingClientRect().width*hostWidth/hostRect;
+  const bar=Math.max(0,scroller.offsetWidth-scroller.clientWidth-(Number.parseFloat(s.borderLeftWidth)||0)-(Number.parseFloat(s.borderRightWidth)||0));
+  return {lineWidth,fixed:Math.max(0,hostWidth-scrollerLocal)+edge,scrollbar:bar};
  }
 
  private setViewportScroll(left:number,top:number):void {
@@ -6430,9 +8643,13 @@ export class InkOverlayPlugin {
   }
  }
 
- private applyViewportBox(next:number):void {
+ private applyViewportBox(next:number,deferPaper=false):void {
   const layout=this.viewportLayout!,host=this.view.dom;
-  host.classList.add("handwriting-note-viewport");layout.parent.classList.add("handwriting-note-viewport-pane");
+  // Only when missing: an add of a token already present still queues a class
+  // mutation record, and the viewport style observer then ran its stamp on
+  // every preview frame for a class that never changed.
+  if(!host.classList.contains("handwriting-note-viewport"))host.classList.add("handwriting-note-viewport");
+  if(!layout.parent.classList.contains("handwriting-note-viewport-pane"))layout.parent.classList.add("handwriting-note-viewport-pane");
   // The pane must never carry a scroll offset of its own: the stylesheet makes
   // it a clip rather than a scroll container, and this resets whatever an
   // engine without `overflow: clip` let through, so an already-shifted surface
@@ -6440,6 +8657,13 @@ export class InkOverlayPlugin {
   // nonzero.
   const pane=layout.parent;
   if(pane.scrollLeft!==0||pane.scrollTop!==0){pane.scrollLeft=0;pane.scrollTop=0;}
+  // THE COLUMN FREEZE, and where it does not apply. `.cm-content` is pinned at its 100% width (styles.css, the owned
+  // host's content rule) so a re-centring margin cannot grow with 1/k under the counter-sized host. Under a theme that
+  // centres its own LINES inside a full-width `.cm-content` that pin is exactly what stops the theme centring them:
+  // measured under Minimal, the line stayed at its 100% inset and needed a 518 px rest at 25%. There the rule is scoped
+  // off by a class and the theme centres the column at every zoom - no margin, no translate at rest. The anchor already
+  // measures the column at both ends of a frame, so a column the theme moves stays under the fingers.
+  if(host.classList.contains("handwriting-note-viewport-own-lines")!==layout.ownLines)host.classList.toggle("handwriting-note-viewport-own-lines",layout.ownLines);
   host.style.setProperty("--handwriting-note-column-width",`${layout.column}px`);
   host.style.setProperty("--handwriting-note-column-margin-left",layout.left);
   // THE COLUMN'S OWN host-local left, frozen at the scale the viewport was
@@ -6453,7 +8677,45 @@ export class InkOverlayPlugin {
   // Stored RAW and clamped only here: a pane narrower than the line drives it
   // negative, and keeping that lets a later widening recover the exact value
   // instead of starting from a floor.
-  if(layout.columnLocal!==null)host.style.setProperty("--handwriting-column-margin-left",`${Math.max(0,layout.columnLocal)}px`);
+  // AT REST, A CENTRED COLUMN IS CENTRED BY THIS MARGIN, not by a pan standing on the sizer. A pan at rest costs on every
+  // path that assumes none: measured, a scroll frame at 25 percent with Readable line length on ran 4.5 -> 5.9 ms against
+  // 1.4.19 while the centring stood as pan. A LIVE FRAME KEEPS THE FROZEN MARGIN - the column is held under the fingers by
+  // the pan there, and moving its margin per frame would reflow the sizer under them - so this is the resting frame's
+  // own value, recorded in `columnRestMargin` for `columnRestPan` to read, and it is one property write in this batch.
+  // THE PAINTED SCROLLBAR, MEASURED ON THE FRAME THAT ASKS. It cannot be predicted from the host-local
+  // width: s86 measured it CONSTANT at 14.00..15.95 across k 0.100..1.500 in one rig and SCALING at
+  // 11.25..44.98 across k 0.600..3.000 in another, with the local width flooring at 15 partway up the
+  // second rig's own range. Both regimes are real and both were measured; the mechanism is not chased here.
+  // ONE rect, and only on a settle - this function runs on EVERY PREVIEW FRAME (:5598), so an unguarded
+  // read here would be a forced layout per frame on the hot path. The guard is production's own: the same
+  // `pinchPreview` test the line below already uses to decide whether there is a rest to compute.
+  if(!this.pinchPreview){
+   const sc=this.view.scrollDOM,r=sc.getBoundingClientRect();
+   const st=this.winRef.getComputedStyle(sc);
+   const bx=(Number.parseFloat(st.borderLeftWidth)||0)+(Number.parseFloat(st.borderRightWidth)||0);
+   const gl=Math.max(0,sc.offsetWidth-sc.clientWidth-bx);
+   const gs=sc.offsetWidth>0&&r.width>0?gl*r.width/sc.offsetWidth:0;
+   if(Number.isFinite(gs)&&gs>=0)layout.gutterScreen=gs;
+  }
+  this.columnRestMargin=this.pinchPreview||!layout.sizerColumn?null:this.columnRestCentred(next,layout.externalScale*next);
+  // s184: a theme that centres its own lines (ownLines) takes the same frozen inset as a sizer column; the stylesheet
+  // applies it to the LINE there (styles.css, the own-lines rule) so the column stops re-centring in the widened host.
+  if(layout.columnLocal!==null)host.style.setProperty("--handwriting-column-margin-left",`${Math.max(0,this.columnRestMargin??(layout.sizerColumn||layout.ownLines?layout.columnLocal:0))}px`);
+
+  // THE AUTO TERM the frozen column is clamped against, as a number: the
+  // scroller's content width at this scale minus the line width, halved.
+  // Arithmetic only, from inputs read in an unowned layout (measureColumnAuto),
+  // and written in this same batch before anything reads, so a preview frame
+  // keeps its one flush. On the zoom host the host is layout.width/next local
+  // px wide and the scrollbar keeps its screen size (scrollbar/next local); on
+  // the transform host the scrollbar is local like everything else. At k = 1
+  // both are the engine's own centring, so the freeze stays invisible at 100%.
+  const auto=layout.columnAuto;
+  const autoLeft=!(layout.sizerColumn||layout.ownLines)?0
+   :auto?Math.max(0,(layout.width/next-auto.fixed-(this.hostZoomSupported()?auto.scrollbar/next:auto.scrollbar)-auto.lineWidth)/2)
+   :Math.max(0,layout.columnLocal??0);
+  const autoValue=`${autoLeft}px`;
+  if(host.style.getPropertyValue("--handwriting-column-auto-left")!==autoValue)host.style.setProperty("--handwriting-column-auto-left",autoValue);
   host.style.setProperty("--handwriting-note-column-margin-right",layout.right);
   // THE SHRINK. `zoom` where the engine has it: it is a layout property with
   // no transform node, so the host's effect node never gets the render
@@ -6540,36 +8802,167 @@ export class InkOverlayPlugin {
   // with the previous scale's quotient. The host's own transform above is scale
   // only: the pan is never written here, because this element contains the
   // scroller and moving it takes the hit surface off the pane.
-  if(this.panX()!==0||this.panY()!==0)this.writeViewportPan();
+  if(this.panX()!==0||this.panY()!==0)this.writeViewportPan(deferPaper);
+  // With no pan, a preview frame still carries the snap's residual out of the paper.
+  else if(this.pinchPreview&&(this.paperSnapResidual.x!==0||this.paperSnapResidual.y!==0)){if(deferPaper)this.previewPaperBoxDirty=true;else this.writePaperPan();}
  }
 
+ /**
+  * The lined, grid and dotted paper: pitch, phase, rule and dot thickness in
+  * layout px; the arithmetic is PaperPlan.ts. The pitch takes the text's size
+  * and the phase the note origin, never the zoom's scale (the host's CSS zoom
+  * scales the background with the note). The zoom reaches thickness, so it
+  * never goes under a device px, and the phase's device px grid, both at the
+  * INTENDED zoom: the external scale times the camera's own, not the measured
+  * read-back. Planned on the refresh path and the camera sync when the text
+  * size is read, when updateExtent captures a moved origin, when a note switch
+  * opens another note, and at a commit, where a thickness can change and the
+  * phase moves at most half a device px onto the new grid. Never on a preview
+  * frame. In the task that read its
+  * inputs, so the first paint after any of them already has it.
+  */
  private updatePaperSpacing():void {
-  if(!this.viewportLayout||!Number.isFinite(this.cssScale)||this.cssScale<=0)return;
-  // Keep every power-of-two rule at low CSS zoom. Font size does not
-  // scale CSS backgrounds. Levels stay bounded by the camera's layout range.
-  const level=Math.min(20,Math.max(0,Math.ceil(Math.log2(1/this.cssScale)-1e-6)));
+  // A detached editor gets nothing.
+  if(!this.view?.dom?.isConnected)return;
+  const layout=this.viewportLayout;
+  const zoom=layout?layout.externalScale*this.pinchScaleNow:Number.isFinite(this.paperRestZoom)?this.paperRestZoom:this.cssScale;
+  const plan=paperPlan(this.paperFontPx,this.paperOriginLayout,(this.dpr||1)*zoom,this.paperOriginLeft);
+  if(!plan)return;
+  // A re-plan while the preview paper rides a bounce (its settle's measure, say) is copied onto it at once; the settle re-copies its own.
+  if(this.writePaperVars(plan)&&this.previewPaperEl&&!this.pinchPreview&&!this.previewPaperSettling)this.rebasePreviewPaper();
+  // The snap's residual, only for a phase this overlay wrote: what a preview carries back out.
+  const residual=(phase:number|null,origin:number|null,name:string):number=>{
+   if(phase===null||origin===null||!Number.isFinite(origin)||this.paperWritten?.get(name)!==`${phase}px`)return 0;
+   const t=((origin%plan.pitch)+plan.pitch)%plan.pitch;
+   const d=phase-t;
+   return d>plan.pitch/2?d-plan.pitch:d<-plan.pitch/2?d+plan.pitch:d;
+  };
+  this.paperSnapResidual={x:residual(plan.phaseX,this.paperOriginLeft,"--handwriting-paper-phase-x"),y:residual(plan.phase,this.paperOriginLayout,"--handwriting-paper-phase")};
+  // A pan written while a residual was carried is re-written once the preview has ended.
+  if(this.paperPanWritten)this.writePaperPan();
+  // s192: the paper kind can have changed with the plan (a note switch, the picker, the cycle command), and the
+  // content can have grown since the last pass. Never on a preview frame: this method is not called on one.
+  this.syncGridPaperBox();
+ }
+
+ /**
+  * The paper's properties on the host, each only when it changes; a plan
+  * with no phase keeps the last one. A value the host holds that the overlay did
+  * not write (a theme's, or one with a priority) is never replaced, at rest or
+  * zoomed: the paper needs no write to follow a zoom, so there is nothing to
+  * override it for.
+  */
+ private writePaperVars(plan:PaperPlan):boolean {
   const host=this.view.dom;
-  for(const [name,value] of [["--handwriting-paper-pitch",`${28*2**level}px`],["--handwriting-paper-rule",`${1/Math.min(1,this.cssScale)}px`]]) {
-   if(host.style.getPropertyValue(name!)!==value)host.style.setProperty(name!,value!);
+  let wrote=false;
+  for(const [name,px] of [["--handwriting-paper-pitch",plan.pitch],["--handwriting-paper-rule",plan.rule],["--handwriting-paper-dot",plan.dot],["--handwriting-paper-phase",plan.phase],["--handwriting-paper-phase-x",plan.phaseX]] as const) {
+   if(px===null)continue;
+   const value=`${px}px`,current=host.style.getPropertyValue(name);
+   if(current===value)continue;
+   if(current&&(host.style.getPropertyPriority(name)||current!==this.paperWritten?.get(name)))continue;
+   host.style.setProperty(name,value);this.paperWritten?.set(name,value);wrote=true;
   }
+  return wrote;
+ }
+
+ /**
+  * Takes the overlay's own paper values off the editor at a release. The
+  * editor outlives the overlay: a zoomed plan left inline stands until the
+  * next at-rest plan, and an overlay mounted later on the same editor (a
+  * plugin reload) takes it for the host's own and never replaces it. Until
+  * the at-rest plan lands the stylesheet's fallback shows. A value that is
+  * not the one written here, or carries a priority, is the host's and stays.
+  */
+ private clearOwnPaperVars():void {
+  const host=this.view?.dom;
+  if(host)for(const name of PAPER_PROPERTIES){const own=this.paperWritten?.get(name);if(own&&host.style.getPropertyValue(name)===own&&!host.style.getPropertyPriority(name))host.style.removeProperty(name);}
+  this.paperWritten?.clear();
+  // The pan properties live on the scroller and are only ever this overlay's.
+  const scroller=this.view?.scrollDOM;
+  if(scroller?.style){scroller.style.removeProperty("--handwriting-paper-pan-x");scroller.style.removeProperty("--handwriting-paper-pan-y");}
+  this.paperPanWritten=null;this.paperRewrapY=0;this.paperColumnDrift=0;this.paperSnapResidual={x:0,y:0};
+ }
+
+ /**
+  * The note origin the paper's phase is planned from, in the gradient's own
+  * layout px, from the origin updateExtent has just computed. Re-plans only when
+  * it really moved. The origin does not move in layout px while the note zooms
+  * or scrolls, but it is read through rects, whose positions the engine stores
+  * to 1/64 screen px: at 10 percent that is a sixth of a layout px, and a
+  * compare on the raw number re-planned the phase on zoom commits and scrolled
+  * frames where nothing moved. A move under 1/32 screen px is not one.
+  */
+ private capturePaperOrigin(originTopInScroller:number,originLeftInScroller:number):void {
+  // Never on a preview frame: the paper follows a preview through its pan, rewrap and column shifts, which this
+  // re-measure would otherwise count a second time.
+  if(this.pinchPreview)return;
+  // surfaceOriginInScroller measures from the scroller's border box; the
+  // gradient's positioning area starts at its padding box, clientTop lower and clientLeft to the right.
+  // Read in the layout updateExtent has just flushed, before any write.
+  const top=originTopInScroller-this.view.scrollDOM.clientTop;
+  const left=originLeftInScroller-this.view.scrollDOM.clientLeft;
+  const scale=Number.isFinite(this.cssScale)&&this.cssScale>0?this.cssScale:1;
+  // A move under 1/32 screen px is not one: rect positions are stored to 1/64 screen px.
+  const moved=(now:number,previous:number|null)=>Number.isFinite(now)&&(previous===null||Math.abs(now-previous)>=1/32/scale);
+  const topMoved=moved(top,this.paperOriginLayout),leftMoved=moved(left,this.paperOriginLeft);
+  if(topMoved)this.paperOriginLayout=top;
+  if(leftMoved)this.paperOriginLeft=left;
+  if(topMoved||leftMoved)this.updatePaperSpacing();
+  // The phases now carry the origin a title rewrap or a column re-centring moved, so the paper's own shifts are spent,
+  // in the same block as the re-plan.
+  if(this.paperRewrapY!==0||this.paperColumnDrift!==0){this.paperRewrapY=0;this.paperColumnDrift=0;this.writePaperPan();}
  }
 
  // CodeMirror owns the root class attribute and rewrites it on focus changes.
  // Its facet must agree with our synchronous camera writes, including while a
  // stroke owns the frame. Reading the DOM class here would retain its loss.
  ownsNoteViewport():boolean {return this.viewportLayout!==null;}
+ /**
+  * DOES THE OWNED HOST CARRY THE OWN-LINES TOKEN, asked by the same `editorAttributes` facet that asserts
+  * `handwriting-note-viewport`. It has to be asked there and not only written in `applyViewportBox`, because
+  * CodeMirror REWRITES the host's whole `class` attribute from that facet on every `updateAttrs`: a token the overlay
+  * only adds imperatively survives exactly until the next view update. Measured on the zoom button at 50 percent under
+  * Minimal: `applyViewportBox` ran once, added the token (traced), and CodeMirror's next `updateAttrs` set
+  * `class="cm-editor ... handwriting-note-viewport"` over it - the freeze came back on and the column stayed 345.5 px
+  * off its centred rest. A pinch hid it, because its preview re-runs the box write every frame and the last one lands
+  * after the update. The imperative write below stays: it makes the token right WITHIN the frame that computes it,
+  * before any update, and this keeps it right across every update after.
+  */
+ noteViewportOwnLines():boolean {return this.viewportLayout?.ownLines===true;}
 
  getNoteViewportState():{zoom:number;busy:boolean;fitAvailable:boolean} {
   const path=this.filePath();
-  const busy=!this.container || !path || !inlineInk.isLoaded(path) || inlineInk.deleteAllReadiness(path).kind==="unsettled" || this.frame.locked || this.builder!==null || this.mode!=="ink";
+  // s137: no note zoom of any kind with the canvas off: the bar, its buttons, Fit and the zoom
+  // commands all read `busy` and stand down together.
+  const busy=!this.container || !path || !inlineInk.isLoaded(path) || inlineInk.deleteAllReadiness(path).kind==="unsettled" || this.frame.locked || this.builder!==null || this.mode!=="ink" || !this.canvasMode;
   return {zoom:this.pinchScaleNow,busy,fitAvailable:!busy&&this.scaleGeometryValid!==false};
  }
 
+ /**
+  * s137/s138: RE-READ THIS NOTE'S CANVAS ANSWER AND APPLY IT. Called by the global setter for every
+  * mounted note, by the frontmatter override when this note's choice moves, and by the host after a
+  * toggle. Off: the wheel zoom run ends, momentum follows the mode, and a zoomed note lands at 100
+  * percent about the pane centre through the ordinary commit (no saved zoom exists to keep: a note's
+  * scale lives only while it is mounted, so canvas on again simply starts from 100 percent).
+  */
+ applyCanvasMode():void {
+  const on=canvasForNote(this.filePath(),scrollExpansionEnabled);
+  const was=this.canvasMode;
+  this.canvasMode=on;
+  this.router?.setCanvasMomentumDisabled(on);
+  if(!on){
+   this.endWheelZoomRun();
+   if(this.pinchScaleNow!==1&&this.container&&!this.frame.locked&&this.builder===null) this.zoomAroundCenter(1);
+  }
+  if(was!==on) this.scheduleRepaint("canvas-mode");
+ }
+ /** s137: read-only, for the zoom bar and the tests. */
+ canvasModeOn():boolean { return this.canvasMode; }
  zoomNoteBy(factor:number):boolean {
   if(this.getNoteViewportState().busy||!Number.isFinite(factor)||factor<=0) return false;
   // Below the floor the lower bound is the current scale: minus is a no-op
   // there, never a jump in to the floor.
-  const next=Math.max(Math.min(this.zoomFloor,this.pinchScaleNow),Math.min(4,this.pinchScaleNow*factor));
+  const next=Math.max(Math.min(this.zoomFloor,this.pinchScaleNow),Math.min(MAX_PINCH_SCALE,this.pinchScaleNow*factor));
   return next===this.pinchScaleNow || this.zoomAroundCenter(next);
  }
  resetNoteZoom():boolean {
@@ -6633,14 +9026,36 @@ export class InkOverlayPlugin {
 
  /** One validated transaction owns layout, transform, native range and scroll. */
  commitCameraScale(next:number,scroll?:{left:number;top:number},settleHold?:object|null,preserveScrollDemand=false,bypassFloor=false):boolean {
+  this.commitDepth=(this.commitDepth||0)+1;
+  try {
 	this.restorePinchLayers();
-  if(this.panAnchorHold!==settleHold)this.retirePanSettle();
+  // A SAME-SCALE RE-COMMIT CARRIES A PENDING SETTLE. A refresh after a theme or
+  // column change, or a resize, re-commits in place with no settle of its own
+  // and no scroll target; retiring the pinch's pending hold there cancelled a
+  // settle nothing had superseded. The hold is carried to this commit and
+  // re-anchored under the refreshed geometry. A new scale or an explicit scroll
+  // target is new navigation and still retires it.
+  const pendingHold=this.panAnchorHold;
+  // NOT inside another commit: a commit nested in a commit's own synchronous
+  // work (its resize, extent, band) or in its settle measure's write would be a
+  // second consumer of the same hold before it converged, which failed the
+  // settle. It retires, named. This call's own entry is depth 1.
+  // NOR inside CodeMirror's own update: the carried settle dispatches its scroll
+  // request, and a dispatch during the update throws, which makes CodeMirror
+  // deactivate this plugin (a font reflow's resize, with the pane not yet
+  // delivered, reaches here from updateInner).
+  const nested=this.commitDepth>1;
+  const carry=!nested&&!this.inUpdate&&settleHold===undefined&&scroll===undefined&&!!pendingHold&&pendingHold.outcome==="pending"&&next===this.pinchScaleNow;
+  if(carry)settleHold=pendingHold;
+  else if(this.panAnchorHold!==settleHold)this.retirePanSettle(nested?"nested":this.inUpdate?"inside CodeMirror's update":settleHold===undefined?"a commit at a new scale or scroll":"another settle");
+  // A commit that ends a live preview (a zoom button, Fit) takes its paper down; the settle's own commit leaves that to the settle.
+  if(!this.previewPaperSettling)this.endPreviewPaper("commit");
   this.pinchPreview=false;
   this.releaseMeasures();
   // Below the floor only a scale at or above the reference commits: the
   // gesture's start while a pinch settles (its previews already wrote
   // pinchScaleNow), else the current scale, so a re-commit in place passes.
-  if(this.frame.locked||this.scaleGeometryValid===false||(!bypassFloor&&next<this.zoomFloor&&!(next>=(this.pinchRefScale??this.pinchScaleNow)))||next>4||!validCameraScale(next,this.view.dom.clientWidth,this.view.dom.clientHeight))return false;
+  if(this.frame.locked||this.scaleGeometryValid===false||(!bypassFloor&&next<this.zoomFloor&&!(next>=(this.pinchRefScale??this.pinchScaleNow)))||next>MAX_PINCH_SCALE||!validCameraScale(next,this.view.dom.clientWidth,this.view.dom.clientHeight))return false;
   const previous=this.pinchScaleNow,effective=this.cssScale/previous*next;
   if(!validCameraScale(effective)||!this.prepareViewportLayout())return false;
   const layout=this.viewportLayout!;
@@ -6654,16 +9069,58 @@ export class InkOverlayPlugin {
   if(![width,height,target.left,target.top].every(n=>Number.isFinite(n)&&n>=0&&n<=MAX_VIEWPORT_LAYOUT)||width===0||height===0)return false;
   if(next!==previous)this.router?.cameraTransformChanged();
   const generation=++this.viewportGeneration,path=this.filePath();
+  this.reloadCameraSettlement=generation;
+  const settled=()=>{if(this.reloadCameraSettlement===generation)this.reloadCameraSettlement=null;};
+  // The carried hold belongs to this commit now; the commit that issued it sees
+  // the newer generation on the hold and stands down without cancelling it.
+  if(carry&&pendingHold&&this.panAnchorHold===pendingHold)pendingHold.generation=generation;
   const hold=this.panAnchorHold, container=this.container;
   const owns=()=>generation===this.viewportGeneration&&path===this.filePath()&&container===this.container&&!!container&&!this.retiring&&!this.frame.locked&&(!hold||this.ownsPanSettle(hold));
   const matchesScroll=()=>!hold||(this.view.scrollDOM.scrollLeft===hold.left&&this.view.scrollDOM.scrollTop===hold.top);
-  const finish=()=>{if(hold){if(hold.outcome==="pending")hold.outcome="cancelled";if(this.panAnchorHold===hold)this.retirePanSettle();}};
+  const finish=()=>{settled();if(hold&&hold.generation===generation){if(hold.outcome==="pending")hold.outcome="cancelled";if(this.panAnchorHold===hold)this.retirePanSettle("its settle measure lost ownership or the scroll moved");}};
   this.pinchScaleNow=next;this.cssScale=effective;this.scale=effective*this.fontZoom;
+  // At the new zoom the pitch plans the same; the thickness can change and the phase moves onto the new device px grid.
   this.updatePaperSpacing();
   this.refreshPenCursor();
   this.applyViewportBox(next);
   this.scrollExpansion?.rebase(this.view.scrollDOM.scrollLeft,this.view.scrollDOM.scrollTop,preserveScrollDemand);
-  this.handleResize();this.updateExtent(true,hold?.expansion??undefined);this.setViewportScroll(target.left,target.top);this.reanchorPan();
+  // The extent pass below releases the band's margin on this commit, not only when a grant shrank.
+  this.bandMarginReleasePending=true;
+  // THE BAND IS RE-PINNED TO THE SETTLED VIEWPORT FIRST. Its margin is headroom for a fling, sized for the viewport it
+  // was pinned in; a zoom-out pins it for the counter-sized one and a settle back at 100 percent used to leave that
+  // margin holding scrollable range nothing had granted - measured on a blank note, 100 -> 25 -> 100: rangeX 175 and the
+  // view parked at scrollLeft 160 with Readable line length on, 175/175 with it off, against 0/0 on a note that never
+  // moved, with the extent's own grant 0 throughout. Re-pinned here, before the extent, the scroll target and the fit
+  // test, the settle lands where a fresh note sits.
+  this.handleResize();if(this.syncBand()!=="none")this.handleResize();this.updateExtent(true,hold?.expansion??undefined);
+  // THE REST THE EXTENT JUST INVALIDATED. `handleResize` above writes the centring margin from the granted extent as
+  // it stood; `updateExtent` then grants more room, so that margin is already stale by the end of this same commit and
+  // the NEXT commit of any kind withdraws it. Measured: the page moves 536.70 px on a bare commit at the same scale
+  // with no gesture behind it at all, which is why it snaps "no matter what" rather than only at a lift.
+  //
+  // Recomputed here against the grant this commit just made, BEFORE the frame is presented, so no stale margin is ever
+  // carried out of a commit and there is usually nothing left to pay. What the page was actually showing - the last
+  // commit's final margin - is what the debt below is measured against.
+  this.restColumnAgainstCurrentGrant(next,effective);
+  // THE PAGE BOX INSIDE THE PANE, folded into this commit's own scroll target once the box and the extent are
+  // written, because it is read off both. Written back onto `target` deliberately: this commit has four scroll
+  // writes (here, the settle measure's re-anchor, and the two convergence retries) and they all write the same
+  // target, so a correction applied to one alone would be handed straight back by the next.
+  target.left=this.ownLinesPageBoxScrollLeft(next,effective,target.left);
+  target.left=this.columnMarginDebtScrollLeft(effective,target.left);
+  // A FITTING COLUMN SETTLES ON ITS REST, AND THE REST IS NOT A SCROLL - the same law the pinch settle
+  // already takes one screen up, on the same predicate and with no new term. Where `columnRestPan` is
+  // non-null the column has an inset to rest in and the page fits the pane, and the margin this commit
+  // just wrote IS that rest; a scroll standing from before the commit then displaces the page by its
+  // whole width. Measured on Fit with ink wider than the page, Readable line length on, at k 0.2192:
+  // the margin was the rest to the last digit (41.07033029241483) while scrollLeft stood at 301.03, and
+  // the column landed at 243.00 against a pane edge of 300 - 57 px of it off the screen, with the ink's
+  // left edge off with it. Zeroing the scroll puts it at 309.00, which is where centring wants it.
+  // NOT carried as pan: a fitting page left panned by a stale scroll is the standing-pan class that was
+  // already closed elsewhere, and the rest belongs in the margin, which now holds it.
+  // s121 add. 6: the fit predicate itself, now that there is no centred rest to stand in for it.
+  if (this.columnFitsPane(next, effective)) target.left = 0;
+  this.setViewportScroll(target.left,target.top);this.reanchorPan();
   // The target scroll can leave the old raster band, especially on zoom-out.
   // Finish its coverage before the router can map and lock the next pen down.
   if(this.syncBand()!=="none")this.handleResize();
@@ -6682,8 +9139,12 @@ export class InkOverlayPlugin {
    const geometry=()=>[this.panX(),this.panY(),this.view.scrollDOM.scrollLeft,this.view.scrollDOM.scrollTop,this.view.scrollDOM.scrollWidth,this.view.scrollDOM.scrollHeight,this.view.contentHeight,this.view.viewport.from,this.view.viewport.to];
    const measure={key:this,read:()=>owns()&&matchesScroll()?geometry():null,write:(before:number[]|null)=>{
     if(!before||!owns()||!matchesScroll()){finish();return;}
-    this.handleResize();this.updateExtent(true,hold?.expansion??undefined);this.setViewportScroll(target.left,target.top);this.reanchorPan();
-    if(this.syncBand()!=="none")this.handleResize();
+    // The hold's own consumer re-anchoring: a commit its resize triggers is nested
+    // too. Load-bearing: this write runs inside CodeMirror's measure (its update
+    // phase), where a carried commit's dispatch would throw; do not remove.
+    this.commitDepth=(this.commitDepth||0)+1;
+    try{this.handleResize();this.updateExtent(true,hold?.expansion??undefined);this.setViewportScroll(target.left,target.top);this.reanchorPan();
+    if(this.syncBand()!=="none")this.handleResize();}finally{this.commitDepth--;}
     this.scheduleRepaint();
     const after=geometry();
     hold.ready=after.every((value,index)=>value===before[index]);
@@ -6695,6 +9156,11 @@ export class InkOverlayPlugin {
      // recognizable so draining it cannot perform default scrolling.
      if(++hold.attempts>=4){hold.outcome="failed";console.warn("Pinch geometry did not converge");finish();}
      else this.view.requestMeasure(measure);
+    } else {
+     // Load-bearing: nothing else calls finish() on this path. Without this,
+     // the reload gate this commit opened above never closes after a
+     // converged pinch settle.
+     settled();
     }
    }};
    this.view.requestMeasure(measure);
@@ -6729,6 +9195,7 @@ export class InkOverlayPlugin {
   }
   this.mobileTools?.refresh();
   return true;
+  } finally { this.commitDepth--; }
  }
 
 	private showPenCursor(sample: PenSample, pointerType?: string): void {
@@ -7247,8 +9714,8 @@ export class InkOverlayPlugin {
 		// reason: the hardware and pen-seen claims belong to the hover and the
 		// pen-down that already happened. `mouseStroke` answers for a mouse.
 		this.showPenCursor({
-			x: visualToNote(ev.clientX - rect.left - this.inkPanX(), this.cssScale),
-			y: visualToNote(ev.clientY - rect.top - this.inkPanY(), this.cssScale),
+			x: visualToNote(ev.clientX - rect.left - this.inkInputPanX(), this.cssScale),
+			y: visualToNote(ev.clientY - rect.top - this.inkInputPanY(), this.cssScale),
 			pressure: 0,
 			timestamp: ev.timeStamp,
 			tiltX: 0,
@@ -8384,7 +10851,7 @@ export class InkOverlayPlugin {
 		}
 		this.restorePinchLayers();
 		if (!this.container) return;
-		// UNDER THE HOLD (D-COV, RULING-4 AD-4 i): no band move, no reallocation,
+		// UNDER THE HOLD (D-COV): no band move, no reallocation,
 		// no camera re-base, no offset clearing. The raster keeps the basis the
 		// preview translate was solved against, and damage that arrived
 		// mid-gesture (a stroke committing) paints into the retained backing at
@@ -8421,7 +10888,9 @@ export class InkOverlayPlugin {
 			// A settled pan must move ink within the bounded raster, not move
 			// every canvas away from part of the writable editor. Change the
 			// camera and input origin together, then redraw all affected layers.
-			this.rasterPan = { x: this.panX() / this.cssScale, y: this.panY() / this.cssScale };
+			// The rest, not a bounce passing through: the ink layer's translate carries the bounce, and baking each of its
+			// frames would re-raster the world a dozen times for an animation that ends where it began.
+			this.rasterPan = { x: this.restPanX() / this.cssScale, y: this.restPanY() / this.cssScale };
 			this.writeInkLayerTransform();
 			this.wet.clear(this.cssWidth, this.cssHeight);
 			this.highlightWet.clear(this.cssWidth, this.cssHeight);
@@ -8549,7 +11018,7 @@ export class InkOverlayPlugin {
 			scrollTop: scroller.scrollTop,
 			clientWidth: scroller.clientWidth,
 			clientHeight: scroller.clientHeight,
-			scrollWidth: scroller.scrollWidth,
+			scrollWidth: this.bandFreeScrollWidth ?? scroller.scrollWidth,
 			scrollHeight: scroller.scrollHeight,
 			// The band's margin is headroom for a fling, and a fling is measured
 			// in the px the reader sees. Below 1.0 the host is counter-sized, so
@@ -8573,6 +11042,7 @@ export class InkOverlayPlugin {
 			return this.carryBandUnderLock(want);
 		}
 		this.bandSyncDeferred = false;
+		this.bandFreeScrollWidth = null;
 		if (!bandNeedsMove(this.band, viewport)) return "none";
 		const band = bandFor(viewport);
 		// A SIZE change has to reach handleResize, and the ResizeObserver will
@@ -8707,13 +11177,13 @@ export class InkOverlayPlugin {
 		// for a whole gesture (1.4.6 §5n).
 		const writtenOn = inlineInk.strokes(path).length > 0 || penSeenThisSession();
 		const scroller = this.view.scrollDOM;
-		const expansion = this.scrollExpansion ?? (scrollExpansionEnabled ? (this.scrollExpansion = new ScrollExpansionDemand()) : null);
-		const scrollRevision = expansion?.sample(path, scrollExpansionEnabled, scroller.scrollLeft, scroller.scrollTop) ?? 0;
+		const expansion = this.scrollExpansion ?? (this.canvasMode ? (this.scrollExpansion = new ScrollExpansionDemand()) : null);
+		const scrollRevision = expansion?.sample(path, this.canvasMode, scroller.scrollLeft, scroller.scrollTop) ?? 0;
 		const inputs: ExtentInputs = {
 			scrollRevision,
 			granted: surfaceExtents.get(path),
 			path,
-			frontier: this.frontierCache.get(path, inlineInk.strokes(path)),
+			frontier: (() => { const f = this.frontierCache.get(path, inlineInk.strokes(path)); this.pageInkX = f.x; return f; })(),
 			writtenOn,
 			camX: cam.x,
 			camY: cam.y,
@@ -8747,6 +11217,9 @@ export class InkOverlayPlugin {
 			scrollTop: scroller.scrollTop,
 			scale: this.cssScale,
 		});
+		// The paper's phase follows this origin: read here, where the extent has
+		// already paid for the layout, and never on a preview frame.
+		this.capturePaperOrigin(origin.top, origin.left);
 		const ink = inputs.frontier;
 		// Shared with writeFrontier below - both need the same document-bottom
 		// number and neither may re-read layout to get it.
@@ -8782,7 +11255,7 @@ export class InkOverlayPlugin {
 					fontZoom: this.fontZoom,
 				})
 			: ZERO_EXTENT;
-		const scroll = scrollExpansionEnabled && expansion ? expansion.reserve({
+		const scroll = this.canvasMode && expansion ? expansion.reserve({
 			left: scroller.scrollLeft, top: scroller.scrollTop,
 			nativeWidth: scroller.clientWidth, nativeHeight: scroller.clientHeight,
 			width: scroller.clientWidth,
@@ -8790,10 +11263,20 @@ export class InkOverlayPlugin {
 			edgeX: scroller.scrollWidth, edgeY: scroller.scrollHeight,
 			origin, fontZoom: this.fontZoom, pinchScale: this.pinchScaleNow,
 		}, navigation) : ZERO_EXTENT;
-		const granted = surfaceExtents.grow(path, {
-			x: Math.max(ink.x, zoom.x, scroll.x),
+		// Sideways room is the ink's to ask for only when it reaches past the pane,
+		// unless Infinite Canvas is on (inkClaimX).
+		const inkX = inkClaimX({
+			frontierX: ink.x,
+			originLeft: origin.left,
+			clientWidth: scroller.clientWidth,
+			fontZoom: this.fontZoom,
+			infiniteCanvas: this.canvasMode,
+		});
+		const grown = surfaceExtents.grow(path, {
+			x: Math.max(inkX, zoom.x, scroll.x),
 			y: Math.max(ink.y, zoom.y, write.y, scroll.y),
 		});
+		const granted = this.shrinkSideways(path, ink, grown, Math.max(inkX, zoom.x), origin.left, scroller, force);
 		if (!this.spacer && granted.x === 0 && granted.y === 0) return;
 		if (!this.spacer) {
 			if (this.winRef.getComputedStyle(scroller).position === "static") {
@@ -8830,6 +11313,19 @@ export class InkOverlayPlugin {
 			moved = true;
 		}
 		if (moved) scrollProbeExtent(`spacer -> (${pos.left},${pos.top})`);
+		// s192: the grant is one of the box's two size terms, so it follows the spacer - only when the spacer moved,
+		// which is not a scrolled frame.
+		if (moved) this.syncGridPaperBox();
+		// The grant shrank since this editor's last pass, here or in another pane
+		// showing the note. Not on first sight of a note: a note switch is not a shrink.
+		const shrinks = surfaceExtents.shrinkCount(path), shrinksSeen = this.shrinksSeen.get(path);
+		this.shrinksSeen.set(path, shrinks);
+		// AND AFTER A SCALE COMMIT, whether or not the grant moved: the band's margin is sized for the viewport it was
+		// pinned in, so a zoom-out pins it for the counter-sized one and the settle back used to leave that margin holding
+		// range nothing had granted (measured on a blank note, 100 -> 25 -> 100: 200 px of it, with the grant 0 throughout).
+		const releaseAfterCommit = this.bandMarginReleasePending;
+		this.bandMarginReleasePending = false;
+		if ((shrinksSeen !== undefined && shrinks !== shrinksSeen) || releaseAfterCommit) this.releaseBandMargin(scroller, pos.left + 1);
 		// RP-4, SECOND OF TWO: the spacer's own demand, which can exceed the
 		// scroll height the browser has applied so far. Growth is monotonic and
 		// idempotent, so the two calls cannot fight; between them the ladder
@@ -8867,6 +11363,102 @@ export class InkOverlayPlugin {
 		// the one case that does.
 		this.ensureScrollableAxis(scroller);
 		if (moved || !this.lastReach) this.measureReach(scroller, pos.left + 1);
+	}
+
+	/**
+	 * The x grant comes back down to what the ink and the zoom still need, when
+	 * one is due: ink was removed (erase, lasso delete, Delete all ink, an undo),
+	 * noticed here as the frontier getting smaller, which writing never does, so
+	 * the chunked growth that keeps a scrollbar from pumping per stroke is
+	 * untouched; or Infinite Canvas was turned off (setScrollExpansionEnabled),
+	 * which takes back the room scrolling had demanded.
+	 *
+	 * Never under what is on screen: not in this editor, and not in any other
+	 * editor showing the note, since the grant is the note's and every pane's
+	 * spacer follows it. The part off to the right of every view goes now; the
+	 * rest stays due until the views move left or a later pass finds it clear.
+	 * The vertical grant is not touched. While Infinite Canvas is on nothing
+	 * shrinks: the grant holds room scrolling demanded, which no frontier knows.
+	 *
+	 * WHEN. A shrink takes its first step at the pass that made it due, which
+	 * follows the removal or the setting. What a view held back steps again only
+	 * at the end of a gesture: a forced pass (a pen, pan, space or pinch
+	 * settle), or once a scroll has been quiet for SHRINK_SCROLL_IDLE_MS. Never
+	 * on a scrolled frame, so a scroll in progress never has its range move.
+	 */
+	private shrinkSideways(path: string, ink: Extent, granted: Extent, neededX: number, originLeft: number, scroller: HTMLElement, force: boolean): Extent {
+		const seen = this.extentFrontierSeen.get(path);
+		if (seen !== undefined && ink.x < seen) surfaceExtents.oweShrinkX(path);
+		this.extentFrontierSeen.set(path, ink.x);
+		this.sidewaysView = { path, scrollLeft: scroller.scrollLeft, clientWidth: scroller.clientWidth, originLeft, fontZoom: this.fontZoom };
+		const due = surfaceExtents.shrinkDue(path);
+		if (due === undefined) return granted;
+		if (this.canvasMode) {
+			surfaceExtents.settleShrinkX(path);
+			return granted;
+		}
+		if (this.shrinkStepped.get(path) === due && !force) return granted;
+		this.shrinkStepped.set(path, due);
+		let floor = 0;
+		for (const p of instances) {
+			const view = p.sidewaysView;
+			if (view && view.path === path) floor = Math.max(floor, onScreenFloorX(view));
+		}
+		const shrunk = shrunkAxis(granted.x, neededX, floor);
+		if (shrunk.complete) surfaceExtents.settleShrinkX(path);
+		if (shrunk.value === granted.x) return granted;
+		scrollProbeExtent(`x grant ${granted.x} -> ${shrunk.value}${shrunk.complete ? "" : " (held by a view)"}`);
+		const next = surfaceExtents.shrinkX(path, shrunk.value);
+		// Every other pane showing the note moves its spacer to the new grant.
+		for (const p of instances) if (p !== this && p.filePath() === path) p.scheduleRepaint("extent-shrink");
+		return next;
+	}
+
+	/** Take a held shrink's next step once the scroll has been quiet a moment; re-armed by every scroll event. */
+	private shrinkWhenScrollIsQuiet(): void {
+		if (this.shrinkIdleTimer !== null) this.winRef.clearTimeout(this.shrinkIdleTimer);
+		this.shrinkIdleTimer = this.winRef.setTimeout(() => {
+			this.shrinkIdleTimer = null;
+			const path = this.filePath();
+			if (this.view?.dom?.isConnected && path && surfaceExtents.owesShrinkX(path)) this.updateExtent(true);
+		}, SHRINK_SCROLL_IDLE_MS);
+	}
+
+	/**
+	 * The band is an absolutely positioned child of the scroller too, and while
+	 * the range was wider it took a sideways margin (bandFor) reaching past where
+	 * the spacer now stands. After a shrink that margin alone holds the range at
+	 * the band's right edge, and every band sync reads back the range it is
+	 * holding up and keeps it: measured, a note scrolled home after its far ink
+	 * was deleted kept a margin's width of sideways scroll for good. So measure
+	 * the range once without the band's margin and let the next sync place the
+	 * band against that. Only on the first pass after the note's grant shrank,
+	 * never on a scroll.
+	 *
+	 * NOT FOR ANY OTHER SPACER MOVE. A spacer that moved left for another reason
+	 * is left to the band, as before: on the note-switch lifecycle cell in
+	 * ScrollColumnAnchorPinch (10 percent) a switch moved the spacer's right edge
+	 * to 342 px against a 1383 px view, a release there re-pinned the band to the
+	 * view's own width, and the band stopped covering the pane.
+	 *
+	 * And never when the range without the band would end short of the view,
+	 * which layout would answer by clamping scrollLeft. A shrink never does that
+	 * (onScreenFloorX); this is the guard that it stays so.
+	 *
+	 * The band is slid left, not hidden, so its right edge meets the spacer while
+	 * its size and top stay put: the range read is everything else's, and the
+	 * vertical range, which the band's bottom can touch, is not disturbed.
+	 */
+	private releaseBandMargin(scroller: HTMLElement, spacerRight: number): void {
+		const band = this.band, container = this.container;
+		if (!band || !container || band.left + band.width <= Math.max(scroller.clientWidth, spacerRight)) return;
+		if (Math.max(scroller.clientWidth, spacerRight) < scroller.scrollLeft + scroller.clientWidth) return;
+		container.setCssStyles({ left: `${spacerRight - band.width}px` });
+		const free = scroller.scrollWidth;
+		container.setCssStyles({ left: `${band.left}px` });
+		this.bandFreeScrollWidth = free;
+		scrollProbeExtent(`band margin released: range without the band ${free}`);
+		this.scheduleRepaint("extent-shrink");
 	}
 
 	private ensureScrollableAxis(scroller: HTMLElement): void {
@@ -8925,9 +11517,13 @@ export class InkOverlayPlugin {
 }
 
 const inkOverlayPlugin = ViewPlugin.fromClass(InkOverlayPlugin, {
-	provide: plugin => EditorView.editorAttributes.of(view =>
-		view.plugin(plugin)?.ownsNoteViewport() ? { class: "handwriting-note-viewport" } : null
-	),
+	provide: plugin => EditorView.editorAttributes.of(view => {
+		const overlay = view.plugin(plugin);
+		if (!overlay?.ownsNoteViewport()) return null;
+		// BOTH tokens, because this facet is the host's class attribute: CodeMirror writes it whole on every update and
+		// anything not named here is dropped. See `noteViewportOwnLines`.
+		return { class: overlay.noteViewportOwnLines() ? "handwriting-note-viewport handwriting-note-viewport-own-lines" : "handwriting-note-viewport" };
+	}),
 });
 
 // Obsidian's ordinary editor keymap also handles Delete and Backspace. Put

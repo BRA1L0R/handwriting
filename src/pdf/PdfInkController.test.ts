@@ -1210,6 +1210,151 @@ describe("pan and space on a pdf", () => {
 	});
 });
 
+// "no ink on the page to erase/select" fires once per PAGE, not once per
+// contact, ruled 2026-09-14 - the note surface's own bug
+// (EmptyPageNotice.ts) reached the PDF controller, which never adopted the
+// gate. Two real pages (3 and 4, stacked so a real page hit-test picks
+// between them) so per-page scoping - not just per-file - is what is tested;
+// a single-page rig cannot tell a composite key from an unscoped one.
+describe("PDF empty-page notice fires once per page, not once per contact", () => {
+	let ops: InkOp[];
+	let notices: string[];
+	let strokes: InkStroke[];
+	let documentId: string | null;
+	let pen: { penDown(s: PenSample, ev?: unknown): void; penRaw(s: PenSample[]): void; penUp(): void };
+	let controller: PdfInkController;
+
+	beforeEach(() => {
+		resetTipModeForTest();
+		ops = [];
+		notices = [];
+		strokes = [];
+		documentId = "doc-1";
+		const sc = { scrollLeft: 0, scrollTop: 0, classList: { add: () => {}, remove: () => {} }, querySelector: () => null };
+		probe.current = {
+			scroller: sc,
+			scaleFactor: SCALE,
+			scaleSource: "test",
+			// Page 3 spans content y 0-800, page 4 spans 800-1600 - a sample at
+			// y=200 hits page 3, a sample at y=1000 hits page 4, scroller at 0.
+			pages: [
+				{ pageNumber: 3, leftPx: 0, topPx: 0, widthPx: 600, heightPx: 800, hasCanvas: true },
+				{ pageNumber: 4, leftPx: 0, topPx: 800, widthPx: 600, heightPx: 800, hasCanvas: true },
+			],
+		};
+		const win = { devicePixelRatio: 1, clearTimeout: () => {}, setTimeout: () => 0, requestAnimationFrame: () => 0 };
+		controller = new PdfInkController(
+			{} as HTMLElement,
+			win as unknown as Window,
+			(page) => strokes.filter((st) => (st.page ?? 1) === page),
+			() => documentId,
+			() => strokes,
+			(op) => ops.push(op),
+			() => {},
+			(message) => notices.push(message)
+		);
+		pen = controller as unknown as typeof pen;
+		(controller as unknown as { boundScroller: unknown }).boundScroller = sc;
+	});
+
+	const eraseAt = (y: number) => { setTipMode("eraser"); pen.penDown(sample(200, y)); pen.penRaw([sample(210, y + 10)]); pen.penUp(); };
+
+	it("three erase gestures on an empty page produce ONE notify, not three", () => {
+		eraseAt(200); eraseAt(200); eraseAt(200);
+		expect(notices).toEqual(["Handwriting: no ink on the page to erase"]);
+	});
+
+	it("a different empty page gets its own notify - per-page, not per-file", () => {
+		eraseAt(200); // page 3, claims it
+		eraseAt(1000); // page 4, its own episode
+		expect(notices).toEqual(["Handwriting: no ink on the page to erase", "Handwriting: no ink on the page to erase"]);
+	});
+
+	it("ink arriving on a claimed page re-arms it; ink leaving again does not re-notify until it is claimed again", () => {
+		eraseAt(200); // page 3 empty, claims and notifies once
+		strokes = [{ ...inkAt("s1"), page: 3 }];
+		eraseAt(200); // page 3 now has ink: no notify, and this re-arms the episode
+		expect(notices).toEqual(["Handwriting: no ink on the page to erase"]);
+		strokes = []; // erased again, page 3 empty once more
+		eraseAt(200); // re-armed, so this is news again
+		expect(notices).toEqual(["Handwriting: no ink on the page to erase", "Handwriting: no ink on the page to erase"]);
+	});
+
+	// The gesture-start re-arm above is
+	// a belt, not the only re-arm - ink that arrives and leaves again BETWEEN
+	// gestures (undo, another pane, a sync), with no erase or lasso gesture
+	// in between to notice it, must still be forgotten the moment refresh()
+	// reports "the ink changed underneath us", or the eraser's next verdict
+	// on that now-empty page is stale.
+	// refresh() runs on every undo,
+	// paste, other-pane commit and sync, so it must not filter every page's
+	// strokes when nothing is claimed - only claimedPages is ever walked.
+	it("refresh() with no claimed pages does no per-page stroke filtering at all", () => {
+		let strokesCalls = 0;
+		const spiedController = new PdfInkController(
+			{} as HTMLElement,
+			{ devicePixelRatio: 1, clearTimeout: () => {}, setTimeout: () => 0, requestAnimationFrame: () => 0 } as unknown as Window,
+			(page) => { strokesCalls++; return strokes.filter((st) => (st.page ?? 1) === page); },
+			() => documentId,
+			() => strokes,
+			(op) => ops.push(op),
+			() => {},
+			(message) => notices.push(message)
+		);
+		strokesCalls = 0; // discard any calls the constructor itself made
+		spiedController.refresh();
+		expect(strokesCalls).toBe(0);
+	});
+
+	it("refresh() (ink changed with no gesture) re-arms a claimed page too, not only a gesture start", () => {
+		eraseAt(200); // page 3 empty, claims and notifies once
+		strokes = [{ ...inkAt("s1"), page: 3 }];
+		controller.refresh(); // ink arrived with NO erase/lasso gesture in between
+		strokes = []; // and left again (undo, another pane, a sync) - still no gesture
+		eraseAt(200); // re-armed by refresh(), so this is news again
+		expect(notices).toEqual(["Handwriting: no ink on the page to erase", "Handwriting: no ink on the page to erase"]);
+	});
+
+	it("unmount (the note surface's file-switch/teardown site) forgets every page", () => {
+		eraseAt(200);
+		expect(notices).toEqual(["Handwriting: no ink on the page to erase"]);
+		controller.unmount();
+		eraseAt(200);
+		expect(notices).toEqual(["Handwriting: no ink on the page to erase", "Handwriting: no ink on the page to erase"]);
+	});
+
+	it("lasso on an empty page also fires once per page, same gate", () => {
+		const lassoAt = (y: number) => { setTipMode("lasso"); pen.penDown(sample(200, y)); pen.penRaw([sample(260, y)]); pen.penRaw([sample(260, y + 60)]); pen.penRaw([sample(200, y + 60)]); pen.penUp(); };
+		lassoAt(200); lassoAt(200);
+		expect(notices).toEqual(["Handwriting: no ink on the page to select"]);
+	});
+
+	// The gate's own contract (EmptyPageNotice.ts): a null path never speaks
+	// and never RECORDS, because there is no key that would later be
+	// forgotten. `documentId() ?? ""` would have broken that - every
+	// unidentified document reduces to the same "#3" key, so the first one to
+	// touch page 3 would speak and silently arm the key for every other
+	// unidentified document that ever touches page 3.
+	//
+	// NOT reachable through a real gesture: `penDown`'s own `!this.documentId()`
+	// guard (above every call site) already returns "still identifying this
+	// PDF" before an erase or lasso branch runs, so a real pen never lets
+	// `sayIfPageEmpty` see a null id today (confirmed - driving `eraseAt` with
+	// `documentId = null` here produces that OTHER notice, not this method at
+	// all, so it cannot be this method's red/green proof). This is a contract
+	// test on the method directly: `sayIfPageEmpty` must hold its own
+	// invariant regardless of what happens to call it, now or later.
+	it("sayIfPageEmpty never speaks or records for a null document id (contract, not gesture-reachable today)", () => {
+		documentId = null;
+		(controller as unknown as { sayIfPageEmpty(page: number, kind: "erase" | "select"): void }).sayIfPageEmpty(3, "erase");
+		(controller as unknown as { sayIfPageEmpty(page: number, kind: "erase" | "select"): void }).sayIfPageEmpty(3, "erase");
+		expect(notices).toEqual([]);
+		documentId = "doc-1";
+		(controller as unknown as { sayIfPageEmpty(page: number, kind: "erase" | "select"): void }).sayIfPageEmpty(3, "erase");
+		expect(notices).toEqual(["Handwriting: no ink on the page to erase"]);
+	});
+});
+
 describe("the scale a pointer sample is converted with", () => {
 	// The offset this prevents: input converted with `--scale-factor` while
 	// the ink was drawn at the box's own scale. Settled, the two agree and
@@ -1506,7 +1651,7 @@ describe("PdfInkController pen reticle - mode-specific looks", () => {
  * THE PAN IS THE EXCEPTION NOW, and its case in here is the inverse of the
  * other two. 1.4.12 ruled that a pan drag paints no reticle at all
  * (`penReticleShown`, PenCursor.ts) and wears the grabbing hand instead; the
- * pdf surface was left behind by that fix and reviewer finding F4 said so
+ * pdf surface was left behind by that fix, as the design notes say
  * (1.4.12-design §11). So where lasso and space assert that the ring SURVIVES
  * the drag, the pan asserts that it goes away once, stays away for every
  * batch, and that something is under the hand in its place the whole time.

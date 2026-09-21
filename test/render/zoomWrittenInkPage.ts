@@ -2,7 +2,7 @@ import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { history } from "@codemirror/commands";
 import { Platform } from "obsidian";
-import { inlineInk, inkOverlayExtension, overlayForPath, setScrollExpansionEnabled, inlineReloadCandidates, inkExternallyReloaded } from "../../src/inline/InkOverlay";
+import { inlineInk, inkOverlayExtension, overlayForPath, setScrollExpansionEnabled, inlineReloadCandidates, captureInlineReloadAdmission, inkExternallyReloaded } from "../../src/inline/InkOverlay";
 import { notifyInkChanged } from "../../src/inline/InkEvents";
 import { PageStore } from "../../src/persistence/PageStore";
 import { FakeAdapter } from "../../src/persistence/FakeAdapter";
@@ -394,7 +394,7 @@ async function lateSidecar(installPoll: Function) {
  const errors:unknown[]=[];
  installPoll.call({store,pdfStore:{},pdfInk:new Map(),pdfIds:new Map(),pollStats:{ticks:0,hidden:0,spaced:0,checks:0},registerInterval(){}},
   {setInterval(fn:()=>void){callback=fn;return 1;}},document,(p:Promise<void>)=>{pending=p;},inlineReloadCandidates,inlineInk,
-  inkExternallyReloaded,notifyInkChanged,()=>null,async()=>false,{error:(...args:unknown[])=>errors.push(args.map(String))});
+  inkExternallyReloaded,notifyInkChanged,()=>null,async()=>false,{error:(...args:unknown[])=>errors.push(args.map(String))},captureInlineReloadAdmission);
  const eligible=inlineReloadCandidates().includes(path);
  callback();await pending;
  adapter.externalWrite(`handwriting/${id}.json`,saved);

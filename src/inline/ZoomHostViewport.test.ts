@@ -38,7 +38,36 @@ const dashed = (name: string): string => name.replace(/[A-Z]/g, (c) => `-${c.toL
  * declaration behind both, so this keeps one map behind both - which is the
  * whole point of the teardown arm below.
  */
-function element(extra: Fields = {}): Fields & { props: Styles; priorities: Styles; calls: Styles[] } {
+/**
+ * The fake host's `classList`, backed by a real token set so `contains` answers
+ * what was actually written. `classWrites` logs every call - a guarded write
+ * that correctly does nothing leaves no entry, which is how the arms below tell
+ * "the class is right" from "the class was written again".
+ */
+function tokenList(classes: Set<string>, writes: string[]): Record<string, unknown> {
+	return {
+		add: (...tokens: string[]): void => {
+			writes.push(`add:${tokens.join(" ")}`);
+			for (const token of tokens) classes.add(token);
+		},
+		remove: (...tokens: string[]): void => {
+			writes.push(`remove:${tokens.join(" ")}`);
+			for (const token of tokens) classes.delete(token);
+		},
+		contains: (token: string): boolean => classes.has(token),
+		toggle: (token: string, on?: boolean): boolean => {
+			writes.push(`toggle:${token}`);
+			const want = on ?? !classes.has(token);
+			if (want) classes.add(token);
+			else classes.delete(token);
+			return want;
+		},
+	};
+}
+
+function element(extra: Fields = {}): Fields & { props: Styles; priorities: Styles; calls: Styles[]; classes: Set<string>; classWrites: string[] } {
+	const classes = new Set<string>();
+	const classWrites: string[] = [];
 	const props: Styles = {};
 	const priorities: Styles = {};
 	const calls: Styles[] = [];
@@ -46,7 +75,17 @@ function element(extra: Fields = {}): Fields & { props: Styles; priorities: Styl
 		props,
 		priorities,
 		calls,
-		classList: { add: () => undefined, remove: () => undefined },
+		// A REAL token set, not a hardwired `contains: () => false`. Both class writes in `applyViewportBox` are guarded -
+		// the viewport token is added only when missing, the own-lines token toggled only when it differs - because an add
+		// or a toggle of a token that is already right still queues a class mutation record, and the viewport style
+		// observer then stamps on every preview frame. A stub that always answers false makes both guards take their write
+		// branch every time, so it cannot tell a guarded write from an unguarded one; it also failed as a bare TypeError
+		// the moment production reached for `toggle`, a member nobody had stubbed. Same shape as the fake elements in
+		// MobileTools.test.ts and FoldOrderControl.test.ts. `classWrites` records every CALL, not every change, which is
+		// what the guards actually suppress.
+		classes,
+		classWrites,
+		classList: tokenList(classes, classWrites),
 		style: {
 			setProperty(name: string, value: string, priority = ""): void {
 				props[name] = value;
@@ -137,7 +176,21 @@ function rig(supported: boolean | null, baseTransform = "none", themeZoom?: stri
 		view: {
 			dom: host,
 			contentDOM: { offsetWidth: 700 },
-			scrollDOM: { scrollLeft: 0, scrollTop: 0 },
+			// A SCROLLER PRODUCTION MEASURES, not a pair of scroll offsets. Both the layout capture
+			// (InkOverlay.ts, `prepareViewportLayout`) and `applyViewportBox` read the painted scrollbar
+			// off this element - `getBoundingClientRect().width`, `offsetWidth` and `clientWidth` - and a
+			// stub carrying only the offsets threw a bare TypeError the moment either ran, exactly as the
+			// class list above did when production first reached for `toggle`. Same fix, same shape as
+			// ZoomFloorLock.test.ts's own scroller stub.
+			// NO SCROLLBAR HERE, deliberately: `clientWidth` equals `offsetWidth` equals the rect's width,
+			// so the gutter this rig reports is 0 - which is what these arms measured before the read
+			// existed, and keeps every box write below asking about the box rather than about a scrollbar
+			// the rig never painted. The gutter's own behaviour belongs with the suites that vary it.
+			scrollDOM: {
+				scrollLeft: 0, scrollTop: 0,
+				offsetWidth: 640, clientWidth: 640,
+				getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 480 }),
+			},
 		},
 		// Class FIELDS do not run under Object.create, so every field the
 		// paths below read is set here rather than assumed.
@@ -156,6 +209,11 @@ function rig(supported: boolean | null, baseTransform = "none", themeZoom?: stri
 		viewportStyleDirty: null,
 		viewportStyleFrame: 0,
 		pinchPreview: false,
+		// Class FIELDS do not run under Object.create (see above), and the preview branch reads this
+		// one: production initialises it to the same zeroes (InkOverlay.ts, `paperSnapResidual`), so a
+		// frame with no snap residual writes no paper pan. Seeded here because an arm that puts the
+		// fingers down reaches it, and a missing field is a bare TypeError rather than a verdict.
+		paperSnapResidual: { x: 0, y: 0 },
 		rasterColumnLocal: null,
 		previewAnchorStale: false,
 		viewportLayout: {
@@ -177,8 +235,11 @@ function rig(supported: boolean | null, baseTransform = "none", themeZoom?: stri
 			styles: new Map<string, { value: string; priority: string }>(),
 		},
 		// The column scan is a neighbouring measurement with its own suites;
-		// these arms are about the box write and the save list.
+		// these arms are about the box write and the save list. Takeover takes
+		// it through `measureNaturalColumn`; stubbed to what the capture read
+		// from this rig before (contentDOM's width and margins, no column).
 		columnLocalAt: () => null,
+		measureNaturalColumn: () => ({ column: 700, left: "24px", right: "24px", columnLocal: null, columnAuto: null }),
 		releaseMeasures: () => undefined,
 		clearViewportPan: () => undefined,
 		clearPreviewInkOffset: () => undefined,
@@ -197,11 +258,23 @@ function prepare(overlay: Fields): void {
 	overlay.viewportPaneObserver = { disconnect: () => undefined };
 	expect((overlay as { prepareViewportLayout(): boolean }).prepareViewportLayout()).toBe(true);
 }
-const layoutOf = (overlay: Fields): { baseZoom?: number; zoomVerified?: boolean; styles: Map<string, { value: string; priority: string }> } =>
-	overlay.viewportLayout as { baseZoom?: number; zoomVerified?: boolean; styles: Map<string, { value: string; priority: string }> };
+const layoutOf = (overlay: Fields): { baseZoom?: number; zoomVerified?: boolean; ownLines?: boolean; styles: Map<string, { value: string; priority: string }> } =>
+	overlay.viewportLayout as { baseZoom?: number; zoomVerified?: boolean; ownLines?: boolean; styles: Map<string, { value: string; priority: string }> };
 type Inline = { setProperty(n: string, v: string, p?: string): void; getPropertyPriority(n: string): string };
 const inline = (host: ReturnType<typeof element>): Inline => host.style as Inline;
 const supportedNow = (overlay: Fields): boolean => (overlay as { hostZoomSupported(): boolean }).hostZoomSupported();
+/**
+ * WHICH ELEMENT WAS ASKED, not how many asks there were.
+ *
+ * These counts are about ONE question - how often the host's own zoom is read back - and a bare
+ * call count answers a different one the moment production reads a computed style off anything
+ * else. It does: the scrollbar measurement d88a5fac added reads the SCROLLER's computed style,
+ * once per settle, guarded by `pinchPreview` so no preview frame pays for it (InkOverlay.ts,
+ * `applyViewportBox`). Counting every call made the host cells red on a scroller read they were
+ * never asking about. Split by element, so each cell says which read it is pinning.
+ */
+const readsOf = (reads: { mock: { calls: unknown[][] } }, el: unknown): number =>
+	reads.mock.calls.filter(call => call[0] === el).length;
 
 describe("applyViewportBox: zoom where the engine has it", () => {
 	it("writes the counter-sized box, `zoom`, and no scale transform when zoom is supported", () => {
@@ -368,14 +441,27 @@ describe("applyViewportBox: a zoom the host already had", () => {
 
 	it("reads the host's zoom back once per takeover, not once per frame", () => {
 		const { overlay, host } = rig(true, "none", "1.25");
+		const scroller = (overlay.view as { scrollDOM: unknown }).scrollDOM;
 		const win = (host.ownerDocument as { defaultView: Fields }).defaultView;
 		const real = win.getComputedStyle as (el?: unknown) => Record<string, string>;
 		const reads = vi.fn(real);
 		win.getComputedStyle = reads;
 		prepare(overlay);
-		const afterCapture = reads.mock.calls.length;
+		const hostAfterCapture = readsOf(reads, host), scrollerAfterCapture = readsOf(reads, scroller);
+		// A FRAME IS A PREVIEW FRAME. The rig sits at `pinchPreview: false`, which is a SETTLE - so a
+		// loop of five `apply` calls on the default rig was five settles wearing the word "frame", and
+		// it could not see a per-frame cost if one appeared. The fingers go down for the loop.
+		overlay.pinchPreview = true;
 		for (const k of [0.5, 0.4, 0.3, 0.2, 0.1]) apply(overlay, k);
-		expect(reads.mock.calls.length - afterCapture, "five frames, one verification read").toBe(1);
+		overlay.pinchPreview = false;
+		expect(readsOf(reads, host) - hostAfterCapture, "five frames, one verification read").toBe(1);
+		// THE SCROLLBAR READ IS THE SETTLE'S, AND ONLY THE SETTLE'S. It forces layout, so a frame that
+		// paid for it would be a per-frame forced layout on the pinch path: the thing `pinchPreview`
+		// guards against. Nothing is asserted about the read's VALUE here; the claim is its frequency.
+		expect(readsOf(reads, scroller) - scrollerAfterCapture, "no frame pays for the scrollbar measurement").toBe(0);
+		const beforeSettle = readsOf(reads, scroller);
+		apply(overlay, 0.1);
+		expect(readsOf(reads, scroller) - beforeSettle, "the settle measures it exactly once").toBe(1);
 	});
 });
 
@@ -644,12 +730,12 @@ describe("verification waits for a shrink that means something", () => {
 		const reads = vi.fn(real);
 		win.getComputedStyle = reads;
 		prepare(overlay);
-		const afterCapture = reads.mock.calls.length;
+		const afterCapture = readsOf(reads, host);
 		apply(overlay, 1);
-		expect(reads.mock.calls.length - afterCapture, "a unity write costs no read").toBe(0);
+		expect(readsOf(reads, host) - afterCapture, "a unity write costs no read").toBe(0);
 		// A pinch preview's frames, a return to 1, and more frames after it.
 		for (const k of [0.9, 0.5, 0.2, 0.1, 1, 0.3]) apply(overlay, k);
-		expect(reads.mock.calls.length - afterCapture, "one real verification, then none").toBe(1);
+		expect(readsOf(reads, host) - afterCapture, "one real verification, then none").toBe(1);
 	});
 });
 
@@ -698,11 +784,11 @@ describe("a unity write and a host whose own zoom is inline and important", () =
 		const win = (host.ownerDocument as { defaultView: Fields }).defaultView;
 		const reads = vi.fn(win.getComputedStyle as (el?: unknown) => Record<string, string>);
 		win.getComputedStyle = reads;
-		const before = reads.mock.calls.length;
+		const before = readsOf(reads, host);
 		apply(overlay, 1);
-		expect(reads.mock.calls.length - before, "a unity write reads nothing").toBe(0);
+		expect(readsOf(reads, host) - before, "a unity write reads nothing").toBe(0);
 		apply(overlay, 0.1);
-		expect(reads.mock.calls.length - before, "one verification, at the shrink").toBe(1);
+		expect(readsOf(reads, host) - before, "one verification, at the shrink").toBe(1);
 		// The important product out-specifies the sheet, so the zoom form holds.
 		expect(supportedNow(overlay), "no fallback: the write took").toBe(true);
 		expect(Number.parseFloat(computedZoom(host)), "1.25 * 0.1 on screen").toBeCloseTo(0.125, 12);
@@ -731,5 +817,55 @@ describe("a unity write and a host whose own zoom is inline and important", () =
 			expect(c.calls.at(-1), `canvas ${i} re-placed for the transform form`)
 				.toEqual({ width: "125px", height: "100px", transform: "scale(8)", transformOrigin: "0 0" });
 		}
+	});
+});
+
+/**
+ * THE TWO CLASS-MUTATION GUARDS IN `applyViewportBox`.
+ *
+ * `applyViewportBox` runs on every preview frame of a pinch. Both of its class
+ * writes are guarded - the viewport token is added only when it is missing, the
+ * own-lines token toggled only when it differs from the layout - because an add
+ * or a toggle of a token that is already correct STILL queues a class mutation
+ * record, and the viewport style observer then stamps on every frame for a class
+ * that never changed. That is a per-frame cost in the pinch hot path, so the
+ * guards are the point of the code, not a tidy-up.
+ *
+ * Nothing observed them until now: the fake host's `classList` hardwired
+ * `contains` to false, so both guards took their write branch on every frame and
+ * a removed guard read exactly the same. These arms count CALLS, not changes.
+ */
+describe("applyViewportBox: class writes only when the class changes", () => {
+	it("writes each token once and leaves both alone on an unchanged second frame", () => {
+		const { overlay, host } = rig(true);
+		layoutOf(overlay).ownLines = true;
+
+		apply(overlay, 0.5);
+		expect(host.classWrites, "first frame writes both tokens")
+			.toEqual(["add:handwriting-note-viewport", "toggle:handwriting-note-viewport-own-lines"]);
+		expect(host.classes.has("handwriting-note-viewport")).toBe(true);
+		expect(host.classes.has("handwriting-note-viewport-own-lines")).toBe(true);
+
+		host.classWrites.length = 0;
+		apply(overlay, 0.25);
+		// The box is still written - only the CLASSES are left alone.
+		expect(host.classWrites, "second frame changes no class, so it writes none").toEqual([]);
+		expect(host.props.zoom, "the frame did run").toBe("0.25");
+		expect(host.classes.has("handwriting-note-viewport")).toBe(true);
+		expect(host.classes.has("handwriting-note-viewport-own-lines")).toBe(true);
+	});
+
+	it("still toggles the own-lines token on the frame the layout's answer changes", () => {
+		const { overlay, host } = rig(true);
+		layoutOf(overlay).ownLines = false;
+		apply(overlay, 0.5);
+		expect(host.classes.has("handwriting-note-viewport-own-lines"), "false needs no token").toBe(false);
+
+		host.classWrites.length = 0;
+		layoutOf(overlay).ownLines = true;
+		apply(overlay, 0.5);
+		expect(host.classWrites, "the answer changed, so the toggle runs")
+			.toEqual(["toggle:handwriting-note-viewport-own-lines"]);
+		expect(host.classes.has("handwriting-note-viewport-own-lines")).toBe(true);
 	});
 });

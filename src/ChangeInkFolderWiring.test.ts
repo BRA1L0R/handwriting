@@ -13,8 +13,7 @@
  * pieces were tested; the assembly moves someone's entire ink folder.
  *
  * HOW IT RUNS THE REAL CODE WITHOUT A PRODUCTION SEAM. `src/main.ts` cannot
- * be imported (it constructs a plugin) and must not be edited - another seat
- * holds it. So the method's own source is sliced out of `main.ts?raw` between
+ * be imported (it constructs a plugin) and must not be edited from here. So the method's own source is sliced out of `main.ts?raw` between
  * verbatim anchors and executed with its collaborators injected, exactly the
  * technique `LiveReloadTestHarness.ts` already uses for the live-reload poll.
  * Every boundary below is asserted, so a rename or a moved anchor fails this

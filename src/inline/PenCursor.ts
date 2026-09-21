@@ -56,7 +56,7 @@ export const PAN_DRAG_CLASS = "handwriting-pan-drag";
  * every frame - flung, and flickering as the sample-driven paint and the
  * scroll-driven repaint alternate.
  *
- * The rule (architect, 1.4.12; Alan's to overturn on screen): a pan drag
+ * The rule (1.4.12; Alan's to overturn on screen): a pan drag
  * paints no reticle. There is no correct place to put one - the tip is holding
  * the page, the page is what moved, and a marker that has to be right about a
  * coordinate nobody can compute is worse than no marker at all. The grabbing

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { StrokeBuilder } from "./StrokeBuilder";
+import { RELEASE_MAX_MS, StrokeBuilder } from "./StrokeBuilder";
 
 function builder(): StrokeBuilder {
 	const value = new StrokeBuilder("pen", "#377dff", 2);
@@ -124,6 +124,99 @@ describe("inline pen release filtering", () => {
 		expect(stroke!.points.map((point) => point.x)).toEqual([0, 10, 25]);
 	});
 });
+
+/**
+ * LIGHT RUNS LONGER THAN A BOUNCE ARE WRITING (2026-09-15; the ink loss in
+ * Alan's trace d1c16bdb).
+ *
+ * Pressure cannot tell release travel from a deliberate light glide: Alan's
+ * in-contact glide went as low as 0.0039, below the fixture's release values.
+ * Duration can. A light run is release travel only while it lasts at most
+ * RELEASE_MAX_MS, timed from its FIRST light sample to its last. A still hold
+ * at confident pressure before the run is not part of it. A longer run is
+ * writing and stays whole, unsplit, whether it sits mid-stroke or at the end
+ * (real captures show no light run at any stroke end: a real lift is a single
+ * sample, below RELEASE_MIN_MS). The edge-inclusive time gate RELEASE_MIN_MS
+ * is unchanged.
+ *
+ * Every run below passes the pressure, time and travel gates, so the keep or
+ * the removal is the ceiling's doing and nothing else.
+ */
+describe("inline pen release filtering: light runs longer than a bounce are writing", () => {
+	/**
+	 * A confident stroke, then 12 light samples whose first-to-last span is
+	 * `lightMs`, starting 4 ms after the release edge; then renewed contact,
+	 * unless `terminal`.
+	 */
+	function withLightRun(lightMs: number, terminal = false): { value: StrokeBuilder; added: number[] } {
+		const value = builder();
+		const added: number[] = [];
+		const add = (x: number, p: number, t: number): void => {
+			if (value.add(x, 0, p, t)) added.push(x);
+		};
+		add(0, 0.4, 1000);
+		add(4, 0.3, 1004); // the release edge
+		const first = 1008;
+		const steps = 12;
+		for (let k = 0; k < steps; k++) {
+			// Light, and moving 3 world px a sample: the travel gate is met many times over.
+			add(7 + 3 * k, k === steps - 1 ? 0.004 : 0.02 - 0.0012 * k, first + (lightMs * k) / (steps - 1));
+		}
+		if (!terminal) {
+			const end = first + lightMs;
+			add(7 + 3 * steps + 3, 0.05, end + 4);
+			add(7 + 3 * steps + 6, 0.2, end + 8);
+			add(7 + 3 * steps + 9, 0.3, end + 12);
+		}
+		return { value, added };
+	}
+
+	it("keeps a 188 ms light glide between two confident contacts whole, as one stroke (Alan's d1c16bdb shape)", () => {
+		const { value, added } = withLightRun(188);
+		const strokes = value.finishReleaseFiltered();
+		expect(strokes, "no split around a glide").toHaveLength(1);
+		expect(strokes[0]!.points.map((point) => point.x), "every sample the wet layer drew is committed").toEqual(added);
+	});
+
+	it("still removes and splits a light run of exactly the ceiling, and keeps one a millisecond longer", () => {
+		expect(RELEASE_MAX_MS).toBeGreaterThan(RELEASE_MIN_MS_FOR_TEST);
+		const atCeiling = withLightRun(RELEASE_MAX_MS).value.finishReleaseFiltered();
+		expect(atCeiling, "a bounce at the ceiling splits").toHaveLength(2);
+		const over = withLightRun(RELEASE_MAX_MS + 1);
+		const kept = over.value.finishReleaseFiltered();
+		expect(kept, "one millisecond over the ceiling is writing").toHaveLength(1);
+		expect(kept[0]!.points.map((point) => point.x)).toEqual(over.added);
+	});
+
+	it("applies the same ceiling at the end of a contact: a long light ending stays, a short light tail goes", () => {
+		const long = withLightRun(188, true);
+		const kept = long.value.finishReleaseFiltered();
+		expect(kept).toHaveLength(1);
+		expect(kept[0]!.points.map((point) => point.x), "a 188 ms light ending is writing").toEqual(long.added);
+		const short = withLightRun(RELEASE_MAX_MS, true).value.finishReleaseFiltered();
+		expect(short).toHaveLength(1);
+		expect(short[0]!.points.map((point) => point.x), "a tail within the ceiling is release travel").toEqual([0, 4]);
+	});
+
+	it("does not count a still hold before the run: a 15 ms bounce after 300 ms without movement is still a bounce", () => {
+		const value = builder();
+		value.add(0, 0, 0.4, 1000);
+		value.add(8, 0, 0.5, 1100); // then the pen holds still: no sample is accepted until it moves
+		value.add(12, 0, 0.01, 1400);
+		value.add(20, 0, 0.01, 1415);
+		value.add(24, 0, 0.5, 1425);
+
+		const strokes = value.finishReleaseFiltered();
+
+		expect(strokes, "the bounce splits the stroke").toHaveLength(2);
+		expect(strokes[0]!.points.map((point) => point.x), "the piece before the bounce").toEqual([0, 8]);
+		// A one-sample piece is stored with a 0.01 px twin so it still draws a dot (buildStroke).
+		expect(strokes[1]!.points[0]!.x, "the piece after it starts where contact resumed").toBe(24);
+	});
+});
+
+/** StrokeBuilder's RELEASE_MIN_MS: a ceiling at or below it would make every light run writing. */
+const RELEASE_MIN_MS_FOR_TEST = 8;
 
 describe("non-finishing release-filtered snapshots", () => {
  it("owns deep points including retained pressure and tilt, without consuming the builder", () => {

@@ -197,10 +197,25 @@ describe("drawStroke routes to the raw flatten", () => {
 	 */
 	function drawnQuads(s: InkStroke): number {
 		let quads = 0;
+		let vertices = 0;
 		const ctx = fakeCtx();
-		(ctx as unknown as { closePath: () => void }).closePath = () => {
-			quads++;
+		// A QUAD IS A FOUR-VERTEX SUBPATH, counted from the stream's own shape.
+		// This counted `closePath` calls until the per-quad close came out of
+		// fillRibbon - it cost 3332 ms of one pinch-end task on Alan's device and
+		// changed no pixel, since `fill` closes subpaths implicitly. A subpath
+		// ends where the next `moveTo` begins or at the `fill`; a disc is a
+		// `moveTo` plus an `arc`, one vertex, so it is not a quad and is not
+		// counted, exactly as before. The expected counts below are unchanged.
+		const endSubpath = () => {
+			if (vertices === 4) quads++;
+			vertices = 0;
 		};
+		Object.assign(ctx, {
+			moveTo: () => { endSubpath(); vertices = 1; },
+			lineTo: () => { vertices++; },
+			closePath: () => endSubpath(),
+			fill: () => endSubpath(),
+		});
 		const before = ribbonCacheStats().flattens;
 		drawStroke(ctx, CAM, s, undefined, true, false);
 		// cacheRibbon false, so this draw flattened rather than replaying.

@@ -156,7 +156,17 @@ export function fillRibbon(
 		if (signedArea(quad) > 0) quad.reverse();
 		ctx.moveTo(quad[0]![0], quad[0]![1]);
 		for (let k = 1; k < 4; k++) ctx.lineTo(quad[k]![0], quad[k]![1]);
-		ctx.closePath();
+		// NO `closePath()` HERE, AND ITS ABSENCE IS LOAD-BEARING. `fill()` closes
+		// every open subpath implicitly, and this path is only ever filled (:96,
+		// :199) and never stroked, so the close changed no pixel - measured, not
+		// assumed: RibbonClosePathParity.test.ts replays this painter's own call
+		// stream closed and open and compares the rasters byte for byte.
+		//
+		// It was not free. The s93 device trace bills `closePath` 3332.0 ms of a
+		// 3536.8 ms pinch-end task, beside `lineTo`'s 5.6 ms at three times the
+		// call count, and the cost of one close grows with the length of the path
+		// it closes (1.17 us at 419 subpaths, 2.57 us at 799). One close per
+		// sample on a page of ink is therefore quadratic, and it froze the app.
 	}
 
 	// Discs must wind the same way as the quads, or they subtract instead of

@@ -15,7 +15,7 @@ import { describe, expect, it, vi } from "vitest";
 (globalThis as { window?: unknown }).window = globalThis;
 
 import { InkOverlayPlugin } from "./InkOverlay";
-import { MIN_PINCH_SCALE } from "./PinchScale";
+import { MIN_PINCH_SCALE, MAX_PINCH_SCALE } from "./PinchScale";
 
 type Phase = "start" | "move" | "end";
 type Point = { x: number; y: number };
@@ -40,7 +40,17 @@ function makeRig(start = 1) {
 	const host = {
 		clientWidth: 640, clientHeight: 480,
 		ownerDocument: { defaultView: win },
-		style: { removeProperty(name: string): void { delete hostStyles[name]; } },
+		// The host's `style` is a CSSStyleDeclaration, and production reads it as one: the resting
+		// column margin is read back before it is written so an unchanged value writes nothing
+		// (InkOverlay.ts, `restColumnAgainstCurrentGrant`). This stub carried `removeProperty`
+		// alone, so that read threw. The two it was missing are stubbed per the DOM API and over
+		// the SAME `hostStyles` record `removeProperty` already uses, so the three agree with each
+		// other: what `setProperty` writes, `getPropertyValue` reads back.
+		style: {
+			getPropertyValue(name: string): string { return hostStyles[name] ?? ""; },
+			setProperty(name: string, value: string): void { hostStyles[name] = value; },
+			removeProperty(name: string): void { delete hostStyles[name]; },
+		},
 		setCssStyles(styles: Record<string, string>): void { Object.assign(hostStyles, styles); },
 	};
 	const scroller = { scrollLeft: 0, scrollTop: 0, scrollWidth: 64000, scrollHeight: 48000, getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 480 }) };
@@ -49,6 +59,12 @@ function makeRig(start = 1) {
 	overlay.view = { dom: host, scrollDOM: scroller, requestMeasure: vi.fn(), measure: vi.fn() };
 	overlay.container = { setCssStyles: vi.fn() };
 	overlay.frame = { locked: false };
+	// s179: THIS RIG'S SUBJECT IS ZOOM MECHANICS, so its note is a CANVAS note. With the canvas off a
+	// two-finger gesture is not a zoom at all (`pinch` returns on its first line), and a fixture left in
+	// that mode would run none of the code these arms are about while still reporting a result - measured,
+	// the mode gate alone turned several of them green by doing nothing. `canvasMode` is a class field and
+	// `Object.create` runs no field initializers, so it is set here rather than assumed.
+	overlay.canvasMode = true;
 	overlay.cssScale = start; overlay.fontZoom = 1; overlay.scale = start;
 	overlay.pinchScaleNow = start;
 	overlay.zoomFloor = MIN_PINCH_SCALE;
@@ -120,7 +136,15 @@ function makeRig(start = 1) {
 	const commit = (next: number): boolean => methods.commitCameraScale.call(overlay, next, { left: 0, top: 0 });
 	const recommit = (): boolean => methods.commitCameraScale.call(overlay, scale(), undefined, undefined, true);
 	const button = (factor: number): boolean => methods.zoomNoteBy.call(overlay, factor);
-	return { overlay, scale, gesture, gestureLiftPending, fit, commit, recommit, button, handleResize };
+	/** A live preview frame, left hanging mid-gesture (no "end") - the applyPinchScale preview branch only, not the settle commit a lift triggers. */
+	const previewTo = (target: number): number => {
+		const from = scale();
+		pinch("start", 1);
+		pinch("move", target / from);
+		if (frames.size > 0) runFrame();
+		return scale();
+	};
+	return { overlay, scale, gesture, gestureLiftPending, fit, commit, recommit, button, previewTo, handleResize };
 }
 
 describe("zoom-out is locked below the 10% floor", () => {
@@ -221,5 +245,62 @@ describe("zoom-out is locked below the 10% floor", () => {
 		expect(rig.scale()).toBe(0.09);
 		expect(rig.commit(MIN_PINCH_SCALE)).toBe(true);
 		expect(rig.commit(0.09), "at 10% the floor is back").toBe(false);
+	});
+});
+
+/**
+ * MAXZOOM-6: MAX_PINCH_SCALE moved from 4 to 6, but the note's zoom-in
+ * ceiling is written at three call sites and only one of them is the named
+ * constant read directly. Each cell below is red against the old bare `4`
+ * literal it replaces and green against MAX_PINCH_SCALE:
+ *
+ *   `applyPinchScale`'s preview branch (InkOverlay.ts, live pinch, no commit)
+ *   `commitCameraScale`'s own refusal (InkOverlay.ts, the settle/commit gate)
+ *   `zoomNoteBy`'s clamp (InkOverlay.ts, the +/- buttons and commands)
+ *
+ * None of these can be caught by `PinchScale.test.ts`'s
+ * `pinchScale(1, 100) === MAX_PINCH_SCALE` assertion: that pin already reads
+ * the constant symbolically, so it stays green whether the constant is 4 or
+ * 6. Nothing there drives an actual preview frame, a real commit, or a
+ * button click past the old ceiling - which is exactly what let two bare `4`
+ * literals sit unnoticed the first time this same ceiling moved (Reviewer F1
+ * on 772960c7).
+ */
+describe("the pinch-in ceiling reaches MAX_PINCH_SCALE, not the old 400%", () => {
+	it("a commit driven to the ceiling succeeds and reads that scale", () => {
+		const rig = makeRig();
+		expect(rig.commit(MAX_PINCH_SCALE)).toBe(true);
+		expect(rig.scale()).toBe(MAX_PINCH_SCALE);
+	});
+
+	it("a commit past the ceiling is still refused", () => {
+		const rig = makeRig();
+		expect(rig.commit(MAX_PINCH_SCALE + 1)).toBe(false);
+		expect(rig.scale()).toBe(1);
+	});
+
+	it("a live preview frame past the old 4x ceiling reaches a scale above it", () => {
+		const rig = makeRig();
+		expect(rig.previewTo(5)).toBeGreaterThan(4);
+		expect(rig.scale()).toBe(5);
+	});
+
+	it("a live preview frame reaches the new ceiling exactly, and no further", () => {
+		const rig = makeRig();
+		expect(rig.previewTo(MAX_PINCH_SCALE)).toBe(MAX_PINCH_SCALE);
+		expect(rig.previewTo(MAX_PINCH_SCALE + 1), "past the ceiling the preview frame is refused, scale holds").toBe(MAX_PINCH_SCALE);
+	});
+
+	it("the plus button rides zoomNoteBy's own ceiling from 400% up to the new one", () => {
+		const rig = makeRig();
+		expect(rig.button(2)).toBe(true);
+		expect(rig.scale()).toBe(2);
+		expect(rig.button(2)).toBe(true);
+		expect(rig.scale(), "the old ceiling: a literal 4 here would already be capped").toBe(4);
+		expect(rig.button(2)).toBe(true);
+		expect(rig.scale(), "zoomNoteBy's own Math.min must read MAX_PINCH_SCALE, not 4").toBe(MAX_PINCH_SCALE);
+		// Once at the ceiling, another zoom-in is a no-op rather than a jump past it.
+		expect(rig.button(2)).toBe(true);
+		expect(rig.scale()).toBe(MAX_PINCH_SCALE);
 	});
 });

@@ -12,8 +12,6 @@ import {
 	setRetiredCommandAction,
 } from "./CommandPaletteSplit";
 import { formatHost } from "./diag/PlatformCapabilities";
-import { CameraState } from "./camera/coordinates";
-import { HANDWRITING_PAGE_VIEW_TYPE, HandwritingHost, HandwritingPageView } from "./view/HandwritingPageView";
 import {
 	HANDWRITING_DIAGNOSTICS_VIEW_TYPE,
 	PenDiagnosticsView,
@@ -21,6 +19,7 @@ import {
 import { HANDWRITING_PEN_LAB_VIEW_TYPE, PenLabView } from "./view/PenLabView";
 import {
 	SlidesInkHost,
+	activeSlidesActions,
 	onSlidesCssChange,
 	reloadSlidesExternal,
 	scanForSlides,
@@ -29,6 +28,7 @@ import {
 	slidesInkEnabled,
 	slidesReloadCandidate,
 } from "./slides/SlidesInkSurface";
+import { mountSlidesTools, presentationCommands, requestSlidesAction } from "./slides/SlidesTools";
 import {
 	addStripSurface,
 	applyToolbarPlacement,
@@ -55,6 +55,7 @@ import {
 	inkOverlayExtension,
 	inlineInk,
 	inlineReloadCandidates,
+	captureInlineReloadAdmission,
 	InkOverlayPlugin,
 	overlayForActiveEditor,
 	overlayForPath,
@@ -185,6 +186,21 @@ import {
 	setPersistPenHardwareSeen,
 	shouldRaiseStripOnPenOff,
 } from "./inline/PenToolsMode";
+import {
+	NoteZoomControlsMode,
+	normalizeNoteZoomControlsMode,
+	setNoteZoomControlsMode,
+	setZoomBarCanvasEnabled,
+} from "./inline/NoteZoomControlsMode";
+// The per-note Infinite Canvas override: the plumbing is CanvasNoteOverride's,
+// the instance and the two ways a user reaches it (the command below and the
+// strip) are this file's.
+import {
+	CanvasNoteOverride,
+	canvasForNote,
+	type NoteCanvasChoice,
+} from "./inline/CanvasNoteOverride";
+import { type BarsPair, normalizeBarsRestore } from "./inline/BarsToggle";
 // The strip owns the fold list: the ids, their default order, and the rule
 // that makes a saved order safe to use all live beside the row they describe -
 // and `PEN_INK_TOGGLE`, the keyboard button's id, which outlived the palette
@@ -193,6 +209,7 @@ import {
 	DEFAULT_FOLD_ORDER,
 	PEN_INK_TOGGLE,
 	normalizeFoldOrder,
+	refreshNoteZoomControlsAll,
 	setStripFoldOrder,
 } from "./inline/MobileTools";
 import { PenCommandHost, penOnOff, togglePenInput } from "./inline/PenCommand";
@@ -215,7 +232,6 @@ import { applyOp } from "./pdf/PdfInkHistory";
 import { isSafePageId, newPageId, parsePage } from "./model/PageData";
 import type { InkPresence, InlineDeleteCapture } from "./inline/InlineInkStore";
 import { PageIdIndex, RegisterVerdict } from "./model/PageIdIndex";
-import { newPageMarkdown } from "./model/MarkdownPage";
 import { PageStore, newPageWriter } from "./persistence/PageStore";
 import { FORK_COPY_PLACEHOLDER, ForkHost, refreshForks } from "./persistence/ForkResolution";
 import { ForkResolutionModal } from "./persistence/ForkResolutionModal";
@@ -297,7 +313,7 @@ const DECLAIM_GRACE_MS = 2_000;
  *    which is the state below. Verbatim: "ehhhhhhhhhhhhhhhh we hsould be
  *    consistent, put a period back at end".
  *
- *    WHY, because the reason bounds it: a seat found that OTHER messages on
+ *    WHY, because the reason bounds it: a read found that OTHER messages on
  *    this same command always carried trailing periods and had never been
  *    shown to him - "open the note in editing view to delete its ink.",
  *    "removed N strokes. Undo restores them.", the disk-error line. Shown
@@ -334,8 +350,11 @@ const PDF_INK_CHANGED_DURING_BACKUP =
 	"Handwriting: the ink changed while its backup was being made. nothing was deleted. run Delete all ink again if you still want to remove it.";
 
 interface HandwritingSettings {
+	/** Named locations use their own schema; opaque records survive older builds. */
+	savedViews: unknown[];
 	/** Per-page camera, kept out of the synced note on purpose (§22). */
-	cameras: Record<string, CameraState>;
+	/** The retired canvas page's per-note cameras: read, copied and removed with their note, never interpreted. */
+	cameras: Record<string, Record<string, unknown>>;
 	/** Nib size multipliers per tool (v0.13.6): 0.6 fine · 1 medium · 1.8 bold. */
 	inkSizes: { pen: number; highlighter: number };
 	/**
@@ -432,6 +451,12 @@ interface HandwritingSettings {
 	extendCanvasWhileScrolling: boolean;
 	/** Pen tools strip (v0.13.16): auto (pen summons it), show, or hide. */
 	penTools: PenToolsMode;
+	/** Note zoom bar: mirrors penTools exactly - auto steps aside while the
+	 * pen inks, show is permanently on, hide is off. */
+	noteZoomControls: NoteZoomControlsMode;
+	/** What the "Toolbar on / off" command hid, put back by its next run; null when nothing is hidden by it. Only
+	 * `penTools` is read back: the command stopped moving the zoom bar in 1.4.20, and the pair shape stays for data.json. */
+	barsRestore: BarsPair | null;
 	/** What the eraser erases, globally (1.0.9): whole strokes by default. */
 	eraserMode: "stroke" | "reticle";
 	/** The reticle that follows the pen tip (1.0.5). On by default. */
@@ -468,6 +493,7 @@ interface HandwritingSettings {
 
 const DEFAULT_SETTINGS: HandwritingSettings = {
 	cameras: {},
+	savedViews: [],
 	inkSizes: { pen: 1, highlighter: 1 },
 	pressureSensitivity: true,
 	inkSmoothing: true,
@@ -522,6 +548,8 @@ const DEFAULT_SETTINGS: HandwritingSettings = {
 	paperStyle: "none",
 	extendCanvasWhileScrolling: false,
 	penTools: "auto",
+	noteZoomControls: "auto",
+	barsRestore: null,
 	eraserMode: "stroke",
 	penReticle: true,
 	shapeSnap: true,
@@ -1126,7 +1154,7 @@ export function bindRecoveryNotices(
 	};
 }
 
-export default class HandwritingPlugin extends Plugin implements HandwritingHost {
+export default class HandwritingPlugin extends Plugin {
 	store!: PageStore;
 	settings: HandwritingSettings = { ...DEFAULT_SETTINGS };
 	/** Set at load: no settings file at all means a first-ever install. */
@@ -1137,8 +1165,6 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	private settingsWriteAgain = false;
 	/** persistSettings' in-flight write, or null when nothing is writing. */
 	private settingsWriting: Promise<void> | null = null;
-	/** Files we are mid-swap on, so layout events don't fight each other. */
-	private swapping = new Set<string>();
 	/**
 	 * Every gated command's definition, by bare id, as `addGatedCommand` saw it.
 	 *
@@ -1320,7 +1346,11 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				// out from it may be written. Set HERE, next to the
 				// substitution, so a third synthetic source is one line from
 				// being covered instead of one id prefix from being missed.
-				() => this.pdfCalibration
+				() => this.pdfCalibration,
+				// The page colour a snip's ink is made readable against: the
+				// flatten's setting, read at each snip so a change applies to
+				// the next one.
+				() => this.settings.inkPdfColorMode
 			);
 			controller.mount();
 			this.pdfInk.set(root, controller);
@@ -1864,6 +1894,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	 */
 	private unloaded = false;
 	notePaper: NotePaper | null = null;
+	canvasOverride: CanvasNoteOverride | null = null;
 
 	/** One ink controller per open PDF view, keyed by its root element. */
 	private pdfInk = new Map<HTMLElement, PdfInkController>();
@@ -1890,8 +1921,6 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	private pdfStore = new PdfInkStore();
 	/** M1 only: draw calibration crosses instead of real ink. Off by default. */
 	private pdfCalibration = false;
-	/** Notes the user explicitly opened as Markdown this session (§ no bounce-back). */
-	private preferMarkdown = new Set<string>();
 	/** Page-id ownership ledger (duplicate detection, v0.13.6). */
 	private pageIds = new PageIdIndex();
 	/** Collisions with no safe owner: id → the paths locked over it. */
@@ -1904,8 +1933,35 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	/** Notes already warned about an unusable page id; see warnUnusablePageId. */
 	private badPageIds = new Set<string>();
 	private resolvingDuplicates = new Set<string>();
-	/** Paths the user deliberately opened on the canvas (host contract). */
-	canvasIntent = new Set<string>();
+
+	/**
+	 * Write one note's Infinite Canvas choice, from the menu or the command.
+	 *
+	 * The word on screen waits for the write. A frontmatter write can fail -
+	 * the note can be deleted or replaced between the click and the write,
+	 * which is the case `save` re-checks for - and a notice fired before the
+	 * await would announce a choice the note never took.
+	 */
+	applyCanvasChoice(path: string, choice: NoteCanvasChoice): void {
+		runDetached((async () => {
+			const written = await this.canvasOverride?.saveForPath(path, choice);
+			if (written !== true) {
+				new Notice("Handwriting: that note is gone - infinite canvas not changed");
+				return;
+			}
+			// The override announces the change to every strip over this note;
+			// this covers the global-resolving surfaces in the same move, so
+			// nothing waits for a rebuild.
+			refreshNoteZoomControlsAll();
+			new Notice(
+				choice === "default"
+					? `Handwriting: Infinite canvas follows the setting (${this.settings.extendCanvasWhileScrolling ? "on" : "off"})`
+					: `Handwriting: Infinite canvas ${choice ? "on" : "off"} for this note`
+			);
+		})(), "save the note's Infinite canvas override", () => {
+			new Notice("Handwriting: could not write infinite canvas to that note");
+		});
+	}
 
 	async onload(): Promise<void> {
 		// Pressure calibration is per DEVICE, so it uses the app's per-vault
@@ -1961,21 +2017,11 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		bindRecoveryNotices(this.store, (pageId) => this.noteNameFor(pageId));
 		await this.loadSettings();
 
-		this.registerView(HANDWRITING_PAGE_VIEW_TYPE, (leaf) => new HandwritingPageView(leaf, this));
 		this.registerView(HANDWRITING_PEN_LAB_VIEW_TYPE, (leaf) => new PenLabView(leaf));
 		this.registerView(
 			HANDWRITING_DIAGNOSTICS_VIEW_TYPE,
 			(leaf) => new PenDiagnosticsView(leaf, this.manifest.version)
 		);
-
-		// One ribbon entry, for the standalone canvas. Inking on an ordinary
-		// note needs no entry point at all. You write on it.
-		// No ribbon icon. The canvas is the older surface, and the most
-		// prominent button the plugin ships must not lead a first-time user
-		// away from the product (ink on ordinary notes). The view, the
-		// commands and the frontmatter routing all stay: existing canvas
-		// pages keep working, the palette still reaches it. The icon comes
-		// back if the canvas ever gets its own release.
 
 		// Inline ink on the ordinary Markdown editor (architecture review +
 		// OneNote-coordinates addendum). Pen-only capture; persistence follows
@@ -2076,6 +2122,39 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		this.register(onInkChanged((p) => embedInkChanged(p)));
 		this.notePaper = new NotePaper(this.app, message => { blockNotice(message); });
 		this.notePaper.start(this);
+		// The per-note Infinite Canvas override, started the same way and in
+		// the same place as the paper override it was modelled on. `start`
+		// registers its own metadata listener and its own teardown on the
+		// plugin, so there is nothing to unregister here.
+		this.canvasOverride = new CanvasNoteOverride(this.app);
+		this.canvasOverride.start(this);
+		// The note's own Infinite Canvas, in the three-dot menu beside "Paper
+		// background" (Alan, 09:3xZ: the paper picker is in the three-dot
+		// menu, top right of the editor) - the same menu, the same
+		// markdown-only guard, registered here rather than in NotePaper.ts
+		// because that file belongs to the paper override.
+		//
+		// ONE LINE, A TICK, AND NO THIRD STATE (Alan, 09:4xZ: "i dont like
+		// there being three lines... that's too many"). The override has three
+		// values, but the menu is the TOGGLE the brief asked for and the third
+		// value - "use the setting" - is the command's, not the menu's.
+		//
+		// The tick is the note's REAL mode, override or setting, not "this
+		// note has an override": what a reader of this menu wants to know is
+		// whether the note they are looking at is a canvas, and a tick that
+		// answered a different question would be off on every untouched note.
+		// So a click always writes an explicit value - the opposite of what
+		// the tick shows - and a note goes back to following the setting
+		// through the command.
+		this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+			if (!(file instanceof TFile) || file.extension !== "md") return;
+			const on = canvasForNote(file.path, this.settings.extendCanvasWhileScrolling);
+			menu.addItem(item => item
+				.setTitle("Infinite canvas")
+				.setIcon("expand")
+				.setChecked(on)
+				.onClick(() => this.applyCanvasChoice(file.path, !on)));
+		}));
 		this.addSettingTab(new HandwritingSettingTab(this.app, this));
 		// A popout is born without the paper class; stamp it as it opens.
 		this.registerEvent(
@@ -2238,11 +2317,10 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 									? "changed"
 									: (this.store.externalChangeObservation?.(id) ?? "unchanged");
 								if (observation === "unchanged") continue;
-								// The quiet check above is a tick old and the stat
-								// awaited: a pen can have landed meanwhile. This
-								// recheck runs in the same microtask as the
-								// adopt, so no gesture can interleave.
-								if (!inlineReloadCandidates().includes(path)) continue;
+								// Stat and preservation both await. Capture the current
+								// cohort now and recheck it at the final adoption boundary.
+								const panesCurrent = captureInlineReloadAdmission(path);
+								if (!panesCurrent) continue;
 								// Same gap, the other half: a stroke that
 								// FINISHED in it left a queued write carrying a
 								// pre-reload snapshot, and reloading refreshes
@@ -2266,7 +2344,8 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 								// the current base for a later poll/save. The method
 								// stays optional for reduced test stand-ins; absence
 								// is also a hold, never reload authority.
-								const adoption = await inlineInk.adoptExternal?.(path);
+								const adoption = await inlineInk.adoptExternal?.(path, () => panesCurrent() &&
+									inlineInk.pageIdOf(path) === id && !this.store.hasQueuedWrite(id));
 								if (adoption?.outcome !== "adopted") continue;
 								if (adoption.changed) {
 									inkExternallyReloaded(path);
@@ -2363,8 +2442,9 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			callback: () => {
 				const on = !mouseInkEnabled();
 				setMouseInk(on);
-				// THE LOUD PATH, and one of only two that write this down (the
-				// settings switch is the other). Asking for the mode BY NAME is
+				// THE LOUD PATH, and the only one that writes this down (the
+				// settings switch was the other, until 1.4.20 took the row
+				// out). Asking for the mode BY NAME is
 				// what earns a place in data.json; the strip's quiet arm and
 				// put-down do not, and no longer get one - alan, 2026-09-04,
 				// "dont persist a quiet arm". See MouseInk.ts for the reports
@@ -2378,10 +2458,8 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				// Both surfaces' strip buttons route here rather than
 				// touching the mode themselves - their hosts execute this
 				// command - so this one branch covers the strip, the palette
-				// and the hotkey alike. The settings switch is the only
-				// other writer and carries the same pair - see
-				// `applyMouseInkUiFanout` for both halves and why each needs
-				// what it calls.
+				// and the hotkey alike - see `applyMouseInkUiFanout` for both
+				// halves and why each needs what it calls.
 				this.applyMouseInkUiFanout(on);
 				// NAMES THE STATE - not a device, not a tool (alan,
 				// 2026-09-05: "maybe Handwriting: ink" "instead of
@@ -2435,6 +2513,10 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				);
 			},
 		});
+		for (const command of presentationCommands(
+			() => activeSlidesActions(typeof activeDocument === "undefined" ? document : activeDocument),
+			(target, action) => requestSlidesAction(this.app, target, action)
+		)) this.addCommand(command);
 		this.addCommand({
 			id: "slides-ink-toggle",
 			name: "Toggle slides ink",
@@ -2460,6 +2542,59 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				this.applyPaper(next);
 				runDetached(this.persistSettings(), "save the paper style");
 				if (routineNoticesVisible()) new Notice(`Handwriting: paper ${next}`);
+			},
+		});
+		// INFINITE CANVAS FOR ONE NOTE (s138). The setting is the default; a
+		// note may say otherwise in its own frontmatter, exactly as it may
+		// override the paper. Three choices, so one command cycles on -> off
+		// -> use default rather than needing three ids or a modal: the same
+		// shape as `paper-cycle` above, which is the command this feature was
+		// asked to behave like.
+		//
+		// The notice is not gated on `routineNoticesVisible`, unlike the paper
+		// cycle's: a frontmatter key is invisible until the user opens
+		// Properties, so without a word on screen a three-way cycle gives no
+		// way to tell which of the three you are now on.
+		this.addCommand({
+			id: "canvas-note-override-cycle",
+			name: "Infinite canvas for this note",
+			checkCallback: (checking: boolean) => {
+				const file = this.app.workspace.getActiveFile();
+				// Markdown only: the override is a frontmatter key, and
+				// `saveForPath` would refuse a PDF or a canvas file anyway.
+				// Checked before the command is offered rather than after it
+				// is run, so the palette does not list an id that cannot work.
+				if (!file || file.extension !== "md") return false;
+				if (checking) return true;
+				const current: NoteCanvasChoice = this.canvasOverride?.choice(file.path) ?? "default";
+				this.applyCanvasChoice(file.path, current === "default" ? true : current === true ? false : "default");
+				return true;
+			},
+		});
+		// The toolbar off and on from the palette or a hotkey, without the settings tab. Writes the same setting the
+		// Toolbar visibility row writes, through the same applier, and remembers what it hid.
+		// Registered outright: with the toolbar hidden it is the way back.
+		//
+		// THE TOOLBAR ONLY, since 1.4.20 (s138 item 15). It used to move the zoom bar with it. The zoom bar now
+		// answers to its own row AND to Infinite Canvas, so a command that hid it took a decision away from both -
+		// and with the canvas off there is no zoom bar on screen for this command to put back. `barsRestore` keeps
+		// its shape in data.json: the zoom bar's mode is carried into the memory unchanged and never read back out.
+		// The id does not move - a hotkey bound to it still resolves.
+		this.addCommand({
+			id: "toolbar-zoom-bar-toggle",
+			name: "Toolbar on / off",
+			callback: () => {
+				const hidden = this.settings.penTools === "hide";
+				const remembered = this.settings.barsRestore?.penTools;
+				const next: PenToolsMode = hidden ? (remembered && remembered !== "hide" ? remembered : "show") : "hide";
+				this.settings.barsRestore = hidden
+					? null
+					: { penTools: this.settings.penTools, noteZoomControls: this.settings.noteZoomControls };
+				this.settings.penTools = next;
+				setPenToolsMode(next);
+				refreshPenToolsAll();
+				runDetached(this.persistSettings(), "save the toolbar visibility");
+				if (routineNoticesVisible()) new Notice(`Handwriting: toolbar ${next === "hide" ? "off" : "on"}`);
 			},
 		});
 		// THE SPLIT (1.4.12). "Extra commands for hotkeys" gates REGISTRATION -
@@ -2667,11 +2802,12 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			name: "Export ink as SVG (drawing only)",
 			checkCallback: (checking) => {
 				const file = this.app.workspace.getActiveFile();
-				if (!file || file.extension !== "md" || !inlineInk.hasInk(file.path)) {
+				const strokes = file ? inlineInk.strokes(file.path) : undefined;
+				if (!file || file.extension !== "md" || !strokes?.some((stroke) => stroke.points.length > 0)) {
 					return false;
 				}
 				if (!checking) {
-					const svg = inkToSvg(inlineInk.strokes(file.path));
+					const svg = inkToSvg(strokes);
 					if (!svg) {
 						new Notice("Handwriting: no ink to export on this note");
 						return true;
@@ -2709,11 +2845,12 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			name: "Export ink as PDF (drawing only)",
 			checkCallback: (checking) => {
 				const file = this.app.workspace.getActiveFile();
-				if (!file || file.extension !== "md" || !inlineInk.hasInk(file.path)) {
+				const strokes = file ? inlineInk.strokes(file.path) : undefined;
+				if (!file || file.extension !== "md" || !strokes?.some((stroke) => stroke.points.length > 0)) {
 					return false;
 				}
 				if (!checking) {
-					const pdf = inkToPdf(inlineInk.strokes(file.path));
+					const pdf = inkToPdf(strokes);
 					if (!pdf) {
 						new Notice("Handwriting: no ink to export on this note");
 						return true;
@@ -3361,33 +3498,6 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			});
 		}
 
-		// THE CANVAS COMMANDS ARE GONE FROM THE PALETTE (1.4.12). Alan: "just
-		// take out the canvas commands completely for now". Seven entries -
-		// New canvas page, Open note on the canvas, Open canvas page as
-		// Markdown and the four `Canvas tool:` ones - for a surface the manual
-		// calls early and rough, sitting in the same list as the export and
-		// flatten commands people came for.
-		//
-		// Only the registrations went. `newPage`, `openAsHandwriting`,
-		// `activeHandwritingView` and the `preferMarkdown` set are all still
-		// here, and the view still opens for any note carrying
-		// `handwriting: page` in its frontmatter - which is how a canvas page
-		// is reached now, and how one gets made. They come back when canvas is
-		// a feature rather than an experiment.
-
-		// Route Handwriting-marked notes to the canvas view.
-		this.registerEvent(
-			this.app.workspace.on("file-open", (file) =>
-				runDetached(this.maybeSwapView(file), "switch a marked note to its canvas view")
-			)
-		);
-		this.app.workspace.onLayoutReady(() => {
-			if (this.unloaded) return;
-			runDetached(
-				this.maybeSwapView(this.app.workspace.getActiveFile()),
-				"switch the active marked note to its canvas view"
-			);
-		});
 
 		// Two unrelated lifecycles share this stretch of vault events; an
 		// earlier version of this comment described only the first and, read
@@ -3420,11 +3530,6 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				if (file instanceof TFile && file.extension === "md") {
 					inlineInk.handleRename(oldPath, file.path);
 					surfaceExtents.handleRename(oldPath, file.path);
-					// Canvas intent is keyed by path for the same reason and
-					// carries the same hazard: left behind, a NEW note later
-					// created at the old path inherits "the user opened this
-					// on the canvas" from a note that no longer exists.
-					if (this.canvasIntent.delete(oldPath)) this.canvasIntent.add(file.path);
 				}
 				// A pdf renamed while OPEN: the pane keeps its id, and the
 				// sidecar's path claim moves with the file - left stale, the
@@ -3446,7 +3551,6 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				if (file instanceof TFile && file.extension === "md") {
 					inlineInk.handleDelete(file.path);
 					surfaceExtents.handleDelete(file.path);
-					this.canvasIntent.delete(file.path);
 				}
 			})
 		);
@@ -3533,12 +3637,6 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				// keeps its old shape until something else repaints it (§5l/AE6).
 				() => {
 					for (const c of this.pdfInk.values()) c.refresh();
-					for (const leaf of this.app.workspace.getLeavesOfType(
-						HANDWRITING_PAGE_VIEW_TYPE
-					)) {
-						const view = leaf.view;
-						if (view instanceof HandwritingPageView) view.repaintInk();
-					}
 				},
 				// And mouse ink going OFF strands the reticle on a PDF the
 				// same way it does on a note: the pointer is still over the
@@ -3871,10 +3969,8 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			const verdict = inlineInk.reassignPage(copyPath, newId, ownerPath);
 			// Anything the copy queued under the OLD id before resolution is
 			// orphaned. Discard it only when this session provably has no other
-			// writer for that id (no live owner record, no canvas view).
-			const canvasOpen =
-				this.app.workspace.getLeavesOfType(HANDWRITING_PAGE_VIEW_TYPE).length > 0;
-			if (verdict === "old-queue-orphaned" && !canvasOpen) {
+			// writer for that id (no live owner record).
+			if (verdict === "old-queue-orphaned") {
 				this.store.discardPending(id);
 			}
 			const cam = this.settings.cameras[id];
@@ -4375,10 +4471,11 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	/**
 	 * Everything the strip on every open surface needs to hear when mouse
 	 * ink flips, on or off. The mouse-ink-toggle command and the settings
-	 * switch are the only two writers of this mode (a9bf181) and both owe it
+	 * switch were the two writers of this mode (a9bf181) and both owed it
 	 * the same pair, so it lives once here rather than twice at the call
 	 * sites - the duplication a9bf181 accepted deliberately turned out to be
-	 * exactly the kind this project keeps paying for.
+	 * exactly the kind this project keeps paying for. The switch went in
+	 * 1.4.20; the command is the one caller now.
 	 *
 	 * ON: `markPenSeen` may flip the strip's VISIBILITY (false to true, for
 	 * someone who has never held a pen), which only `refreshPenToolsAll`'s
@@ -4400,9 +4497,9 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	 * finding 2026-09-03: "you have to tap a couple times for pen to
 	 * light").
 	 */
-	// Not private: HandwritingSettingTab is the mode's second writer
-	// (a9bf181) and calls this through `this.plugin`, the same access
-	// `applyBooxMode` already gets for the same reason.
+	// Not private: HandwritingSettingTab called this through `this.plugin`
+	// as the mode's second writer (a9bf181) until 1.4.20 took its switch
+	// out, and TipModeCommand.test.ts still drives it directly.
 	/**
 	 * The settings side of the fold order: write it, apply it, save it.
 	 *
@@ -4515,6 +4612,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// First, so that anything still waiting on onLayoutReady finds it set.
 		this.unloaded = true;
 		this.notePaper?.destroy();
+		this.canvasOverride?.destroy();
 		// Pending recycles are DROPPED, never run early. A sidecar left in
 		// place is an orphan somebody can delete; ink recycled for a note
 		// that was about to come back is the failure this delay exists to
@@ -4647,6 +4745,20 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			console.error("[handwriting] slides settle on unload failed", err);
 		}
 		try {
+			// Same reason, the PDF store: a stroke drawn while its sidecar is
+			// still being read reaches the page store only when the read lands.
+			await this.pdfStore.settle();
+		} catch (err) {
+			console.error("[handwriting] pdf settle on unload failed", err);
+		}
+		try {
+			// And the canvas: a page's first sidecar waits on the Markdown save
+			// of its page id, and reaches the store only when that lands.
+			await this.store.settleDeferred();
+		} catch (err) {
+			console.error("[handwriting] deferred sidecar settle on unload failed", err);
+		}
+		try {
 			await this.store.flush();
 		} catch (err) {
 			console.error("[handwriting] flush on unload failed", err);
@@ -4658,120 +4770,11 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		}
 	}
 
-	// ---- HandwritingHost ----------------------------------------------------------
-
-	getCamera(pageId: string): CameraState | undefined {
-		return this.settings.cameras[pageId];
-	}
-
-	setCamera(pageId: string, cam: CameraState): void {
-		const prev = this.settings.cameras[pageId];
-		if (prev && prev.x === cam.x && prev.y === cam.y && prev.zoom === cam.zoom) return;
-		this.settings.cameras[pageId] = cam;
-		this.settingsDirty = true;
-		if (this.settingsTimer !== null) window.clearTimeout(this.settingsTimer);
-		this.settingsTimer = window.setTimeout(
-			() => runDetached(this.flushSettings(), "flush camera settings"),
-			2000
-		);
-	}
-
-	// ---- pages --------------------------------------------------------------
-
-	private async newPage(): Promise<void> {
-		const folder = this.app.workspace.getActiveFile()?.parent?.path ?? "";
-		const base = "Handwriting page";
-		const pageId = newPageId();
-		try {
-			// One attempt, matching what this caller always did: it made exactly
-			// one create attempt, and routing it through the shared turn must not
-			// quietly turn that into `createFreshFile`'s default of eight.
-			const { result: file } = await createFreshFile(
-				() => this.firstFreePath((n) => this.pathFor(folder, n === 1 ? base : `${base} ${n}`)),
-				(path) => this.app.vault.create(path, newPageMarkdown(pageId)),
-				1
-			);
-			const leaf = this.app.workspace.getLeaf(true);
-			await leaf.setViewState({
-				type: HANDWRITING_PAGE_VIEW_TYPE,
-				state: { file: file.path },
-				active: true,
-			});
-			await this.app.workspace.revealLeaf(leaf);
-		} catch (err) {
-			console.error("[handwriting] could not create page", err);
-			new Notice("Handwriting: could not create the page. See the developer console.");
-		}
-	}
-
-	private pathFor(folder: string, name: string): string {
-		return normalizePath(folder ? `${folder}/${name}.md` : `${name}.md`);
-	}
-
-	/**
-	 * Open any note on the canvas.
-	 *
-	 * There is no conversion step, because there is nothing to convert to: this
-	 * changes which view is showing the note, and touches the file not at all.
-	 * The note's own body is what you see and can write next to; if you never
-	 * draw, the file is never written.
-	 */
-	private async openAsHandwriting(file: TFile): Promise<void> {
-		this.preferMarkdown.delete(file.path);
-		this.canvasIntent.add(file.path);
-		const leaf = this.app.workspace.getLeaf(false);
-		await leaf.setViewState({
-			type: HANDWRITING_PAGE_VIEW_TYPE,
-			state: { file: file.path },
-			active: true,
-		});
-	}
-
 	/** Open the pen probe in a new tab. Its own leaf, so the note stays put. */
 	private async openPenDiagnostics(): Promise<void> {
 		const leaf = this.app.workspace.getLeaf(true);
 		await leaf.setViewState({
 			type: HANDWRITING_DIAGNOSTICS_VIEW_TYPE,
-			active: true,
-		});
-	}
-
-	private activeHandwritingView(): HandwritingPageView | null {
-		const view = this.app.workspace.getActiveViewOfType(HandwritingPageView);
-		return view ?? null;
-	}
-
-	private isHandwritingPage(file: TFile): boolean {
-		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
-		const marker: unknown = fm?.["handwriting"];
-		return marker === "page" || marker === true;
-	}
-
-	private async maybeSwapView(file: TFile | null): Promise<void> {
-		if (!file || file.extension !== "md") return;
-		// The marker is a preference, not a lock: the user asked for Markdown on
-		// this note, so leave it in Markdown until they ask for the canvas again.
-		if (this.preferMarkdown.has(file.path)) return;
-		if (!this.isHandwritingPage(file)) return;
-		if (this.swapping.has(file.path)) return;
-
-		const leaves = this.app.workspace.getLeavesOfType("markdown");
-		const target = leaves.find(
-			(leaf) => (leaf.view as { file?: TFile }).file?.path === file.path
-		);
-		if (!target) return;
-		this.swapping.add(file.path);
-		try {
-			await this.swapLeaf(target, file);
-		} finally {
-			this.swapping.delete(file.path);
-		}
-	}
-
-	private async swapLeaf(leaf: WorkspaceLeaf, file: TFile): Promise<void> {
-		await leaf.setViewState({
-			type: HANDWRITING_PAGE_VIEW_TYPE,
-			state: { file: file.path },
 			active: true,
 		});
 	}
@@ -4985,14 +4988,17 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	 */
 	private async claimNotePageId(
 		path: string,
-		proposedId: string
-	): Promise<{ pageId: string; futureVersion?: number }> {
+		proposedId: string,
+		guard?: { file: TFile; markdown: string; current: () => boolean }
+	): Promise<{ pageId: string; futureVersion?: number; content?: string }> {
 		const file = this.app.vault.getFileByPath(path);
 		if (!file) throw new Error(`Handwriting: no file at ${path}`);
-		let out: { pageId: string; futureVersion?: number } = { pageId: proposedId };
+		let out: { pageId: string; futureVersion?: number; content?: string } = { pageId: proposedId };
 		await this.app.vault.process(file, (data) => {
+			if (guard && (file !== guard.file || !guard.current() || data !== guard.markdown))
+				throw new Error("This canvas changed before its page identity could be saved.");
 			const r = claimMarkdown(data, proposedId);
-			out = { pageId: r.pageId, futureVersion: r.futureVersion };
+			out = { pageId: r.pageId, futureVersion: r.futureVersion, content: r.content };
 			return r.content;
 		});
 		// A claim is a first sighting for the ownership ledger. The note
@@ -5024,6 +5030,10 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 	private startSlidesInk(): void {
 		const writer = newPageWriter("slides");
 		const host: SlidesInkHost = {
+			mountTools: (parent, actions) => mountSlidesTools(parent, actions, this.app, id => {
+				const registry = this.app as unknown as { commands?: { executeCommandById(id: string): void } };
+				registry.commands?.executeCommandById(id);
+			}, message => blockNotice(message)),
 			activeFilePath: () => this.app.workspace.getActiveFile()?.path ?? null,
 			readSource: async (path) => {
 				const file = this.app.vault.getFileByPath(path);
@@ -5185,6 +5195,8 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		const carried = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
 		this.settings = {
 			...carried,
+			// The retired canvas page's named views: carried through untouched, so an older build still finds them.
+			savedViews: Array.isArray(raw?.savedViews) ? raw.savedViews : [],
 			cameras: raw?.cameras && typeof raw.cameras === "object" ? raw.cameras : {},
 			inkSizes: {
 				pen: clampInkSize(raw?.inkSizes?.pen ?? 1),
@@ -5194,15 +5206,17 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 				pen: normalizeInkColor("pen", raw?.inkColors?.pen),
 				highlighter: normalizeInkColor("highlighter", raw?.inkColors?.highlighter),
 			},
-			// Vaults written before the rename carry `inkShaping`, which drove the
-			// same toggle. Honour it once so nobody's choice is silently reset.
-			pressureSensitivity:
-				raw?.pressureSensitivity ??
-				(raw as { inkShaping?: boolean } | undefined)?.inkShaping !== false,
-			// Its own key, deliberately not the legacy `inkShaping` one above:
-			// that key is already spoken for by the pressure toggle it was
-			// renamed into, and reading it here would make one old choice
-			// silently set two different things.
+			// ALWAYS ON (1.4.20, Alan's settings simplification): the switch is
+			// gone from the tab, so a stored `false` - or the pre-rename
+			// `inkShaping: false` that used to stand in for it - is ignored
+			// rather than left in force with no row to turn it back on. The
+			// key is still written, as true, so an older build reading this
+			// file draws with pressure too.
+			pressureSensitivity: true,
+			// Its own key, deliberately not the legacy `inkShaping` one: that
+			// key belonged to the pressure toggle it was renamed into, and
+			// reading it here would make one old choice silently set a
+			// different thing.
 			inkSmoothing: raw?.inkSmoothing !== false,
 			// `=== true`, NOT `!== false`: a vault with no stored value must come
 			// back OFF to match the default above. `!== false` reads absence as
@@ -5230,6 +5244,8 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 			paperStyle: normalizePaperStyle(raw?.paperStyle),
 			extendCanvasWhileScrolling: raw?.extendCanvasWhileScrolling === true,
 			penTools: normalizePenToolsMode(raw?.penTools),
+			noteZoomControls: normalizeNoteZoomControlsMode(raw?.noteZoomControls),
+			barsRestore: normalizeBarsRestore(raw?.barsRestore),
 			// A fresh key on purpose: the old boolean keys carried the OLD
 			// default in every data.json (full-object saves), so reading
 			// them pinned the whole fleet to reticle and the stroke default
@@ -5318,6 +5334,7 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// `penHardwareEverSeen: true` from another machine is ignored here.
 		restorePenHardwareEverSeenFromStore();
 		setPenToolsMode(this.settings.penTools);
+		setNoteZoomControlsMode(this.settings.noteZoomControls);
 		setToolbarCorner(this.settings.toolbarCorner);
 		// Beside the corner, and for the same reason: both are strip facts the
 		// settings own, and both must be in place before a surface builds its
@@ -5374,9 +5391,9 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		});
 		// No writer for mouse ink beside these four, and its absence is the
 		// rule rather than an omission: a quiet arm is for this session only
-		// (alan, 2026-09-04) and the two places that DO write it - the
-		// mouse-ink toggle command and the settings switch - write
-		// `settings.mouseInk` themselves. See MouseInk.ts.
+		// (alan, 2026-09-04) and the one place that DOES write it - the
+		// mouse-ink toggle command; the settings switch went in 1.4.20 -
+		// writes `settings.mouseInk` itself. See MouseInk.ts.
 		setPersistInkColor((tool, hex) => {
 			this.settings.inkColors[tool] = hex;
 			runDetached(this.persistSettings(), "save the ink color");
@@ -5428,6 +5445,11 @@ export default class HandwritingPlugin extends Plugin implements HandwritingHost
 		// numbers for both, and both had moved by the time anyone read it.)
 		this.applyPaperTo(document, this.settings.paperStyle);
 		setScrollExpansionEnabled(this.settings.extendCanvasWhileScrolling);
+		// s137 item 9: the zoom bar answers to Infinite Canvas as well as to
+		// its own row. The strip cannot read the setting (it does not import
+		// InkOverlay), so this file tells it, here at load and again at every
+		// flip of the row - the two call sites MobileTools.test.ts pins.
+		setZoomBarCanvasEnabled(this.settings.extendCanvasWhileScrolling);
 		this.app.workspace.onLayoutReady(() => {
 			if (this.unloaded) return;
 			this.applyPaper(this.settings.paperStyle);
@@ -5861,7 +5883,7 @@ type SettingKey = keyof HandwritingSettings;
 /** The legacy painter reads our own definition data, not newer host API objects. */
 type LegacySettingControl =
 	| { type: "toggle"; key: SettingKey; disabled?: boolean | (() => boolean) }
-	| { type: "dropdown"; key: SettingKey; options: Readonly<Record<string, string>> }
+	| { type: "dropdown"; key: SettingKey; options: Readonly<Record<string, string>>; disabled?: boolean | (() => boolean) }
 	| { type: "text" | "textarea" | "number" | "file" | "folder" | "slider" | "color" };
 
 type LegacySettingItem =
@@ -6060,8 +6082,8 @@ export class HandwritingSettingTab extends PluginSettingTab {
 				heading: "Appearance",
 				items: [
 					{
-						name: "Infinite Canvas",
-						desc: "Scroll to the right or down infinitely. Momentum is turned off when this setting is toggled on.",
+						name: "Infinite canvas",
+						desc: "Turns on Infinite canvas. Also turns on zoom bar. Default off.",
 						control: { type: "toggle", key: "extendCanvasWhileScrolling" },
 					},
 					{
@@ -6086,6 +6108,23 @@ export class HandwritingSettingTab extends PluginSettingTab {
 							type: "dropdown",
 							key: "penTools",
 							options: { hide: "Off", show: "On", auto: "Auto" },
+						},
+					},
+					{
+						// Option labels match the Toolbar visibility row's above
+						// verbatim - the two settings behave identically.
+						name: "Zoom bar",
+						desc: "Show or hide the zoom bar. Default Auto. Needs Infinite canvas.",
+						control: {
+							type: "dropdown",
+							key: "noteZoomControls",
+							options: { hide: "Off", show: "On", auto: "Auto" },
+							// The zoom bar cannot show without the canvas, so the row
+							// that decides when it shows cannot be used without it
+							// either. A predicate, not a stored value: it is read at
+							// render time, and `setControlValue` redraws the tab when
+							// the canvas moves, so the greying follows at once.
+							disabled: (): boolean => !this.plugin.settings.extendCanvasWhileScrolling,
 						},
 					},
 					{
@@ -6114,8 +6153,7 @@ export class HandwritingSettingTab extends PluginSettingTab {
 						// dropdown shape for a reorderable list, and the two are
 						// mutually exclusive on one row (obsidian.d.ts's
 						// `SettingDefinitionRender`), which is the same reason
-						// `renderPressureSensitivity` and `renderSupport` are
-						// written this way.
+						// `renderSupport` is written this way.
 						render: (setting) => this.renderFoldOrder(setting),
 					},
 				],
@@ -6149,8 +6187,12 @@ export class HandwritingSettingTab extends PluginSettingTab {
 						// default. Do not lengthen it; the option labels carry
 						// the rest, and the mechanism lives in InkPdfAppend.ts
 						// where it belongs.
-						name: "Ink color when flattening PDFs",
+						name: "Ink color on PDFs",
 						desc: "Darken, lighten, or leave it alone. Default darken.",
+						// Shipped in 1.4.18 as "Ink color when flattening PDFs".
+						// Search indexes name, desc and aliases only, so the old
+						// title stays findable here; see "Toolbar placement".
+						aliases: ["Ink color when flattening PDFs", "flatten"],
 						control: {
 							type: "dropdown",
 							key: "inkPdfColorMode",
@@ -6192,31 +6234,12 @@ export class HandwritingSettingTab extends PluginSettingTab {
 							disabled: () => this.plugin.settings.booxMode,
 						},
 					},
-					{
-						name: "Boox mode",
-						desc: "Adjust pen input and animations for e-ink screens. Default off.",
-						control: { type: "toggle", key: "booxMode" },
-					},
 				],
 			},
 			{
 				type: "group",
 				heading: "Pen",
 				items: [
-					{
-						name: "Pressure sensitivity",
-						desc: "Adjust line width with pen pressure. Default on.",
-						aliases: ["recalibrate", "calibration"],
-						// The command palette used to carry two separate commands for
-						// this row - "Pressure sensitivity: toggle" and "Pen pressure:
-						// recalibrate" - and Alan ruled both out of the palette
-						// (2026-09-05: "pressure sensitivity... those are all
-						// settings"). The toggle keeps going through `control`'s own
-						// path (`getControlValue`/`setControlValue`, same as every
-						// other row); `render` only adds the button beside it, the
-						// same escape hatch `renderSyncButton` below uses.
-						render: (setting) => this.renderPressureSensitivity(setting),
-					},
 					{
 						// The smoothing users can actually feel. setInkShaping has been
 						// honoured by the renderers all along but nothing ever called it: the
@@ -6248,18 +6271,6 @@ export class HandwritingSettingTab extends PluginSettingTab {
 						name: "Shape snap",
 						desc: "Hold at the end of a stroke to snap it into a shape. Default on.",
 						control: { type: "toggle", key: "shapeSnap" },
-					},
-				],
-			},
-			{
-				type: "group",
-				heading: "Mouse",
-				items: [
-					{
-						name: "Mouse ink",
-						desc: "Draw with the left mouse button. Default off.",
-						aliases: ["left click"],
-						control: { type: "toggle", key: "mouseInk" },
 					},
 				],
 			},
@@ -6342,6 +6353,27 @@ export class HandwritingSettingTab extends PluginSettingTab {
 							"Show diagnostic commands after reloading the plugin. Default off.",
 						control: { type: "toggle", key: "devDiagnostics" },
 					},
+					{
+						// Moved here from Latency, unchanged (1.4.20, Alan's settings
+						// simplification). The rows it overrides keep their
+						// `disabled` read of it wherever they sit.
+						name: "Boox mode",
+						desc: "Adjust pen input and animations for e-ink screens. Default off.",
+						control: { type: "toggle", key: "booxMode" },
+					},
+					{
+						// What is left of the Pen group's "Pressure sensitivity" row
+						// (1.4.20, Alan: A3). The switch is gone - pressure is always
+						// on, see `loadSettings` - but the button is a different
+						// feature and still the only road to it: the palette's
+						// "Pen pressure: recalibrate" was ruled out on 2026-09-05 in
+						// favour of this button. The old row's name stays an alias
+						// so settings search still lands somewhere.
+						name: "Recalibrate pen pressure",
+						desc: "Forget the pressure range learned on this device and relearn it from your next strokes.",
+						aliases: ["pressure sensitivity", "recalibrate", "calibration"],
+						render: (setting) => this.renderPressureRecalibrate(setting),
+					},
 				],
 			},
 		];
@@ -6378,17 +6410,6 @@ export class HandwritingSettingTab extends PluginSettingTab {
 	getControlValue(key: string): unknown {
 		if (key === "inkReadableInExports") return this.plugin.settings.inkReadableInExports ? "auto" : "keep";
 		if (this.overriddenByBoox(key)) return this.BOOX_OVERRIDES[key as SettingKey];
-		// Mouse ink is the one row whose LIVE value can differ from the saved
-		// one, and it started to the day a quiet arm stopped being written
-		// down (alan, 2026-09-04). A mouse click on a tool button turns the
-		// mode on for this session; the stored `false` beside it is then not
-		// what is in force, and a switch showing "off" over a mouse that is
-		// inking is worse than wrong - its first press would ask for the state
-		// it already has and look broken. Same reasoning as BOOX_OVERRIDES
-		// just above: the row reports what is in force. `apply` still writes
-		// the user's explicit answer, which is what makes it survive a
-		// restart.
-		if (key === "mouseInk") return mouseInkEnabled();
 		return key in this.plugin.settings ? this.plugin.settings[key as SettingKey] : undefined;
 	}
 
@@ -6420,11 +6441,16 @@ export class HandwritingSettingTab extends PluginSettingTab {
 			case "extendCanvasWhileScrolling":
 				s.extendCanvasWhileScrolling = on;
 				setScrollExpansionEnabled(on);
-				break;
-			case "pressureSensitivity":
-				s.pressureSensitivity = on;
-				setPressureSensitivity(on);
-				repaintAllInkOverlays();
+				// The zoom bar's other half (s137 item 9). The setter announces
+				// to strips listening for a mode change; the push covers the
+				// ones built before anyone subscribed, exactly as the fold
+				// order is pushed.
+				setZoomBarCanvasEnabled(on);
+				refreshNoteZoomControlsAll();
+				// The Zoom bar row is greyed out by this value, and its `disabled`
+				// predicate is read at render time: without this the row keeps the
+				// state it was drawn in until the tab is closed and opened again.
+				this.rerender();
 				break;
 			case "strokePrediction":
 				s.strokePrediction = on;
@@ -6496,18 +6522,6 @@ export class HandwritingSettingTab extends PluginSettingTab {
 			case "devDiagnostics":
 				s.devDiagnostics = on;
 				break;
-			case "mouseInk":
-				s.mouseInk = on;
-				setMouseInk(on);
-				// The settings switch is the second writer of this mode
-				// (a9bf181) and owes it the same fan-out as the command -
-				// see `applyMouseInkUiFanout` for both halves. Written as a
-				// call here rather than pushed into `setMouseInk` because
-				// `MouseInk.ts` cannot import `PenToolsMode.ts` - that
-				// module already imports `mouseActsAsPen` from it, and the
-				// cycle would be real.
-				this.plugin.applyMouseInkUiFanout(on);
-				break;
 			case "paperStyle": {
 				const style = normalizePaperStyle(str);
 				s.paperStyle = style;
@@ -6519,6 +6533,16 @@ export class HandwritingSettingTab extends PluginSettingTab {
 				s.penTools = m;
 				setPenToolsMode(m);
 				refreshPenToolsAll();
+				break;
+			}
+			case "noteZoomControls": {
+				// No refreshPenToolsAll equivalent needed: unlike penTools, the
+				// zoom bar's existence never changes with its mode - only its
+				// in-place visibility, which each live MobileTools instance
+				// re-applies itself via onNoteZoomControlsChanged (MobileTools.ts).
+				const m = normalizeNoteZoomControlsMode(str);
+				s.noteZoomControls = m;
+				setNoteZoomControlsMode(m);
 				break;
 			}
 			case "toolbarCorner": {
@@ -6594,46 +6618,38 @@ export class HandwritingSettingTab extends PluginSettingTab {
 					if (off) t.setDisabled(true);
 				});
 			} else if (item.control?.type === "dropdown") {
-				const { key, options } = item.control;
+				const { key, options, disabled } = item.control;
+				// Same reason as the toggle above, and the Zoom bar row is a
+				// dropdown: a row the definitions mark unusable must not paint as
+				// a live control here while 1.13 greys it.
+				const off = typeof disabled === "function" ? disabled() : disabled === true;
 				setting.addDropdown((d) => {
 					for (const [value, label] of Object.entries(options)) d.addOption(value, label);
 					const current = this.getControlValue(key);
 					d.setValue(typeof current === "string" ? current : "").onChange((v) => {
 						this.setControlValue(key, v);
 					});
+					if (off) d.setDisabled(true);
 				});
 			}
 		}
 	}
 
 	/**
-	 * The toggle and the "Pen pressure: recalibrate" command, now both here.
+	 * The Recalibrate button, on its own row in Developer since 1.4.20 took
+	 * the pressure switch it used to sit beside out of the tab.
 	 *
-	 * The toggle is the ordinary `control` path drawn by hand: everything
-	 * `paint()`'s own `type === "toggle"` branch does (`getControlValue` for
-	 * the seed value, `setControlValue` on change, which is the exact call
-	 * `pressureSensitivity`'s case in `setControlValue` always made - the
-	 * command used to reach the same two calls through `applyPressureSensitivity`
-	 * instead), reproduced here because `render` and `control` are mutually
-	 * exclusive on one row (obsidian.d.ts's `SettingDefinitionRender`) and a
-	 * button can only be added to this row through `render`.
-	 *
-	 * The button runs exactly what the removed `pressure-recalibrate` command
-	 * ran, notice included: `resetPressureCalibration()` then the same
-	 * "relearns from your next strokes" text, word for word.
+	 * It runs exactly what the removed `pressure-recalibrate` command ran,
+	 * notice included: `resetPressureCalibration()` then the same "relearns
+	 * from your next strokes" text, word for word.
 	 */
-	private renderPressureSensitivity(setting: Setting): void {
+	private renderPressureRecalibrate(setting: Setting): void {
 		setting.addButton((btn) =>
 			btn.setButtonText("Recalibrate").onClick(() => {
 				resetPressureCalibration();
 				new Notice("Handwriting: pressure relearns from your next strokes");
 			})
 		);
-		setting.addToggle((t) => {
-			t.setValue(this.getControlValue("pressureSensitivity") === true).onChange((v) => {
-				this.setControlValue("pressureSensitivity", v);
-			});
-		});
 	}
 
 	// One button, not a path field. "Where should the ink live" is not a

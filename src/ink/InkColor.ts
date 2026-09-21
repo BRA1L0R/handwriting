@@ -29,7 +29,7 @@ export const PEN_COLORS: ReadonlyArray<InkColorChoice> = [
 	{ name: "white", hex: "#f4f4f2" },
 	{ name: "red", hex: "#cf3040" },
 	{ name: "orange", hex: "#de6b12" },
-	{ name: "green", hex: "#2f8f5b" },
+	{ name: "green", hex: "#12873d" },
 	{ name: "purple", hex: "#7a4bbd" },
 ];
 

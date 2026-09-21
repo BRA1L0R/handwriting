@@ -187,16 +187,25 @@ export function inkPdfContent(
 	return out + "Q";
 }
 
-/** The box every stroke fits inside, in note px, plus a margin. */
-export function inkPageBox(strokes: readonly InkStroke[]): { w: number; h: number } {
-	let maxX = 0;
-	let maxY = 0;
+/** Preserve the note origin unless negative ink requires an earlier page edge. */
+function inkPageBounds(strokes: readonly InkStroke[]): { x: number; y: number; w: number; h: number } {
+	let minX = 0, minY = 0;
+	let maxX = -Infinity, maxY = -Infinity;
 	for (const s of strokes) {
 		if (s.points.length === 0) continue;
+		if (s.bbox.x < 0) minX = Math.min(minX, Math.floor(s.bbox.x) - MARGIN_PX);
+		if (s.bbox.y < 0) minY = Math.min(minY, Math.floor(s.bbox.y) - MARGIN_PX);
 		maxX = Math.max(maxX, s.bbox.x + s.bbox.width);
 		maxY = Math.max(maxY, s.bbox.y + s.bbox.height);
 	}
-	return { w: Math.ceil(maxX) + MARGIN_PX, h: Math.ceil(maxY) + MARGIN_PX };
+	if (maxX === -Infinity) return { x: 0, y: 0, w: MARGIN_PX, h: MARGIN_PX };
+	return { x: minX, y: minY, w: Math.ceil(maxX) - minX + MARGIN_PX, h: Math.ceil(maxY) - minY + MARGIN_PX };
+}
+
+/** The box every stroke fits inside, in note px, plus a margin. */
+export function inkPageBox(strokes: readonly InkStroke[]): { w: number; h: number } {
+	const { w, h } = inkPageBounds(strokes);
+	return { w, h };
 }
 
 /**
@@ -310,6 +319,10 @@ export function inkToPdf(
 ): string {
 	const inked = strokes.filter((s) => s.points.length > 0);
 	if (inked.length === 0) return "";
-	const { w, h } = inkPageBox(inked);
-	return pdfDocument(w, h, inkPdfContent(inked, h, "GSa", destination));
+	const { x, y, w, h } = inkPageBounds(inked);
+	const content = inkPdfContent(inked, h, "GSa", destination);
+	// Translation is in PDF's y-up space, outside the existing content flip.
+	// Keep positive-only documents byte-identical and appended PDF ink untouched.
+	return pdfDocument(w, h, x === 0 && y === 0 ? content :
+		`q 1 0 0 1 ${pdfNum(-x)} ${pdfNum(y)} cm ${content} Q`);
 }

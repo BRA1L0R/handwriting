@@ -427,7 +427,7 @@ describe("the preset chips do not go oval when their row has no room", () => {
  * The report was "the ink color selection circles come out as ovals" on a
  * Boox Note5C (jakolson, 2026-09-07). The squeeze pinned above is a real
  * mechanism but not that one: it needs the pop narrowed, and the pop is a
- * hardcoded 144px. This is the one Architect 2 reproduced against the
+ * hardcoded 144px. This is the one reproduced against the
  * INSTALLED app - 216 cases, real Chromium, real MobileTools - and it needs
  * nothing narrowed at all.
  *

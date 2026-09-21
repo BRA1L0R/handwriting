@@ -2,7 +2,7 @@ import { telemetry } from "../diag/Telemetry";
 import { GuardDecision, ManipulationGuard } from "../input/ManipulationGuard";
 import { PalmGate, paroleEarned } from "../input/PalmGate";
 import { PenSample, silentLift } from "../input/PointerRouter";
-import { visualToNote } from "./ZoomScale";
+import { noteToVisual, visualToNote } from "./ZoomScale";
 import { hideProbeMarkers, markRawPointer } from "./PenProbe";
 import { describeEl, hitProbeDown, hitProbeHover, isHitProbeEnabled } from "./PenHitProbe";
 import { scrollProbeTouch } from "./ScrollProbe";
@@ -15,6 +15,9 @@ import {
 } from "./PointerDeliveryTrace";
 import { captureUndoTrace, clearUndoTrace } from "../diag/UndoHistoryTrace";
 import { VelocitySample, flingStep, releaseVelocity } from "../input/Fling";
+
+/** s138(12a): the glide's decay in canvas mode, shorter than Fling.ts's default so the open room is not crossed in one flick. */
+const CANVAS_FLING_TAU_MS = 200;
 import { carryFrom, carryPinned, carryStep, scrollGrid, type ScrollCarry } from "./AssistScroll";
 import { armGuardStyle, disarmGuardStyle } from "./GuardStyle";
 import { HOVER_GHOST_MS, isPenCompatMouseMove } from "./PenCursor";
@@ -65,6 +68,8 @@ export interface InlinePenCallbacks {
 	onPenDown(sample: PenSample, ev: PointerEvent): void;
 	/** Retire earlier viewport ownership before new input changes its frame. */
 	onViewportInput?(): void;
+	/** Every contact has lifted (no touch, no assist pan) and none replaced it. A cancelled ease may have left the page stranded off its rest; the overlay decides whether there is anything to resume. */
+	onAllContactsLifted?(): void;
 	/** Finish pending raster coverage before the first sample is mapped. */
 	onBeforePenDown?(): void;
 	/**
@@ -90,6 +95,22 @@ export interface InlinePenCallbacks {
 		 *  here so the page does not slide out from under the fingers. */
 		centroid: { x: number; y: number }
 	): void;
+	/**
+	 * The give the page is allowed past an end, painted px, or 0 for none.
+	 *
+	 * Asked of the host because the host knows the external scale, and because
+	 * a host with no boundary to bounce off - Infinite Canvas on, where the
+	 * page is showing room it can grow into - answers 0 and nothing is carried.
+	 */
+	overscrollAllowancePx?(): number;
+	/**
+	 * The page is held past an end by this much, painted px: cumulative, and
+	 * already capped at the allowance. The host paints it. It is transient, and
+	 * the scroller's own offset never leaves its range while it is carried.
+	 */
+	onOverscrollPull?(x: number, y: number): void;
+	/** The gesture ended with a give outstanding: ease it back to zero. */
+	onOverscrollRelease?(): void;
 	/** Input-rate coalesced samples while a stroke is active. */
 	onPenRaw(samples: PenSample[], ev: PointerEvent): void;
 	/** rAF-rate move, for metrics only (`coalescedCount`). */
@@ -199,6 +220,13 @@ export interface InlinePenCallbacks {
 	 * native touch, which keeps PDF and every existing caller unchanged.
 	 */
 	fingerInk?(): boolean;
+	/**
+	 * Does a two-finger gesture belong to the host at all? s185 (Alan, 2026-09-20: "it should stay
+	 * obsidian stock behavior"). Undefined means yes, which keeps PDF and every existing caller
+	 * unchanged. False and the router does not watch, guard or claim the second contact: both
+	 * fingers stay the browser's and the host pinches the way it does with no plugin loaded.
+	 */
+	pinchZoom?(): boolean;
 	/** Drop the provisional finger stroke before handing two contacts to pinch. */
 	onFingerInkCancelled?(): void;
 	/**
@@ -1313,6 +1341,15 @@ export class InlinePenRouter {
 						const id = te.changedTouches[i]?.identifier;
 						if (typeof id === "number") this.liveTouchIds.delete(id);
 					}
+					// The browser's own statement that the hand is off the glass.
+					// A contact whose pointerup never arrived is still in
+					// `touchPos`, and the next single finger would make the size
+					// 2 and pinch with itself. A document switch or a capture
+					// transfer with fingers still down reports a non-empty
+					// `touches` and never takes this branch.
+					if (te.touches.length === 0 && this.touchPos.size > 0) {
+						this.retireAllContactsOnNativeEnd();
+					}
 					this.finishFingerInkPreparation();
 				}
 				// PEN OFF: nothing below this line may eat a touch. The three
@@ -1960,6 +1997,21 @@ export class InlinePenRouter {
 	// ---- standing gesture guard ---------------------------------------------
 
 	/** Apply a ManipulationGuard decision to the scroller and timers. */
+	/**
+	 * WHAT THE STANDING GUARD WRITES, for this surface AND this moment. s185 add. 1 (Architect):
+	 * Chromium reads `touch-action` at the FIRST contact of a sequence, so refusing to claim the
+	 * SECOND finger buys nothing while the first has already put `none` on the scroller - the
+	 * browser has decided the whole gesture is ours by then. With the host's own pinch in force the
+	 * guard arms at `pinch-zoom` instead: the browser keeps two-finger zoom, and one-finger panning
+	 * is still refused to it, which is what the assist pan replaces.
+	 *
+	 * The constructor value is the surface's own (an editor asks for `none`, the PDF viewer already
+	 * asks for `pinch-zoom`), and it is what a host that answers nothing still gets.
+	 */
+	private armedTouchAction(): string {
+		return (this.cb.pinchZoom?.() ?? true) ? this.guardTouchAction : "pinch-zoom";
+	}
+
 	private applyGuard(d: GuardDecision, why: string): void {
 		if (!guardEnabled) {
 			this.restoreGuardStyle();
@@ -1980,7 +2032,7 @@ export class InlinePenRouter {
 		if (wantNone && !this.guardApplied) {
 			this.captureRootTouchAction();
 			this.guardApplied = true;
-			armGuardStyle(this.scrollEl, this.guardTouchAction);
+			armGuardStyle(this.scrollEl, this.armedTouchAction());
 			tr("guard", null, `touch-action: none (${why})`);
 		} else if (!wantNone && this.guardApplied) {
 			this.guardApplied = false;
@@ -2014,7 +2066,7 @@ export class InlinePenRouter {
 	private syncRootTouchAction(): void {
 		if (!this.savedTouchActionKnown) return;
 		const owned = this.canvasMomentumDisabled || this.guardApplied;
-		const touchAction = this.canvasMomentumDisabled ? "none" : this.guardApplied ? this.guardTouchAction : this.savedTouchAction;
+		const touchAction = this.canvasMomentumDisabled ? "none" : this.guardApplied ? this.armedTouchAction() : this.savedTouchAction;
 		if (this.scrollEl.style.touchAction !== touchAction) this.scrollEl.setCssStyles({ touchAction });
 		if (!owned && this.savedTouchActionPriority) this.scrollEl.style.setProperty("touch-action", this.savedTouchAction, this.savedTouchActionPriority);
 	}
@@ -2085,7 +2137,7 @@ export class InlinePenRouter {
 	 * (audit-fixes-design.md 5i I2). Callers that still have both contacts
 	 * live when they call this (none do today) can omit it.
 	 */
-	private endPinch(e: PointerEvent, centroid?: { x: number; y: number }): void {
+	private endPinch(e: PointerEvent | null, centroid?: { x: number; y: number }): void {
 		if (!this.pinchLive) return;
 		this.pinchLive = false;
 		this.cb.onPinch("end", 1, centroid ?? this.pinchCentroid());
@@ -2139,7 +2191,12 @@ export class InlinePenRouter {
 
 	private canvasMomentumDisabled = false;
 
-	/** Inline-note policy: own touch pan from contact start, without a release glide. */
+	/**
+	 * Inline-note policy: own the touch pan from contact start. s138(12): this used to refuse the
+	 * release glide as well, so a canvas flick stopped dead at the lift. Owning the pan and gliding
+	 * after it are separate things - the assist carries both - so the glide now runs in either mode
+	 * and only the ownership follows this flag.
+	 */
 	setCanvasMomentumDisabled(on: boolean): void {
 		if (on === this.canvasMomentumDisabled) return;
 		if (on) this.captureRootTouchAction();
@@ -2211,6 +2268,8 @@ export class InlinePenRouter {
 
 	private endAssist(e: PointerEvent): boolean {
 		if (e.pointerId !== this.assistPointerId) return false;
+		// The hand is off the glass: any give it was holding eases back from here.
+		this.releaseOverscrollPull();
 		const engaged = this.assistEngaged;
 		this.assistPointerId = null;
 		this.assistEngaged = false;
@@ -2228,7 +2287,6 @@ export class InlinePenRouter {
 	 * Cancelled by ANY new pointer contact. The pen always wins instantly.
 	 */
 	private startFling(vx: number, vy: number): void {
-		if (this.canvasMomentumDisabled) return;
 		// The one number a "scrolling feels too fast" report needs: what the
 		// release actually measured. Everything downstream is deterministic
 		// physics, so a bad glide is either a bad velocity here or a surface
@@ -2245,15 +2303,39 @@ export class InlinePenRouter {
 		const tick = () => {
 			this.flingRaf = 0;
 			const now = performance.now();
-			const s = flingStep(this.flingVx, this.flingVy, now - this.flingLastT);
+			// s138(12a): THE CANVAS GLIDE IS SHORTER. Travel is v0 * tau, so 200 ms against the default 325
+			// carries a hard flick about 1600 px instead of about 2600 - the room is open there and the
+			// default sails across it. Canvas off keeps the shipped glide. Alan tunes the number on the device.
+			const s = flingStep(this.flingVx, this.flingVy, now - this.flingLastT,
+				this.canvasMomentumDisabled ? CANVAS_FLING_TAU_MS : undefined);
 			this.flingLastT = now;
 			this.flingVx = s.vx;
 			this.flingVy = s.vy;
 			const w = this.carryScrollBy(s.dx, s.dy);
-			const pinned = carryPinned(w.x, w.left, w.grid) && carryPinned(w.y, w.top, w.grid);
+			const xPinned = carryPinned(w.x, w.left, w.grid), yPinned = carryPinned(w.y, w.top, w.grid);
+			// s134: THE GLIDE ENDS AT THE END IT HITS. Every real flick carries a small residual across its
+			// own direction, and that residual kept the glide alive - `done` reads the speed of both axes
+			// together, so a flick into the left edge with a hand's worth of drift downward went on gliding
+			// down by fractions of a pixel for the better part of two seconds while the give stood at its
+			// cap waiting for the glide to end (Alan, device, 2026-09-20: "it will hang for a bit too long").
+			// So the glide is over when the axis carrying its main direction is pinned, not only when both
+			// are; the give springs back at once and the residual is dropped with it, which is what hitting
+			// an edge looks like. A glide whose main axis still has room is untouched.
+			// The axis carrying the glide's main direction; when BOTH are pinned this is one of them, so the
+			// old `(xPinned && yPinned) || mainPinned` could never be true where this is not.
+			const pinned = Math.abs(this.flingVx) >= Math.abs(this.flingVy) ? xPinned : yPinned;
 			// Done when the physics say so, or the carried target is clamped at an
 			// edge and the glide has nowhere left to go.
-			if (s.done || (pinned && Math.abs(s.dx) + Math.abs(s.dy) > 0.5)) return;
+			if (s.done || (pinned && Math.abs(s.dx) + Math.abs(s.dy) > 0.5)) {
+				// THE GLIDE'S OWN GIVE. `carryScrollBy` above accrues what the scroller
+				// refused on every frame of this chain, exactly as it does under a finger,
+				// and a glide that runs out of page against an end accrues the lot. The
+				// hand left at the lift, so if this does not hand it back nothing ever
+				// will: the page stays held an allowance past the end, with the preview
+				// paper up, until the next contact. A no-op when no pull stands.
+				this.releaseOverscrollPull();
+				return;
+			}
 			this.flingRaf = this.winRef.requestAnimationFrame(tick);
 		};
 		this.flingRaf = this.winRef.requestAnimationFrame(tick);
@@ -2274,13 +2356,109 @@ export class InlinePenRouter {
 		const grid = scrollGrid(visualToNote(1, scale));
 		const left = el.scrollLeft;
 		const top = el.scrollTop;
-		const x = carryStep(this.scrollCarryX ?? carryFrom(left), { offset: left, range: el.scrollWidth - el.clientWidth }, -visualToNote(dx, scale), grid);
-		const y = carryStep(this.scrollCarryY ?? carryFrom(top), { offset: top, range: el.scrollHeight - el.clientHeight }, -visualToNote(dy, scale), grid);
+		const beforeX = this.scrollCarryX ?? carryFrom(left);
+		const beforeY = this.scrollCarryY ?? carryFrom(top);
+		const stepX = -visualToNote(dx, scale);
+		const stepY = -visualToNote(dy, scale);
+		const x = carryStep(beforeX, { offset: left, range: el.scrollWidth - el.clientWidth }, stepX, grid);
+		const y = carryStep(beforeY, { offset: top, range: el.scrollHeight - el.clientHeight }, stepY, grid);
 		this.scrollCarryX = x.carry;
 		this.scrollCarryY = y.carry;
 		el.scrollLeft = x.carry.target;
 		el.scrollTop = y.carry.target;
+		// THE GIVE AT AN END. What the clamp refused is not nothing: it is the hand still
+		// moving against a page that has run out. `carryStep` starts from the adopted
+		// offset or the carried target and clamps the sum into [0, range], so the part it
+		// would not take is the step minus the distance actually travelled. That remainder
+		// is carried as a transient pull and handed to the host, which paints it and eases
+		// it back on the lift. The scroller's own offset is untouched: it stays inside its
+		// range, exactly as written above.
+		this.accrueOverscrollPull(
+			stepX - (x.carry.target - (x.adopted ? left : beforeX.target)),
+			stepY - (y.carry.target - (y.adopted ? top : beforeY.target)),
+			scale,
+		);
 		return { x, y, left, top, grid };
+	}
+
+	/** The transient give, painted px, per axis. Zero whenever the page is not held past an end. */
+	private overscrollPullX = 0;
+	private overscrollPullY = 0;
+
+	/**
+	 * Accrue the part of a step the scroller refused, in note px, as a pull in
+	 * painted px.
+	 *
+	 * The allowance comes from the host (`overscrollAllowancePx`) because it is
+	 * the host that knows the external scale, and because a host with no give
+	 * to offer - Infinite Canvas on, where an end is not a boundary - answers
+	 * zero and nothing is carried at all.
+	 */
+	private accrueOverscrollPull(refusedNoteX: number, refusedNoteY: number, scale: number): void {
+		const allowance = this.cb.overscrollAllowancePx?.() ?? 0;
+		if (allowance <= 0) return;
+		const refusedX = noteToVisual(refusedNoteX, scale);
+		const refusedY = noteToVisual(refusedNoteY, scale);
+		if (Math.abs(refusedX) < 1e-9 && Math.abs(refusedY) < 1e-9) return;
+		const clamp = (v: number): number => Math.max(-allowance, Math.min(allowance, v));
+		// The pull is the hand's direction: the content follows the hand, and
+		// the refused step was expressed against it.
+		this.overscrollPullX = clamp(this.overscrollPullX - refusedX);
+		this.overscrollPullY = clamp(this.overscrollPullY - refusedY);
+		this.cb.onOverscrollPull?.(this.overscrollPullX, this.overscrollPullY);
+	}
+
+	/** The gesture ended: hand the give back to the host, which eases it to zero. */
+	private releaseOverscrollPull(): void {
+		if (this.overscrollPullX === 0 && this.overscrollPullY === 0) return;
+		this.overscrollPullX = 0;
+		this.overscrollPullY = 0;
+		this.cb.onOverscrollRelease?.();
+	}
+
+	/**
+	 * Which side of the assist gate the last touch contact went, and why. Written at the gate, never
+	 * read by production: a fixture that finds no give has to be able to say whether the assist
+	 * refused the gesture or took it and found nothing to refuse, and the guard's own state cannot
+	 * answer that - `touchStart` moves armed to armed-assist whether it grants or refuses.
+	 */
+	assistGateReadout: { assistThisGesture: boolean; guardEnabled: boolean; edgeStart: boolean; took: boolean } =
+		{ assistThisGesture: false, guardEnabled: false, edgeStart: false, took: false };
+
+	/**
+	 * True when a drag starting now could only produce give, not scrolling: the host offers an
+	 * allowance - which is Infinite Canvas OFF, since it answers 0 when on - and the scroller is
+	 * against an end on an axis, or has no range there at all.
+	 *
+	 * Asked at the CONTACT, because that is when ownership is decided; no later point in the gesture
+	 * can recover a drag that was handed to the native scroller. The direction is not known yet, so
+	 * either axis being at an end is enough: a drag that turns out to head back into the range is
+	 * carried by the assist exactly as it is at any other offset, and gives nothing.
+	 */
+	/**
+	 * s128: THE LIFT SITS WHERE NATIVE SCROLLING HAS NOTHING TO DO. Narrower than `dragBeginsAgainstAnEnd`
+	 * on purpose: an axis with no range at all is ignored (a note that fits sideways still scrolls natively
+	 * up and down), so only a lift at the top, bottom, left or right of an axis that CAN scroll, or on a note
+	 * with no range on either axis, keeps the guard armed. Mid-page lifts open the native window as before.
+	 */
+	private liftAgainstAnEnd(): boolean {
+		if ((this.cb.overscrollAllowancePx?.() ?? 0) <= 0) return false;
+		const el = this.scrollEl;
+		const rangeX = el.scrollWidth - el.clientWidth;
+		const rangeY = el.scrollHeight - el.clientHeight;
+		const endX = rangeX > 0 && (el.scrollLeft <= 0 || el.scrollLeft >= rangeX);
+		const endY = rangeY > 0 && (el.scrollTop <= 0 || el.scrollTop >= rangeY);
+		return endX || endY || (rangeX <= 0 && rangeY <= 0);
+	}
+
+	private dragBeginsAgainstAnEnd(): boolean {
+		if ((this.cb.overscrollAllowancePx?.() ?? 0) <= 0) return false;
+		const el = this.scrollEl;
+		const rangeX = el.scrollWidth - el.clientWidth;
+		const rangeY = el.scrollHeight - el.clientHeight;
+		const atX = rangeX <= 0 || el.scrollLeft <= 0 || el.scrollLeft >= rangeX;
+		const atY = rangeY <= 0 || el.scrollTop <= 0 || el.scrollTop >= rangeY;
+		return atX || atY;
 	}
 
 	private cancelFling(): void {
@@ -2288,10 +2466,22 @@ export class InlinePenRouter {
 			this.winRef.cancelAnimationFrame(this.flingRaf);
 			this.flingRaf = 0;
 		}
+		// A glide cut short with a give standing leaves the page held past an end by a
+		// gesture that is over. Every caller here is a gesture ending or changing hands -
+		// a new contact, a pinch beginning, a tool or camera change, a blur, teardown - so
+		// the give goes home from all of them rather than being stranded by whichever one
+		// happened to arrive. A no-op when no pull stands, which is the common case: the
+		// release returns at once and the host is never called.
+		this.releaseOverscrollPull();
 	}
 
 	get isStroking(): boolean {
 		return this.activePenId !== null;
+	}
+
+	/** Existing navigation lifetime only: hover and swallowed palms do not hold sync. */
+	get hasActiveNavigation(): boolean {
+		return this.guardTouches.size > 0 || this.pinchLive || this.assistPointerId !== null || this.flingRaf !== 0;
 	}
 
 	/**
@@ -2550,7 +2740,9 @@ export class InlinePenRouter {
 				this.touchPos.set(e.pointerId, { x: e.clientX, y: e.clientY });
 				this.manip.touchStart();
 				this.cancelFingerInkForPinch();
-				if (this.touchPos.size === 2) this.beginPinch(e);
+				// s185: with the host's own pinch in force the second contact is not ours to turn into a zoom.
+				// The provisional finger stroke is already revoked above; the gesture is left to the browser.
+				if (this.touchPos.size === 2 && (this.cb.pinchZoom?.() ?? true)) this.beginPinch(e);
 				e.preventDefault();
 				e.stopPropagation();
 				return;
@@ -2590,6 +2782,18 @@ export class InlinePenRouter {
 			// slam's leading palm graze must never sell out the pen that lands
 			// milliseconds later). The native window opens on last-finger lift,
 			// and only if the gesture actually panned.
+			// s185, ALAN DIRECT (2026-09-20, "it should stay obsidian stock behavior"): A SECOND FINGER IS NOT
+			// OURS WITH THE ZOOM OFF. The overlay already ignores every pinch phase with the Infinite Canvas off
+			// (a4508b26), but the router still claimed both contacts and armed the guard, so the host never saw
+			// the gesture at all: no stock pinch, and nothing in its place. Asked BEFORE the contact is recorded
+			// or guarded, so the browser owns it from the first event rather than having it handed back later.
+			if (this.touchPos.size === 1 && !(this.cb.pinchZoom?.() ?? true)) {
+				// OPEN, NOT DECIDED HERE: the first finger's guard is left exactly as it stands. Whether the host
+				// can pinch at all while the scroller still carries touch-action none is a device question, and
+				// releasing it means telling `ManipulationGuard` a finger lifted when none did. Flagged to the
+				// Architect rather than invented (s185 handback).
+				return;
+			}
 			this.guardTouches.add(e.pointerId);
 			this.touchPos.set(e.pointerId, { x: e.clientX, y: e.clientY });
 			const d = this.manip.touchStart();
@@ -2607,7 +2811,19 @@ export class InlinePenRouter {
 				e.stopPropagation();
 				return;
 			}
-			if (this.canvasMomentumDisabled || (d.assistThisGesture && guardEnabled)) {
+			// A DRAG THAT BEGINS AGAINST AN END IS OURS, whatever the guard thinks. The give is the
+			// remainder `carryScrollBy` refuses, and that only runs while the assist owns the drag;
+			// when it does not, the touch goes to the native scroller instead. Inside the range that
+			// is invisible - native scrolling carries it and nobody can tell who owned it - but
+			// against an end the native scroller has nothing to do, so the gesture is dropped and
+			// there is no refused remainder for the give to carry. The guard is armed for the FIRST
+			// finger of a gesture and re-arms a second after the last lift, so the drag that fails
+			// this way is the SECOND one: try, nothing happens, try again, still nothing. Measured at
+			// 20c182e1 in AssistEdgeGive - the first drag gives, the second gives nothing.
+			const edgeStart = this.dragBeginsAgainstAnEnd();
+			this.assistGateReadout = { assistThisGesture: d.assistThisGesture, guardEnabled, edgeStart, took: false };
+			if (this.canvasMomentumDisabled || (d.assistThisGesture && guardEnabled) || edgeStart) {
+				this.assistGateReadout.took = true;
 				this.beginAssist(e);
 				tr("pointerdown", e, "touch (guard held; assist will carry this gesture)");
 			} else {
@@ -2627,7 +2843,7 @@ export class InlinePenRouter {
 		if (e.pointerType === "pen" && this.activeIsFinger) {
 			this.commitFingerInkForPenPreemption();
 		}
-		// ADDENDUM 3 ("button should become the truth", alan, 2026-09-05,
+		// ALAN, 2026-09-05 ("button should become the truth",
 		// ~16:4x, verbatim): "what if we're on mouse cursor and then they
 		// touch with a pen, it should light up." A device that has NEVER
 		// seen a pen and sits in cursor mode (pen off here) gets its first
@@ -2635,7 +2851,7 @@ export class InlinePenRouter {
 		// very contact must ink.
 		//
 		// THIS IS AN ORDERING FIX, NOT A REFUSAL FIX - stated because an
-		// earlier pass through this brief argued the pen-off early return
+		// earlier version of this change argued the pen-off early return
 		// two blocks down would otherwise REFUSE this exact contact and the
 		// latch would never flip. THAT WAS WRONG, and is on the record as
 		// wrong rather than quietly dropped: `penOff()` reads `!penInkEnabled
@@ -2649,7 +2865,7 @@ export class InlinePenRouter {
 		// it turns that flag on for a device sitting in keyboard mode - so
 		// without this, a pen-less device's first real contact while in
 		// keyboard mode is refused, exactly as any other pen contact would
-		// be while pen input is off. Addendum 3 asks for that ONE contact to
+		// be while pen input is off. Alan asks for that ONE contact to
 		// be let in instead, which means `penOff()` has to already read
 		// false by the time the claim decision two lines down runs it.
 		//
@@ -3240,6 +3456,9 @@ export class InlinePenRouter {
 				this.finishFingerInkPreparation();
 				return;
 			}
+			// Read BEFORE endPinch clears it: whether this lift genuinely ended a live pinch, not merely
+			// whether this pointerId happened to be in touchPos (a lone tap sits there too).
+			const endedLivePinch = this.touchPos.has(e.pointerId) && this.pinchLive;
 			if (this.touchPos.has(e.pointerId)) {
 				// Read the centroid while BOTH contacts are still in touchPos -
 				// deleting first (the old order) left only the remaining
@@ -3256,13 +3475,30 @@ export class InlinePenRouter {
 				// `panned` = this gesture really scrolled (assist engaged at any
 				// point). Only then does the native touch window open on the
 				// last lift; taps and resting palms leave the guard armed.
-				this.applyGuard(this.manip.touchEnd(this.gesturePanned || wasAssistPan), "touch-end");
+				// s128: A LIFT AGAINST AN END DOES NOT OPEN THE NATIVE WINDOW. The window hands the next finger to the
+				// browser; against an end the browser has nothing to scroll and cancels that finger a few px in
+				// (pointercancel -> retireAllContactsOnNativeEnd -> the pull released), which is the give "letting go
+				// immediately" on Alan's device at the top, the left and the corner. touch-action is read by the
+				// browser at the touch's start, so the guard has to be armed BEFORE that finger lands: re-arm now.
+				let lift = this.manip.touchEnd(this.gesturePanned || wasAssistPan);
+				if (lift.scheduleRearm && this.liftAgainstAnEnd()) lift = this.manip.rearm();
+				this.applyGuard(lift, "touch-end");
 				if (this.guardTouches.size === 0) {
 					this.gesturePanned = false;
 					this.fingerInkBlockedUntilAllLift = false;
 				}
 			}
 			this.finishFingerInkPreparation();
+			// Every contact is gone AND this lift was not itself a pinch, an assist pan or a stroke -
+			// a tap or a resting palm, the only contacts that can cancel a playing ease (onViewportInput,
+			// pointerDown) without owning anything to replace it with. A real gesture's own settle already
+			// starts its own bounce synchronously inside endPinch/endAssist above, so excluding those here
+			// (rather than trusting the overlay's bounceState no-op alone) keeps this from racing the very
+			// first frame of that settle's own ease - measured: THE BOUNCE's commit-frame step widened past
+			// its 9.5px bound (10.37) when this fired unconditionally on the pinch's own last-finger lift.
+			if (!endedLivePinch && !wasAssistPan && !duringStroke && this.touchPos.size === 0 && this.guardTouches.size === 0) {
+				this.cb.onAllContactsLifted?.();
+			}
 			if (wasAssistPan || duringStroke || blockedFingerGesture) {
 				// The pan already happened (or a palm is lifting mid-stroke);
 				// keep the trailing tap machinery off the editor, matching a
@@ -3314,6 +3550,39 @@ export class InlinePenRouter {
 	 * scroller's normal touch-up tail. Normal pointer-up reaches this same
 	 * helper first and therefore cannot double-decrement the guard afterward.
 	 */
+	/**
+	 * Every contact goes at once, because the browser says none are left.
+	 *
+	 * The helpers around this one each retire ONE contact, keyed by pointer
+	 * id, off the pointer stream. Nothing retired a contact on the browser's
+	 * word, and pointer ids are never reconciled with `Touch.identifier`, so a
+	 * contact whose `pointerup` never arrived - the selection UI or the OS
+	 * swallowed it - stayed in `touchPos` for the rest of the session: the next
+	 * single finger made the size 2, which is the pinch trigger, and one finger
+	 * zoomed the note (iPad: long-press to select, then one finger down).
+	 *
+	 * `liveTouchIds` is deliberately not touched here. It mirrors the native
+	 * stream and the branch that calls this has already maintained it.
+	 */
+	private retireAllContactsOnNativeEnd(): void {
+		if (this.pinchLive) {
+			// Read the centroid while the contacts are still there, the same
+			// order the release path uses (audit-fixes-design.md 5i I2).
+			const centroid = this.pinchCentroid();
+			this.endPinch(null, centroid);
+		}
+		// The assist stands down without a fling: this is a recovery, not a
+		// release the writer made, and there is no velocity to honour.
+		this.assistPointerId = null;
+		this.assistEngaged = false;
+		this.assistSamples = [];
+		this.releaseOverscrollPull();
+		for (const id of [...this.touchPos.keys()]) this.retireEndedFingerContact(id);
+		this.pinchStartSpread = 0;
+		this.paroleId = null;
+		this.paroleOverlapped = false;
+	}
+
 	private retireEndedFingerContact(pointerId: number): void {
 		this.touchPos.delete(pointerId);
 		if (!this.guardTouches.delete(pointerId)) return;

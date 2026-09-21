@@ -28,6 +28,9 @@ const NEUTRAL: ShapeParams = {
 	taperWidths: 0,
 	taperMaxShare: 0,
 	tipFloor: 1,
+	liftHoldRatio: 0,
+	exp7TipTaper: false,
+	edgeSlope: Number.POSITIVE_INFINITY,
 };
 
 function line(n: number, spacing: number, dtMs: number, pressure = 0.5): InkPoint[] {

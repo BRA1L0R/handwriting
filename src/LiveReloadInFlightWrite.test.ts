@@ -212,7 +212,8 @@ beforeEach(async () => {
 		() => {},
 		() => null,
 		async () => false,
-		{ error: (...args: unknown[]) => pollErrors.push(args) }
+		{ error: (...args: unknown[]) => pollErrors.push(args) },
+		() => () => true, // Explicit quiet binding in this reduced host.
 	);
 
 	// Seed: a sidecar already on disk, so the store knows its mtime, and the

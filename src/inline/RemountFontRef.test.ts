@@ -141,6 +141,8 @@ function makeRig(): Rig {
 	const dom = el({ ownerDocument: { defaultView: win }, parentElement: null });
 
 	o.view = {
+		// Explicit fileless editor binding for the real unmount admission census.
+		state: { field: () => undefined },
 		dom,
 		scrollDOM,
 		// handleResize's unchanged-guard now re-reads this on every call

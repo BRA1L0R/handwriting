@@ -307,3 +307,31 @@ describe("the page", () => {
 		expect(withEmpty).toEqual(without);
 	});
 });
+
+describe("negative world PDF bounds", () => {
+	it.each([
+		["all-negative", [-120, -80], -120],
+		["mixed", [-40, 60], -30],
+		["distant", [-10000, -9960], -8000],
+	] as const)("keeps %s paths within the page at unchanged scale", (_name, xs, y) => {
+		const s = stroke("pen", [...xs], y);
+		const pdf = inkToPdf([s]);
+		const box = /\/MediaBox \[0 0 ([\d.]+) ([\d.]+)\]/.exec(pdf)!;
+		const matrices = [...pdf.matchAll(/(-?[\d.]+) (-?[\d.]+) (-?[\d.]+) (-?[\d.]+) (-?[\d.]+) (-?[\d.]+) cm/g)].map(m => m.slice(1).map(Number));
+		const transform = (p: {x:number;y:number}) => matrices.reduceRight((p, [a,b,c,d,e,f]) => ({x:a!*p.x+c!*p.y+e!, y:b!*p.x+d!*p.y+f!}), p);
+		const points = subpaths(strokePdfOps(s)).flat().map(transform);
+		expect(points.length).toBeGreaterThan(0);
+		for (const p of points) {
+			expect(p.x).toBeGreaterThanOrEqual(0); expect(p.y).toBeGreaterThanOrEqual(0);
+			expect(p.x).toBeLessThanOrEqual(Number(box[1])); expect(p.y).toBeLessThanOrEqual(Number(box[2]));
+		}
+		const a = transform(s.points[0]!), b = transform(s.points[1]!);
+		expect(b.x-a.x).toBeCloseTo((xs[1]-xs[0])*PX_TO_PT);
+		expect(b.y-a.y).toBeCloseTo(-PX_TO_PT);
+	});
+	it("preserves positive-only output byte for byte", () => {
+		const s = stroke("pen", [100,200], 300);
+		const w = Math.ceil(s.bbox.x+s.bbox.width)+12, h = Math.ceil(s.bbox.y+s.bbox.height)+12;
+		expect(inkToPdf([s])).toBe(pdfDocument(w,h,inkPdfContent([s],h,"GSa","#ffffff")));
+	});
+});

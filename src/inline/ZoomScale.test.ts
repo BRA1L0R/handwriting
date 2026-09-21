@@ -28,6 +28,7 @@ import {
 	ownedEffectiveScale,
 	validCameraScale,
 } from "./ZoomScale";
+import { MAX_PINCH_SCALE } from "./PinchScale";
 
 describe("owned camera scale provenance", () => {
 	it("recombines external CSS with owned zoom without clamping the inverse", () => {
@@ -246,6 +247,25 @@ describe("backingScale — bounded so any canvas can still be allocated", () => 
 		expect(backingScale(2, 2.5, 100, 100)).toBe(2 * MAX_ZOOM_BACKING);
 	});
 
+	// MAXZOOM-6 (1.4.20): the pinch ceiling moved from 4 to 6 (MAX_PINCH_SCALE,
+	// PinchScale.ts), but MAX_ZOOM_BACKING was already saturating this function
+	// below the OLD ceiling - 2 < 4 < 6 - so the backing store's memory guard
+	// was never a function of where the pinch ceiling sits. This is the proof:
+	// 600% costs the canvas EXACTLY what 400% already did, on every pane shape,
+	// which is also the answer to "does 6x fit under the engine's canvas
+	// limit" - it fits iff 4x already did, and the tests above already show it
+	// does.
+	it("MAXZOOM-6: 600% claims exactly what 400% already did - the cap absorbed the raise", () => {
+		expect(MAX_PINCH_SCALE).toBe(6); // premise: this pin is only meaningful past the old ceiling
+		for (const [d, w, h] of [
+			[2, 100, 100],
+			[2, 1180, 820], // the iPad pane from "holds a zoomed pane inside the area budget" below
+			[3, 1400, 900], // the dpr-3 desktop pane from the WebKit-ceiling test below
+		] as const) {
+			expect(backingScale(d, MAX_PINCH_SCALE, w, h)).toBe(backingScale(d, 4, w, h));
+		}
+	});
+
 	it("still tracks the zoom below the cap", () => {
 		expect(backingScale(2, 1.5, 100, 100)).toBe(3);
 	});
@@ -314,6 +334,21 @@ describe("backingScale — bounded so any canvas can still be allocated", () => 
 		expect(b).toBeGreaterThan(2);
 	});
 
+	// MAXZOOM-6 companion to the cell above: same pane, the new 600% ceiling.
+	// Identical result to the 4x cell, because MAX_ZOOM_BACKING already capped
+	// the zoom's contribution before either ceiling. Written as its own cell
+	// rather than folded into a loop with the 4x one, so a future change that
+	// makes 600% behave differently from 400% fails a NAMED cell instead of an
+	// iteration nobody reads closely.
+	it("MAXZOOM-6: holds the SAME zoomed pane inside the area budget at 600%", () => {
+		const w = 1180;
+		const h = 820;
+		const b = backingScale(2, MAX_PINCH_SCALE, w, h);
+		expect(b).toBe(backingScale(2, 4, w, h));
+		expect(w * b * (h * b)).toBeLessThanOrEqual(MAX_BACKING_AREA + 1);
+		expect(b).toBeGreaterThan(2);
+	});
+
 	it("trims a MOBILE pane that is over budget with no zoom at all", () => {
 		// A 3000x2000 pane at dpr 2 is 24M device px against a 10M budget
 		// before any pinch. On mobile the budget is a real ceiling and takes
@@ -357,6 +392,38 @@ describe("backingScale — bounded so any canvas can still be allocated", () => 
 		expect(2 * 1366 * (2 * 1350)).toBeLessThan(MAX_BACKING_AREA); // premise
 		expect(backingScale(2, 1, 1366, 1350, true)).toBe(2);
 		expect(backingScale(2, 1, 1366, 1350)).toBe(2);
+	});
+
+	// MAXZOOM-6 (Fleet 3 c2): the exact figures for "600% at dpr 3 on the same
+	// 1400x900 pane the cell above already uses" - actual device px, not just
+	// a pass/fail, so the numbers are on record rather than only the
+	// assertion. WebKit's per-canvas ceiling is ~16.7M device px (1.4.12-
+	// design.md §14, cited throughout this file); MAX_BACKING_AREA (10M) is
+	// deliberately under that, and this is the proof the ceiling raise cannot
+	// push a real pane past either number.
+	it("MAXZOOM-6: 600% at dpr 3 on a 1400px pane - the actual device px, against both ceilings", () => {
+		const w = 1400, h = 900, dpr = 3;
+		const WEBKIT_PER_CANVAS_CEILING = 16_700_000; // 1.4.12-design.md §14
+
+		// DESKTOP: the floor hands back what dpr 1 would have used unzoomed,
+		// same as the 400%/oldFloor cell above - the ceiling raise changes
+		// nothing here because that floor is not indexed by the pinch scale.
+		const bDesktop = backingScale(dpr, MAX_PINCH_SCALE, w, h);
+		const desktopDevicePx = { width: w * bDesktop, height: h * bDesktop };
+		expect(bDesktop).toBe(backingScale(dpr, 4, w, h)); // identical to the old ceiling
+		expect(desktopDevicePx).toEqual({ width: 4200, height: 2700 });
+		expect(desktopDevicePx.width * desktopDevicePx.height).toBe(11_340_000);
+		expect(desktopDevicePx.width * desktopDevicePx.height).toBeLessThan(WEBKIT_PER_CANVAS_CEILING);
+		expect(desktopDevicePx.width * desktopDevicePx.height).toBeGreaterThan(MAX_BACKING_AREA); // the desktop floor deliberately exceeds the budget here (the TRIPWIRE above)
+
+		// MOBILE: the budget is a real ceiling here, so 600% lands on the same
+		// trimmed scale 400% already did - never the flat zoom multiple.
+		const bMobile = backingScale(dpr, MAX_PINCH_SCALE, w, h, true);
+		const mobileDevicePx = { width: w * bMobile, height: h * bMobile };
+		expect(bMobile).toBe(backingScale(dpr, 4, w, h, true));
+		expect(bMobile).toBeLessThan(dpr); // device ratio IS spent on mobile
+		expect(mobileDevicePx.width * mobileDevicePx.height).toBeCloseTo(MAX_BACKING_AREA, 0);
+		expect(mobileDevicePx.width * mobileDevicePx.height).toBeLessThan(WEBKIT_PER_CANVAS_CEILING);
 	});
 
 	it("never returns zero or a NaN, whatever it is handed", () => {

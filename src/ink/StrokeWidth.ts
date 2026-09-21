@@ -41,6 +41,9 @@ export function strokeWidthPolicy(
 			gamma: 1,
 			maxWidthFactor: 1,
 			pressureOffWidthFactor: 1,
+			// A caller's style may carry exp7 (EXP7_PEN does); uniform ink has no
+			// pressure profile, and every exp7 gate in InkShape keys on this field.
+			pressureProfile: undefined,
 		},
 		shapeWidth: false,
 	};

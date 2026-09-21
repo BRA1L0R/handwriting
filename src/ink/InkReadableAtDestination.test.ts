@@ -13,12 +13,13 @@ import {
 	withInkDestination,
 } from "./InkTheme";
 import { inkSvgLayers, inkToSvg } from "./SvgExport";
-import { PDF_PAGE_WHITE, inkPdfContent, inkToPdf } from "./InkPdf";
+import { PDF_PAGE_WHITE, PdfPageAssumption, inkPdfContent, inkToPdf } from "./InkPdf";
 import { appendInkToPdf } from "./InkPdfAppend";
 import { drawStroke } from "./StrokeRenderer";
 import { InkPoint, InkStroke, computeBBox } from "./Stroke";
 import { CameraState } from "../camera/coordinates";
 import { document as pdfDocumentFixture, streamObject } from "../../test/pdf-fixture";
+import { PdfInkController } from "../pdf/PdfInkController";
 
 /**
  * THE COMPLAINT, AS A SUITE.
@@ -141,6 +142,74 @@ function latin1(bytes: Uint8Array): string {
 	return s;
 }
 
+/**
+ * PATH 5's painter: the PDF snip, run by the real controller over one page the
+ * viewer has not rendered (so the snip paints its own white ground), with the
+ * page assumption handed to it the way main.ts hands it the setting. The fuller
+ * cases - the viewer's page crop, a dark page, the production construction
+ * site, a live setting change and the scope ending before the encode - are in
+ * src/pdf/PdfSnipDestination.test.ts. What this returns is the context's
+ * fillStyle once the snip has painted: the ink's, because the ink is the last
+ * thing the snip fills, and the white ground's if no ink was painted at all.
+ */
+async function pdfSnipFill(assumption: PdfPageAssumption, stroke: InkStroke): Promise<string> {
+	const page = {
+		tagName: "DIV",
+		className: "page",
+		parentElement: null,
+		clientWidth: 600,
+		clientHeight: 800,
+		offsetTop: 0,
+		offsetLeft: 0,
+		clientTop: 0,
+		clientLeft: 0,
+		getAttribute: (n: string) => (n === "data-page-number" ? "1" : null),
+		querySelector: () => null,
+		querySelectorAll: () => [],
+	};
+	const scroller = {
+		querySelectorAll: (sel: string) => (sel === "div.page[data-page-number]" ? [page] : []),
+		querySelector: (sel: string) => (sel === 'div.page[data-page-number="1"]' ? page : null),
+	};
+	const root = { querySelector: (sel: string) => (sel === ".pdf-viewer-container" ? scroller : null) };
+	const win = {
+		devicePixelRatio: 1,
+		getComputedStyle: () => ({ getPropertyValue: (p: string) => (p === "--scale-factor" ? "2" : "") }),
+	};
+	const ctx = Object.assign(fakeCtx(), { fillRect() {}, drawImage() {} });
+	const g = globalThis as unknown as Record<string, unknown>;
+	g.createEl = () => ({
+		width: 0,
+		height: 0,
+		getContext: () => ctx,
+		toBlob: (cb: (b: Blob | null) => void) => cb(new Blob([new Uint8Array([0x89])])),
+	});
+	try {
+		const strokes = [{ ...stroke, page: 1 }];
+		const controller = new PdfInkController(
+			root as unknown as HTMLElement,
+			win as unknown as Window,
+			() => strokes,
+			() => "doc-1",
+			() => strokes,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			() => assumption
+		);
+		const priv = controller as unknown as { selected: string[]; selectionPage: number };
+		priv.selected = [stroke.id];
+		priv.selectionPage = 1;
+		const r = await controller.snipSelection();
+		if (!r.ok) throw new Error(`pdf snip refused: ${r.reason}`);
+		return String(ctx.fillStyle);
+	} finally {
+		delete g.createEl;
+	}
+}
+
 beforeEach(() => {
 	resetInkTheme();
 });
@@ -261,14 +330,14 @@ describe("the setting gates the rule, and nothing else does", () => {
 	});
 });
 
-describe("the four paint paths, each asserted on its own", () => {
+describe("the five paint paths, each asserted on its own", () => {
 	it("PATH 2, Flatten: ink appended to an existing PDF page adapts", () => {
 		// Flatten was about to be recommended publicly as the workaround for
 		// this complaint. It is better on sharpness and page breaks and
 		// IDENTICAL on colour - it would have handed over the same ghost page.
 		//
 		// This case was briefly inverted on 2026-09-08 and is RESTORED here on
-		// Alan's ruling ("ink readable on white pages"), not on any seat's
+		// Alan's ruling ("ink readable on white pages"), not on anyone else's
 		// judgement. Assuming white does cost readability on grey and dark
 		// stock - see the sweep in InkPdfFlattenDestination.test.ts - and his
 		// answer to that was a toggle rather than a different default. The OFF
@@ -354,6 +423,21 @@ describe("the four paint paths, each asserted on its own", () => {
 		expect(contrastOn(painted, WHITE), `snip painted ${painted}`).toBeGreaterThanOrEqual(
 			EXPORT_MIN_CONTRAST
 		);
+	});
+
+	it("PATH 5, the PDF snip: ink is readable on the page the setting declares", async () => {
+		// The snip paints the viewer's page under its ink and cannot see what
+		// colour that page is, so the destination is the page the user declares
+		// ("Ink color on PDFs"). Against fed59a8c this fails with
+		// the stored colour: the snip declared no destination at all.
+		const painted = await pdfSnipFill("darken", strokeOf(PEN_WHITE));
+		expect(contrastOn(painted, WHITE), `pdf snip painted ${painted}`).toBeGreaterThanOrEqual(
+			EXPORT_MIN_CONTRAST
+		);
+	});
+
+	it("PATH 5 on \"keep\": the stored colour is painted through", async () => {
+		expect(await pdfSnipFill("keep", strokeOf(PEN_WHITE))).toBe(PEN_WHITE);
 	});
 
 	it("PATH 4: a highlighter in the same snip comes through untouched", () => {

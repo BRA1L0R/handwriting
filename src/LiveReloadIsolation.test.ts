@@ -84,6 +84,7 @@ function harness(options: Options = {}) {
 		() => "deck.slides",
 		() => reload("deck.slides"),
 		{ error: (...args: unknown[]) => errors.push(args) },
+		() => () => true, // Explicit quiet binding in this reduced host.
 	);
 	return {
 		events, errors, detachedErrors, queued, document, controllers, roots, host,

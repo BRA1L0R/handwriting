@@ -52,12 +52,13 @@ import surfaceSrc from "./slides/SlidesInkSurface.ts?raw";
  * what those surfaces already show today.
  *
  * WHO REFUSES: inline (`InlineInkStore.ts:454`), pdf (`PdfInkStore.ts:208`) and
- * slides (`SlidesInkSurface.ts:2274`) all return before adopting. Canvas
- * (`HandwritingPageView.ts:471`) sets `spatialDamaged` and falls through, so it
- * renders the remnant and goes read-only - it is the surface that already does
- * the right thing, and the reason the count is three and not four. Slides is
- * cited rather than harnessed here: its load path needs a live deck, and the
- * refusal is the same two lines.
+ * slides (`SlidesInkSurface.ts:2274`) all return before adopting. Every
+ * surface in the plugin now refuses. The canvas page view was the one that
+ * did NOT - it set `spatialDamaged`, fell through, rendered the remnant and
+ * went read-only - and it was deleted in s197, so the behaviour this file
+ * argues for has no implementation left to point at. Slides is cited rather
+ * than harnessed here: its load path needs a live deck, and the refusal is
+ * the same two lines.
  */
 
 const PAGE_ID = "partly-decodable-blank";

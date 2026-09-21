@@ -33,11 +33,12 @@ export interface PaletteCommand {
 }
 
 /**
- * The fourteen that stay registered whatever the setting says: everything the
+ * The fifteen that stay registered whatever the setting says: everything the
  * pen toolbar cannot do, plus the two nibs and the two input toggles, which
- * are the way BACK when the strip is hidden.
+ * are the way BACK when the strip is hidden, and the toolbar and zoom bar
+ * toggle, which is the way back when both bars are hidden.
  *
- * FOURTEEN: `Pen on / off` absorbed the other pen command, and the toolbar
+ * FOURTEEN until 1.4.20: `Pen on / off` absorbed the other pen command, and the toolbar
  * auto/show/hide command left with its retired settings row.
  * Alan, 2026-09-05: "there are two of these Handwriting: Pen and Handwriting:
  * toggle pen input on/off - i think that's stupid there should only be one" ->
@@ -56,6 +57,7 @@ export const ALWAYS_COMMANDS: readonly PaletteCommand[] = [
 	{ id: "inline-tool-highlighter", name: "Highlighter" },
 	{ id: "mouse-ink-toggle", name: "Mouse on / off" },
 	{ id: "paper-cycle", name: "Paper: none / lines / grid / dots" },
+	{ id: "toolbar-zoom-bar-toggle", name: "Toolbar on / off" },
 	{ id: "export-ink-svg", name: "Export ink as SVG (drawing only)" },
 	{ id: "export-ink-pdf", name: "Export ink as PDF (drawing only)" },
 	{ id: "flatten-pdf-ink", name: "Flatten ink into a copy of this PDF" },

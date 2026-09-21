@@ -48,6 +48,12 @@ export function worldToScreen(cam: CameraState, wx: number, wy: number): Point {
 	};
 }
 
+/** The caller admits zoom first; a blocked scale still translates the anchor. */
+export function zoomBetweenAcceptedPoints(cam: CameraState, previous: Point, next: Point, zoom: number): CameraState {
+	const anchor = screenToWorld(cam, previous.x, previous.y);
+	return { x: anchor.x - next.x / zoom, y: anchor.y - next.y / zoom, zoom };
+}
+
 /**
  * Pan the camera by a screen-space delta (e.g. finger dragged dx,dy pixels).
  * Dragging content right (positive dx) moves the camera left in world space.

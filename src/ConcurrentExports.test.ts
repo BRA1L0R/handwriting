@@ -69,6 +69,9 @@ const build = (code: string, deps: Deps): unknown => {
 
 /** The two registered commands, as the real `onload` would register them. */
 function registerCommand(block: string, deps: Deps, host: PluginStub): CommandSpec {
+	// No stub dependencies left: the canvas page view the export blocks used to
+	// name went out in s197, and the blocks reference nothing of their own
+	// beyond what each caller passes.
 	let captured: CommandSpec | null = null;
 	const self = { ...host, addCommand: (spec: CommandSpec) => void (captured = spec) };
 	(build(`return function () { ${block} }`, deps) as (this: unknown) => void).call(self);
@@ -240,7 +243,7 @@ describe("two overlapping exports keep both snapshots", () => {
 
 			const fire = (strokes: InkStroke[], tag: string): Promise<unknown> => {
 				const stub: PluginStub = {
-					app: { workspace: { getActiveFile: () => ({ path: "note.md", extension: "md" }) }, vault: host.vault },
+					app: { workspace: { getActiveViewOfType: () => null, getActiveFile: () => ({ path: "note.md", extension: "md" }) }, vault: host.vault },
 					firstFreePath: firstFreePathOn(host.vault),
 					pdfStore: { strokes: () => strokes },
 					// `flattenPdf` reads the pdf ink colour mode off the plugin,
@@ -312,7 +315,7 @@ describe("two overlapping exports keep both snapshots", () => {
 		const host = makeVault({ "note.md": "# note" });
 		const fire = (strokes: InkStroke[], tag: string) => {
 			const stub: PluginStub = {
-				app: { workspace: { getActiveFile: () => ({ path: "note.md", extension: "md" }) }, vault: host.vault },
+				app: { workspace: { getActiveViewOfType: () => null, getActiveFile: () => ({ path: "note.md", extension: "md" }) }, vault: host.vault },
 				firstFreePath: firstFreePathOn(host.vault),
 			};
 			const spec = registerCommand(SVG_BLOCK, {
@@ -335,7 +338,7 @@ describe("two overlapping exports keep both snapshots", () => {
 	it("checking=true mutates nothing", async () => {
 		const host = makeVault({ "note.md": "# note" });
 		const stub: PluginStub = {
-			app: { workspace: { getActiveFile: () => ({ path: "note.md", extension: "md" }) }, vault: host.vault },
+			app: { workspace: { getActiveViewOfType: () => null, getActiveFile: () => ({ path: "note.md", extension: "md" }) }, vault: host.vault },
 			firstFreePath: firstFreePathOn(host.vault),
 		};
 		const spec = registerCommand(SVG_BLOCK, {

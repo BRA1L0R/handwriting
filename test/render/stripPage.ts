@@ -31,6 +31,7 @@ import type { InkPreset } from "../../src/ink/InkPresets";
 import type { ToolbarCorner } from "../../src/inline/ToolbarCorner";
 import { installObsidianDom } from "./obsidianDom";
 import { setPenToolsMode, type PenToolsMode } from "../../src/inline/PenToolsMode";
+import { setNoteZoomControlsMode, type NoteZoomControlsMode } from "../../src/inline/NoteZoomControlsMode";
 
 const fakeHost = (): MobileToolsHost => ({
 	exec: () => {},
@@ -298,6 +299,83 @@ function buildStrip(): HTMLElement {
 	document.body.appendChild(pane);
 	new MobileTools(pane, fakeHost());
 	return pane;
+}
+
+/**
+ * A computed-style check of `.handwriting-note-viewport-controls.is-inking`,
+ * real engine, real stylesheet - the render harness `fakeHost()`'s own
+ * `MobileTools.test.ts:132` note says the group has never been built in a
+ * unit test at all (`noteViewport` unset there), so this is also the
+ * baseline fixture under a real engine.
+ */
+let lastNoteZoomStrip: MobileTools | null = null;
+
+function buildNoteZoomStrip(): HTMLElement {
+	installObsidianDom();
+	const pane = document.createElement("div");
+	pane.style.cssText = "position:relative;width:1200px;height:800px;";
+	document.body.appendChild(pane);
+	lastNoteZoomStrip = new MobileTools(pane, {
+		...fakeHost(),
+		noteViewport: {
+			getNoteViewportState: () => ({ zoom: 1, busy: false, fitAvailable: true }),
+			zoomNoteBy: () => true,
+			resetNoteZoom: () => true,
+			fitHandwriting: () => "ok",
+		},
+	});
+	return pane;
+}
+
+interface NoteZoomVisibilityProbe {
+	/** Whether the group exists at all - the baseline fact under test. */
+	exists: boolean;
+	opacity: string;
+	visibility: string;
+	display: string;
+	buttonCount: number;
+	/**
+	 * The first button's own `.focus()` really lands on it, or not - a
+	 * behavioural check that a hidden zoom button cannot take focus, not just
+	 * a class name: `querySelectorAll` still finds a `display:none` ancestor's
+	 * children (they are not REMOVED from the DOM), so counting nodes proves
+	 * nothing about focusability. The browser's own focus algorithm does.
+	 */
+	firstButtonFocusable: boolean;
+}
+
+/**
+ * `.is-inking`'s CSS transition (`opacity 40ms linear, visibility 0s linear
+ * 40ms`, styles.css) is real, and headless Chromium's rendering pipeline does
+ * not reliably tick its timeline forward on a plain wall-clock wait in this
+ * harness (measured: `document.getAnimations()` still reports the transition
+ * "running" at localTime 0 after 200ms of `page.waitForTimeout`, M). This
+ * cell's own claim is about the RESOLVED value, not the animation's timing,
+ * so every transition on the element is force-finished via the Web
+ * Animations API (`Animation.finish()`) before reading computed style -
+ * exact, and independent of whether this environment's compositor is
+ * actually producing frames.
+ */
+function noteZoomVisibilityProbe(pane: HTMLElement, opts: { mode: NoteZoomControlsMode; inking: boolean }): NoteZoomVisibilityProbe {
+	setNoteZoomControlsMode(opts.mode);
+	lastNoteZoomStrip!.setInking(opts.inking);
+	for (const a of document.getAnimations()) a.finish();
+	const el = pane.querySelector<HTMLElement>(".handwriting-note-viewport-controls");
+	if (!el) return { exists: false, opacity: "", visibility: "", display: "", buttonCount: 0, firstButtonFocusable: false };
+	const cs = getComputedStyle(el);
+	const buttons = [...el.querySelectorAll<HTMLButtonElement>("button")];
+	const first = buttons[0] ?? null;
+	first?.focus();
+	const firstButtonFocusable = first !== null && document.activeElement === first;
+	first?.blur();
+	return {
+		exists: true,
+		opacity: cs.opacity,
+		visibility: cs.visibility,
+		display: cs.display,
+		buttonCount: buttons.length,
+		firstButtonFocusable,
+	};
 }
 
 /** What the folded second row looks like, measured. */
@@ -965,6 +1043,8 @@ declare global {
 			moreRowProbe: typeof moreRowProbe;
 			gridProbe: typeof gridProbe;
 			dragProbe: typeof dragProbe;
+			buildNoteZoomStrip: typeof buildNoteZoomStrip;
+			noteZoomVisibilityProbe: typeof noteZoomVisibilityProbe;
 		};
 	}
 }
@@ -983,4 +1063,6 @@ window.__hw = {
 	moreRowProbe,
 	gridProbe,
 	dragProbe,
+	buildNoteZoomStrip,
+	noteZoomVisibilityProbe,
 };

@@ -80,8 +80,10 @@ describe("B: first stroke claims identity before any sidecar (model half)", () =
 		// Reopen: the stroke's sidecar key is recoverable from the file.
 		expect(open(out).pageId).toBe(doc.pageId);
 	});
-	// The on-disk ordering (id write AWAITED before store.schedule) lives in
-	// HandwritingPageView.scheduleSidecar, verified on the test Surface.
+	// The on-disk ordering (id write AWAITED before store.schedule) lived in
+	// the canvas page view's scheduleSidecar, verified on the test Surface.
+	// That view was deleted in s197; the ordering rule itself is the inline
+	// surface's now (InlineInkStore's claim-then-write path).
 });
 
 describe("C: external edit while ink is on the page", () => {

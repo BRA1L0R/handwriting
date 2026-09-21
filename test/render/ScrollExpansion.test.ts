@@ -1,3 +1,4 @@
+// Harness engine supports CSS zoom; hostZoom pinned true; the transform fallback in applyViewportBox has no harness coverage.
 import {beforeAll,afterAll,it,expect} from "vitest";
 import {build} from "esbuild";
 import {fileURLToPath} from "node:url";
@@ -28,7 +29,11 @@ it.each([[true,true,1],[true,false,1.5],[true,false,2],[false,false,1]] as const
 			expect(trace.steps.some((s:any)=>JSON.stringify(s.before.camera)===JSON.stringify(s.after.camera)&&s.after.grant[s.axis]>s.before.grant[s.axis])).toBe(true);
 		}else expect(trace.initial.grant).toEqual({x:0,y:0});
 		expect(trace.afterStill).toEqual(trace.beforeStill);
-		expect(trace.disabled.left).toBe(trace.afterStill.left);expect(trace.disabled.top).toBe(trace.afterStill.top);expect(trace.disabled.grant).toEqual(trace.afterStill.grant);
+		expect(trace.disabled.left).toBe(trace.afterStill.left);expect(trace.disabled.top).toBe(trace.afterStill.top);
+		// Turning Infinite Canvas off takes back the sideways room scrolling made (Alan, 2026-09-15): the x grant may only
+		// shrink, never under the view, and nothing moves. The vertical grant is untouched.
+		expect(trace.disabled.grant.y).toBe(trace.afterStill.grant.y);expect(trace.disabled.grant.x).toBeLessThanOrEqual(trace.afterStill.grant.x);
+		expect(trace.disabled.width).toBeGreaterThanOrEqual(trace.disabled.left+trace.disabled.clientWidth);
 		expect(trace.afterStill.history).toBe(0);expect(trace.afterStill.writes).toBe(0);expect(trace.afterStill.strokes).toBe(0);
 		for(const canvas of trace.afterStill.backings)expect(canvas.width*canvas.height).toBeLessThan(8_000_000);
 		if (on && !baseline) {
@@ -47,7 +52,17 @@ it.each([[true,true,1],[true,false,1.5],[true,false,2],[false,false,1]] as const
 			expect(c.resizeStill).toEqual(c.resized);
 			expect(c.zoomStill).toEqual(c.zoomed);
 			expect(c.zoomTravel.scale).toBe(scale);
-			expect(c.zoomTravel.transform).toBe(scale === 1 ? "" : `scale(${scale})`);
+			// The zoom host is the form under test: the harness engine has css zoom and the overlay's gate agrees with it (file header).
+			expect(c.zoomTravel.engineZoom, "the harness engine supports css zoom").toBe(true);
+			expect(c.zoomTravel.hostZoom, "the overlay's host-form gate agrees with the engine").toBe(c.zoomTravel.engineZoom);
+			// Zoom host: the transform is left empty (this page sets none of its own) and the scale is the host's inline `zoom`.
+			expect(c.zoomTravel.transform, "zoom host: no scale transform").toBe("");
+			if (scale !== 1) {
+				// Production writes the host's own zoom times the scale. This page sets no zoom on the host, so the base is 1 and the
+				// written zoom is the scale; the base is asserted rather than assumed.
+				expect(c.zoomTravel.baseZoom, "this page sets no zoom of its own on the host").toBe("1");
+				expect(Number(c.zoomTravel.inlineZoom), "zoom host: the host's zoom is its base zoom times the pinched scale").toBeCloseTo(Number(c.zoomTravel.baseZoom) * scale, 9);
+			}
 			for (const step of c.zoomTravel.steps) expect(step.after.grant[step.axis]).toBeGreaterThan(step.before.grant[step.axis]);
 			expect(c.oldGrantAfterSwitch).toEqual(c.savedGrant);
 			expect(c.exportBeforeTravel).toContain("<svg");

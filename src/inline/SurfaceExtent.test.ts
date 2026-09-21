@@ -32,8 +32,11 @@ import {
 	ZERO_EXTENT,
 	grownAxis,
 	grownExtent,
+	inkClaimX,
 	inkFrontier,
 	isScrollableOverflow,
+	onScreenFloorX,
+	shrunkAxis,
 	spacerPosition,
 	surfaceOriginInScroller,
 	writeFrontier,
@@ -113,6 +116,83 @@ describe("grownExtent", () => {
 		const next = grownExtent({ x: 512, y: 512 }, { x: 600, y: 100 });
 		expect(next.x).toBe(Math.ceil((600 + EXTENT_HEADROOM) / EXTENT_CHUNK) * EXTENT_CHUNK);
 		expect(next.y).toBe(512);
+	});
+});
+
+describe("inkClaimX (sideways room grows from ink near the edge, or from any ink with Infinite Canvas on)", () => {
+	const pane = { originLeft: 40, clientWidth: 420, fontZoom: 1 };
+
+	it("with Infinite Canvas on, is the frontier, as before", () => {
+		expect(inkClaimX({ ...pane, frontierX: 100, infiniteCanvas: true })).toBe(100);
+		expect(inkClaimX({ ...pane, frontierX: 370, infiniteCanvas: true })).toBe(370);
+	});
+
+	it("with it off, is nothing while the ink stays further than the margin from the pane's right edge", () => {
+		// 40 + 260 = 300 = 420 - 120: at the margin, not inside it.
+		expect(inkClaimX({ ...pane, frontierX: 260, infiniteCanvas: false })).toBe(0);
+		expect(inkClaimX({ ...pane, frontierX: 10, infiniteCanvas: false })).toBe(0);
+	});
+
+	it("with it off, is the frontier once the ink comes within the margin of the pane's right edge", () => {
+		expect(inkClaimX({ ...pane, frontierX: 261, infiniteCanvas: false })).toBe(261);
+		// At the pane's edge: within the margin, so it claims (it did not under the old past-the-edge rule).
+		expect(inkClaimX({ ...pane, frontierX: 380, infiniteCanvas: false })).toBe(380);
+		expect(inkClaimX({ ...pane, frontierX: 1500, infiniteCanvas: false })).toBe(1500);
+	});
+
+	it("scales the frontier and the margin by the font zoom before comparing them with the pane", () => {
+		// 40 + 70 * 2 = 180 = 420 - 120 * 2.
+		expect(inkClaimX({ ...pane, fontZoom: 2, frontierX: 70, infiniteCanvas: false })).toBe(0);
+		expect(inkClaimX({ ...pane, fontZoom: 2, frontierX: 71, infiniteCanvas: false })).toBe(71);
+	});
+
+	it("asks for nothing on no ink or an unusable zoom", () => {
+		expect(inkClaimX({ ...pane, frontierX: 0, infiniteCanvas: false })).toBe(0);
+		expect(inkClaimX({ ...pane, frontierX: 900, fontZoom: 0, infiniteCanvas: false })).toBe(0);
+		expect(inkClaimX({ ...pane, frontierX: Number.NaN, infiniteCanvas: false })).toBe(0);
+	});
+});
+
+describe("onScreenFloorX (a shrink never pulls the range under the view)", () => {
+	it("is nothing at the left edge", () => {
+		expect(onScreenFloorX({ scrollLeft: 0, clientWidth: 420, originLeft: 40, fontZoom: 1 })).toBe(0);
+	});
+
+	it("reaches the right edge of the view, in whole chunks", () => {
+		// 815 + 420 + 1 - 40 = 1196 -> 5 chunks.
+		const floor = onScreenFloorX({ scrollLeft: 815, clientWidth: 420, originLeft: 40, fontZoom: 1 });
+		expect(floor).toBe(5 * EXTENT_CHUNK);
+		expect(40 + floor).toBeGreaterThanOrEqual(815 + 420);
+	});
+
+	it("is in note px under a font zoom", () => {
+		// (815 + 420 + 1 - 40) / 2 = 598 -> 3 chunks.
+		expect(onScreenFloorX({ scrollLeft: 815, clientWidth: 420, originLeft: 40, fontZoom: 2 })).toBe(3 * EXTENT_CHUNK);
+	});
+});
+
+describe("shrunkAxis (the grant after ink is removed)", () => {
+	it("comes down to what the remaining need would earn from nothing", () => {
+		expect(shrunkAxis(2048, 0, 0)).toEqual({ value: 0, complete: true });
+		expect(shrunkAxis(2048, 300, 0)).toEqual({ value: grownAxis(0, 300), complete: true });
+	});
+
+	it("stops at the floor and owes the rest", () => {
+		expect(shrunkAxis(2048, 0, 1280)).toEqual({ value: 1280, complete: false });
+	});
+
+	it("is complete once the floor is under the need", () => {
+		expect(shrunkAxis(2048, 1000, 512)).toEqual({ value: grownAxis(0, 1000), complete: true });
+	});
+
+	it("never raises the grant", () => {
+		expect(shrunkAxis(256, 0, 1280)).toEqual({ value: 256, complete: false });
+		expect(shrunkAxis(512, 1000, 0)).toEqual({ value: 512, complete: true });
+	});
+
+	it("does not grow back on the next pass: the shrunk grant clears the growth margin", () => {
+		const { value } = shrunkAxis(4096, 700, 0);
+		expect(grownAxis(value, 700)).toBe(value);
 	});
 });
 
@@ -242,6 +322,86 @@ describe("ScrollAxisGuard", () => {
 		expect(axisRuleBody(live)).toMatch(/overflow-x:\s*auto/);
 		expect(axisRuleBody(`/*\n${live}*/\n`)).toBeNull();
 		expect(axisRuleBody(`/*\n${live}*/\n${loud}`)).toContain("!important");
+	});
+});
+
+describe("SurfaceExtents: a sideways shrink falls due", () => {
+	it("only for a note holding sideways room", () => {
+		const extents = new SurfaceExtents();
+		extents.grow("tall.md", { x: 0, y: 900 });
+		extents.oweShrinkX("tall.md");
+		expect(extents.owesShrinkX("tall.md")).toBe(false);
+		extents.grow("wide.md", { x: 1500, y: 0 });
+		extents.oweShrinkX("wide.md");
+		expect(extents.owesShrinkX("wide.md")).toBe(true);
+		extents.settleShrinkX("wide.md");
+		expect(extents.owesShrinkX("wide.md")).toBe(false);
+	});
+
+	it("for every wide note at once when Infinite Canvas is turned off", () => {
+		const extents = new SurfaceExtents();
+		extents.grow("a.md", { x: 1500, y: 0 });
+		extents.grow("b.md", { x: 0, y: 900 });
+		extents.grow("c.md", { x: 700, y: 700 });
+		extents.oweShrinkXEverywhere();
+		expect(["a.md", "b.md", "c.md"].map(p => extents.owesShrinkX(p))).toEqual([true, false, true]);
+	});
+
+	it("carries a new generation each time it falls due, so a fresh shrink is told from a held one", () => {
+		const extents = new SurfaceExtents();
+		extents.grow("a.md", { x: 1500, y: 0 });
+		expect(extents.shrinkDue("a.md")).toBeUndefined();
+		extents.oweShrinkX("a.md");
+		const first = extents.shrinkDue("a.md");
+		expect(first).toBeDefined();
+		extents.oweShrinkX("a.md");
+		expect(extents.shrinkDue("a.md")).not.toBe(first);
+		extents.oweShrinkXEverywhere();
+		const third = extents.shrinkDue("a.md");
+		expect([first, third].every(g => g !== undefined) && third !== first).toBe(true);
+		extents.settleShrinkX("a.md");
+		expect(extents.shrinkDue("a.md")).toBeUndefined();
+	});
+
+	it("follows a rename and goes with a delete", () => {
+		const extents = new SurfaceExtents();
+		extents.grow("old.md", { x: 1500, y: 0 });
+		extents.oweShrinkX("old.md");
+		const due = extents.shrinkDue("old.md");
+		extents.handleRename("old.md", "new.md");
+		expect(extents.owesShrinkX("old.md")).toBe(false);
+		expect(extents.owesShrinkX("new.md")).toBe(true);
+		expect(extents.shrinkDue("new.md"), "the rename keeps the generation").toBe(due);
+		extents.handleDelete("new.md");
+		expect(extents.owesShrinkX("new.md")).toBe(false);
+	});
+});
+
+describe("SurfaceExtents.shrinkX", () => {
+	it("lowers only the x grant, and only downward", () => {
+		const extents = new SurfaceExtents();
+		extents.grow("a.md", { x: 1500, y: 900 });
+		const before = extents.get("a.md");
+		expect(extents.shrinkX("a.md", 4096)).toBe(before);
+		const after = extents.shrinkX("a.md", 256);
+		expect(after).toEqual({ x: 256, y: before.y });
+		expect(extents.get("a.md")).toBe(after);
+		expect(extents.shrinkX("a.md", -10)).toEqual({ x: 0, y: before.y });
+	});
+
+	it("counts the shrinks, and only the shrinks, per note", () => {
+		const extents = new SurfaceExtents();
+		extents.grow("a.md", { x: 1500, y: 900 });
+		expect(extents.shrinkCount("a.md")).toBe(0);
+		extents.shrinkX("a.md", 4096);
+		extents.grow("a.md", { x: 3000, y: 900 });
+		expect(extents.shrinkCount("a.md"), "a no-op shrink and a grow are not shrinks").toBe(0);
+		extents.shrinkX("a.md", 512);
+		expect(extents.shrinkCount("a.md")).toBe(1);
+		extents.handleRename("a.md", "b.md");
+		expect([extents.shrinkCount("a.md"), extents.shrinkCount("b.md")]).toEqual([0, 1]);
+		extents.handleDelete("b.md");
+		expect(extents.shrinkCount("b.md")).toBe(0);
 	});
 });
 

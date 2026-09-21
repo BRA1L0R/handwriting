@@ -32,6 +32,7 @@ import { exportInkColor, inkExportReadabilityEnabled } from "./ink/InkTheme";
 import { clampInkSize } from "./ink/InkSize";
 import { clampEraserRadius } from "./ink/EraserSize";
 import { normalizePenToolsMode, resetPenToolsForTest } from "./inline/PenToolsMode";
+import { normalizeNoteZoomControlsMode, resetNoteZoomControlsForTest } from "./inline/NoteZoomControlsMode";
 
 const proto = HandwritingPlugin.prototype as unknown as {
 	loadSettings(this: unknown): Promise<void>;
@@ -101,15 +102,29 @@ describe("settings control consistency preserves saved behavior", () => {
 		(plugin as unknown as Record<string, unknown>).manifest = { version: "1.5.0" };
 		const tab = Object.create(HandwritingSettingTab.prototype);
 		tab.plugin = plugin;
-		type Row = { name?: string; desc?: string; items?: Row[]; control?: { type: string; key: string; options?: Record<string, string> } };
+		type Row = { name?: string; desc?: string; aliases?: string[]; items?: Row[]; control?: { type: string; key: string; options?: Record<string, string> } };
 		const flatten = (items: Row[]): Row[] => items.flatMap(item => item.items ? flatten(item.items) : [item]);
 		const rows = flatten(tab.getSettingDefinitions());
 		const exported = rows.find(row => row.name === "Ink color when exporting")!;
-		const pdf = rows.find(row => row.name === "Ink color when flattening PDFs")!;
+		expect(exported, 'no settings row named "Ink color when exporting"').toBeDefined();
+		const pdf = rows.find(row => row.name === "Ink color on PDFs")!;
+		expect(pdf, 'no settings row named "Ink color on PDFs"').toBeDefined();
+		// The renamed row keeps its shipped title as a search term.
+		expect(pdf.aliases ?? [], 'the "Ink color on PDFs" row lost its old-title search alias').toContain("Ink color when flattening PDFs");
 		expect(exported.control).toEqual({ type: "dropdown", key: "inkReadableInExports", options: { auto: "Automatic readability", keep: "Keep original colors" } });
 		expect(pdf.control?.type).toBe("dropdown");
 		expect(pdf.control?.options).toEqual({ darken: "Darken for light pages", lighten: "Lighten for dark pages", keep: "Keep original colors" });
 		expect(rows.find(row => row.name === "Paper background")?.desc).toBe("Lined, grid, or dotted paper. Global setting. Default none.");
+		// The zoom bar's option labels are copied verbatim from the Toolbar
+		// visibility row beside it - the two settings behave identically.
+		const toolbarVisibility = rows.find(row => row.name === "Toolbar visibility")!;
+		const zoomBar = rows.find(row => row.name === "Zoom bar")!;
+		// The row also carries a `disabled` predicate since s138 (SettingsCanvasRows.test.ts
+		// owns what it says); the shape asserted here is the dropdown itself.
+		expect(zoomBar.control?.type).toBe("dropdown");
+		expect(zoomBar.control?.key).toBe("noteZoomControls");
+		expect(zoomBar.control?.options).toEqual({ hide: "Off", show: "On", auto: "Auto" });
+		expect(zoomBar.control?.options).toEqual(toolbarVisibility.control?.options);
 	});
 	it.each([undefined, true, false])("maps legacy export %s to dropdown without changing color policy", async value => {
 		const plugin = await loadThenSave(value === undefined ? {} : { inkReadableInExports: value });
@@ -135,10 +150,50 @@ describe("settings control consistency preserves saved behavior", () => {
 		expect(plugin.settings.penTools).toBe(mode ?? "auto");
 		expect(plugin.saved?.penTools).toBe(mode ?? "auto");
 	});
+	// The zoom bar's mode round-trips exactly like the pen toolbar's, key for
+	// key.
+	it.each([undefined, "auto", "show", "hide"])("preserves zoom bar visibility %s", async mode => {
+		const plugin = await loadThenSave(mode === undefined ? {} : { noteZoomControls: mode });
+		expect(plugin.settings.noteZoomControls).toBe(mode ?? "auto");
+		expect(plugin.saved?.noteZoomControls).toBe(mode ?? "auto");
+	});
+	// Two sites decide the default, and they must agree - a cell that cannot
+	// fail is a defect, so this is re-derived from the real normaliser and
+	// the real load path rather than two literal "auto"s.
+	it("agrees with itself on the default: normalizeNoteZoomControlsMode(undefined) and a fresh load", async () => {
+		expect(normalizeNoteZoomControlsMode(undefined)).toBe("auto");
+		const plugin = await loadThenSave({});
+		expect(plugin.settings.noteZoomControls).toBe(normalizeNoteZoomControlsMode(undefined));
+	});
 });
 
 describe("loadSettings carries keys this build does not know", () => {
-	beforeEach(resetPenToolsForTest);
+	beforeEach(() => {
+		resetPenToolsForTest();
+		resetNoteZoomControlsForTest();
+	});
+
+	// The EDIT half of this case went with the canvas page in s197: the view
+	// that wrote saved views, and the `editCanvasSavedViews` path that renamed
+	// them, are both deleted. What still matters - and is what this case was
+	// really guarding - is that a vault which HAS these records keeps them
+	// byte for byte through reopen cycles of a build that can no longer make
+	// any of them. A build that dropped them would erase a canvas page user's
+	// saved views the first time this one saved anything.
+	it("persists saved views and their opaque records through two plugin reopen cycles", async () => {
+		const view = { schema: 1, id: "view-a", name: "A", pageId: "page-a", surface: "canvas",
+			location: { kind: "canvas-world", x: -40000, y: 900000, zoom: .035, zoomPolicy: "fit-derived" } };
+		const opaque = [{ schema: 99, id: "future", surface: "future", extension: [1, 2] },
+			{ ...view, id: "policy", location: { ...view.location, zoomPolicy: "future-policy" } }];
+		let plugin: any = await loadThenSave({ savedViews: [view, ...opaque], unrelatedSetting: { untouched: true } });
+		for (let cycle = 0; cycle < 2; cycle++) {
+			plugin = await loadThenSave(JSON.parse(JSON.stringify(plugin.saved)));
+			expect(plugin.settings.savedViews).toEqual([view, ...opaque]);
+			expect(plugin.saved.savedViews).toEqual(plugin.settings.savedViews);
+			expect(plugin.settings.unrelatedSetting).toEqual({ untouched: true });
+		}
+	});
+
 
 	it("round-trips an unknown key through the load and the write", async () => {
 		const plugin = await loadThenSave({ futureKey: 1, mouseInk: true });
@@ -158,6 +213,7 @@ describe("loadSettings carries keys this build does not know", () => {
 			inkSizes: { pen: 999, highlighter: 999 },
 			eraserRadiusPx: -40,
 			penTools: "nonsense",
+			noteZoomControls: "nonsense",
 		});
 
 		// Re-derived by calling the same normaliser main.ts calls, never a
@@ -169,11 +225,13 @@ describe("loadSettings carries keys this build does not know", () => {
 		});
 		expect(plugin.settings.eraserRadiusPx).toBe(clampEraserRadius(-40));
 		expect(plugin.settings.penTools).toBe(normalizePenToolsMode("nonsense"));
+		expect(plugin.settings.noteZoomControls).toBe(normalizeNoteZoomControlsMode("nonsense"));
 		// The spread put the rotten values in first; the known keys are
 		// written over it. This is the assertion that fails if the two are
 		// ever swapped.
 		expect(plugin.settings.inkSizes).not.toEqual({ pen: 999, highlighter: 999 });
 		expect(plugin.saved?.penTools).toBe(normalizePenToolsMode("nonsense"));
+		expect(plugin.saved?.noteZoomControls).toBe(normalizeNoteZoomControlsMode("nonsense"));
 		expect(plugin.saved?.futureKey).toBe(1);
 	});
 
@@ -202,6 +260,7 @@ describe("loadSettings carries keys this build does not know", () => {
 		// are written unconditionally, so nothing here is left undefined.
 		expect(fromArray.settings.mouseInk).toBe(false);
 		expect(fromArray.settings.penTools).toBe(normalizePenToolsMode(undefined));
+		expect(fromArray.settings.noteZoomControls).toBe(normalizeNoteZoomControlsMode(undefined));
 	});
 });
 

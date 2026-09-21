@@ -2,7 +2,7 @@
  * The inline strip's trash button acts on its OWN overlay, never on
  * whichever editor `overlayForPath` happens to resolve.
  *
- * Measured by the head engineer on two refs: `activeInkSurface()` (main.ts)
+ * Measured on two refs: `activeInkSurface()` (main.ts)
  * routes an inline surface through `overlayForPath(file.path)`
  * (InkOverlay.ts), which answers the FIRST mounted overlay showing that
  * path. With two editors A then B open on the same note and B active,

@@ -1,3 +1,5 @@
+import { activeSlidesActions } from "./SlidesInkSurface";
+import { presentationCommands } from "./SlidesTools";
 /**
  * The pure half of the slides ink surface (design §7).
  *
@@ -1029,6 +1031,10 @@ class FakeEl {
 		this.appendChild(child);
 		return child;
 	}
+	/** Obsidian gives every element this shorthand; the deck now uses it. */
+	createDiv(): FakeEl {
+		return this.createEl("div");
+	}
 	readonly style: Record<string, string> = { position: "", touchAction: "" };
 	readonly children: FakeEl[] = [];
 	className = "";
@@ -1217,6 +1223,7 @@ interface ClearCounts {
 }
 
 class FakeDoc {
+	refusedContextClass: string | undefined;
 	activeElement: unknown = null;
 	readonly clearCounts: ClearCounts = { clears: 0, rects: [] };
 	/** What `getContextAttributes().desynchronized` answers on this document's canvases (F4). */
@@ -1233,11 +1240,11 @@ class FakeDoc {
 		const counts = this.clearCounts;
 		const doc = this;
 		const canvas = el as unknown as {
-			getContext: () => CanvasRenderingContext2D;
+			getContext: () => CanvasRenderingContext2D | null;
 			width: number;
 			height: number;
 		};
-		canvas.getContext = () => fakeCtx(counts, () => doc.grantedDesynchronized, el);
+		canvas.getContext = () => el.className === doc.refusedContextClass ? null : fakeCtx(counts, () => doc.grantedDesynchronized, el);
 		// Accessors rather than plain fields, so that "was the backing store
 		// REALLOCATED" is answerable (F2/item 2). A plain assignment of the
 		// same number is invisible to a reader that only sees the value, and
@@ -1437,6 +1444,7 @@ interface RigOptions {
 	devicePixelRatio?: number;
 	/** What the canvases' `getContextAttributes()` GRANTS for `desynchronized` (F4). */
 	grantedDesynchronized?: boolean;
+	refusedContextClass?: string;
 	/** The host's `claimId`, when a test needs to hold the claim open. */
 	claim?: (path: string, proposed: string) => Promise<{ pageId: string; futureVersion?: number }>;
 	/** The host's immediate writer, when a test needs a real rejection. */
@@ -1473,6 +1481,7 @@ function makeRig(opts: RigOptions = {}): Rig {
 	win.navigator = opts.navigator;
 	if (opts.devicePixelRatio !== undefined) win.devicePixelRatio = opts.devicePixelRatio;
 	if (opts.grantedDesynchronized !== undefined) doc.grantedDesynchronized = opts.grantedDesynchronized;
+	doc.refusedContextClass = opts.refusedContextClass;
 	if (opts.deckStylesheet !== undefined) {
 		const href = `app://obsidian.md/lib/reveal/${opts.deckStylesheet}.css`;
 		doc.head = {
@@ -1663,7 +1672,7 @@ describe("routine diagnostics", () => {
 		expect(rig.scheduled).toHaveLength(1);
 		expect(rig.scheduled[0]!.page.strokes).toHaveLength(1);
 		expect(rig.logs.join("\n")).not.toContain("deck found:");
-		expect(rig.logs.join("\n")).not.toContain("mount: three canvases");
+		expect(rig.logs.join("\n")).not.toContain("mount: four canvases");
 		expect(rig.logs.join("\n")).not.toContain("deck took focus");
 		expect(rig.logs.join("\n")).not.toContain("focus at stroke end:");
 		expect(rig.logs.join("\n")).not.toContain("stroke end on slide 0:");
@@ -1685,7 +1694,7 @@ describe("routine diagnostics", () => {
 
 		const lines = rig.logs.join("\n");
 		expect(lines).toContain("deck found: container div, reveal div, slides div, 2 section(s)");
-		expect(lines).toContain("mount: three canvases on div, starting on slide 0");
+		expect(lines).toContain("mount: four canvases on div, starting on slide 0");
 		expect(lines).toContain("deck took focus from none");
 		expect(lines).toContain("focus at stroke end: active=div, insideDeck=true");
 		expect(lines).toContain("stroke end on slide 0: reason=up, samples=3, +1");
@@ -1706,10 +1715,13 @@ describe("routine diagnostics", () => {
 		expect(readFailure.logs.join("\n")).toContain(
 			"sidecar load failed for note-1.slides: Error: read exploded"
 		);
-		expect(readFailure.notices).toEqual([]);
+		expect(readFailure.notices).toEqual([
+			"Handwriting: this presentation's ink file could not be read, so new ink is not being saved.",
+		]);
 		drawStrokeOn(readFailure);
-		expect(readFailure.scheduled).toHaveLength(1);
+		expect(readFailure.scheduled).toHaveLength(0);
 		readFailure.deck.dispose();
+		expect(readFailure.savedNow).toHaveLength(0);
 
 		let writes = 0;
 		const writeFailure = makeRig({
@@ -2156,7 +2168,8 @@ describe("the erase frame (§3.2: once per rAF, not once per move)", () => {
 		// the reader exactly one.
 		expect(rig.doc.clearCounts.clears).toBe(before);
 		rig.win.runFrames();
-		expect(rig.doc.clearCounts.clears).toBe(before + 1);
+		// One repaint clears the pen and highlight backings once each.
+		expect(rig.doc.clearCounts.clears).toBe(before + 2);
 		// ...and it is genuinely one frame, not one queued per move.
 		expect(rig.win.frames.size).toBe(0);
 		rig.deck.dispose();
@@ -2272,10 +2285,10 @@ describe("the silent lift (S5 extended: a lift is not always an event)", () => {
 	 * ("PointerRouter.ts IS the source of truth for this predicate and a drift
 	 * here is a bug here") and nothing enforced it.
 	 *
-	 * slicer 2 put the shape better than I did, and it is theirs: on the remnant
+	 * A review put the shape better than this comment first did: on the remnant
 	 * guard "the rule moved and my copy did not; here the rule could move and
-	 * the copy would not, with nothing to say so". And the sharper half, also
-	 * theirs: a duplication carrying a comment that ACKNOWLEDGES the duplication
+	 * the copy would not, with nothing to say so". And the sharper half, from the
+	 * same review: a duplication carrying a comment that ACKNOWLEDGES the duplication
 	 * reads as a managed one - the comment is what stops the next reader
 	 * looking.
 	 *
@@ -3015,6 +3028,24 @@ describe("native menus over a live deck (contextmenu)", () => {
 });
 
 describe("A3: capture is taken at promotion, not at contact", () => {
+	it.each(["pen", "mouse", "touch"])("a held %s Exit press stays a control gesture", async (pointerType) => {
+		setMouseInk(true);
+		const rig = makeRig();
+		await new Promise((r) => setTimeout(r, 0));
+		const exit = new FakeEl("button", rig.doc);
+		exit.classes.add("slides-close-btn");
+		rig.reveal.appendChild(exit);
+		const icon = new FakeEl("svg", rig.doc);
+		exit.appendChild(icon);
+		let prevented = false;
+		rig.down({ target: icon, pointerType, preventDefault: () => { prevented = true; } });
+		rig.move(210, 210, { target: icon, pointerType });
+		rig.end("pointerup", { target: icon, pointerType, buttons: 0, timeStamp: 10_000 });
+		expect(prevented).toBe(false);
+		expect(rig.reveal.captureCalls).toEqual([]);
+		expect(rig.scheduled).toEqual([]);
+		rig.deck.dispose();
+	});
 	// Alan, mouse, 2026-09-05: "click on arrow does NOT turn page". A1 let the
 	// click through, but `setPointerCapture` at pointerdown retargets the
 	// pointerup to `.reveal`, so the browser builds the click from the common
@@ -3347,7 +3378,7 @@ describe("the wet layer asks for a plain (non-desynchronized) canvas", () => {
 		).layers;
 		if (!l) throw new Error("no layers mounted; the assertion below would be vacuous");
 		expect(l.wet.requested).toBe(false);
-		const mountLine = rig.logs.find((line) => line.includes("mount: three canvases"));
+		const mountLine = rig.logs.find((line) => line.includes("mount: four canvases"));
 		expect(mountLine).toBeDefined();
 		expect(mountLine).toContain(`wet desynchronized: requested ${l.wet.requested}`);
 		expect(mountLine).toContain(`actual ${l.wet.actualDesynchronized}`);
@@ -3721,6 +3752,8 @@ describe("partial erase follows the note surface's eraser setting (item 3b)", ()
  * surface that drew nothing.
  */
 function layersOf(rig: Rig): {
+	highlightGroup: FakeEl;
+	highlight: FakeEl;
 	committed: FakeEl;
 	wetCanvas: FakeEl;
 	tailCanvas: FakeEl;
@@ -3729,6 +3762,8 @@ function layersOf(rig: Rig): {
 	const l = (
 		rig.deck as unknown as {
 			layers: {
+				highlightGroup: FakeEl;
+				highlight: FakeEl;
 				committed: FakeEl;
 				wetCanvas: FakeEl;
 				tailCanvas: FakeEl;
@@ -4335,6 +4370,30 @@ describe("scanForSlides: a pop-out window must not kill the live deck (S1)", () 
 		delete (globalThis as { MutationObserver?: unknown }).MutationObserver;
 	});
 
+	it("command handles belong to the owner document and retire on deck replacement", async () => {
+		const main = makeScanDoc(), popout = makeScanDoc();
+		const original = makeDeckElements(main.doc);
+		main.setDeck(original.container);
+		(globalThis as { document?: unknown }).document = main.doc;
+		setSlidesInk(true, makeHost());
+		await new Promise(r => setTimeout(r, 0));
+		const captured = activeSlidesActions(main.doc as unknown as Document)!;
+		expect(captured).not.toBeNull();
+		expect(activeSlidesActions(popout.doc as unknown as Document)).toBeNull();
+		drawOn(original.reveal);
+		expect(captured.status().totalCount).toBe(1);
+		(original.container as unknown as { isConnected: boolean }).isConnected = false;
+		const replacement = makeDeckElements(main.doc);
+		main.setDeck(replacement.container);
+		scanForSlides();
+		await new Promise(r => setTimeout(r, 0));
+		const next = activeSlidesActions(main.doc as unknown as Document)!;
+		expect(next).not.toBe(captured);
+		drawOn(replacement.reveal);
+		expect(captured.run("clear-all")).toBe(false);
+		expect(next.status().totalCount).toBe(1);
+	});
+
 	it("keeps a live deck when a scan lands on a pop-out that has focus - it is still the same, drawable deck", () => {
 		const main = makeScanDoc();
 		const popout = makeScanDoc();
@@ -4400,7 +4459,28 @@ describe("scanForSlides: a pop-out window must not kill the live deck (S1)", () 
  * ratio the compositor has to resample, sized for a display the window has
  * already left, and not in the document at all.
  */
-describe("the backing stores (a full-viewport canvas, three times over)", () => {
+describe("the backing stores (a full-viewport canvas, four times over)", () => {
+	it.each(["handwriting-slides-highlight", "handwriting-slides-ink", "handwriting-slides-ink-wet", "handwriting-slides-tail"])("removes every layer when %s refuses its context", (cls) => {
+		const rig = makeRig({ refusedContextClass: cls });
+		expect((rig.deck as unknown as { layers: unknown }).layers).toBeNull();
+		expect(rig.reveal.children).toHaveLength(0);
+		rig.deck.dispose();
+	});
+
+	it("rebuilds a detached highlight backing and removes the old opacity group", () => {
+		const rig = makeRig();
+		const old = layersOf(rig);
+		old.highlight.remove();
+		rig.reveal.dispatch({ type: "resize" });
+		const fresh = layersOf(rig);
+		expect(fresh.highlight).not.toBe(old.highlight);
+		expect(old.highlightGroup.parentElement).toBeNull();
+		expect(fresh.highlightGroup.parentElement).toBe(rig.reveal);
+		expect(fresh.highlight.parentElement).toBe(fresh.highlightGroup);
+		rig.deck.dispose();
+		expect(fresh.highlightGroup.parentElement).toBeNull();
+		expect(rig.reveal.children).toHaveLength(0);
+	});
 	it("leaves an ordinary display at its full ratio and only reduces past the budget", () => {
 		// A Surface Pro's own panel: 1440x960 css at dpr 2 is 5.5M device px,
 		// well inside. The floor the note surface's `backingScale` needed is
@@ -4434,7 +4514,7 @@ describe("the backing stores (a full-viewport canvas, three times over)", () => 
 		rig.win.devicePixelRatio = 2;
 		rig.reveal.dispatch({ type: "resize" });
 		const l = layersOf(rig);
-		for (const c of [l.committed, l.wetCanvas, l.tailCanvas]) {
+		for (const c of [l.highlight, l.committed, l.wetCanvas, l.tailCanvas]) {
 			const canvas = c as unknown as { width: number; height: number };
 			expect(canvas.width).toBeLessThan(5120 * 2);
 			// Rounding the two axes independently can land a few hundred px
@@ -4466,7 +4546,7 @@ describe("the backing stores (a full-viewport canvas, three times over)", () => 
 		rig.win.devicePixelRatio = 1.5;
 		rig.reveal.dispatch({ type: "resize" });
 		const l = layersOf(rig);
-		for (const c of [l.committed, l.wetCanvas, l.tailCanvas]) {
+		for (const c of [l.highlight, l.committed, l.wetCanvas, l.tailCanvas]) {
 			const canvas = c as unknown as { width: number; height: number };
 			expect(canvas.width).toBe(2561);
 			expect(canvas.height).toBe(1601);
@@ -4492,7 +4572,7 @@ describe("the backing stores (a full-viewport canvas, three times over)", () => 
 		// `.reveal` is the same 1000x800 css px it always was, so `resize`
 		// never fires and the ResizeObserver never beats.
 		rig.win.changeResolution(2);
-		for (const c of [l.committed, l.wetCanvas, l.tailCanvas]) {
+		for (const c of [l.highlight, l.committed, l.wetCanvas, l.tailCanvas]) {
 			const canvas = c as unknown as { width: number; height: number };
 			expect(canvas.width).toBe(2000);
 			expect(canvas.height).toBe(1600);
@@ -4527,6 +4607,7 @@ describe("the backing stores (a full-viewport canvas, three times over)", () => 
 		// `.reveal` survived. Every listener still fires - capture, the palm
 		// guard, the tap rule all live on `.reveal` - so the pen keeps working
 		// and nothing is painted: the reader draws invisibly.
+		l.highlightGroup.remove();
 		l.committed.remove();
 		l.wetCanvas.remove();
 		l.tailCanvas.remove();
@@ -4636,7 +4717,7 @@ describe("onSlidesCssChange (GAP 16): re-arm the deck-theme measurement on css-c
 		win.computedBackground = "rgb(255, 255, 255)";
 		onSlidesCssChange();
 		expect(inkThemeOverride()).toBe(false);
-		expect(doc.clearCounts.clears).toBe(before + 1);
+		expect(doc.clearCounts.clears).toBe(before + 2);
 	});
 
 	it("(b) is a no-op with no deck live: no throw, no override change", () => {
@@ -4776,7 +4857,7 @@ describe("syncGeometry's two protections (item 2)", () => {
 		const rig = await mountedRig();
 		const l = layersOf(rig);
 		const total = (): number =>
-			l.committed.backingWrites + l.wetCanvas.backingWrites + l.tailCanvas.backingWrites;
+			l.highlight.backingWrites + l.committed.backingWrites + l.wetCanvas.backingWrites + l.tailCanvas.backingWrites;
 		const before = total();
 		// Same viewport, same ratio: three syncs that change nothing.
 		rig.reveal.dispatch({ type: "resize" });
@@ -4997,7 +5078,7 @@ describe("the mount line reports the GRANTED desynchronized flag (item 9)", () =
 		expect(SLIDES_DESYNCHRONIZED).toBe(false);
 		const rig = makeRig({ grantedDesynchronized: true });
 		await new Promise((r) => setTimeout(r, 0));
-		const mount = rig.logs.find((l) => l.includes("mount: three canvases"));
+		const mount = rig.logs.find((l) => l.includes("mount: four canvases"));
 		expect(mount).toBeDefined();
 		expect(mount).toContain("wet desynchronized: requested false actual true");
 		rig.deck.dispose();
@@ -5009,7 +5090,7 @@ describe("the mount line names the running build (stale-plugin visibility)", () 
 		setDiagnosticsEnabled(true);
 		const rig = makeRig();
 		await new Promise((r) => setTimeout(r, 0));
-		const mount = rig.logs.find((l) => l.includes("mount: three canvases"));
+		const mount = rig.logs.find((l) => l.includes("mount: four canvases"));
 		expect(mount).toBeDefined();
 		expect(mount).toContain(`build ${TEST_BUILD_ID}`);
 		rig.deck.dispose();
@@ -5022,7 +5103,7 @@ describe("the committed repaint opts INTO the ribbon cache (item 10)", () => {
 		// resize, over every stroke on the slide; flattening each ribbon again
 		// each time is the cost this argument exists to avoid.
 		const body = slice("private repaint(): void {", "\n\t}");
-		expect(body).toContain("drawStroke(l.ctx, cam, s, undefined, true);");
+		expect(body).toContain("drawStroke(s.tool === \"highlighter\" ? l.highlightCtx : l.ctx, cam, s, undefined, true);");
 	});
 });
 
@@ -5329,7 +5410,7 @@ describe("live reload while sidecar I/O is pending", () => {
 		expect(rig.savedNow).toHaveLength(1);
 		expect(rig.savedNow[0]!.page.strokes.map((s) => s.id).sort()).toEqual([mine, "stored-1", "stored-2"].sort());
 	});
-	async function pendingReloadRig(): Promise<{
+	async function pendingReloadRig(eraseWhole = true): Promise<{
 		rig: Rig;
 		release: (page: ParseResult | null) => void;
 		reject: (error: Error) => void;
@@ -5341,7 +5422,7 @@ describe("live reload while sidecar I/O is pending", () => {
 			reject = fail;
 		});
 		let cold = true;
-		const rig = makeRig({ load: () => cold
+		const rig = makeRig({ eraseWhole, load: () => cold
 			? Promise.resolve(storedPageWith("note-1.slides", ["stored-1"]))
 			: pending });
 		await Promise.all(rig.deck.inFlightWork());
@@ -5350,6 +5431,54 @@ describe("live reload while sidecar I/O is pending", () => {
 		expect(rig.scheduled).toEqual([]);
 		return { rig, release, reject };
 	}
+
+	it.each(["draw", "whole erase", "partial erase"] as const)("a %s spanning authoritative adoption cannot later undo remote ink", async mode => {
+		const { rig, release } = await pendingReloadRig(mode !== "partial erase");
+		if (mode !== "draw") drawStrokeOn(rig);
+		const reload = rig.deck.reloadExternal("note-1.slides");
+		if (mode === "draw") { rig.down(); rig.move(260, 260); }
+		else {
+			rig.down({ buttons: 32, clientX: 260, clientY: 260 });
+			rig.move(270, 270, { buttons: 32 });
+		}
+		expect(rig.deck.status().pendingGesture).toBe(true);
+		release(storedPageWith("note-1.slides", ["remote-new"]));
+		await reload;
+		const admitted = structuredClone(strokesOn(rig, 0));
+		expect(admitted.some(s => s.id === "remote-new")).toBe(true);
+		expect(admitted.some(s => s.id === "stored-1")).toBe(false);
+		if (mode === "draw") expect(admitted).toHaveLength(2);
+		if (mode === "partial erase") expect(admitted.length).toBeGreaterThan(1);
+		rig.end("pointerup", { buttons: 0 });
+		expect(strokesOn(rig, 0)).toEqual(admitted);
+		expect(rig.deck.status().undoLabel).toBeNull();
+		expect(rig.deck.run("undo")).toBe(false);
+		expect(rig.scheduled.at(-1)!.page.strokes).toEqual(admitted);
+		drawStrokeOn(rig);
+		expect(rig.deck.run("undo")).toBe(true);
+		expect(strokesOn(rig, 0)).toEqual(admitted);
+		expect(rig.scheduled.at(-1)!.page.strokes).toEqual(admitted);
+		rig.deck.dispose();
+	});
+
+	it.each(["missing", "rejected", "damaged", "future"] as const)("a %s reload does not end a live gesture or reset completed history", async outcome => {
+		const { rig, release, reject } = await pendingReloadRig();
+		drawStrokeOn(rig);
+		rig.deck.run("clear-current");
+		const priorLabel = rig.deck.status().undoLabel;
+		const reload = rig.deck.reloadExternal("note-1.slides");
+		rig.down(); rig.move(260, 260);
+		if (outcome === "rejected") reject(Error("offline"));
+		else release(outcome === "missing" ? null : { ...storedPageWith("note-1.slides", ["remote-new"]),
+			...(outcome === "damaged" ? { damaged: true } : { futureVersion: 999 }) });
+		await reload;
+		expect(rig.deck.status().pendingGesture).toBe(true);
+		expect(rig.deck.status().undoLabel).toBe(priorLabel);
+		rig.move(300, 300); rig.end("pointerup", { buttons: 0 });
+		expect(rig.deck.status().undoLabel).toBe("Draw on slide 1");
+		expect(strokesOn(rig, 0).some(s => s.id !== "remote-new")).toBe(true);
+		rig.deck.dispose();
+	});
 
 	it("holds saves until remote ink and a stroke drawn during the read are merged", async () => {
 		const { rig, release } = await pendingReloadRig();
@@ -5754,5 +5883,123 @@ describe("a remote delete of locally-drawn ink (characterisation: today's behavi
 			"WRONG-BUT-CURRENT: the remote delete is undone because local ink is never adopted"
 		).toContain(mine);
 		expect(ids).toContain("stored-1");
+	});
+});
+
+
+describe("presentation actions own the deck history", () => {
+	const settle = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+	const last = (rig: Rig) => rig.scheduled.at(-1)?.page.strokes ?? [];
+	const navigate = (rig: Rig, index: number) => {
+		rig.slides.children.forEach((s, i) => i === index ? s.classes.add("present") : s.classes.delete("present"));
+		rig.reveal.dispatch({ type: "slidechanged" });
+	};
+
+	it("registered current clear and undo preserve the other slide and exact ink", async () => {
+		const rig = makeRig(); await settle();
+		drawStrokeOn(rig);
+		navigate(rig, 1); drawStrokeOn(rig);
+		const before = structuredClone(last(rig));
+		const commands = presentationCommands(() => rig.deck, (deck, action) => { deck.run(action); });
+		const clear = commands.find(c => c.id === "slides-clear-current")!;
+		expect(clear.checkCallback(true)).toBe(true);
+		expect(last(rig)).toEqual(before);
+		expect(clear.checkCallback(false)).toBe(true);
+		expect(last(rig)).toEqual(before.filter(s => s.page === 1));
+		expect(rig.deck.run("undo")).toBe(true);
+		expect(last(rig)).toEqual(before);
+		expect(rig.deck.status().index).toBe(1);
+		expect(rig.scheduled.every(s => s.id === "note-1.slides" && s.page.surface === "slides")).toBe(true);
+		expect(rig.claims).toEqual([]);
+		rig.deck.dispose();
+	});
+
+	it("all clear includes retained unmatched ink and is one undoable operation", async () => {
+		const stored = storedPage("note-1.slides", "remote");
+		stored.data.strokes.push({ ...stored.data.strokes[0]!, id: "unmatched", page: 42 });
+		const rig = makeRig({ load: async () => stored }); await settle();
+		drawStrokeOn(rig); const before = structuredClone(last(rig));
+		expect(rig.deck.status().totalCount).toBe(3);
+		expect(rig.deck.run("clear-all")).toBe(true); expect(last(rig)).toEqual([]);
+		expect(rig.deck.run("clear-all")).toBe(false);
+		expect(rig.deck.run("undo")).toBe(true); expect(last(rig)).toEqual(before);
+		expect(rig.deck.run("redo")).toBe(true); expect(last(rig)).toEqual([]);
+		rig.deck.dispose();
+	});
+
+	it.each([true, false])("draw, erase (whole=%s), clear share chronological history", async eraseWhole => {
+		const rig = makeRig({ eraseWhole }); await settle(); drawStrokeOn(rig);
+		const drawn = structuredClone(last(rig));
+		rig.down({ buttons: 32, clientX: 260, clientY: 260 });
+		rig.move(270, 270, { buttons: 32 });
+		rig.end("pointerup", { buttons: 0, timeStamp: 10000 });
+		const erased = structuredClone(last(rig));
+		expect(erased).not.toEqual(drawn);
+		expect(rig.deck.status().undoLabel).toBe("Erase on slide 1");
+		if (erased.length) { expect(rig.deck.run("clear-current")).toBe(true); rig.deck.run("undo"); expect(last(rig)).toEqual(erased); }
+		expect(rig.deck.run("undo")).toBe(true); expect(last(rig)).toEqual(drawn);
+		expect(rig.deck.run("undo")).toBe(true); expect(last(rig)).toEqual([]);
+		rig.deck.dispose();
+	});
+
+	it("finishes live ink on its original slide before clear, with two undo steps", async () => {
+		const rig = makeRig(); await settle();
+		rig.down(); rig.move(260, 260);
+		expect(rig.deck.run("clear-current")).toBe(true); expect(last(rig)).toEqual([]);
+		expect(rig.deck.run("undo")).toBe(true); expect(last(rig)).toHaveLength(1);
+		expect(last(rig)[0]!.page).toBe(1);
+		expect(rig.deck.run("undo")).toBe(true); expect(last(rig)).toEqual([]);
+		rig.deck.dispose();
+	});
+
+	it("initial adoption rebases local history without removing remote ink on undo", async () => {
+		let release!: (p: ParseResult) => void;
+		const rig = makeRig({ load: () => new Promise(r => { release = r; }) });
+		await settle(); drawStrokeOn(rig);
+		expect(rig.deck.run("undo")).toBe(false);
+		release(storedPage("note-1.slides", "remote")); await settle();
+		expect(rig.deck.run("undo")).toBe(true);
+		expect(last(rig).map(s => s.id)).toEqual(["remote"]);
+		expect(rig.deck.run("redo")).toBe(true); expect(last(rig)).toHaveLength(2);
+		rig.deck.dispose();
+	});
+
+	it("successful adoption resets history; failed reads and mere availability checks do not", async () => {
+		let response: ParseResult | null = null;
+		let fail = false;
+		const rig = makeRig({ load: async () => { if (fail) throw Error("offline"); return response; } });
+		await settle(); drawStrokeOn(rig);
+		const label = rig.deck.status().undoLabel;
+		rig.deck.reloadCandidateSidecarId(); expect(rig.deck.status().undoLabel).toBe(label);
+		fail = true; await rig.deck.reloadExternal("note-1.slides"); expect(rig.deck.status().undoLabel).toBe(label);
+		fail = false; response = storedPage("note-1.slides", "remote");
+		await rig.deck.reloadExternal("note-1.slides");
+		expect(rig.deck.status().undoLabel).toBeNull(); expect(rig.deck.run("undo")).toBe(false);
+		rig.deck.dispose();
+	});
+
+	it("callbacks re-resolve on execution and retired deck actions cannot touch a successor", async () => {
+		const rig = makeRig(); await settle(); drawStrokeOn(rig);
+		let target: SlidesDeck | null = rig.deck;
+		const commands = presentationCommands(() => target, (deck, action) => { deck.run(action); });
+		const clear = commands.find(c => c.id === "slides-clear-current")!;
+		expect(clear.checkCallback(true)).toBe(true);
+		target = null;
+		expect(clear.checkCallback(false)).toBe(false); expect(last(rig)).toHaveLength(1);
+		const retained = rig.deck;
+		rig.deck.dispose();
+		const successor = makeRig(); await settle(); drawStrokeOn(successor);
+		expect(retained.run("clear-all")).toBe(false); expect(last(successor)).toHaveLength(1);
+		successor.deck.dispose();
+	});
+
+	it("future and damaged data keep new mutation actions disabled", async () => {
+		for (const flag of ["futureVersion", "damaged"] as const) {
+			const page = storedPage("note-1.slides", "remote");
+			if (flag === "futureVersion") page.futureVersion = 999; else page.damaged = true;
+			const rig = makeRig({ load: async () => page }); await settle(); drawStrokeOn(rig);
+			expect(rig.deck.run("clear-all")).toBe(false); expect(rig.deck.run("undo")).toBe(false);
+			expect(rig.scheduled).toEqual([]); rig.deck.dispose();
+		}
 	});
 });

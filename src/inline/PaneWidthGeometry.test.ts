@@ -24,7 +24,7 @@
  * screenshots. The one-minute check is readable line length OFF, then
  * toggle the sidebar.
  *
- * AND THE TRIGGER IS NOT ON THIS LINE AT ALL. The 1.5.0 architect diagnosed
+ * AND THE TRIGGER IS NOT ON THIS LINE AT ALL. The 1.5.0 investigation diagnosed
  * the detach on Alan's Surface and it needs a PINNED COLUMN to exist: the
  * boxed rule sets `width: var(--handwriting-box-w)` on `.cm-sizer`, a flex
  * child of CodeMirror's scroller with no `flex-shrink: 0`, so the variable

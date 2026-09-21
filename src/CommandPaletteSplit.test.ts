@@ -8,8 +8,8 @@
  *
  *   1. every gated id registers under the gated path, with the name the table
  *      says it has, so the list Settings prints is the list the palette gets;
- *   2. the canvas commands are gone from registration, ids and `Canvas tool:`
- *      alike, and cannot come back through a merge unnoticed;
+ *   2. the canvas entry commands register while parked `Canvas tool:`
+ *      commands cannot come back through a merge unnoticed;
  *   3. the settings row prints the table rather than a second copy of it - the
  *      one thing that makes claim 1 worth anything;
  *   4. the two ROUTES a gated command can answer through - registered in the
@@ -134,8 +134,10 @@ describe("the gated set: table and registration agree", () => {
 		expect(ALWAYS_COMMANDS.map((c) => c.id)).not.toContain("pen-tools-cycle");
 		expect(MAIN).not.toContain('id: "pen-tools-cycle"');
 		// Fourteen after `pen-ink-toggle` and `pen-tools-cycle` both left the
-		// palette. The exact count stops either retired command creeping back in.
-		expect(ALWAYS_COMMANDS).toHaveLength(14);
+		// palette; fifteen with the toolbar and zoom bar on / off toggle (1.4.20),
+		// a new id, not the retired cycle. The exact count stops either retired
+		// command creeping back in.
+		expect(ALWAYS_COMMANDS).toHaveLength(15);
 	});
 });
 
@@ -193,28 +195,6 @@ describe("the always set stays registered outright", () => {
 			before.lastIndexOf("this.addCommand({"),
 			`${id} must not be behind the setting`
 		).toBeGreaterThan(before.lastIndexOf("addGatedCommand({"));
-	});
-});
-
-describe("the canvas commands are out of the palette", () => {
-	it("registers none of the three ids", () => {
-		for (const id of ["new-page", "open-as-canvas", "open-as-markdown"]) {
-			expect(MAIN, id).not.toContain(`id: "${id}"`);
-		}
-	});
-
-	it("registers no `Canvas tool:` command", () => {
-		expect(MAIN).not.toContain("Canvas tool:");
-		expect(MAIN).not.toContain("id: `tool-${tool}`");
-	});
-
-	it("keeps the code paths they called", () => {
-		// Removal of the registrations only: the canvas view still opens for a
-		// note carrying the frontmatter marker, and every method the commands
-		// used is still here to serve it.
-		for (const kept of ["private async newPage(", "private async openAsHandwriting(", "this.preferMarkdown"]) {
-			expect(MAIN, kept).toContain(kept);
-		}
 	});
 });
 

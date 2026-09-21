@@ -170,6 +170,15 @@ export const RELEASE_NOTES: Record<string, string[]> = {
 	"1.4.19": [
 		"ZOOM BUG FIX",
 	],
+	"1.4.20": [
+		"zoom to 600% + bug fixes",
+		"ink fixes",
+		"infinite canvas per note (same place as line/dot/grid. check the ... in top right -alan)",
+		"bounce added :)",
+		"note background fixes",
+		"bug fixes",
+		"thank you to seekermarcel for help",
+	],
 };
 
 /** One release's own notes, kept apart so the toast can label them honestly. */

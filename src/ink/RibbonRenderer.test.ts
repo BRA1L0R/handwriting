@@ -26,18 +26,29 @@ function recordingCtx() {
 	const arcs: boolean[] = [];
 	let current: Quad | null = null;
 	let fills = 0;
+	/** A four-vertex subpath is a quad; a disc (moveTo + arc) is not. */
+	const endSubpath = () => {
+		if (current && current.length === 4) quads.push(current);
+		current = null;
+	};
 	const ctx = {
 		fillStyle: "",
 		beginPath() {},
 		moveTo(x: number, y: number) {
+			// A subpath ENDS where the next one begins. The painter used to mark
+			// that boundary with `closePath` and this recorder keyed off it. The
+			// close was removed - it cost 3332 ms of one pinch-end task on Alan's
+			// device and changed no pixel, since `fill` closes subpaths
+			// implicitly - so the boundary is read from the stream's own shape
+			// instead. Every assertion below is unchanged.
+			endSubpath();
 			current = [[x, y]];
 		},
 		lineTo(x: number, y: number) {
 			current?.push([x, y]);
 		},
 		closePath() {
-			if (current && current.length === 4) quads.push(current);
-			current = null;
+			endSubpath();
 		},
 		arc(
 			_x: number,
@@ -50,6 +61,7 @@ function recordingCtx() {
 			arcs.push(anticlockwise === true);
 		},
 		fill() {
+			endSubpath();
 			fills++;
 		},
 	};
@@ -175,23 +187,36 @@ function argRecordingCtx() {
 	const quads: Quad[] = [];
 	const arcs: Array<{ x: number; y: number; r: number; anticlockwise: boolean }> = [];
 	let current: Quad | null = null;
+	/** A four-vertex subpath is a quad; a disc (moveTo + arc) is not. */
+	const endSubpath = () => {
+		if (current && current.length === 4) quads.push(current);
+		current = null;
+	};
 	const ctx = {
 		fillStyle: "",
 		beginPath() {},
 		moveTo(x: number, y: number) {
+			// A subpath ENDS where the next one begins. The painter used to mark
+			// that boundary with `closePath` and this recorder keyed off it. The
+			// close was removed - it cost 3332 ms of one pinch-end task on Alan's
+			// device and changed no pixel, since `fill` closes subpaths
+			// implicitly - so the boundary is read from the stream's own shape
+			// instead. Every assertion below is unchanged.
+			endSubpath();
 			current = [[x, y]];
 		},
 		lineTo(x: number, y: number) {
 			current?.push([x, y]);
 		},
 		closePath() {
-			if (current && current.length === 4) quads.push(current);
-			current = null;
+			endSubpath();
 		},
 		arc(x: number, y: number, r: number, _a0: number, _a1: number, anticlockwise?: boolean) {
 			arcs.push({ x, y, r, anticlockwise: anticlockwise === true });
 		},
-		fill() {},
+		fill() {
+			endSubpath();
+		},
 	};
 	return { ctx: ctx as unknown as CanvasRenderingContext2D, quads, arcs };
 }

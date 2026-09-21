@@ -77,14 +77,14 @@
  * by nothing that runs in the plugin.
  */
 
-export type InkSurfaceId = "note" | "pdf" | "canvas" | "penlab" | "demo" | "slides";
+export type InkSurfaceId = "note" | "pdf" | "penlab" | "demo" | "slides";
 
 /**
  * Which pointer router a surface is built on. This is the fault line: `note`
  * and `pdf` share `InlinePenRouter`, which declares TEN callbacks and lets
  * each surface answer them independently, so it is the pair that diverges.
- * `canvas` and `penlab` share `PointerRouter` and own their whole surface;
- * `demo` and `slides` are on neither and wire their own pointer handlers.
+ * `penlab` is on `PointerRouter` and owns its whole surface; `demo` and
+ * `slides` are on neither and wire their own pointer handlers.
  * Those two are "none" for different reasons: the demo cannot reach a router
  * because the site bundle does not carry one, and the slides surface will not
  * reach for `InlinePenRouter` because doing so would drag its whole eighteen-
@@ -115,19 +115,22 @@ export interface InkSurface {
 	 * rule may legitimately skip it.
 	 */
 	readonly userReachable: boolean;
-	/** Does this surface construct a `MobileTools` strip? Only note and pdf do. */
+	/** Does this surface construct a `MobileTools` strip, directly or through an adapter? */
 	readonly mountsStrip: boolean;
+	/** Separate adapter construction site, when the input surface stays DOM-only. */
+	readonly stripFile?: string;
 	/**
-	 * Does the pen TIP here obey `TipMode` - eraser, lasso, pan, space? The
-	 * canvas does not, and not by omission: its own `type Tool` has no `pan`
-	 * member at all and it pans by transient gesture instead. A rule about the
-	 * tip mode is therefore not missing from the canvas, it is inapplicable.
+	 * Does the pen TIP here obey `TipMode` - eraser, lasso, pan, space? A
+	 * surface can answer `false` without that being an omission: a surface
+	 * whose own tool set has no `pan` member pans by transient gesture
+	 * instead, and a rule about the tip mode is inapplicable to it rather
+	 * than missing from it.
 	 */
 	readonly honoursTipMode: boolean;
 }
 
 /**
- * Each `file` is where the stroke is built, and for the four router-bearing
+ * Each `file` is where the stroke is built, and for the three router-bearing
  * surfaces it is also where the router is constructed and the callbacks are
  * wired. `demo` and `slides` have no router, so for them the stroke and the
  * pointer wiring are both the whole of it.
@@ -141,12 +144,6 @@ export interface InkSurface {
  * source. The columns are still hand-set
  * and only `mountsStrip` is derived, so treat the rest as claims a reader can
  * check rather than as facts the suite guarantees.
- *
- * `canvas` is PARKED by Alan, twice - see the "Canvas: pan-mode selection
- * clear - FILED, NOT TO BE WORKED" entry in `1.4.9-design.md`'s claims
- * register, and the claim-released note right after it. It is listed because
- * leaving it out is exactly the omission this file exists to make impossible;
- * nothing here asks for behaviour to be added to it.
  */
 export const INK_SURFACES: readonly InkSurface[] = [
 	{
@@ -164,14 +161,6 @@ export const INK_SURFACES: readonly InkSurface[] = [
 		userReachable: true,
 		mountsStrip: true,
 		honoursTipMode: true,
-	},
-	{
-		id: "canvas",
-		file: "/src/view/HandwritingPageView.ts",
-		router: "PointerRouter",
-		userReachable: true,
-		mountsStrip: false,
-		honoursTipMode: false,
 	},
 	{
 		id: "penlab",
@@ -230,9 +219,8 @@ export const INK_SURFACES: readonly InkSurface[] = [
 		// writes on the deck with the pen. Unlike `penlab`, something in the
 		// UI opens it, so no rule may skip it for being unreachable.
 		//
-		// mountsStrip false: `grep -c MobileTools` is 0. Derived rather than
-		// believed, like every other row - there is no plugin chrome on a
-		// presentation at all, and the nib comes from the host.
+		// The presentation owns its toolbar through the dedicated SlidesTools adapter.
+		// The input surface remains independent of Obsidian and MobileTools imports.
 		//
 		// honoursTipMode: THE TRUTH IS PARTIAL, and `true` is the honest half
 		// of the two available. The tip obeys exactly ONE member of TipMode -
@@ -243,16 +231,18 @@ export const INK_SURFACES: readonly InkSurface[] = [
 		// TipMode has something to say here", NEVER as all four: the lasso,
 		// pan and space rows in `InkSurfaceRules.test.ts` exempt this surface
 		// and are right to. `false` would be the worse lie of the two. It is
-		// the value `canvas` carries, and the two exemptions that cite this
-		// column by name read it as "no TipMode at all" - which would hide
-		// the fact that eraser MODE is the only way a pen with no tail end
-		// takes ink back off a slide, and would contradict the "reads the tip
-		// mode" row, which this surface carries with a real call site.
+		// the value a surface with no TipMode at all carries, and the two
+		// exemptions that cite this column by name read it that way - which
+		// would hide the fact that eraser MODE is the only way a pen with no
+		// tail end takes ink back off a slide, and would contradict the
+		// "reads the tip mode" row, which this surface carries with a real
+		// call site.
 		id: "slides",
 		file: "/src/slides/SlidesInkSurface.ts",
 		router: "none",
 		userReachable: true,
-		mountsStrip: false,
+		mountsStrip: true,
+		stripFile: "/src/slides/SlidesTools.ts",
 		honoursTipMode: true,
 	},
 ];

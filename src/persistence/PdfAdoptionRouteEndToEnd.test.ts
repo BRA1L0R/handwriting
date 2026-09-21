@@ -124,7 +124,8 @@ function pollBridge(
 		() => {},
 		() => null,
 		async () => false,
-		{ error: () => {} }
+		{ error: () => {} },
+		() => null,
 	);
 	return {
 		host,

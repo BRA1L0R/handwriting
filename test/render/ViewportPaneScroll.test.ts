@@ -20,12 +20,17 @@
  * a contact that lands on the editor focuses it, so a contact on the editor
  * first would hide the offset this file is about.
  *
+ * Harness engine supports CSS zoom; hostZoom pinned true; the transform
+ * fallback in applyViewportBox has no harness coverage.
+ *
  * Arms: FIXED (the shipped rule: a written offset reads back 0, the host is
  * the pane, the corner claims, stores and paints, the crossing stroke paints
- * to the end); PLANT (the pre-fix rule restored by an injected stylesheet:
- * the same write shifts the host and the corner contact lands on bare pane,
- * delivered but never claimed - the instrument can fail); SELF-HEAL (under
- * the plant, the next box application puts the pane back to 0).
+ * to the end); two REGIME GUARDS under the pre-fix rule restored by an injected
+ * stylesheet. They are not a plant and cannot show the fix working: css zoom
+ * shrinks the counter-sized host to the pane, so in this cell the pre-fix rule
+ * leaves nothing to scroll, and they assert that precondition set. The plant
+ * and self-heal that could fail belonged to the transform host and were
+ * removed with its arms.
  */
 import { beforeAll, afterAll, it, expect } from "vitest";
 import { build } from "esbuild";
@@ -132,39 +137,52 @@ it("FIXED: at 10% far right+bottom a scroll offset written onto the owned pane r
 	} finally { await page.close(); }
 }, 240_000);
 
-it("PLANT: with the pre-fix rule restored, the same write shifts the editor surface and the corner contact lands on bare pane, delivered to the page but never claimed (the instrument can fail)", async () => {
+it("REGIME GUARD, pre-fix rule restored: at 10% far right+bottom the zoom host leaves the pane nothing to scroll, so the write is a no-op and the corner contact is still claimed (not a plant)", async () => {
 	const { page, errors, geo } = await open(true);
 	try {
 		expect(errors, `page errors: ${errors.join(" | ")}`).toEqual([]);
-		expect(geo.paneOverflow, "the plant restored the scroll container").toBe("hidden");
+		expect(geo.paneOverflow, "the injected rule restored the scroll container").toBe("hidden");
+		// The zoom host is the form under test: the harness engine has css zoom and the overlay's gate agrees with it (file header).
+		expect(geo.engineZoom, "the harness engine supports css zoom").toBe(true);
+		expect(geo.hostZoom, "the overlay's host-form gate agrees with the engine").toBe(geo.engineZoom);
 		const r = await cornerAndCrossing(page);
 		// eslint-disable-next-line no-console
-		console.log(`PANESCROLL plant ${JSON.stringify(r)}`);
-		expect(r.written, "the write took on the scroll container").toEqual(OFFSET);
-		expect(r.geo.rects.host.r, "the host ends short of the pane's right edge by the offset").toBeCloseTo(r.geo.rects.pane.r - OFFSET.left, 0);
-		expect(r.geo.rects.host.b, "the host ends short of the pane's bottom edge by the offset").toBeCloseTo(r.geo.rects.pane.b - OFFSET.top, 0);
-		expect(r.cornerInScroller, `corner contact lands on bare pane: ${r.cornerTarget.join(" > ")}`).toBe(false);
-		expect(r.cornerDelivered, "the page received the contact").toBe(1);
-		expect(r.cornerClaimed, "the router never saw it").toBe(0);
-		expect(r.cornerStrokes, "nothing stored").toBe(0);
-		expect(r.cornerInk.pixels, "nothing painted at the corner").toBe(0);
+		console.log(`PANESCROLL regime-guard ${JSON.stringify(r)}`);
+		// css zoom shrinks the counter-sized host to the pane, so even with the scroll container restored there is nothing to scroll
+		// and the pre-fix defect cannot occur. This cannot show the fix working. It asserts the whole precondition set that makes the
+		// fix redundant, in this one cell only (10%, the far host, this pane size): it goes red if the zoom host overflows this pane
+		// under the pre-fix rule, and says nothing about other scales or panes. If it does go red, the zoom host needs a real plant.
+		expect(r.geo.paneOverflow, "regime guard: the pre-fix rule is in force").toBe("hidden");
+		expect(r.geo.pane.sw, "regime guard: no horizontal overflow under the pre-fix rule").toBe(r.geo.pane.cw);
+		expect(r.geo.pane.sh, "regime guard: no vertical overflow under the pre-fix rule").toBe(r.geo.pane.ch);
+		expect(r.geo.rects.host, "regime guard: the host box is the pane box").toEqual(r.geo.rects.pane);
+		expect(r.written, "regime guard: the write is a no-op, nothing to scroll").toEqual({ left: 0, top: 0 });
+		expect(r.cornerInScroller, `regime guard: corner contact lands on the scroller, not ${r.cornerTarget.join(" > ")}`).toBe(true);
+		expect(r.cornerClaimed, "regime guard: the router claimed the corner contact").toBe(1);
 	} finally { await page.close(); }
 }, 240_000);
 
-it("SELF-HEAL: under the plant an already-offset pane is put back to 0 the next time the viewport box is applied", async () => {
-	const { page, errors } = await open(true);
+it("REGIME GUARD, pre-fix rule restored: through a box application the zoom host pane stays at 0 with nothing to scroll, so there is no offset to heal (not a self-heal)", async () => {
+	const { page, errors, geo } = await open(true);
 	try {
 		expect(errors, `page errors: ${errors.join(" | ")}`).toEqual([]);
+		// The zoom host is the form under test (file header).
+		expect(geo.engineZoom, "the harness engine supports css zoom").toBe(true);
+		expect(geo.hostZoom, "the overlay's host-form gate agrees with the engine").toBe(geo.engineZoom);
 		const written = await page.evaluate(o => (window as any).scrollColumnAnchor.runPaneScrollWrite(o.left, o.top), OFFSET);
-		expect(written, "the write took on the scroll container").toEqual(OFFSET);
-		const shifted = await read(page);
-		expect(shifted.rects.host.r, "shifted before the heal").toBeCloseTo(shifted.rects.pane.r - OFFSET.left, 0);
-		const healed = await page.evaluate(() => (window as any).scrollColumnAnchor.runPaneScrollNudge());
+		const before = await read(page);
+		// Under the pre-fix rule the pane has no overflow to carry an offset (see the first regime guard); the same precondition set,
+		// held through a box application, in this one cell only.
+		expect(before.paneOverflow, "regime guard: the pre-fix rule is in force").toBe("hidden");
+		expect(before.pane.sw, "regime guard: no horizontal overflow under the pre-fix rule").toBe(before.pane.cw);
+		expect(before.pane.sh, "regime guard: no vertical overflow under the pre-fix rule").toBe(before.pane.ch);
+		expect(before.rects.host, "regime guard: the host box is the pane box").toEqual(before.rects.pane);
+		expect(written, "regime guard: the write is a no-op").toEqual({ left: 0, top: 0 });
+		const still = await page.evaluate(() => (window as any).scrollColumnAnchor.runPaneScrollNudge());
 		// eslint-disable-next-line no-console
-		console.log(`PANESCROLL self-heal before=${JSON.stringify(shifted.pane)} after=${JSON.stringify(healed.pane)} host=${JSON.stringify(healed.rects.host)} pane=${JSON.stringify(healed.rects.pane)}`);
-		expect(healed.pane.left, "pane scrollLeft reset by applyViewportBox").toBe(0);
-		expect(healed.pane.top, "pane scrollTop reset by applyViewportBox").toBe(0);
-		expect(healed.rects.host.r, "host right edge back on the pane's").toBeCloseTo(healed.rects.pane.r, 0);
-		expect(healed.rects.host.b, "host bottom edge back on the pane's").toBeCloseTo(healed.rects.pane.b, 0);
+		console.log(`PANESCROLL regime-guard box-application pane=${JSON.stringify(still.pane)} host=${JSON.stringify(still.rects.host)}`);
+		expect(still.pane.left, "regime guard: pane scrollLeft stays 0 through the box application").toBe(0);
+		expect(still.pane.top, "regime guard: pane scrollTop stays 0 through the box application").toBe(0);
+		expect(still.rects.host, "regime guard: the host box is still the pane box after the box application").toEqual(still.rects.pane);
 	} finally { await page.close(); }
 }, 240_000);

@@ -20,15 +20,14 @@ import type { InkStroke } from "./ink/Stroke";
  *   D  main file unreadable, the   a real page, plus `damagedKeptAs`
  *      interrupted save promoted   (`PageStore.ts:1235`)
  *
- * THE ONE READER is `HandwritingPageView.ts:478` -
- * `else if (result?.recovered && !result.damagedKeptAs)` - and it says
+ * THE ONE READER was the canvas page view's recovery branch -
+ * `else if (result?.recovered && !result.damagedKeptAs)` - which said
  * "Handwriting recovered this note's ink from an interrupted save. Nothing was
- * lost." It excludes A (the earlier `damaged` branch takes it) and D (by
- * `damagedKeptAs`). **It does not exclude C.**
- *
- * SO A TRASH RESTORE IS ANNOUNCED AS AN INTERRUPTED SAVE. Its own comment says
- * "this is the bare interrupted-save case" and enumerates exactly one
- * exclusion - true when written, false once the trash-recovery path existed.
+ * lost." It excluded A (the earlier `damaged` branch took it) and D (by
+ * `damagedKeptAs`). **It did not exclude C**, so a trash restore was announced
+ * as an interrupted save. That reader was deleted with the view in s197, and
+ * no surface reads `recovered` this way today - which removes the live defect
+ * and leaves the field exactly as ambiguous as it was for the next one.
  * The identical failure as `PdfInkStore.ts:205` and `SlidesInkSurface.ts:2275`,
  * which still assert that `damaged` means placeholder.
  *
@@ -107,8 +106,9 @@ describe("a page recovered from the trash is indistinguishable from an interrupt
 
 		expect(result!.recovered).toBe(true);
 		expect(result!.damagedKeptAs).toBeUndefined();
-		// This is `HandwritingPageView.ts:478` verbatim, which is the branch
-		// that announces an interrupted save.
+		// This is the deleted view's recovery condition verbatim: the branch
+		// that announced an interrupted save, kept here as the shape a future
+		// reader would most likely write.
 		expect(!!result!.recovered && !result!.damagedKeptAs).toBe(true);
 
 		// And the store DOES know which event happened - it says so in a field

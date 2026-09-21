@@ -1,12 +1,15 @@
 import { setPenGestureGuardEnabled } from "../../src/inline/InlinePenRouter";
-import { EditorState, StateEffect } from "@codemirror/state";
+import { EditorState, StateEffect, type Extension } from "@codemirror/state";
 import { EditorView, Decoration, WidgetType } from "@codemirror/view";
 import { history, undoDepth, undo, redo, isolateHistory } from "@codemirror/commands";
-import { inlineInk, inkOverlayExtension, overlayForPath, setScrollExpansionEnabled, setInlineEraserMode, setInlineLassoMode, setInlineSpaceMode } from "../../src/inline/InkOverlay";
+import { inlineInk, inkOverlayExtension, overlayForPath, overlayForActiveEditor, captureInlineReloadAdmission, inlineReloadBindings, inkExternallyReloaded, setScrollExpansionEnabled, setInlineEraserMode, setInlineLassoMode, setInlineSpaceMode } from "../../src/inline/InkOverlay";
+import { notifyInkChanged } from "../../src/inline/InkEvents";
+import { PageStore } from "../../src/persistence/PageStore";
+import { FakeAdapter, gate } from "../../src/persistence/FakeAdapter";
 import { surfaceExtents } from "../../src/inline/SurfaceExtent";
 import { setPenInk } from "../../src/inline/PenInk";
 import { installObsidianDom } from "./obsidianDom";
-import { editorInfoField } from "./iphoneObsidianStub";
+import { editorInfoField, setBrowserEditorInfo } from "./iphoneObsidianStub";
 
 import { serializePage, parsePage, emptyPage, type PageData } from "../../src/model/PageData";
 installObsidianDom();
@@ -17,8 +20,14 @@ const blockedIds=new Set<string>();
 const save = (id:string,page:PageData) => { writes++; pages.set(id,serializePage(page)); };
 inlineInk.attachHost({readPageId:p=>ids.get(p)??null,claimId:async(p,id)=>{writes++;ids.set(p,id);return{pageId:id};},loadSidecar:async id=>{if(blockedIds.has(id))await new Promise<void>(r=>heldLoads.set(id,r));return pages.has(id)?parsePage(pages.get(id)!,id):null;},scheduleSidecar:save,scheduleSidecarNow:async(id,p)=>save(id,p),notify:()=>{}});
 const settle = async () => { for(let i=0;i<8;i++) await new Promise<void>(r=>requestAnimationFrame(()=>r())); };
+// s189: a lift under the canvas eases its measured travel for up to 500 ms. `rest` is `settle` plus waiting that ease out, for a
+// cell whose reading is the page AT REST; `settle` stays as it was for cells that read the lift itself.
+const rest = async () => { await settle(); for(let f=0;f<90&&[...rigs.values()].some(r=>r.overlay?.overscrollBounceReadout?.().active);f++) await new Promise<void>(r=>requestAnimationFrame(()=>r())); };
 async function run(zoom:number,candidate:boolean,axis: "x" | "y" = "y",font=1,cancel=false) {
 	const path = `viewport-${zoom}-${axis}-${font}-${cancel}.md`;
+	// s179 add.6: this rig drives the zoom bar buttons, gated busy with the canvas off (s179(1)) - canvas on so
+	// the bar stays live; the fling below then runs under canvas's own shorter tau (InlinePenRouter.ts CANVAS_FLING_TAU_MS).
+	setScrollExpansionEnabled(true);
  surfaceExtents.grow(path,{x:250000,y:250000});
 	// Stable has no scroll-demand expansion switch; seeded fixture extent only.
 	const host = document.body.appendChild(document.createElement("div"));
@@ -28,15 +37,26 @@ async function run(zoom:number,candidate:boolean,axis: "x" | "y" = "y",font=1,ca
 	await settle();
 	const overlay=overlayForPath(path)!;
 	if(!overlay) throw new Error("mounted overlay missing");
-	const positions=()=>Array.from({length:Math.min(doc.length,100)},(_,i)=>{const c=view.coordsAtPos(i)!;const origin=view.contentDOM.getBoundingClientRect();return [Math.round((c.left-origin.left)/view.scaleX*100)/100,Math.round((c.top-origin.top)/view.scaleY*100)/100];});
+	// Divides by the COMMANDED scale (the zoom this call is known to be at,
+	// times font), not CodeMirror's separately measured-back view.scaleX/
+	// scaleY - a real x/y glyph-position check, not one that cancels its own
+	// producer's rounding against the assert's. `before` is called while the
+	// camera is still at its start-of-test zoom (1, no button click yet); the
+	// caller passes that in explicitly rather than this function assuming it.
+	const positions=(scale:number)=>Array.from({length:Math.min(doc.length,100)},(_,i)=>{const c=view.coordsAtPos(i)!;const origin=view.contentDOM.getBoundingClientRect();return [Math.round((c.left-origin.left)/scale*100)/100,Math.round((c.top-origin.top)/scale*100)/100];});
+	// The line BOX (`.cm-line`): where the line sits, measured back through
+	// CodeMirror's own view.scaleY (a coarser, less precision-sensitive read
+	// than the glyph positions above - see F4/read-linebox.txt). `top`/`height`
+	// both recorded so a re-wrap (height change) is visible beside a shift.
+	const lineBoxes=()=>{const origin=view.contentDOM.getBoundingClientRect();return Array.from(view.contentDOM.querySelectorAll<HTMLElement>(".cm-line")).map(l=>{const r=l.getBoundingClientRect();return {top:(r.top-origin.top)/view.scaleY,height:r.height/view.scaleY};});};
 	if(font!==1){view.contentDOM.style.fontSize=`${16*font}px`;view.requestMeasure();await settle();}
- const layoutBefore=positions();
+ const layoutBefore=positions(font);const lineBoxBefore=lineBoxes();
 	const before={doc:view.state.doc.toString(),writes,history:undoDepth(view.state)};
 	for(let tries=0;tries<5&&(overlay as any).getNoteViewportState().zoom>zoom;tries++){host.querySelector<HTMLButtonElement>('[aria-label="Zoom out"]')!.click();await settle();}
  for(let tries=0;tries<5&&(overlay as any).getNoteViewportState().zoom<zoom;tries++){host.querySelector<HTMLButtonElement>('[aria-label="Zoom in"]')!.click();await settle();}
  view.requestMeasure(); await settle();
  if((overlay as any).getNoteViewportState().zoom!==zoom)throw Error(JSON.stringify({state:(overlay as any).getNoteViewportState(),loaded:inlineInk.isLoaded(path),mode:(overlay as any).mode,builder:(overlay as any).builder,valid:(overlay as any).scaleGeometryValid,button:host.querySelector<HTMLButtonElement>('[aria-label="Zoom out"]')?.disabled}));
-	const layoutAfter=positions();
+	const layoutAfter=positions(zoom*font);const lineBoxAfter=lineBoxes();
 	const after={doc:view.state.doc.toString(),writes,history:undoDepth(view.state)};
 	const scroller=view.scrollDOM;
 	const hit=(x:number,y:number)=>{const target=document.elementFromPoint(x,y);return{tag:target?.tagName,inside:!!target&&scroller.contains(target)};};
@@ -98,8 +118,15 @@ const lock={rejected,scaleBefore,scaleAfter,transformBefore,transformAfter,befor
  const hidden={valid:(overlay as any).scaleGeometryValid,scale:(overlay as any).cssScale,rejected:!((overlay as any).commitCameraScale?.(1)??true)};
  host.style.display="";view.requestMeasure();await settle();
  const recovered={valid:(overlay as any).scaleGeometryValid,scale:(overlay as any).cssScale,transform:view.dom.style.transform};
+	// The pin: the harness ENGINE's own CSS-zoom support, and separately the
+	// OVERLAY's cached gate (InkOverlay.ts hostZoomSupported(), same private
+	// method scrollExpansionPage.ts:98 reads) - two different things, read
+	// separately so a disagreement between them is visible rather than assumed
+	// (same pair, same names as ScrollExpansion.test.ts:52-53).
+	const engineZoom=CSS.supports("zoom","0.5");
+	const hostZoom=(overlay as any).hostZoomSupported() as boolean;
  view.destroy();host.remove();
-	return {zoom,candidate,layoutBefore,layoutAfter,before,after,corners,strokes,errors,measured,touchTrace,flingUpdates,terminalOffset,cancelled,cancelOffset,lock,axis,font,cancel,invalidBefore,invalidRejected,hidden,recovered};
+	return {zoom,candidate,layoutBefore,layoutAfter,lineBoxBefore,lineBoxAfter,engineZoom,hostZoom,before,after,corners,strokes,errors,measured,touchTrace,flingUpdates,terminalOffset,cancelled,cancelOffset,lock,axis,font,cancel,invalidBefore,invalidRejected,hidden,recovered};
 }
 (window as any).noteViewportRun=run;
 
@@ -115,9 +142,9 @@ async function mountControl() {
 
 // Persisted fixture data is loaded through the real store/host boundary.
 class InlineWidget extends WidgetType { toDOM(){const el=document.createElement("span");el.textContent="[widget]";return el;} }
-const rigs=new Map<string,{host:HTMLElement;view:EditorView;overlay:any;path:string}>();
-async function setup(id:string,kind="far",font=1,external=1,initialDoc?:string) {
- const path=`fit-${id}.md`,pageId=`fit-page-${id}`;
+const rigs=new Map<string,{host:HTMLElement;view:EditorView;overlay:any;path:string;extensions:Extension[];overlayExtension:Extension}>();
+async function setup(id:string,kind="far",font=1,external=1,initialDoc?:string,sharedPath?:string) {
+ const path=sharedPath??`fit-${id}.md`,pageId=ids.get(path)??`fit-page-${id}`;
  if(kind==="loading")blockedIds.add(pageId);
  setScrollExpansionEnabled(true);
  if(!ids.has(path)) {
@@ -126,9 +153,9 @@ async function setup(id:string,kind="far",font=1,external=1,initialDoc?:string) 
   const long=kind!=="point"&&kind!=="edge";const width=long?32:2,dx=long?800:10,dy=long?600:8;
   data.strokes=points.map(([x,y],i)=>({id:`seed-${i}`,tool:"pen" as const,color:"#000000",width,createdAt:1,points:[{x:x!,y:y!,pressure:.5,t:0},{x:x!+dx,y:y!+dy,pressure:.5,t:10}],bbox:{x:x!-width,y:y!-width,width:dx+2*width,height:dy+2*width}}));
   if(kind==="thick-dot"||kind==="negative")data.strokes=[{id:"seed-0",tool:"pen",color:"#000000",width:kind==="thick-dot"?1000:2,createdAt:1,points:[{x:kind==="thick-dot"?3000:-100,y:3000,pressure:.5,t:0}],bbox:{x:0,y:0,width:0,height:0}}]; // Parse recomputes the stored bbox.
-  // Geometry below reproduces R2's mounted-review receipt exactly (bboxes
+  // Geometry below reproduces the mounted-review receipt exactly (bboxes
   // 92,92 / 92,-60 / -508,99992 / 99992,-508, all 36x36), so the fixtures
-  // match the exact configuration R2 verified rather than an invented one.
+  // match the exact configuration that was verified rather than an invented one.
   // A single reachable stroke: x/y 96..124, pen width 2 -> bbox {x:92,y:92,width:36,height:36}.
   if(kind==="reachable-body-only")data.strokes=[
    {id:"body",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:96,y:96,pressure:.5,t:0},{x:124,y:124,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
@@ -151,7 +178,7 @@ async function setup(id:string,kind="far",font=1,external=1,initialDoc?:string) 
    {id:"aboveLine",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:96,y:-56,pressure:.5,t:0},{x:124,y:-28,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
    {id:"body",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:96,y:96,pressure:.5,t:0},{x:124,y:124,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
   ];
-  // Exactly R2's "disjoint-unreachable" case: the same two outliers with NO
+  // Exactly the "disjoint-unreachable" case: the same two outliers with NO
   // reachable body - distinct from "empty" (no strokes at all), which must
   // still reset to 100% rather than refuse.
   if(kind==="wholly-unreachable-multi")data.strokes=[
@@ -169,16 +196,22 @@ async function setup(id:string,kind="far",font=1,external=1,initialDoc?:string) 
  if(kind==="theme") {document.body.classList.add("handwriting-paper-grid");document.body.style.setProperty("--background-modifier-border","#aaaaaa");const style=document.createElement("style");style.textContent=`[data-rig="${id}"] .cm-content {max-width:500px;margin:0 auto;padding:20px 24px;} [data-rig="${id}"] .cm-line {padding:0 12px;}`;host.appendChild(style);}
  if(external!==1){host.style.transform=`scale(${external})`;host.style.transformOrigin="0 0";}
  const doc=initialDoc??("alpha beta gamma delta ".repeat(30)+"\n# Heading\n- list item\nsecond line");
- const view=new EditorView({parent:host,state:EditorState.create({doc,extensions:[history(),EditorView.lineWrapping,EditorView.decorations.of(Decoration.set(doc.includes("# Heading")?[Decoration.widget({widget:new InlineWidget()}).range(doc.indexOf("# Heading"))]:[])),editorInfoField.init(()=>({app:{commands:{executeCommandById:()=>false}},file:{path},editor:{}})),inkOverlayExtension(),EditorView.theme({"&":{width:"640px",height:"480px"},".cm-content":{fontFamily:"monospace",fontSize:`${16*font}px`,lineHeight:"24px"}})]})});
+ const overlayExtension=inkOverlayExtension();
+ const extensions=[history(),EditorView.lineWrapping,EditorView.decorations.of(Decoration.set(doc.includes("# Heading")?[Decoration.widget({widget:new InlineWidget()}).range(doc.indexOf("# Heading"))]:[])),editorInfoField.init(()=>({app:{commands:{executeCommandById:()=>false}},file:{path},editor:{}})),overlayExtension,EditorView.theme({"&":{width:"640px",height:"480px"},".cm-content":{fontFamily:"monospace",fontSize:`${16*font}px`,lineHeight:"24px"}})];
+ const view=new EditorView({parent:host,state:EditorState.create({doc,extensions})});
  await settle();
- const overlay=overlayForPath(path)!;rigs.set(id,{host,view,overlay,path});
+ const info=view.state.field(editorInfoField)!;
+ const overlay=overlayForActiveEditor(info.editor as never,info.file as never)!;rigs.set(id,{host,view,overlay,path,extensions,overlayExtension});
  return snap(id);
 }
 function snap(id:string) {
  const {host,view,overlay,path}=rigs.get(id)!;
  const cr=view.contentDOM.getBoundingClientRect(),sr=view.scrollDOM.getBoundingClientRect(),scale=overlay.cssScale,font=overlay.fontZoom;
  const paperStyle=getComputedStyle(view.scrollDOM);
- return {paddingTop:Number.parseFloat(getComputedStyle(view.contentDOM).paddingTop),paper:{image:paperStyle.backgroundImage,attachment:paperStyle.backgroundAttachment},state:overlay.getNoteViewportState(),doc:view.state.doc.toString(),writes,history:undoDepth(view.state),strokes:JSON.parse(JSON.stringify(inlineInk.strokes(path))),extent:surfaceExtents.get(path),scroll:{left:view.scrollDOM.scrollLeft,top:view.scrollDOM.scrollTop,width:view.scrollDOM.scrollWidth,height:view.scrollDOM.scrollHeight},viewport:{x:sr.x,y:sr.y,width:sr.width,height:sr.height},ink:inlineInk.strokes(path).map(s=>({id:s.id,x:cr.left+s.bbox.x*scale*font,y:view.documentTop+s.bbox.y*scale*font,right:cr.left+(s.bbox.x+s.bbox.width)*scale*font,bottom:view.documentTop+(s.bbox.y+s.bbox.height)*scale*font})),layout:Array.from({length:Math.min(100,view.state.doc.length+1)},(_,i)=>{const c=view.coordsAtPos(i)!;return[(c.left-cr.left)/scale,(c.top-cr.top)/scale];}),buttons:[...host.querySelectorAll(".handwriting-note-viewport-controls button")].map(b=>b.getBoundingClientRect().toJSON()),backings:[...host.querySelectorAll("canvas")].map(c=>c.width*c.height),selection:view.state.selection.main.toJSON(),selected:overlay.selection.strokeIds,handles:host.querySelectorAll(".handwriting-selection-handle").length};
+ // The pin, same pair/names as `run()`'s (F3): the harness engine's own
+ // CSS-zoom support, and the overlay's separately cached gate.
+ const engineZoom=CSS.supports("zoom","0.5"),hostZoom=(overlay as any).hostZoomSupported() as boolean;
+ return {engineZoom,hostZoom,paddingTop:Number.parseFloat(getComputedStyle(view.contentDOM).paddingTop),paper:{image:paperStyle.backgroundImage,attachment:paperStyle.backgroundAttachment},state:overlay.getNoteViewportState(),doc:view.state.doc.toString(),writes,history:undoDepth(view.state),strokes:JSON.parse(JSON.stringify(inlineInk.strokes(path))),extent:surfaceExtents.get(path),scroll:{left:view.scrollDOM.scrollLeft,top:view.scrollDOM.scrollTop,width:view.scrollDOM.scrollWidth,height:view.scrollDOM.scrollHeight},viewport:{x:sr.x,y:sr.y,width:sr.width,height:sr.height},ink:inlineInk.strokes(path).map(s=>({id:s.id,x:cr.left+s.bbox.x*scale*font,y:view.documentTop+s.bbox.y*scale*font,right:cr.left+(s.bbox.x+s.bbox.width)*scale*font,bottom:view.documentTop+(s.bbox.y+s.bbox.height)*scale*font})),layout:Array.from({length:Math.min(100,view.state.doc.length+1)},(_,i)=>{const c=view.coordsAtPos(i)!;return[(c.left-cr.left)/scale,(c.top-cr.top)/scale];}),buttons:[...host.querySelectorAll(".handwriting-note-viewport-controls button")].map(b=>b.getBoundingClientRect().toJSON()),backings:[...host.querySelectorAll("canvas")].map(c=>c.width*c.height),selection:view.state.selection.main.toJSON(),selected:overlay.selection.strokeIds,handles:host.querySelectorAll(".handwriting-selection-handle").length};
 }
 async function fit(id:string) {const r=rigs.get(id)!.overlay.fitHandwriting();await settle();return {result:r,...snap(id)};}
 /**
@@ -250,6 +283,20 @@ function strokesPainted(id:string):{id:string;painted:number;sampled:boolean}[] 
 async function fitVisible(id:string) {const r=rigs.get(id)!.overlay.fitHandwriting();await settle();return {result:r,visiblePainted:visiblePainted(id),strokesPainted:strokesPainted(id),...snap(id)};}
 async function growEmpty(id:string){surfaceExtents.grow(rigs.get(id)!.path,{x:500000,y:600000});rigs.get(id)!.overlay.updateExtent(true);await settle();return snap(id);}
 async function reopen(id:string) {const r=rigs.get(id)!;r.view.destroy();r.host.remove();await setup(id);return snap(id);}
+// The same view switching to another note (as a leaf does), not a fresh mount:
+// the overlay sees the path change in its update and releases the viewport.
+async function switchPath(id:string,path:string) {const r=rigs.get(id)!;const info=r.view.state.field(editorInfoField,false) as any;r.view.dispatch({effects:setBrowserEditorInfo.of({...info,file:{path}})});await settle();return snap(id);}
+// A plugin reload on an open editor: the overlay's extension leaves the view's
+// configuration (its instance is destroyed) and joins it again as a new
+// instance on the same editor DOM. Every other extension is the same object.
+// `fontPxWhileAway` sets the text size between the two, as a font change made
+// while the plugin is disabled would.
+// A text-size change as the app makes one: Obsidian's line height is 1.5 times
+// the font, so the lines reflow with it. This rig's theme pins a 24 px line
+// height, under which a note with no text would not reflow at all and nothing
+// would observe the change.
+function setTextPx(view:EditorView,px:number){view.contentDOM.style.fontSize=`${px}px`;view.contentDOM.style.lineHeight=`${px*1.5}px`;}
+async function reloadOverlay(id:string,fontPxWhileAway?:number) {const r=rigs.get(id)!;const before=r.overlay;r.view.dispatch({effects:StateEffect.reconfigure.of(r.extensions.filter(e=>e!==r.overlayExtension))});await settle();if(fontPxWhileAway!==undefined){setTextPx(r.view,fontPxWhileAway);r.view.requestMeasure();await settle();}r.view.dispatch({effects:StateEffect.reconfigure.of(r.extensions)});await settle();const info=r.view.state.field(editorInfoField)!;r.overlay=overlayForActiveEditor(info.editor as never,info.file as never)!;return {newInstance:!!r.overlay&&r.overlay!==before,...snap(id)};}
 function penEvent(type:string,x:number,y:number,pointerId=120){document.elementFromPoint(x,y)?.dispatchEvent(new PointerEvent(type,{bubbles:true,cancelable:true,pointerType:"pen",pointerId,isPrimary:true,clientX:x,clientY:y,buttons:type==="pointerup"?0:1,pressure:.5}));}
 async function gesture(id:string,kind:string) {
  const r=rigs.get(id)!;const s=snap(id),b=s.ink[0]!;
@@ -270,7 +317,48 @@ async function stale(id:string) {
  r.view.dispatch({changes:{from:0,to:r.view.state.doc.length,insert:"replacement untouched"},effects:StateEffect.reconfigure.of([history(),editorInfoField.init(()=>({app:{commands:{executeCommandById:()=>false}},file:{path:next},editor:{}})),inkOverlayExtension()])});
  await settle();return {doc:r.view.state.doc.toString(),scroll:[r.view.scrollDOM.scrollLeft,r.view.scrollDOM.scrollTop],transform:r.view.dom.style.transform,flashes:r.host.querySelectorAll(".handwriting-ink-flash").length};
 }
-(window as any).viewportFixture={setup,snap,fit,fitVisible,growEmpty,reopen,gesture,stale,settle,
+// The note's surface grown to a given extent, as ink or scrolling far out would grow it.
+const TRANSLATE=/translate\(\s*(-?[\d.e+-]+)px\s*,\s*(-?[\d.e+-]+)px\s*\)/;
+function previewPaperState(id:string){
+ const r=rigs.get(id)!,host=r.view.dom,sc=r.view.scrollDOM;
+ const all=document.querySelectorAll(".handwriting-paper-preview").length;
+ const readout=typeof r.overlay.previewPaperReadout==="function"?r.overlay.previewPaperReadout():null;
+ const el=host.querySelector(":scope > .handwriting-paper-preview") as HTMLElement|null;
+ const previewing=sc.classList.contains("handwriting-paper-previewing");
+ if(!el)return {present:false,all,previewing,readout};
+ const cs=getComputedStyle(el),m=TRANSLATE.exec(el.style.transform);
+ const tx=m?Number(m[1]):0,ty=m?Number(m[2]):0;
+ const marginY=sc.offsetTop+sc.clientTop-Number.parseFloat(cs.top),marginX=sc.offsetLeft+sc.clientLeft-Number.parseFloat(cs.left);
+ const pitch=readout?.pitch??Number.NaN,fold=(v:number)=>((v%pitch)+pitch)%pitch;
+ const er=el.getBoundingClientRect(),rr=sc.getBoundingClientRect(),k=Number.parseFloat(getComputedStyle(host).zoom)||1;
+ return {present:true,all,previewing,readout,tx,ty,marginX,marginY,pitch,panX:fold(tx-marginX+sc.scrollLeft),panY:fold(ty-marginY+sc.scrollTop),
+  image:cs.backgroundImage,size:cs.backgroundSize,position:cs.backgroundPosition,color:cs.backgroundColor,
+  rect:{left:er.left,top:er.top,width:er.width,height:er.height},scroller:{left:rr.left+sc.clientLeft*k,top:rr.top+sc.clientTop*k,width:sc.clientWidth*k,height:sc.clientHeight*k},
+  box:{top:Number.parseFloat(cs.top),left:Number.parseFloat(cs.left),width:Number.parseFloat(cs.width),height:Number.parseFloat(cs.height)}};
+}
+function paperOriginNow(id:string){
+ const r=rigs.get(id)!,host=r.view.dom,sc=r.view.scrollDOM,hs=getComputedStyle(host);
+ const num=(v:string,d:number)=>{const n=Number.parseFloat(v);return Number.isFinite(n)?n:d;};
+ const painted=(r.overlay as any).cssScale as number;
+ const k=Number.isFinite(painted)&&painted>0?painted:num(hs.zoom,1),pitch=num(hs.getPropertyValue("--handwriting-paper-pitch"),28);
+ const phase=num(hs.getPropertyValue("--handwriting-paper-phase"),0),phaseX=num(hs.getPropertyValue("--handwriting-paper-phase-x"),0);
+ const el=host.querySelector(":scope > .handwriting-paper-preview") as HTMLElement|null;
+ if(el){const er=el.getBoundingClientRect();return {source:"element" as const,x:er.left+phaseX*k,y:er.top+phase*k,k,pitch,phase,phaseX};}
+ const ss=getComputedStyle(sc),rr=sc.getBoundingClientRect();
+ const panX=num(ss.getPropertyValue("--handwriting-paper-pan-x"),0),panY=num(ss.getPropertyValue("--handwriting-paper-pan-y"),0);
+ return {source:"scroller" as const,x:rr.left+(sc.clientLeft+phaseX+panX-sc.scrollLeft)*k,y:rr.top+(sc.clientTop+phase+panY-sc.scrollTop)*k,k,pitch,phase,phaseX,panX,panY};
+}
+async function growTo(id:string,x:number,y:number){surfaceExtents.grow(rigs.get(id)!.path,{x,y});rigs.get(id)!.overlay.updateExtent(true);await settle();return snap(id);}
+(window as any).viewportFixture={setup,snap,fit,fitVisible,growEmpty,growTo,reopen,switchPath,reloadOverlay,gesture,stale,settle,rest,
+ preview:(id:string)=>!!(rigs.get(id)!.overlay as any).pinchPreview,
+ panValues:(id:string)=>{const sc=rigs.get(id)!.view.scrollDOM;return {x:sc.style.getPropertyValue("--handwriting-paper-pan-x"),y:sc.style.getPropertyValue("--handwriting-paper-pan-y"),pitch:Number.parseFloat(rigs.get(id)!.view.dom.style.getPropertyValue("--handwriting-paper-pitch"))};},
+ // The preview paper as the page shows it: its translate, its margin (from its resolved box, not from its rounding),
+ // and the pan that places it, folded the way the scroller's pan properties would carry that pan.
+ previewPaper:(id:string)=>previewPaperState(id),
+ // The rig's overlay itself, for a cell that must drive one of its paths directly (a thrown settle, a standing pan).
+ overlay:(id:string)=>rigs.get(id)!.overlay,
+ // Where the paper's lattice origin is on screen this frame (client px), from whichever element draws the paper.
+ paperOrigin:(id:string)=>paperOriginNow(id),
  hiddenFit:async(id:string)=>{const r=rigs.get(id)!;r.host.style.display="none";r.view.requestMeasure();await settle();const valid=r.overlay.scaleGeometryValid,result=r.overlay.fitHandwriting();return {valid,result,writes,strokes:JSON.parse(JSON.stringify(inlineInk.strokes(r.path)))};},
  caret:(id:string,pos:number)=>rigs.get(id)!.view.coordsAtPos(pos),
  keyboard:()=>setPenInk(false),
@@ -279,10 +367,191 @@ async function stale(id:string) {
  busy:(id:string)=>{const r=rigs.get(id)!;setPenInk(true);setInlineEraserMode(false);setInlineLassoMode(false);penEvent("pointerdown",100,180);const result=r.overlay.fitHandwriting();penEvent("pointerup",100,180);return result;},
  release:async(id:string)=>{const pageId=`fit-page-${id}`;blockedIds.delete(pageId);heldLoads.get(pageId)?.();await settle();return snap(id);},
  font:async(id:string)=>{const r=rigs.get(id)!;r.view.contentDOM.style.fontSize="24px";r.view.requestMeasure();await settle();return snap(id);},
+ fontPx:async(id:string,px:number)=>{const r=rigs.get(id)!;setTextPx(r.view,px);r.view.requestMeasure();await settle();return snap(id);},
  corners:async(id:string)=>{const r=rigs.get(id)!;const before=inlineInk.strokes(r.path).length;setPenInk(true);setInlineEraserMode(false);setInlineLassoMode(false);for(const [x,y] of [[24,104],[610,104],[24,450],[610,450]]){penEvent("pointerdown",x!,y!);penEvent("pointermove",x!+4,y!);penEvent("pointerup",x!+4,y!);await settle();}const now=snap(id);const cr=r.view.contentDOM.getBoundingClientRect();const errors=inlineInk.strokes(r.path).slice(before).map((s,i)=>{const target=[[24,104],[610,104],[24,450],[610,450]][i]!;return [s.points[0]!.x-(target[0]!-cr.left)/r.overlay.scale,s.points[0]!.y-(target[1]!-r.view.documentTop)/r.overlay.scale];});return {added:inlineInk.strokes(r.path).length-before,errors,...now};},
  scroll:async(id:string)=>{const r=rigs.get(id)!;const before=snap(id);r.view.scrollDOM.scrollLeft=r.view.scrollDOM.scrollWidth-r.view.scrollDOM.clientWidth-1;r.view.scrollDOM.scrollTop=r.view.scrollDOM.scrollHeight-r.view.scrollDOM.clientHeight-1;await settle();return {before,after:snap(id)};},
  original:async(id:string)=>{const r=rigs.get(id)!;r.view.dom.style.setProperty("width","640px","important");r.view.dom.style.setProperty("transform","scale(0.8)");r.view.requestMeasure();await settle();return r.view.dom.getAttribute("style");},
  dispose:(id:string)=>{const r=rigs.get(id)!;r.view.destroy();return {style:r.view.dom.getAttribute("style"),classes:r.view.dom.className,parent:r.host.className};},
+};
+
+/**
+ * Mounted sync admission proof. This reuses the real editors, hit-tested pen /
+ * lasso driver, shared InlineInkStore and PageStore preservation. FakeAdapter
+ * is the only filesystem/transport seam. The store route is invoked directly;
+ * CompatibilitySyncWorkflow.test.ts separately runs the registered poll.
+ */
+(window as any).mountedSyncAdmission=async(kind:"pen"|"selection"|"transient-pane",phase:"before"|"during")=>{
+ await setup("sync-a","point");
+ const path=rigs.get("sync-a")!.path,pageId=ids.get(path)!,live=`.handwriting/${pageId}.json`;
+ const adapter=new FakeAdapter();adapter.externalWrite(live,pages.get(pageId)!);
+ const store=new PageStore({vault:{adapter}});
+ await store.load(pageId);
+ let accepts=0,preparations=0,notifications=0;
+ const notices:string[]=[];
+ inlineInk.attachHost({
+  readPageId:p=>ids.get(p)??null,claimId:async(_p,id)=>({pageId:id}),
+  loadSidecar:id=>store.load(id),scheduleSidecar:(id,data)=>store.schedule(id,data),
+  scheduleSidecarNow:(id,data)=>store.saveNow(id,data),notify:message=>notices.push(message),
+  prepareExternalAdoption:(id,data)=>{preparations++;return store.prepareExternalAdoption(id,data);},
+  acceptExternalAdoption:prepared=>{accepts++;store.acceptExternalAdoption(prepared);},
+ });
+ await setup("sync-b","point",1,1,undefined,path);
+ const a=rigs.get("sync-a")!,b=rigs.get("sync-b")!;
+ if(a.overlay===b.overlay)throw Error("same-note fixture did not resolve distinct mounted overlays");
+ const incoming=parsePage(adapter.files.get(live)!,pageId)!.data;
+ incoming.strokes=structuredClone(incoming.strokes);
+ incoming.strokes[0]!.id="incoming";
+ for(const point of incoming.strokes[0]!.points){point.x+=140;point.y+=60;}
+ adapter.externalWrite(live,serializePage(incoming));
+ const painted=(id:string)=>{
+  const {host}=rigs.get(id)!,canvas=host.querySelectorAll<HTMLCanvasElement>(".handwriting-ink-layer canvas")[2]!;
+  const bytes=canvas.getContext("2d")!.getImageData(0,0,canvas.width,canvas.height).data;
+  let hash=2166136261;for(let i=3;i<bytes.length;i+=4)hash=Math.imul(hash^bytes[i]!,16777619);
+  return {alphaHash:hash>>>0,visible:visiblePainted(id)};
+ };
+ const pane=(id:string)=>{const s=snap(id);return {strokes:s.strokes,selected:s.selected,history:s.history,doc:s.doc,paint:painted(id)};};
+ const state=async()=>({a:pane("sync-a"),b:pane("sync-b"),accepts,preparations,notifications,notices:[...notices],
+  changed:await store.externallyChanged(pageId),queued:store.hasQueuedWrite(pageId),
+  quiet:inlineReloadBindings().filter(x=>x.path===path).map(x=>x.quiet)});
+ const adopt=async()=>{
+  const admission=captureInlineReloadAdmission(path);
+  const result=await inlineInk.adoptExternal(path,()=>!!admission&&admission()&&inlineInk.pageIdOf(path)===pageId&&!store.hasQueuedWrite(pageId));
+  if(result.outcome==="adopted"&&result.changed){notifications++;inkExternallyReloaded(path);notifyInkChanged(path);}
+  await settle();return result;
+ };
+ const rect=b.view.scrollDOM.getBoundingClientRect(),start={x:rect.left+320,y:rect.top+200};
+ const route=(type:string,dx=0,dy=0)=>{
+  const x=start.x+dx,y=start.y+dy,target=document.elementFromPoint(x,y);
+  if(!target||!b.view.scrollDOM.contains(target))throw Error("sync pen was not hit-tested into busy sibling");
+  penEvent(type,x,y,977);
+ };
+ let joined:any=null;
+ const begin=async()=>{
+  if(kind==="transient-pane"){
+   await setup("sync-transient","point",1,1,undefined,path);joined=await state();
+   const transient=rigs.get("sync-transient")!;transient.view.destroy();transient.host.remove();await settle();
+  }else if(kind==="selection")await gesture("sync-b","lasso");
+  else {setPenInk(true);setInlineEraserMode(false);setInlineLassoMode(false);route("pointerdown");route("pointermove",20,5);await settle();}
+ };
+ const before=await state();
+ let busy:any,result:any;
+ if(phase==="during"){
+  const held=gate(),entered=gate(),write=adapter.write.bind(adapter);
+  adapter.writeGate=held.promise;
+  adapter.write=async(p,data)=>{entered.release();return write(p,data);};
+  const pending=adopt();
+  await Promise.race([entered.promise,pending.then(r=>{throw Error(`adoption ended before preservation gate: ${JSON.stringify(r)}`);})]);
+  await begin();busy=await state();
+  held.release();adapter.writeGate=null;result=await pending;
+ }else {await begin();busy=await state();result=await adopt();}
+ const refused=await state();
+ let completed:any=null,undone:any=null,redone:any=null;
+ if(kind==="selection"){
+  // A real lasso already lifted in begin(); only the user's Escape dismisses it.
+  b.view.contentDOM.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true}));
+  await settle();
+ }else if(kind==="pen"){
+  // Continue the SAME live stroke after the held await; no second pointerdown.
+  route("pointermove",50,15);route("pointerup",50,15);await settle();
+  completed=await state();
+  undo(b.view);await settle();undone=await state();
+  redo(b.view);await settle();redone=await state();
+  await store.flush();
+  // A later delivered revision is the visibility target after local writes drain.
+  // Selection cases above need no local edit or second delivery to converge.
+  adapter.externalWrite(live,serializePage(incoming));
+ }
+ const released=await state(),retry=await adopt(),after=await state();
+ const recovery=[...adapter.files.entries()].filter(([p])=>p.includes(".conflict-")).map(([p,data])=>({path:p,ids:parsePage(data,pageId)?.data.strokes.map(s=>s.id)}));
+ const pointScale=b.overlay.scale;
+ return {kind,phase,before,joined,busy,result,refused,completed,undone,redone,released,retry,after,recovery,pointScale};
+};
+
+// C1 (s90 add. 11): the converged-pinch-settle path closes the reload gate.
+// 7c95786e's InkOverlay.ts carries `settled()` in the `hold.ready` branch of the settle
+// measure's write, and that call is in NEITHER parent of the merge. mountedSyncCameraSettlement
+// above drives the Zoom out BUTTON, which never builds a pan-anchor hold, so it does not reach
+// that branch; nothing else did either.
+//
+// THE OUTCOME IS READ, NOT JUST THE GATE. finish() also calls settled(), so a run that bailed
+// out would close the gate too and a gate-only assertion would pass on the wrong path. The hold
+// is captured before the settle and its `outcome` read after: "converged" is set only at
+// InkOverlay.ts:7201, on the path the plant deletes.
+(window as any).mountedSyncPinchSettlement=async()=>{
+ await setup("pinch-settling","point");const r=rigs.get("pinch-settling")!;const o=r.overlay as any;
+ // OBSIDIAN'S `.cm-sizer > .cm-contentContainer` IS INSERTED FIRST, the way
+ // scrollColumnAnchorPage.ts:255-266 does it. `panSizer()` (InkOverlay.ts:6396) looks for
+ // `.cm-sizer`, vanilla CodeMirror 6 has none, and with no sizer the settle builds NO pan-anchor
+ // hold at all - measured here: outcome "no hold built", diag.sizer false. A pinch on a rig
+ // without it is not the gesture production runs. `.cm-content` is MOVED, not cloned, so
+ // CodeMirror keeps measuring the element it holds a reference to.
+ if(!r.view.dom.querySelector(".cm-sizer")){
+  const content=r.view.contentDOM,sizer=document.createElement("div"),container=document.createElement("div");
+  sizer.className="cm-sizer";container.className="cm-contentContainer";
+  content.parentElement!.insertBefore(sizer,content);sizer.appendChild(container);container.appendChild(content);
+  void r.view.scrollDOM.clientWidth;await settle();
+ }
+ const before=!!captureInlineReloadAdmission(r.path);
+ // THE HOLD IS CAUGHT AT ASSIGNMENT, NOT BY SAMPLING. Build, commit, measure and retirement can all
+ // run inside one flush, so a per-frame read of `panAnchorHold` sees null before and null after and
+ // reports "no hold built" for a settle that did build one (measured: previewSeen true, sizer true,
+ // scale 1 -> 0.5, and still no hold visible). An accessor over the instance's own property records
+ // the first non-null assignment and otherwise behaves exactly like the field it replaces.
+ let hold:any=null;
+ {const own=o.panAnchorHold;let cur=own;
+  Object.defineProperty(o,"panAnchorHold",{configurable:true,
+   get(){return cur;},set(v:any){cur=v;if(v&&!hold)hold=v;}});}
+ // THE GATE IS TRAPPED THE SAME WAY AND FOR THE SAME REASON. `reloadCameraSettlement` is opened at
+ // InkOverlay.ts:8203 and closed by settled() at :8293 inside the same flush, so no per-frame read
+ // ever catches it open. What the cell needs is that it WAS opened and IS closed, not the instant.
+ let gateOpened=false;
+ {let cur=o.reloadCameraSettlement;
+  Object.defineProperty(o,"reloadCameraSettlement",{configurable:true,
+   get(){return cur;},set(v:any){cur=v;if(v!==null)gateOpened=true;}});}
+ const focal={x:320,y:240};
+ // FRAMES BETWEEN THE PHASES. `pinch("move")` schedules the preview on a rAF; calling "end" in the
+ // same tick settles before any preview frame painted, and the settle then takes a path that builds
+ // no pan-anchor hold (measured: previewSeen false, outcome "no hold built", even with the sizer in
+ // place). A real two-finger pinch spans frames, so this one does too.
+ o.pinch("start",1,focal);
+ await new Promise<void>(res=>requestAnimationFrame(()=>res()));
+ o.pinch("move",.7,focal);
+ await new Promise<void>(res=>requestAnimationFrame(()=>res()));
+ o.pinch("move",.5,focal);
+ await new Promise<void>(res=>requestAnimationFrame(()=>res()));
+ const previewSeen=!!o.pinchPreview;
+ const during=!!captureInlineReloadAdmission(r.path);
+ o.pinch("end",.5,focal);
+ // THE HOLD AND THE GATE ARE SAMPLED ACROSS THE SETTLE, NOT AT ONE INSTANT. `pinch("end")` only
+ // schedules the settle; the hold is built inside the commit a frame or more later, and it is
+ // retired again once its measure consumes it. Reading `panAnchorHold` immediately after the
+ // gesture sees null and reading it after the settle sees null too - the first version of this
+ // cell did the former and reported "no hold built", which is a measurement artifact, not a
+ // finding. The object is captured the first frame it exists and read afterwards; it survives
+ // its own retirement because the retirement drops the reference, not the object.
+ for(let i=0;i<64;i++){
+  await new Promise<void>(res=>requestAnimationFrame(()=>res()));
+  if(hold&&hold.outcome!=="pending")break;
+ }
+ await settle();
+ return {before,during,gateOpened,after:!!captureInlineReloadAdmission(r.path),
+  gate:o.reloadCameraSettlement,outcome:hold?hold.outcome:"no hold built",zoom:snap("pinch-settling").state.zoom,
+  diag:{sizer:!!(o.view?.dom?.querySelector?.(".cm-sizer")),scaleNow:o.scale,pinchScaleNow:o.pinchScaleNow,
+   previewSeen,generation:o.viewportGeneration,firstConsumer:typeof o.firstSettleConsumer==="function"?o.firstSettleConsumer():"n/a"}};
+};
+
+(window as any).mountedSyncCameraSettlement=async()=>{
+ await setup("settling","point");const r=rigs.get("settling")!;
+ const before=!!captureInlineReloadAdmission(r.path);
+ setPenInk(false);r.view.focus();r.view.dispatch({selection:{anchor:1,head:8}});await settle();
+ const textSelection=!!captureInlineReloadAdmission(r.path),textRange=r.view.state.selection.main.toJSON();
+ setPenInk(true);setInlineLassoMode(true);
+ const chosenTool=!!captureInlineReloadAdmission(r.path);
+ r.view.scrollDOM.dispatchEvent(new PointerEvent("pointermove",{bubbles:true,pointerType:"pen",pointerId:966,isPrimary:true,clientX:300,clientY:200,buttons:0,pressure:0}));
+ const hover=!!captureInlineReloadAdmission(r.path);setInlineLassoMode(false);
+ r.host.querySelector<HTMLButtonElement>('[aria-label="Zoom out"]')!.click();
+ const pending=!!captureInlineReloadAdmission(r.path);
+ await settle();return {before,textSelection,textRange,chosenTool,hover,pending,after:!!captureInlineReloadAdmission(r.path),zoom:snap("settling").state.zoom};
 };
 
 async function momentum(zoom:number,axis:"x"|"y",mode:string) {

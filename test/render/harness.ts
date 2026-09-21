@@ -315,6 +315,43 @@ export async function openStrip(browser: Browser, opts: OpenOptions = {}): Promi
 	};
 }
 
+export interface NoteZoomHarness {
+	page: Page;
+	close(): Promise<void>;
+	/** Sets the mode, applies inking, reads the group's computed style. */
+	probe(o: { mode: "auto" | "show" | "hide"; inking: boolean }): Promise<{
+		exists: boolean;
+		opacity: string;
+		visibility: string;
+		display: string;
+		buttonCount: number;
+		firstButtonFocusable: boolean;
+	}>;
+}
+
+/**
+ * Opens a page holding the real strip, built with `noteViewport` set - the
+ * baseline `MobileTools.test.ts`'s own `fakeHost()` never builds - under the
+ * real stylesheet.
+ */
+export async function openNoteZoomStrip(browser: Browser, opts: OpenOptions = {}): Promise<NoteZoomHarness> {
+	const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+	await injectSheets(page, "note zoom controls", opts);
+	await page.addScriptTag({ content: await stripBundle() });
+	await page.evaluate(() => {
+		(window as unknown as { __pane: HTMLElement }).__pane = window.__hw.buildNoteZoomStrip();
+	});
+	return {
+		page,
+		close: () => page.close(),
+		probe: (o) =>
+			page.evaluate(
+				a => window.__hw.noteZoomVisibilityProbe((window as unknown as { __pane: HTMLElement }).__pane, a),
+				o,
+			),
+	};
+}
+
 export type BrowserEngine = "chromium" | "webkit";
 
 export async function launch(engine: BrowserEngine = "chromium"): Promise<Browser> {

@@ -68,9 +68,9 @@ describe("command palette: surviving ids carry the renamed labels", () => {
 
 it("the commands taken out of the palette no longer have an addCommand block", () => {
 	// Pen/highlighter switch, pressure recalibrate, pressure-sensitivity
-	// toggle - both pressure functions now run from the Settings tab
-	// (renderPressureSensitivity), Pen and Highlighter already exist as
-	// their own commands.
+	// toggle - recalibrate now runs from the Settings tab's Developer group
+	// (renderPressureRecalibrate) and pressure is always on since 1.4.20, Pen
+	// and Highlighter already exist as their own commands.
 	//
 	// `pen-ink-toggle` joined them in 1.4.12, for a different reason: not a
 	// setting, but a second name for something `Pen on / off` now says by

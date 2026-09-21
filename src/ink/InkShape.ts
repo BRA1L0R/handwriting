@@ -44,7 +44,53 @@ export interface ShapeParams {
 	taperMaxShare: number;
 	/** Half-width multiplier remaining at the extreme tip (0 aliases away). */
 	tipFloor: number;
+	/**
+	 * A final sample whose pressure is at or below this share of the one
+	 * before it is drawn at the one before's pressure (0 = never). exp7 ink
+	 * with pressure sensitivity on only; see shapedHalfWidths.
+	 */
+	liftHoldRatio: number;
+	/**
+	 * Whether exp7 ink with pressure sensitivity on still takes the geometric
+	 * tip taper, the pre-1.4.20 law (see applyEndTaper). false: pressure draws
+	 * the tips. A plant for tests and for the frozen pre-1.4.20 oracle; legacy
+	 * and pressure-off ink take the taper either way.
+	 */
+	exp7TipTaper: boolean;
+	/**
+	 * The fastest the half-width may change per world unit of path, either
+	 * way (Infinity = uncapped). exp7 ink with pressure sensitivity on only;
+	 * see RIBBON_EDGE_SLOPE.
+	 */
+	edgeSlope: number;
 }
+
+/**
+ * The half-width may grow or shrink by at most this much per world unit of
+ * path, so a stroke is never wider than it is long at its own start.
+ *
+ * Why (the start blot, bug reports 28d6c5e4 and 4a3db156): a light pen-down
+ * sample followed, one long frame later, by full writing pressure barely a
+ * nib's width away widens the ribbon faster than the path moves, and a mark
+ * wider than its lead-in reads as a disc. The 1.4.19 start taper hid it;
+ * pressure ink has no geometric taper since 1.4.20. Capping the RATE draws the
+ * landing as a short cone instead: the pen-down width is kept (a light start
+ * stays light) and the full width arrives after a few px of travel. It is not
+ * a taper to a point, and it is time-free on purpose: the silent frame before
+ * the second sample would outlast any time window.
+ *
+ * 0.5 is an edge angle of about 27 degrees. Measured, it leaves these
+ * untouched: the quick and push synthetics at every slider size, and the
+ * stroke of 28d6c5e4's first three contacts and d1c16bdb at zoom 1, 2 and 4
+ * and every size (RibbonEdgeSlope.test.ts, BlotCapture.test.ts). It DOES bind
+ * on other real strokes whose firm start climbs as steeply as the blot's,
+ * which in Alan's stored ink at the largest sizes is most strokes, and on a
+ * few steep pressure drops late in a stroke, by about 1 percent of the width.
+ * On the wet layer it also bounds the unheld quarter-pressure lift sample's
+ * drop until the committed repaint replaces the tail. The number is Alan's to
+ * tune on his screen.
+ */
+export const RIBBON_EDGE_SLOPE = 0.5;
 
 /**
  * Tuned on a Surface at zoom 1, where world units are CSS pixels and
@@ -65,6 +111,9 @@ export const PEN_SHAPE: ShapeParams = {
 	// that says so.
 	taperMaxShare: 0.18,
 	tipFloor: 0.12,
+	liftHoldRatio: 0.35,
+	exp7TipTaper: false,
+	edgeSlope: RIBBON_EDGE_SLOPE,
 };
 
 // ---- global switch ----------------------------------------------------------
@@ -120,6 +169,19 @@ function taperEase(u: number, tipFloor: number): number {
  * Per-sample half-widths for a whole stroke: filtered pressure through the
  * style's width law, then velocity thinning. No taper here; taper depends on
  * arc length over the flattened ribbon and is applied by applyEndTaper.
+ *
+ * The lift sample. The pen's last report before it leaves the glass comes in
+ * at a quarter of the pressure before it (0.248-0.251 on 8 of 10 strokes in
+ * Alan's 1.4.20 captures and 10 of 12 stored ones). Drawn as it stands it
+ * drags the last half-width down, and exp7's end taper floors at the last
+ * half-width over the widest, so one bad sample shaves the whole end zone:
+ * 21-54 px^2 per stroke, an end about half the line's width. A final sample
+ * at or below `liftHoldRatio` of the one before is therefore drawn at the
+ * one before's pressure. It keeps its position, so the ink still reaches the
+ * pen-up point, and every earlier sample is untouched (the filter is causal).
+ * Legacy ink and pressure-off ink are left as they were: the first has a
+ * fixed tip floor, the second never reads pressure. The wet layer cannot know
+ * which sample is last, so the change lands with the committed repaint.
  */
 export function shapedHalfWidths(
 	points: readonly InkPoint[],
@@ -128,22 +190,44 @@ export function shapedHalfWidths(
 ): number[] {
 	const out: number[] = [];
 	if (points.length === 0) return out;
+	const last = points.length - 1;
+	const held =
+		style.pressureProfile === "exp7" &&
+		pressureSensitivityEnabled() &&
+		params.liftHoldRatio > 0 &&
+		last > 1 &&
+		points[last]!.pressure <= params.liftHoldRatio * points[last - 1]!.pressure;
+	const capped = edgeSlopeFor(style, params);
 	let pHat = points[0]!.pressure;
 	let vHat = 0;
 	let prev = points[0]!;
 	for (let i = 0; i < points.length; i++) {
 		const pt = points[i]!;
+		let d = 0;
 		if (i > 0) {
-			const d = Math.hypot(pt.x - prev.x, pt.y - prev.y);
+			d = Math.hypot(pt.x - prev.x, pt.y - prev.y);
 			const dt = Math.max(1, pt.t - prev.t);
 			vHat += params.velocityAlpha * (d / dt - vHat);
-			pHat += params.pressureAlpha * (pt.pressure - pHat);
+			const pressure = held && i === last ? prev.pressure : pt.pressure;
+			pHat += params.pressureAlpha * (pressure - pHat);
 		}
 		const f = Math.max(params.minVelocityFactor, 1 / (1 + params.thinningK * vHat));
-		out.push((widthForPressure(style, pHat) / 2) * f);
+		const hw = (widthForPressure(style, pHat) / 2) * f;
+		out.push(i > 0 && capped ? capEdge(hw, out[i - 1]!, d, params.edgeSlope) : hw);
 		prev = pt;
 	}
 	return out;
+}
+
+/** Whether this style's half-widths take the edge slope cap. */
+function edgeSlopeFor(style: PenStyle, params: ShapeParams): boolean {
+	return style.pressureProfile === "exp7" && pressureSensitivityEnabled() && Number.isFinite(params.edgeSlope);
+}
+
+/** `hw`, moved no further from the previous (capped) half-width than `slope` per unit of travel `d`. */
+function capEdge(hw: number, previous: number, d: number, slope: number): number {
+	const room = slope * d;
+	return Math.min(previous + room, Math.max(previous - room, hw));
 }
 
 // ---- endpoint taper ---------------------------------------------------------
@@ -152,6 +236,16 @@ export function shapedHalfWidths(
  * Multiply half-widths down toward the tip floor over a short arc length at
  * both ends of a flattened ribbon. Mutates `pts` in place (they are always
  * freshly built by the caller).
+ *
+ * Pressure ink draws its own tips (1.4.20). exp7 ink with pressure sensitivity
+ * on starts and ends at the width its pressure gives, with no geometric taper.
+ * The taper it used to take floored each end at that end's width over the
+ * stroke's widest, and a push starts light: its start was already thin from
+ * pressure and the taper multiplied it by that small ratio again, to about a
+ * sixth of what the wet layer had drawn while the pen was down, so the start
+ * visibly vanished at lift. Legacy (1.4.12) ink and pressure-off ink, which
+ * carry no pressure in their width, keep the taper; `exp7TipTaper` restores the
+ * old law for exp7 as a plant.
  */
 export function applyEndTaper(
 	pts: RibbonPt[],
@@ -160,6 +254,7 @@ export function applyEndTaper(
 ): void {
 	const n = pts.length;
 	if (n < 2) return;
+	if (style.pressureProfile === "exp7" && pressureSensitivityEnabled() && !params.exp7TipTaper) return;
 	const arc: number[] = [0];
 	for (let i = 1; i < n; i++) {
 		const a = pts[i - 1]!;
@@ -251,6 +346,8 @@ export class IncrementalShaper {
 	private lastHw = 0;
 	private startHw = 0;
 	private maxHw = 0;
+	/** The previous sample's half-width after the edge slope cap, before any taper. */
+	private cappedHw = 0;
 
 	constructor(private params: ShapeParams = PEN_SHAPE) {}
 
@@ -261,6 +358,7 @@ export class IncrementalShaper {
 		this.arcFromStart = 0;
 		this.startHw = first && style ? widthForPressure(style, first.pressure) / 2 : 0;
 		this.maxHw = this.startHw;
+		this.cappedHw = this.startHw;
 		this.lastHw = this.startHw *
 			(style?.pressureProfile === "exp7" && pressureSensitivityEnabled() ? 1 : this.params.tipFloor);
 	}
@@ -268,8 +366,9 @@ export class IncrementalShaper {
 	/** Shaped half-width at this sample, start taper included. */
 	push(style: PenStyle, pt: InkPoint): number {
 		const prev = this.prev;
+		let d = 0;
 		if (prev) {
-			const d = Math.hypot(pt.x - prev.x, pt.y - prev.y);
+			d = Math.hypot(pt.x - prev.x, pt.y - prev.y);
 			const dt = Math.max(1, pt.t - prev.t);
 			this.arcFromStart += d;
 			this.vHat += this.params.velocityAlpha * (d / dt - this.vHat);
@@ -279,15 +378,20 @@ export class IncrementalShaper {
 			this.params.minVelocityFactor,
 			1 / (1 + this.params.thinningK * this.vHat)
 		);
-		const hw = (widthForPressure(style, this.pHat) / 2) * f;
+		let hw = (widthForPressure(style, this.pHat) / 2) * f;
+		// The same cap, the same order, as shapedHalfWidths: wet and committed agree.
+		if (prev && edgeSlopeFor(style, this.params)) hw = capEdge(hw, this.cappedHw, d, this.params.edgeSlope);
+		this.cappedHw = hw;
 		this.maxHw = Math.max(this.maxHw, hw);
-		const startFloor = style.pressureProfile === "exp7" && pressureSensitivityEnabled()
+		const exp7 = style.pressureProfile === "exp7" && pressureSensitivityEnabled();
+		const startFloor = exp7
 			? Math.max(this.params.tipFloor, this.maxHw > 0 ? this.startHw / this.maxHw : this.params.tipFloor)
 			: this.params.tipFloor;
-		const taper = taperEase(
-			this.arcFromStart / (this.params.taperWidths * style.baseWidth),
-			startFloor
-		);
+		// Pressure draws the tips, here as in applyEndTaper, so the start the pen
+		// lifts from is the start that was on screen while it was down.
+		const taper = exp7 && !this.params.exp7TipTaper
+			? 1
+			: taperEase(this.arcFromStart / (this.params.taperWidths * style.baseWidth), startFloor);
 		this.prev = pt;
 		this.lastHw = hw * taper;
 		return this.lastHw;

@@ -29,7 +29,7 @@ describe.each(["chromium", "webkit"] satisfies BrowserEngine[])("per-note paper 
 			expect(result.initial[3]!.image).toBe(result.initial[0]!.image);
 			for (const index of [0, 3]) {
 				expect(result.changed[index]!.image).toContain("radial-gradient");
-				expect(result.changed[index]!.size).toBe("28px 28px");
+				expect(result.changed[index]!.size.split(", ").every(size => size === "28px 28px"), result.changed[index]!.size).toBe(true);
 			}
 			expect(result.switched[0]!.image).toBe("none");
 			expect(result.switched[1]!.image).toBe("none");
@@ -40,8 +40,10 @@ describe.each(["chromium", "webkit"] satisfies BrowserEngine[])("per-note paper 
 				if (effective === "none") expect(item.image).toBe("none");
 				else if (effective === "dots") expect(item.image).toContain("radial-gradient");
 				else expect(item.image.match(/repeating-linear-gradient/g)).toHaveLength(effective === "grid" ? 2 : 1);
-				if (effective === "dots") expect(item.size).toBe("28px 28px");
-				else expect(item.size.split(", ").every(value => value === "auto")).toBe(true);
+				// Dots tile one pitch square on every layer; lined and grid paper, and
+				// none, are untiled.
+				if (effective === "dots") expect(item.size.split(", ").every(size => size === "28px 28px"), item.size).toBe(true);
+				else expect(item.size.split(", ").every(value => value === "auto"), item.size).toBe(true);
 			}
 			for (const item of result.cleared) {
 				expect(item.attribute).toBeNull();

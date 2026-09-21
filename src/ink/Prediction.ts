@@ -96,8 +96,8 @@ const UNSEEN_LATENCY_MS = 5;
  * The ceiling used to be `EINK_CAPS.maxHorizonMs` (48ms). That was wrong:
  * this function's only callers all gate `predictionEinkOn()` first -
  * `predictionEinkOn() ? EINK_CAPS : adaptiveCaps(presentLagMs())` at
- * InkOverlay.ts:2191, PdfInkController.ts:1594 and
- * HandwritingPageView.ts:958, the only three call sites in the tree - so
+ * InkOverlay.ts:2191 and PdfInkController.ts:1594, the only two call sites
+ * left in the tree (a third went with the canvas page view in s197) - so
  * e-ink mode never reaches `adaptiveCaps` at all; it uses `EINK_CAPS`
  * directly. The e-ink ceiling was bounding a function e-ink never calls.
  *

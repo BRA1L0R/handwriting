@@ -21,8 +21,7 @@
 .handwriting-paper,
 .handwriting-committed,
 .handwriting-wet,
-.handwriting-tail,
-.handwriting-highlight {
+.handwriting-tail {
 	position: absolute;
 	inset: 0;
 	pointer-events: none;
@@ -33,92 +32,11 @@
 }
 
 /*
- * Highlighter ink is drawn opaque and made translucent here, once, for the
- * whole layer. Painting translucent ink instead would double-blend every
- * overlap into a dark seam.
+ * The only text-container rule left after s197: `PointerRouter` still asks
+ * `closest(".cm-editor, .handwriting-box-editor")` before it claims a
+ * contact, so the selector stays live even though the canvas page that built
+ * these elements is gone.
  */
-.handwriting-highlight {
-	opacity: 0.35;
-}
-
-/* ---- images ---- */
-
-/*
- * Same single-transform trick as the text layer: one composited change per
- * camera move, and pictures scale with the world for free.
- */
-.handwriting-images {
-	position: absolute;
-	inset: 0;
-	transform-origin: 0 0;
-	pointer-events: none;
-	will-change: transform;
-}
-
-.handwriting-image {
-	position: absolute;
-	pointer-events: none;
-	overflow: hidden;
-	border-radius: 2px;
-}
-
-.handwriting-image img {
-	width: 100%;
-	height: 100%;
-	object-fit: fill;
-	-webkit-user-drag: none;
-	user-select: none;
-}
-
-/* The attachment could not be resolved. Show the hole, do not hide it. */
-.handwriting-image.is-missing {
-	border: 1px dashed var(--text-error);
-	opacity: 0.6;
-}
-
-/* ---- text containers ---- */
-
-/*
- * One transform for the whole layer: panning a page with fifty boxes is a
- * single composited change, not fifty layout writes. Boxes are positioned in
- * world units inside it.
- */
-.handwriting-objects {
-	position: absolute;
-	inset: 0;
-	transform-origin: 0 0;
-	pointer-events: none;
-	will-change: transform;
-}
-
-.handwriting-box {
-	position: absolute;
-	pointer-events: none;
-	padding: 2px 4px;
-	border: 1px solid transparent;
-	border-radius: 4px;
-	color: #1c1f26;
-	font-size: 16px;
-	line-height: 1.5;
-}
-
-.handwriting-box.is-editing {
-	border-color: rgba(28, 31, 38, 0.2);
-	background: #ffffff;
-}
-
-.handwriting-box-content > :first-child {
-	margin-top: 0;
-}
-
-.handwriting-box-content > :last-child {
-	margin-bottom: 0;
-}
-
-.handwriting-box-content.is-empty {
-	min-height: 1.5em;
-}
-
 .handwriting-box-editor {
 	display: block;
 	width: 100%;
@@ -136,46 +54,6 @@
 	pointer-events: auto;
 	user-select: text;
 	-webkit-user-select: text;
-}
-
-/* Small, quiet grab point. The box body stays pointer-transparent so ink
-   can cross typed text. */
-.handwriting-box-handle {
-	position: absolute;
-	left: -16px;
-	top: -2px;
-	width: 12px;
-	height: 12px;
-	border-radius: 3px;
-	background: var(--text-faint);
-	opacity: 0.25;
-	pointer-events: auto;
-	cursor: move;
-	touch-action: none;
-}
-
-.handwriting-box-handle:hover {
-	opacity: 0.8;
-}
-
-/* ---- interaction affordances ---- */
-
-.handwriting-caret {
-	position: absolute;
-	left: 0;
-	top: 0;
-	width: 2px;
-	height: 22px;
-	transform-origin: 0 0;
-	background: var(--text-accent);
-	pointer-events: none;
-	animation: handwriting-blink 1s steps(2, start) infinite;
-}
-
-@keyframes handwriting-blink {
-	to {
-		visibility: hidden;
-	}
 }
 
 .handwriting-pen-cursor,
@@ -510,63 +388,228 @@ div.handwriting-snap-chip.handwriting-snap-chip {
 .handwriting-paper-swatch {
 	--handwriting-paper-pitch: 28px;
 	--handwriting-paper-rule: 1px;
+	--handwriting-paper-dot: 1px;
+	--handwriting-paper-phase: 0px;
+	--handwriting-paper-phase-x: 0px;
 }
+/* The text's pinch pan (plus its title rewrap and column re-centring during a
+   pinch), handed to the paper on the scroller itself (InkOverlay.writePaperPan).
+   A pinch holds the note under the fingers with a translate on the scroller's
+   children, and a background does not move with a child's transform, so
+   without these the letters slide over a paper that stays put until the
+   settle. Registered and NOT inherited: only the scroller's own background
+   reads them, and a preview frame that writes them restyles nothing inside the
+   scroller. At 0 the paper draws exactly as it does without them. */
+@property --handwriting-paper-pan-x {
+	syntax: "<length>";
+	inherits: false;
+	initial-value: 0px;
+}
+@property --handwriting-paper-pan-y {
+	syntax: "<length>";
+	inherits: false;
+	initial-value: 0px;
+}
+/* The overlay writes pitch, phase, rule and dot thickness in layout px from the
+   text's size and the note origin (src/inline/PaperPlan.ts); the note's zoom
+   scales the paper with the text, so zooming out packs the lines together,
+   with rules and dots kept at least a device px. Lined, grid and dotted paper
+   are built from the same properties. The phase moves the stops
+   themselves, every one of which has a position: each period is clear from the
+   phase to the rule, then the rule up to phase + pitch. Carried as a
+   background-position offset instead, the same phase rasterised the rules
+   smeared across several device rows at DPR 2. */
 .handwriting-paper-swatch[data-paper="lines"],
 body.handwriting-paper-lines .markdown-source-view .cm-scroller,
 body [data-handwriting-paper][data-handwriting-paper="lines"] .markdown-source-view .cm-scroller {
+	/* s192: this scroller is not grid, whatever a global grid class says. The overlay reads this one property to
+	   decide whether the second box below belongs here; every paper kind states it, so a note's own choice wins. */
+	--handwriting-paper-grid: 0;
 	background-image: repeating-linear-gradient(
 		to bottom,
-		transparent,
-		transparent calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
-		var(--background-modifier-border) calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
-		var(--background-modifier-border) var(--handwriting-paper-pitch, 28px)
+		transparent calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px)),
+		transparent calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+		var(--background-modifier-border) calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+		var(--background-modifier-border) calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px))
 	);
 	background-attachment: local;
+	/* The phase and the pan are in the stops; the tile itself sits at the origin. Set here, not left to the cascade,
+	   so a note set to lines under global dots does not take the dots' tile position as well. */
+	background-position: 0 0;
 }
 
-.handwriting-paper-swatch[data-paper="grid"],
-body.handwriting-paper-grid .markdown-source-view .cm-scroller,
-body [data-handwriting-paper][data-handwriting-paper="grid"] .markdown-source-view .cm-scroller {
+/* GRID PAPER PAINTS ONE AXIS PER BOX (s192; Alan on Orion at 51.8 percent: rules missing in long stretches, the
+   rest smeared or alternating strong and faint). Measured, s192 add. 5: the FIRST of two repeating gradients on
+   one box degrades with that box's area - clean at 2021 x 1729, 37.8 percent spread at 3749 x 1729, five rules
+   lost at 4613 x 1729 - and a scroller under the Infinite Canvas is both tall and wide. One gradient per box is
+   clean at every area measured. So the scroller keeps the horizontal layer, exactly as lined paper has it, and
+   the vertical layer moves to the box below.
+
+   The picker's swatch is 44 px square and is not a scroller: it keeps both layers on the one element, where they
+   have always painted correctly. */
+.handwriting-paper-swatch[data-paper="grid"] {
 	background-image:
 		repeating-linear-gradient(
 			to bottom,
-			transparent,
-			transparent calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
-			var(--background-modifier-border) calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
-			var(--background-modifier-border) var(--handwriting-paper-pitch, 28px)
+			transparent calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px)),
+			transparent calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px))
 		),
 		repeating-linear-gradient(
 			to right,
-			transparent,
-			transparent calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
-			var(--background-modifier-border) calc(var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
-			var(--background-modifier-border) var(--handwriting-paper-pitch, 28px)
+			transparent calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px)),
+			transparent calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px) + var(--handwriting-paper-pitch, 28px))
 		);
 	background-attachment: local, local;
+	background-size: auto;
+	background-position: 0 0;
+}
+
+body.handwriting-paper-grid .markdown-source-view .cm-scroller,
+body [data-handwriting-paper][data-handwriting-paper="grid"] .markdown-source-view .cm-scroller {
+	/* Read by the overlay (InkOverlay.syncGridPaperBox) to decide whether this scroller gets the vertical box. A
+	   property rather than the class, so a note's own paper beats a global one by the ordinary cascade. */
+	--handwriting-paper-grid: 1;
+	/* THE DEFAULT IS STILL BOTH LAYERS, and it has to be: the box below is the overlay's, so a grid scroller with no
+	   overlay on it - or one in the frames before the overlay's first pass - would paint lined paper if this rule
+	   dropped the vertical layer on its own. Half a grid is worse than the flaw being fixed. The scroller drops to
+	   one layer only under the class the overlay adds in the same call that puts the box up (s192 add. 6). */
+	background-image:
+		repeating-linear-gradient(
+			to bottom,
+			transparent calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px)),
+			transparent calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px))
+		),
+		repeating-linear-gradient(
+			to right,
+			transparent calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px)),
+			transparent calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px) + var(--handwriting-paper-pitch, 28px))
+		);
+	background-attachment: local, local;
+	/* Untiled, as lined paper is: a repeating gradient keeps its period exactly,
+	   where a tile's size is stored in 1/64 px, which drifted the rules off their
+	   pitch down a long note, and a tile as wide as a very wide note was not
+	   painted at all. Set here rather than left to the cascade, so a note set to
+	   grid under global dots does not pick up the dots' tile. */
+	background-size: auto;
+	/* Likewise the position: the grid's phase and pan are in its stops, so a note set to grid under global dots
+	   must not take the dots' tile position too. */
+	background-position: 0 0;
+}
+
+/* THE SPLIT ITSELF. The overlay adds `handwriting-paper-grid-split` to the scroller in the same call that puts the
+   box below into the page, and takes it off in the same call that removes it, so no frame has one without the
+   other. Only then does the scroller give up the vertical layer, because only then is something else painting it.
+   Same two chains as the rule above plus that class, so it wins on specificity with no `!important`. */
+body.handwriting-paper-grid .markdown-source-view .cm-scroller.handwriting-paper-grid-split,
+body [data-handwriting-paper][data-handwriting-paper="grid"] .markdown-source-view .cm-scroller.handwriting-paper-grid-split {
+	background-image:
+		repeating-linear-gradient(
+			to bottom,
+			transparent calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px)),
+			transparent calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px) + var(--handwriting-paper-pitch, 28px))
+		);
+	background-attachment: local;
+}
+
+/* THE VERTICAL LAYER'S OWN BOX. Made by the overlay under grid paper only, as the scroller's first child, covering
+   the scrolled area and scrolling with the content - which is what `background-attachment: local` means for the
+   layer left on the scroller, so the two axes move as one.
+
+   z-index -1 puts it behind every line of text and above the scroller's own background: a positioned child at 0 or
+   auto paints OVER the text.
+
+   `--handwriting-paper-pan-x` is registered `inherits: false` (above), so this box cannot read the scroller's
+   copy; the overlay writes the same value here, in the same call. Pitch, rule and phase-x are unregistered and do
+   inherit, so they arrive on their own.
+
+   It never adds scroll range: the overlay sizes it from the content and the granted extent, never from
+   `scrollWidth` or `scrollHeight`, which its own size would feed. */
+.handwriting-paper-grid-column {
+	position: absolute;
+	left: 0;
+	top: 0;
+	z-index: -1;
+	pointer-events: none;
+	background-image:
+		repeating-linear-gradient(
+			to right,
+			transparent calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px)),
+			transparent calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px) + var(--handwriting-paper-pitch, 28px) - var(--handwriting-paper-rule, 1px)),
+			var(--background-modifier-border) calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px) + var(--handwriting-paper-pitch, 28px))
+		);
+	background-repeat: repeat;
+	background-position: 0 0;
+	background-size: auto;
 }
 
 /* Dots read quieter than the grid - a single mark per cell instead of two
    crossing rules - which is the point: it is the ruling canvas apps (Obsidian's
    own, the ipad drawing apps) reach for when they want a page that still shows
-   through the ink. Same 28px pitch as lines and grid so switching between the
-   three doesn't shift anything on the page, same border token, same local
-   attachment so the dots are paper and not a window decal. */
+   through the ink. Same pitch and thickness as lines and grid, same border
+   token, same local attachment so the dots are paper and not a window decal.
+   One dot per tile, centred in it, as it always was: the dot thickness is its
+   solid radius and half as much again its soft edge, which stays inside half
+   the tile down to 10 percent for text of 12.5 px and up, so no dot is cut at a
+   tile edge there (a Fit below 10 percent can trim the soft edge). One gradient
+   layer; three, to carry the note-origin phase across tile edges, cost several
+   times the raster. */
 .handwriting-paper-swatch[data-paper="dots"],
 body.handwriting-paper-dots .markdown-source-view .cm-scroller,
 body [data-handwriting-paper][data-handwriting-paper="dots"] .markdown-source-view .cm-scroller {
-	background-image: radial-gradient(circle, var(--background-modifier-border) 1px, transparent 1.5px);
-	background-size: 28px 28px;
+	background-image: radial-gradient(circle, var(--background-modifier-border) var(--handwriting-paper-dot, 1px), transparent calc(var(--handwriting-paper-dot, 1px) * 1.5));
+	background-size: var(--handwriting-paper-pitch, 28px) var(--handwriting-paper-pitch, 28px);
+	/* A tile has no stops to carry a phase: the dots take the text's origin (the column's left edge, the note's top)
+	   and the text's pinch pan as their tile position. */
+	background-position: calc(var(--handwriting-paper-phase-x, 0px) + var(--handwriting-paper-pan-x, 0px)) calc(var(--handwriting-paper-phase, 0px) + var(--handwriting-paper-pan-y, 0px));
 	background-attachment: local;
+	/* s192: not grid, so no second box. */
+	--handwriting-paper-grid: 0;
+}
+
+/* THE PREVIEW PAPER (InkOverlay.beginPreviewPaper). While a pinch preview (and
+   the bounce its settle may start) lives, the paper is a copy of the scroller's
+   resolved background on an element under the scroller, moved by a composited
+   transform, and the scroller's own background is off. A pan moved through the
+   gradient stops re-rasters the whole background on every frame of a drag; a
+   transform re-rasters nothing. The copy carries every rule below as resolved,
+   so this block has no paper kinds of its own. */
+.cm-scroller.handwriting-paper-previewing {
+	background-image: none !important;
+	background-color: transparent !important;
+}
+/* s192: the preview element carries BOTH axes (two layers on a pane-sized box, measured clean), so the grid's own
+   box goes quiet under the same class - no frame shows an axis twice or not at all. */
+.cm-scroller.handwriting-paper-previewing .handwriting-paper-grid-column {
+	background-image: none !important;
+}
+.handwriting-paper-preview {
+	position: absolute;
+	pointer-events: none;
+	will-change: transform;
 }
 
 /* The extra attribute specificity lets a note override any global style
    without !important. Keep gradients on the scroller so theme colors still
-   resolve there. Non-dot overrides also clear a global dot pattern's size. */
+   resolve there. The other overrides clear a global dots or grid tile size;
+   dots and grid set their own. */
 body [data-handwriting-paper][data-handwriting-paper="none"] .markdown-source-view .cm-scroller {
 	background-image: none;
+	/* s192: not grid, so no second box, whatever a global grid class says. */
+	--handwriting-paper-grid: 0;
 }
 
-body [data-handwriting-paper]:not([data-handwriting-paper="dots"]) .markdown-source-view .cm-scroller {
+body [data-handwriting-paper]:not([data-handwriting-paper="dots"]):not([data-handwriting-paper="grid"]) .markdown-source-view .cm-scroller {
 	background-size: auto;
 }
 
@@ -1746,7 +1789,7 @@ body [data-handwriting-paper]:not([data-handwriting-paper="dots"]) .markdown-sou
    held. 42 x 22, in BOTH rows - and the colour grid's fixed 22px tracks
    cannot help, because a track cannot shrink a padding floor. That is the
    shape the report described: "the ink color selection circles come out as
-   ovals" (jakolson, Boox Note5C, 2026-09-07), reproduced by Architect 2
+   ovals" (jakolson, Boox Note5C, 2026-09-07), reproduced
    against the installed app across 216 cases, 108 of them failing on tablet
    classes alone with nothing narrowed.
 
@@ -1929,7 +1972,8 @@ body [data-handwriting-paper]:not([data-handwriting-paper="dots"]) .markdown-sou
 }
 
 .handwriting-mobile-tools.is-inking,
-.handwriting-pen-pill.is-inking {
+.handwriting-pen-pill.is-inking,
+.handwriting-note-viewport-controls.is-inking {
 	opacity: 0;
 	visibility: hidden;
 	transition: opacity 40ms linear, visibility 0s linear 40ms;
@@ -1996,13 +2040,6 @@ body [data-handwriting-paper]:not([data-handwriting-paper="dots"]) .markdown-sou
 	color: var(--text-on-accent);
 }
 
-.handwriting-zoom-label {
-	font-size: 12px;
-	font-variant-numeric: tabular-nums;
-	color: var(--text-muted);
-	min-width: 42px;
-}
-
 /* Pen lab diagnostics overlay */
 .handwriting-overlay {
 	position: absolute;
@@ -2028,30 +2065,6 @@ body [data-handwriting-paper]:not([data-handwriting-paper="dots"]) .markdown-sou
 	color: var(--text-faint);
 	text-transform: uppercase;
 	letter-spacing: 0.04em;
-}
-
-.handwriting-status {
-	position: absolute;
-	bottom: 8px;
-	left: 8px;
-	z-index: 10;
-	white-space: pre;
-	font-family: var(--font-monospace);
-	font-size: 11px;
-	line-height: 1.5;
-	color: var(--text-faint);
-	pointer-events: none;
-	opacity: 0.75;
-}
-
-.handwriting-status.is-debug {
-	color: var(--text-muted);
-	background: var(--background-secondary);
-	border: 1px solid var(--background-modifier-border);
-	border-radius: 8px;
-	padding: 6px 10px;
-	max-width: 70%;
-	overflow: hidden;
 }
 
 /* ---- pen diagnostics ---- */
@@ -2972,8 +2985,14 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
 .handwriting-note-viewport-pane { overflow: hidden; overflow: clip; }
 .cm-editor.handwriting-note-viewport,
 .markdown-source-view.mod-cm6 .cm-editor.handwriting-note-viewport { flex: none; max-width: none; max-height: none; }
-.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-content,
-.cm-editor.handwriting-note-viewport > .cm-scroller > .cm-sizer > .cm-contentContainer > .cm-content {
+/*
+ * NOT under a theme that centres its own lines (`handwriting-note-viewport-own-lines`, set by applyViewportBox when the
+ * sizer sits at the scroller's edge while the line is inset - Minimal). There `.cm-content` is full width by the theme's
+ * own rule and the lines are centred inside it; pinning its width here is what stopped them re-centring as the zoom
+ * fell, and left the overlay to supply a 518 px rest at 25% that the theme would otherwise have given for nothing.
+ */
+.cm-editor.handwriting-note-viewport:not(.handwriting-note-viewport-own-lines) > .cm-scroller > .cm-content,
+.cm-editor.handwriting-note-viewport:not(.handwriting-note-viewport-own-lines) > .cm-scroller > .cm-sizer > .cm-contentContainer > .cm-content {
  box-sizing: border-box;
  width: var(--handwriting-note-column-width);
  min-width: var(--handwriting-note-column-width);
@@ -3012,6 +3031,15 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
  * written the variable the declaration is still valid and the first owned frame
  * is centred rather than hard-left.
  *
+ * THE AUTO TERM IS A NUMBER, NOT A PERCENTAGE, on the zoom host. Under css
+ * `zoom` the engine resolves that `100%` in a mixed basis (the scroller's width
+ * with its scrollbar counted in screen px), so the term shrank with k and won
+ * the clamp: the column sat 7.5 (1/k - 1) local px left of its frozen place and
+ * hopped by that much when a pinch settled. applyViewportBox now writes
+ * `--handwriting-column-auto-left` from inputs read once in an unowned layout,
+ * on both host forms; the percentage stays only as the fallback for a line
+ * width that is not plain px, where nothing writes the variable.
+ *
  * `!important` scoped to the owned class, deliberately: some themes centre the
  * inner elements with `!important` (Minimal is one), so specificity alone cannot
  * win. All of it lifts the moment the class does.
@@ -3033,10 +3061,54 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
  */
 .cm-editor.handwriting-note-viewport > .cm-scroller > .cm-sizer {
  margin-left: clamp(0px,
-                    calc((100% - var(--file-line-width)) / 2),
+                    var(--handwriting-column-auto-left, calc((100% - var(--file-line-width)) / 2)),
                     var(--handwriting-column-margin-left,
-                        calc((100% - var(--file-line-width)) / 2))) !important;
+                        var(--handwriting-column-auto-left, calc((100% - var(--file-line-width)) / 2)))) !important;
  margin-right: auto !important;
+}
+/*
+ * s184 (Alan, Orion, 2026-09-20): A THEME THAT CENTRES ITS OWN LINES GETS THE SAME FREEZE AS THE SIZER. Minimal
+ * centres each line with `margin-inline-start: var(--content-margin-start) !important` (max(50% - line/2, ...)),
+ * resolved against a `.cm-content` the owned host widens by 1/k, so the column re-centred further right after every
+ * zoom-out - the column's home read 392, 998, 1554, 1697 host px across three pinches on Alan's device while the
+ * settle itself landed at pan 0 each time. s121 (Alan direct): the plugin centres nowhere. The line's inset is held
+ * to the value measured at 100% - the same clamp the sizer margin takes above - and the theme's own auto term
+ * (`--handwriting-column-auto-left`, written for this case too) still wins at k > 1, where it is the smaller.
+ * Specificity: Minimal's selector plus the two owned classes, so the tie the reset below lost is won here.
+ * Every child, `div` included: `.cm-line` is a div, and Minimal centres those with a second rule
+ * (`> div { margin-inline: auto !important }`). The sizer takes no inset here - the variable is the LINE's under
+ * this class, and a sizer that read it too would inset the column twice (measured 734.5 local px for 367.25).
+ */
+.cm-editor.handwriting-note-viewport.handwriting-note-viewport-own-lines > .cm-scroller > .cm-sizer {
+ margin-left: 0 !important;
+}
+.cm-editor.handwriting-note-viewport.handwriting-note-viewport-own-lines .cm-contentContainer.cm-contentContainer > .cm-content > *,
+.markdown-source-view.mod-cm6.is-readable-line-width .cm-editor.handwriting-note-viewport.handwriting-note-viewport-own-lines .cm-contentContainer.cm-contentContainer > .cm-content > * {
+ margin-inline-start: clamp(0px,
+                           var(--handwriting-column-auto-left, calc((100% - var(--file-line-width)) / 2)),
+                           var(--handwriting-column-margin-left,
+                               var(--handwriting-column-auto-left, calc((100% - var(--file-line-width)) / 2)))) !important;
+}
+/*
+ * s191 (Alan, Orion, 2026-09-21, Minimal, 20.7%): "the untitled title moves to the right as i pinch outward". Obsidian
+ * hangs the inline title, the properties block and the backlinks off the SIZER, beside the contentContainer, so the
+ * freeze above - written on the content's children - never reached them. Minimal centres all three with
+ * `margin-inline: var(--content-margin) !important` (theme.css:1860-1867) inside a sizer the owned host widens by 1/k,
+ * so they re-centre further right on every zoom-out while the frozen lines stay put. The same clamp, on the same three
+ * elements, at a selector that outranks the theme's 0,5,0 with and without the setting class: the sizer is named twice
+ * for the specificity, as `.cm-contentContainer.cm-contentContainer` is above. The plugin's own reset further down
+ * zeroes two of these at 0,5,0 and loses on order; this wins on specificity over both.
+ */
+.cm-editor.handwriting-note-viewport.handwriting-note-viewport-own-lines > .cm-scroller > .cm-sizer.cm-sizer > .inline-title,
+.cm-editor.handwriting-note-viewport.handwriting-note-viewport-own-lines > .cm-scroller > .cm-sizer.cm-sizer > .metadata-container,
+.cm-editor.handwriting-note-viewport.handwriting-note-viewport-own-lines > .cm-scroller > .cm-sizer.cm-sizer > .embedded-backlinks,
+.markdown-source-view.mod-cm6.is-readable-line-width .cm-editor.handwriting-note-viewport.handwriting-note-viewport-own-lines > .cm-scroller > .cm-sizer.cm-sizer > .inline-title,
+.markdown-source-view.mod-cm6.is-readable-line-width .cm-editor.handwriting-note-viewport.handwriting-note-viewport-own-lines > .cm-scroller > .cm-sizer.cm-sizer > .metadata-container,
+.markdown-source-view.mod-cm6.is-readable-line-width .cm-editor.handwriting-note-viewport.handwriting-note-viewport-own-lines > .cm-scroller > .cm-sizer.cm-sizer > .embedded-backlinks {
+ margin-inline-start: clamp(0px,
+                           var(--handwriting-column-auto-left, calc((100% - var(--file-line-width)) / 2)),
+                           var(--handwriting-column-margin-left,
+                               var(--handwriting-column-auto-left, calc((100% - var(--file-line-width)) / 2)))) !important;
 }
 .cm-editor.handwriting-note-viewport > .cm-scroller > .cm-sizer > .cm-contentContainer,
 .cm-editor.handwriting-note-viewport > .cm-scroller > .cm-sizer .cm-content,
@@ -3046,8 +3118,19 @@ body.handwriting-boox .handwriting-mobile-tool.is-pressed:not(.is-disabled) {
  margin-left: 0 !important;
  margin-right: 0 !important;
 }
-.handwriting-note-viewport-controls { position:absolute; top:52px; right:8px; z-index:30; display:flex; gap:2px; padding:3px; border:1px solid var(--background-modifier-border); border-radius:8px; background:var(--background-primary); box-shadow:0 2px 8px #0002; }
+/* The RETURN transition (after .is-inking comes off) is the strip's own base
+   one (.handwriting-mobile-tools above), not the pill's - they read the same
+   today (opacity 60ms linear 160ms, visibility 0s linear 160ms) but this is
+   copied from the strip on purpose: the zoom bar sits alongside the strip,
+   not the collapsed pill. */
+.handwriting-note-viewport-controls { position:absolute; top:52px; right:8px; z-index:30; display:flex; gap:2px; padding:3px; border:1px solid var(--background-modifier-border); border-radius:8px; background:var(--background-primary); box-shadow:0 2px 8px #0002; transition: opacity 60ms linear 160ms, visibility 0s linear 160ms; }
 .handwriting-note-viewport-controls button { min-width:30px; height:30px; padding:0 6px; font-size:12px; }
+/* Hide is a permanent state chosen in settings, not a step-aside - out of
+   paint, the tab order and the accessibility tree, same idiom as
+   .handwriting-mobile-tools.is-collapsed above. */
+.handwriting-note-viewport-controls.is-hidden {
+	display: none;
+}
 
 /* Only Infinite Canvas note routers opt in; wheel input remains native. */
 .handwriting-no-momentum { touch-action: none; }

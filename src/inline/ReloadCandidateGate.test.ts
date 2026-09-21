@@ -1,47 +1,9 @@
-/**
- * The reload poll's gate: which editors are quiet enough that another device's
- * ink may replace what is on their screen.
- *
- * `reloadCandidatePath` (InkOverlay.ts) is four lines and, until this file,
- * was executed by nothing. The live-reload suites stub `inlineReloadCandidates`
- * wholesale - `LiveReloadTestHarness.ts` lists it among the names it
- * substitutes - so the real predicate was never driven, and its own suites were
- * green either way. It decides whether a remote revision may overwrite ink the
- * user can see, which is the same shape as the worst defect on this board.
- *
- * THE REFUSALS ARE THE POINT. An acceptance that should have been a refusal is
- * another device overwriting a stroke in progress; a refusal that should have
- * been an acceptance is a reload arriving one poll later. Only the first is
- * damage, so every rule here is driven from BOTH sides within its own case:
- * the quiet reading is asserted first, then exactly one field is changed and
- * the refusal asserted. Without that pairing a case would pass against a gate
- * that refused everything.
- *
- * DRIVEN FOR REAL, NOT STUBBED. The overlay is constructed the way this repo's
- * other overlay suites construct it (`new InkOverlayPlugin(view as never)` with
- * a stub CodeMirror view), and `filePath()` is left alone so the third branch
- * runs the real CodeMirror field read rather than an override. `state.field`
- * returning `undefined` is how a view with no file is expressed, which is the
- * honest source of the null path rather than a stubbed method.
- *
- * Every overlay built here registers itself in the module's `instances` set in
- * its constructor, so each case destroys what it made; `inlineReloadCandidates`
- * reads that set and a leaked overlay would silently join a later case's answer.
- * The aggregator cases assert an empty set before they build anything.
- */
-
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import { InkOverlayPlugin, inlineReloadCandidates, setInlineInkEnabled } from "./InkOverlay";
+import { InlinePenRouter } from "./InlinePenRouter";
+import { InkOverlayPlugin, inlineReloadCandidates, captureInlineReloadAdmission, setInlineInkEnabled } from "./InkOverlay";
 
-/**
- * The constructor mounts unless the module's enable flag is off, and mounting
- * reaches for Obsidian's injected DOM helpers (`scroller.createDiv`) that a node
- * run has no reason to build. An unmounted overlay is the honest fixture rather
- * than a workaround: the gate reads three fields and never touches mounted
- * chrome, the constructor registers the instance in `instances` either way, and
- * an overlay that is registered but not mounted is a state production really
- * reaches - `setInlineInkEnabled(false)` puts every live overlay in exactly it.
- */
+// Reduced DOM fixture, real overlay binding/quiet predicate and registry.
+// Explicitly attach a stable container; unmounted overlays are ineligible.
 beforeAll(() => setInlineInkEnabled(false));
 
 const noop = (): void => {};
@@ -85,8 +47,10 @@ function makeOverlay(path: string | null): Record<string, unknown> {
 		devicePixelRatio: 1,
 		matchMedia: () => ({ addEventListener: noop, removeEventListener: noop }),
 	};
+	const info = path === null ? undefined : { file: { path }, editor: {} };
 	const view = {
 		dom: {
+			isConnected: true,
 			parentElement: { setCssStyles: noop },
 			ownerDocument: { defaultView: win },
 			style: { removeProperty: noop },
@@ -119,9 +83,11 @@ function makeOverlay(path: string | null): Record<string, unknown> {
 		},
 		// The real `filePath()` reads this. Left to run rather than overridden,
 		// so the branch that returns the path is the shipped one.
-		state: { field: () => (path === null ? undefined : { file: { path } }) },
+		state: { field: () => info },
 	};
 	const overlay = new InkOverlayPlugin(view as never) as unknown as Record<string, unknown>;
+	overlay.container = { isConnected: true, remove: noop };
+	(overlay as unknown as {invalidateReloadBindings(path:string|null):void}).invalidateReloadBindings(path);
 	live.push(overlay as unknown as Gate);
 	return overlay;
 }
@@ -216,19 +182,7 @@ describe("the aggregator collects the quiet editors", () => {
 		expect(inlineReloadCandidates()).toEqual([PATH]);
 	});
 
-	/**
-	 * CHARACTERISATION, AND A FINDING RATHER THAN A GUARANTEE. The aggregator
-	 * is a UNION of quiet paths; it does not subtract a path some other pane is
-	 * drawing on. With one note open in two panes, one idle and one mid-stroke,
-	 * the note is still offered as a reload candidate - and `inkExternallyReloaded`
-	 * then reaches EVERY overlay showing that path, clearing the selection and
-	 * scheduling a repaint on the pane whose stroke is in progress.
-	 *
-	 * This pins what the code does today, not what it should do. If the rule is
-	 * changed so a busy pane vetoes its note, this case is the one that must be
-	 * updated, and its going red is the intended signal.
-	 */
-	it("does NOT let a pane mid-stroke veto another pane on the same note", () => {
+	it("requires every attached pane on the same note to be quiet", () => {
 		expect(inlineReloadCandidates(), "no overlay leaked in from an earlier case").toEqual([]);
 
 		const idle = makeOverlay(PATH);
@@ -238,6 +192,75 @@ describe("the aggregator collects the quiet editors", () => {
 		drawing.builder = LIVE_STROKE;
 		drawing.mode = "ink";
 
+		expect(inlineReloadCandidates()).toEqual([]);
+		drawing.builder = null;
 		expect(inlineReloadCandidates()).toEqual([PATH]);
 	});
+});
+
+
+describe("fresh binding qualification", () => {
+ it("holds a retained selection after pen-up until dismissal", () => {
+  const pane = makeOverlay(PATH);
+  expect(gate(pane)).toBe(PATH);
+  (pane.selection as {selectExactly(ids:string[]):void}).selectExactly(["selected"]);
+  expect(gate(pane)).toBeNull();
+  (pane.selection as {clear():void}).clear();
+  expect(gate(pane)).toBe(PATH);
+ });
+ it.each(["pinchRefScale", "pinchPending", "pinchPreview", "pinchRaf", "reloadCameraSettlement"])("holds %s through settlement", field => {
+  const pane=makeOverlay(PATH), before=pane[field];
+  expect(gate(pane)).toBe(PATH);pane[field]=1;expect(gate(pane)).toBeNull();
+  pane[field]=before;expect(gate(pane)).toBe(PATH);
+ });
+ it("excludes detached and unbound overlays", () => {
+  const pane=makeOverlay(PATH);expect(gate(pane)).toBe(PATH);
+  (pane.container as {isConnected:boolean}).isConnected=false;
+  expect(inlineReloadCandidates()).toEqual([]);
+  expect(captureInlineReloadAdmission(PATH)).toBeNull();
+ });
+ it.each(["busy", "join", "retire", "attachment", "epoch", "file", "editor"])("requalifies %s after capture", change => {
+  const pane=makeOverlay(PATH);const admit=captureInlineReloadAdmission(PATH)!;
+  expect(admit()).toBe(true);
+  if(change==="busy")pane.builder=LIVE_STROKE;
+  if(change==="join")makeOverlay(PATH);
+  if(change==="retire")(pane.container as {isConnected:boolean}).isConnected=false;
+  if(change==="attachment")pane.container={isConnected:true,remove:noop};
+  if(change==="epoch")pane.reloadBindingEpoch=(pane.reloadBindingEpoch as number)+1;
+  if(change==="file" || change==="editor"){
+   const view=pane.view as {state:{field():any}};view.state.field()[change]={path:PATH};
+  }
+  expect(admit()).toBe(false);
+ });
+});
+
+
+describe("attachment lifetime and navigation qualification", () => {
+ it("a sibling joining and retiring during an await invalidates the earlier cohort", () => {
+  makeOverlay(PATH); const old=captureInlineReloadAdmission(PATH)!;expect(old()).toBe(true);
+  const transient=makeOverlay(PATH);(transient as unknown as Gate).destroy();
+  live.splice(live.indexOf(transient as unknown as Gate),1);
+  expect(old()).toBe(false);expect(captureInlineReloadAdmission(PATH)!()).toBe(true);
+ });
+ it("unrelated attachment lifetimes do not veto this path", () => {
+  makeOverlay(PATH);const old=captureInlineReloadAdmission(PATH)!;
+  makeOverlay(OTHER);expect(old()).toBe(true);
+ });
+ it.each(["guardTouches","pinchLive","assistPointerId","flingRaf","activePenId"])("holds the router's %s lifetime", field => {
+  const pane=makeOverlay(PATH);
+  const router=Object.assign(Object.create(InlinePenRouter.prototype),{
+   guardTouches:new Set(),pinchLive:false,assistPointerId:null,flingRaf:0,activePenId:null,dispose:noop,
+  });pane.router=router;
+  expect(gate(pane)).toBe(PATH);const before=router[field];
+  router[field]=field==="guardTouches"?new Set([1]):1;
+  expect(gate(pane)).toBeNull();router[field]=before;expect(gate(pane)).toBe(PATH);
+ });
+ it("hover and swallowed palms alone do not create a navigation hold", () => {
+  const pane=makeOverlay(PATH);
+  pane.router=Object.assign(Object.create(InlinePenRouter.prototype),{
+   guardTouches:new Set(),pinchLive:false,assistPointerId:null,flingRaf:0,activePenId:null,
+   swallowedTouches:new Set([1]),penHoverLive:true,dispose:noop,
+  });
+  expect(gate(pane)).toBe(PATH);
+ });
 });

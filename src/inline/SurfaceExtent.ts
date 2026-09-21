@@ -10,10 +10,12 @@ import { visualToNote } from "./ZoomScale";
  * scrollWidth/scrollHeight then cover the inked surface and native scrolling
  * reaches it. No wheel handling, no scroll hijacking.
  *
- * The granted extent GROWS in coarse chunks and never shrinks during a
- * session, so the scroll range is stable while writing (a scrollbar that
+ * The granted extent GROWS in coarse chunks and does not shrink while ink is
+ * being written, so the scroll range is stable while writing (a scrollbar that
  * pumps per stroke is nauseating). Growth is driven by the ink frontier,
- * the maximum x/y any stroke's bbox reaches on that note.
+ * the maximum x/y any stroke's bbox reaches on that note. The one way back
+ * down is sideways, after ink is removed or Infinite Canvas is turned off
+ * (`shrunkAxis`, `onScreenFloorX`, `SurfaceExtents.oweShrinkX`).
  *
  * RECONSTRUCTION NOTE (2026-08-21): this module was first written in the
  * session that produced the deployed hardware build of 2026-08-20 (the one
@@ -134,6 +136,74 @@ export function grownExtent(current: Extent, needed: Extent): Extent {
 	const y = grownAxis(current.y, needed.y);
 	return x === current.x && y === current.y ? current : { x, y };
 }
+
+/**
+ * What the ink frontier asks of the x axis, in note px.
+ *
+ * Sideways room grows from ink. With Infinite Canvas on, any ink grows it
+ * (frontier plus headroom, as before). With it off, ink grows it only once the
+ * frontier comes within EXTENT_MARGIN of the pane's right edge, and the room
+ * shrinks back when the ink retreats or is deleted. Growth after the first grant
+ * follows the Y rule (grownAxis) in both modes.
+ *
+ * The margin is note px, scaled into the pane like the frontier.
+ * `originLeft` and `clientWidth` are the scroller's content px; the frontier is
+ * scaled into them by `fontZoom`.
+ */
+export function inkClaimX(g: {
+	frontierX: number;
+	originLeft: number;
+	clientWidth: number;
+	fontZoom: number;
+	infiniteCanvas: boolean;
+}): number {
+	if (g.infiniteCanvas) return g.frontierX;
+	if (!Number.isFinite(g.frontierX) || g.frontierX <= 0 || !Number.isFinite(g.fontZoom) || g.fontZoom <= 0) return 0;
+	return g.originLeft + g.frontierX * g.fontZoom > g.clientWidth - EXTENT_MARGIN * g.fontZoom ? g.frontierX : 0;
+}
+
+/**
+ * The smallest x grant that keeps what is on screen scrollable, in note px:
+ * the spacer must still reach the right edge of the view, or the browser pulls
+ * scrollLeft back and the page jumps. Rounded up to whole chunks, so a shrink
+ * that waits on the view steps down a chunk at a time as the view moves left
+ * rather than moving the spacer on every scrolled frame. 0 at scrollLeft 0: the
+ * pane itself is always in range.
+ */
+export function onScreenFloorX(g: {
+	scrollLeft: number;
+	clientWidth: number;
+	originLeft: number;
+	fontZoom: number;
+}): number {
+	if (!Number.isFinite(g.scrollLeft) || g.scrollLeft <= 0 || !Number.isFinite(g.fontZoom) || g.fontZoom <= 0) return 0;
+	// One px spare for the spacer's own rounding (spacerPosition).
+	const needed = (g.scrollLeft + g.clientWidth + 1 - g.originLeft) / g.fontZoom;
+	return needed <= 0 ? 0 : Math.ceil(needed / EXTENT_CHUNK) * EXTENT_CHUNK;
+}
+
+/**
+ * One axis of a grant re-measured after ink was removed: the grant `needed`
+ * would earn from nothing (`grownAxis(0, needed)`, so the next stroke does not
+ * immediately grow it back), held at `floor`, and never above `current`.
+ * `complete` is false while the floor is what holds it up: the rest is still
+ * owed, and comes off when the view moves left or at the next pass.
+ */
+export function shrunkAxis(current: number, needed: number, floor: number): { value: number; complete: boolean } {
+	const settled = grownAxis(0, needed);
+	const held = Number.isFinite(floor) && floor > settled ? floor : settled;
+	return { value: Math.min(current, held), complete: held === settled || current <= settled };
+}
+
+/**
+ * How long a scroll must have been still before a shrink the view held back
+ * takes its next step, ms. A shrink never steps on a scrolled frame: it goes at
+ * the pass that made it due, and after that only at the end of a gesture (a
+ * pen, pan, space or pinch settle) or once the scroll has been quiet this long.
+ * Wheel notches and touchpad frames arrive well inside it, so a scroll in
+ * progress never sees the range move under it.
+ */
+export const SHRINK_SCROLL_IDLE_MS = 250;
 
 /** The ink frontier: the furthest right/down any stroke's bbox reaches. */
 export function inkFrontier(strokes: readonly InkStroke[]): Extent {
@@ -346,6 +416,11 @@ export class ScrollAxisGuard {
  */
 export class SurfaceExtents {
 	private byPath = new Map<string, Extent>();
+	/** Notes whose x grant is due to be re-measured from their ink, each with the generation it fell due at. */
+	private owedX = new Map<string, number>();
+	private owedGeneration = 0;
+	/** How many times each note's x grant has shrunk, so every pane showing it can tell. */
+	private shrinks = new Map<string, number>();
 
 	get(path: string): Extent {
 		return this.byPath.get(path) ?? ZERO_EXTENT;
@@ -358,10 +433,61 @@ export class SurfaceExtents {
 		return next;
 	}
 
+	/**
+	 * Re-measure this note's x grant at its next extent pass: ink left it. The
+	 * shrink is the editor's to make, because only an editor knows what is on
+	 * screen (onScreenFloorX); this only remembers that one is due, across
+	 * editors and across note switches.
+	 */
+	oweShrinkX(path: string): void {
+		if (this.get(path).x > 0) this.owedX.set(path, ++this.owedGeneration);
+	}
+
+	/** Every note holding sideways room is due: Infinite Canvas was turned off. */
+	oweShrinkXEverywhere(): void {
+		for (const [path, extent] of this.byPath) if (extent.x > 0) this.owedX.set(path, ++this.owedGeneration);
+	}
+
+	owesShrinkX(path: string): boolean {
+		return this.owedX.has(path);
+	}
+
+	/**
+	 * The generation this note's shrink fell due at, or undefined when none is
+	 * due. A new one each time it falls due again, so an editor can tell a fresh
+	 * shrink (take it now) from the remainder of one it has already made.
+	 */
+	shrinkDue(path: string): number | undefined {
+		return this.owedX.get(path);
+	}
+
+	settleShrinkX(path: string): void {
+		this.owedX.delete(path);
+	}
+
+	/** Changes exactly when this note's x grant shrinks. */
+	shrinkCount(path: string): number {
+		return this.shrinks.get(path) ?? 0;
+	}
+
+	/** Lower the x grant to `x` (never raise it); the SAME object when nothing changed. */
+	shrinkX(path: string, x: number): Extent {
+		const current = this.get(path);
+		if (!Number.isFinite(x) || x >= current.x) return current;
+		const next = { x: Math.max(0, x), y: current.y };
+		this.byPath.set(path, next);
+		this.shrinks.set(path, this.shrinkCount(path) + 1);
+		return next;
+	}
+
 	handleRename(oldPath: string, newPath: string): void {
 		const moved = this.byPath.get(oldPath);
 		if (!moved) return;
 		this.byPath.delete(oldPath);
+		const owed = this.owedX.get(oldPath);
+		if (owed !== undefined) { this.owedX.delete(oldPath); this.owedX.set(newPath, owed); }
+		const shrinks = this.shrinks.get(oldPath);
+		if (shrinks !== undefined) { this.shrinks.delete(oldPath); this.shrinks.set(newPath, shrinks); }
 		const existing = this.byPath.get(newPath);
 		this.byPath.set(
 			newPath,
@@ -373,6 +499,8 @@ export class SurfaceExtents {
 
 	handleDelete(path: string): void {
 		this.byPath.delete(path);
+		this.owedX.delete(path);
+		this.shrinks.delete(path);
 	}
 }
 

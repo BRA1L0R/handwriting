@@ -213,9 +213,8 @@ describe("adaptiveCaps", () => {
 	it("reaches its own desktop ceiling on a slow path - never EINK_CAPS's", () => {
 		// adaptiveCaps is the non-e-ink path exclusively: every caller gates
 		// predictionEinkOn() first and uses EINK_CAPS directly when it's on
-		// (InkOverlay.ts:2191, PdfInkController.ts:1594,
-		// HandwritingPageView.ts:958), so this function must never reach the
-		// e-ink numbers, on any lag, however long.
+		// (InkOverlay.ts:2191, PdfInkController.ts:1594), so this function
+		// must never reach the e-ink numbers, on any lag, however long.
 		const DESKTOP_CEILING_MS = 20;
 		const caps = adaptiveCaps(58);
 		expect(caps.maxHorizonMs).toBe(DESKTOP_CEILING_MS);

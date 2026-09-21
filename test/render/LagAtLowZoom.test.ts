@@ -33,7 +33,7 @@ let browser: Browser, script: string;
 const report: unknown[] = [];
 /** The stabilizer's own cap, in displayed CSS px (src/inline/CameraOriginY.ts). */
 const STABILIZER_CAP = 1 / 1024;
-/** R1: the margin a raw delta must sit inside, so a count that went green on
+/** The margin a raw delta must sit inside, so a count that went green on
  * which prior the stabilizer happened to retain cannot pass for a fix. */
 const RAW_DELTA_MARGIN = STABILIZER_CAP / 4;
 /** Q3: every far arm's raw per-frame delta, read across arms at the end. */
@@ -95,7 +95,7 @@ afterAll(async () => {
 	if (process.env.HW_LAG_REPORT) writeFileSync(process.env.HW_LAG_REPORT, JSON.stringify(report, null, 1));
 });
 
-async function arm(plant: "lag" | "lagNoIc" | "lagDense" | "lagFling" | "lagFlingDense" | "lagCreep" | "bandCost", pinch = 0.1, options?: { axis: "x" | "y" | "both"; routed: boolean; far: boolean; rapid: boolean; infiniteCanvas: boolean; frames: number; distance: number; pixels?: boolean; farVisual?: number; host?: boolean; zoomCycles?: number; fitCommit?: boolean; fitThenPinch?: number[] }) {
+async function arm(plant: "lag" | "lagNoIc" | "lagDense" | "lagFling" | "lagFlingDense" | "lagCreep" | "bandCost", pinch = 0.1, options?: { axis: "x" | "y" | "both"; routed: boolean; far: boolean; rapid: boolean; infiniteCanvas: boolean; frames: number; distance: number; pixels?: boolean; farVisual?: number; host?: boolean; zoomCycles?: number; fitCommit?: boolean; fitThenPinch?: number[] }, readable = true) {
 	const page = await browser.newPage({ viewport: { width: 1500, height: 900 }, deviceScaleFactor: 2 });
 	try {
 		const errors: string[] = [];
@@ -116,8 +116,8 @@ async function arm(plant: "lag" | "lagNoIc" | "lagDense" | "lagFling" | "lagFlin
 		const tracing = !!(options?.zoomCycles && process.env.HW_LAG_TRACE);
 		if (tracing) await browser.startTracing(page, { path: `${process.env.HW_LAG_TRACE}-${pinch}-${options!.farVisual}.json`, categories: process.env.HW_LAG_TRACE_CATS?.split(",") ?? ["devtools.timeline", "disabled-by-default-devtools.timeline", "blink.user_timing"] });
 		const r = await page.evaluate(
-			a => (window as any).scrollColumnAnchor.run(true, a.plant, a.pinch, false, false, 0, .25, a.options),
-			{ plant, pinch, options }
+			a => (window as any).scrollColumnAnchor.run(a.readable, a.plant, a.pinch, false, false, 0, .25, a.options),
+			{ plant, pinch, options, readable }
 		);
 		if (tracing) await browser.stopTracing();
 		expect(errors, `page errors in ${plant}: ${errors.join(" | ")}`).toEqual([]);
@@ -164,9 +164,13 @@ function checkArm(name: string, r: any): void {
 
 it("the scroll-then-draw sequence at 10% zoom is measured, not assumed", async () => {
 	const on = await arm("lag");
-	const off = await arm("lagNoIc");
+	// s179 (Alan, 2026-09-20): the two Infinite-Canvas-off arms are retired. Both reached 10% zoom
+	// by pinching with the canvas off, and the product no longer zooms in that mode, so the state
+	// they measured cannot occur. The refusal itself is pinned once for this rig, in
+	// ZoomFreezeTouch.test.ts, through the real touch listeners. The cost question these arms
+	// answered - does a scroll-then-draw at low zoom repaint the world - belongs to the IC-on arm
+	// now, which is the only mode that can be at low zoom at all.
 	checkArm("IC-on", on);
-	checkArm("IC-off", off);
 	// THE ARM IS LIVE: the flick has somewhere to go. Without this an extent
 	// that was already large enough would make every counter below read zero
 	// for a reason that has nothing to do with the code under test.
@@ -253,11 +257,12 @@ it("a scroll that does not move the band does not re-rasterise the world", async
  */
 it.each([
 	{ zoom: .1, axis: "both" as const, infiniteCanvas: true },
-	{ zoom: .1, axis: "both" as const, infiniteCanvas: false },
 	{ zoom: .15, axis: "both" as const, infiniteCanvas: true },
-	{ zoom: .15, axis: "both" as const, infiniteCanvas: false },
 	{ zoom: .1, axis: "x" as const, infiniteCanvas: true },
 	{ zoom: 1, axis: "both" as const, infiniteCanvas: true },
+	// s180: the canvas-off rows that stood here are retired. With the Infinite Canvas off the
+	// product now ignores every pinch phase, so the note stays at 100 percent and there is no
+	// zoomed canvas-off state left to measure. See RETIRED-CELLS.md.
 ])("fractional scroll/draw steps keep a stationary band cheap: $zoom/$axis/IC=$infiniteCanvas", async ({ zoom, axis, infiniteCanvas }) => {
 	const r = await arm("lagFlingDense", zoom, { axis, infiniteCanvas, routed: true, far: true, rapid: true, frames: 30, distance: 39, pixels: true });
 	checkArmPatches("fractional", r);
@@ -357,11 +362,28 @@ it("a pinch to 0.019 settles at the ten-percent floor, and Fit's commit at 0.019
 	expect(fit.margin, "the fraction binds, not the lifted ceiling").toBeLessThan(320 / fit.cssScale);
 	// THE CLAIM. Same pane, same band in the reader's px, same allocation.
 	expect(fit.bandVisual!.height).toBeCloseTo(one.bandVisual!.height, 0);
-	// Width carries the scrollbar gutter, which is a fixed VISUAL width and so
-	// a different share of a counter-sized client box: 1% here, not a term the
-	// margin controls.
-	expect(Math.abs(fit.bandVisual!.width - one.bandVisual!.width) / one.bandVisual!.width).toBeLessThan(0.02);
-	expect(fit.backingPx / one.backingPx, "backing ratio, zoomed out : 1.0").toBeCloseTo(1, 1);
+	// s180 add. 1 (Architect). WIDTH IS NOT A NEAR-EQUALITY UNDER THE CANVAS. The old row asked for
+	// the two visual widths to agree within 2 percent, on the cell's own note that "the horizontal
+	// margin is only spent when the surface is sideways scrollable, and in this arm neither scale
+	// reaches that". With the Infinite Canvas on the zoomed-out arm IS sideways scrollable, so it
+	// spends the margin on both sides and the widths part company by exactly that: measured at
+	// aa437ff1, 1782.48 against 1383 with a visual margin of 199.99, and 1383 + 2 x 199.99 =
+	// 1782.48. The structural claim is that difference and nothing else - two margins, no more -
+	// so it is asserted directly instead of being hidden inside a tolerance.
+	// The residue is the scrollbar gutter, which is a fixed VISUAL width and so a different share of a
+	// counter-sized client box: measured 0.50 px at aa437ff1 (399.48 against 2 x 199.99 = 399.98).
+	// The bound is 1 px on a 400 px quantity, so the two margins are the claim and the gutter is the
+	// only thing allowed to sit inside it.
+	expect(Math.abs((fit.bandVisual!.width - one.bandVisual!.width) - 2 * (fit.marginVisual as number)),
+		`the zoomed-out band is wider by its two horizontal margins, px (band delta ${(fit.bandVisual!.width - one.bandVisual!.width).toFixed(2)}, margins ${(2 * (fit.marginVisual as number)).toFixed(2)})`)
+		.toBeLessThanOrEqual(1);
+	// s180 add. 1: the backing follows the band, and under the canvas the band is wider by its two
+	// margins, so the old "same backing as 1.0" row cannot hold either. Measured at aa437ff1:
+	// 42,780,000 device px against 33,192,000, a ratio of 1.2889, and the band width ratio is
+	// 1782.48 / 1383 = 1.2888 - the same number. THE CLAIM: the backing buys the band and nothing
+	// more, so the two ratios agree; a backing that grew for any other reason parts from it.
+	expect(fit.backingPx / one.backingPx, "the backing grows exactly as the band does, zoomed out : 1.0")
+		.toBeCloseTo(fit.bandVisual!.width / one.bandVisual!.width, 2);
 	// AND IT IS INSIDE THE CEILING THAT ACTUALLY EXISTS - per canvas, which is
 	// what `backingScale` trims against.
 	expect(fit.maxCanvasPx).toBeLessThanOrEqual(fit.capPerCanvas);
@@ -455,7 +477,9 @@ it.each([
 	// the float32 step doubles again above 32768 visual px, and a fix that
 	// removed the magnitude from the measurement does not notice.
 	{ zoom: .15, far: FAR_ALAN * 4, infiniteCanvas: true },
-	{ zoom: .1, far: FAR_ALAN, infiniteCanvas: false },
+	// s180: the canvas-off rows that stood here are retired. With the Infinite Canvas off the
+	// product now ignores every pinch phase, so the note stays at 100 percent and there is no
+	// zoomed canvas-off state left to measure. See RETIRED-CELLS.md.
 ])("far extent fractional scroll/draw keeps a stationary band cheap: $zoom/$far/IC=$infiniteCanvas", async ({ zoom, far, infiniteCanvas }) => {
 	await farExtentArm(zoom, far, infiniteCanvas, false);
 }, 180_000);
@@ -512,7 +536,7 @@ async function farExtentArm(zoom: number, far: number, infiniteCanvas: boolean, 
 		if (r.stabilizerPresent) expect(round.scroll.camera.withPrior, "raw compared against a retained origin").toBeGreaterThan(0);
 		expect.soft(round.scroll.cameraChangesWithoutBand.length, "scrolling alone must not manufacture camera motion at the far extent").toBe(0);
 		expect.soft(round.scroll.full, "full redraws follow actual band moves").toBe(round.scroll.bandMoved);
-		// R1: THE RAW DELTA, NOT ONLY THE COUNT. A redraw count depends on which
+		// THE RAW DELTA, NOT ONLY THE COUNT. A redraw count depends on which
 		// prior the stabilizer happened to retain - .10/22964 counted 9/0/0 on
 		// 6dee0d06 while the raw error was the same in all three rounds - so a
 		// count alone can go green by luck. This is the measurement the cap acts

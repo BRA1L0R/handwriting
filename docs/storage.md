@@ -43,9 +43,10 @@ and the ink does not follow; the id stays in the frontmatter, so putting the
 sidecar back later reconnects it.
 
 Two other frontmatter keys exist and Handwriting does not add either on its
-own. `handwriting: page` means "open this note on the canvas view", and is
-written only by `New canvas page`. `handwriting-version` appears only on
-notes that carry canvas block markers.
+own. `handwriting: page` marked a note for the canvas page view, which the
+plugin no longer has; a note carrying it opens as ordinary Markdown, and the
+key is left alone rather than stripped. `handwriting-version` appears only on
+notes that carry the same older block markers.
 
 ## pdfs
 
@@ -115,11 +116,13 @@ Stable fields, safe to depend on:
 
 - `schemaVersion` (number)
 - `pageId` (string, matches the note's `handwriting-page-id`)
-- `surface` (`"inline"` for editor ink, `"pdf"` for ink on a PDF; absent
-  means a canvas page)
+- `surface` (`"inline"` for editor ink, `"pdf"` for ink on a PDF; absent in
+  sidecars written by the canvas page view, which the plugin no longer has)
 - `strokes` (array; each has `id`, `tool`, `color`, `width`, `createdAt`, and
   points)
-- `textBoxes` and `images` (canvas pages only; `id`, position, size, `z`)
+- `textBoxes` and `images` (`id`, position, size, `z`) - written only by the
+  canvas page view, which the plugin no longer has. The format still reads
+  and writes both keys
 
 Internal, and subject to change without a schema bump:
 
