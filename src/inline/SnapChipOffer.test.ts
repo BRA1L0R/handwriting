@@ -230,6 +230,11 @@ function makeRig(): Rig {
 	view.damage = { addRect: () => undefined, addAll: () => undefined };
 	view.eraserEl = null;
 	view.frame = { locked: false, end: () => undefined, cancel: () => undefined };
+	view.viewportPan = { x: 0, y: 0 };
+	view.previewInkOffset = 0;
+	view.boundReadout = { floorX: 0, floorY: 0, bx: 0, width: 0, rawX: 0, cx: 0, rawY: 0, cy: 0,
+		dragFrame: false, neverZoomed: false, steady: false, next: 0, fromScale: 0, fromScaleValid: false,
+		restCeilX: 0, startX: 0, startY: 0, lastX: 0, lastY: 0, bounded: false, settling: false };
 	// `prune` is reached by `applyInkOp` (the undo leg), `clear` by
 	// `resetGestureState` (the teardown test).
 	view.selection = { clear: () => undefined, prune: () => undefined, isEmpty: true };

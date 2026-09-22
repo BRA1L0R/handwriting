@@ -47,6 +47,7 @@ import { describe, expect, it } from "vitest";
 (globalThis as { window?: unknown }).window = globalThis;
 
 import { InkOverlayPlugin } from "./InkOverlay";
+import { WheelZoomRun } from "./WheelZoom";
 
 type Fields = Record<string, unknown>;
 
@@ -194,6 +195,9 @@ function makeRig(): Rig {
 	o.cssHeight = 0;
 
 	o.frame = { locked: false, cancel: () => undefined };
+	o.wheelZoomRun = new WheelZoomRun();
+	o.paperKindWatch = [];
+	o.paperKindFrame = null;
 	o.band = null;
 	o.router = null;
 	o.axisChecked = false;

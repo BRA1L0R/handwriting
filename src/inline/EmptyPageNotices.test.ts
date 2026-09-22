@@ -338,6 +338,10 @@ describe("successful final erase handles the empty-page episode", () => {
 		view.hideEraserCursor = () => undefined;
 		view.frontierCache = { invalidate: () => undefined };
 		view.view = { hasFocus: true, dispatch: vi.fn() };
+		view.boundReadout = { floorX: 0, floorY: 0, bx: 0, width: 0, rawX: 0, cx: 0, rawY: 0, cy: 0,
+			dragFrame: false, neverZoomed: false, steady: false, next: 0, fromScale: 0, fromScaleValid: false,
+			restCeilX: 0, startX: 0, startY: 0, lastX: 0, lastY: 0, bounded: false, settling: false };
+		view.viewportPan = { x: 0, y: 0 };
 		const changed: string[] = [];
 		const off = onInkChanged((p) => {
 			if (p !== path) return;

@@ -55,6 +55,7 @@ function makeRig(external = 1, dpr = 1) {
 		clientWidth: 640, clientHeight: 480,
 		isConnected: true,
 		ownerDocument: { defaultView: win },
+		getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 480 }),
 		style: {
 			getPropertyValue: (name: string): string => styles[name] ?? "",
 			getPropertyPriority: (name: string): string => priorities[name] ?? "",
@@ -66,7 +67,7 @@ function makeRig(external = 1, dpr = 1) {
 	const scroller = { scrollLeft: 0, scrollTop: 0, scrollWidth: 64000, scrollHeight: 48000, clientTop: 0, getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 480 }) };
 
 	const overlay = Object.create(InkOverlayPlugin.prototype) as Fields;
-	overlay.view = { dom: host, scrollDOM: scroller, requestMeasure: vi.fn(), measure: vi.fn() };
+	overlay.view = { dom: host, scrollDOM: scroller, contentDOM: { getBoundingClientRect: () => ({ left: 0, top: 0 }), children: [] as unknown[] }, requestMeasure: vi.fn(), measure: vi.fn() };
 	overlay.container = { setCssStyles: vi.fn() };
 	overlay.frame = { locked: false };
 	// s179: THIS RIG'S SUBJECT IS ZOOM MECHANICS, so its note is a CANVAS note. With the canvas off a
@@ -80,6 +81,8 @@ function makeRig(external = 1, dpr = 1) {
 	overlay.zoomFloor = MIN_PINCH_SCALE;
 	overlay.pinchRasterScale = 1;
 	overlay.pinchRefScale = null;
+	overlay.pinchStartPan = { x: 0, y: 0 };
+	overlay.pinchBand = { history: [] as number[], lastPan: { x: 0, y: 0 } };
 	overlay.pinchAnchor = null;
 	overlay.pinchPending = null;
 	overlay.pinchRaf = 0;

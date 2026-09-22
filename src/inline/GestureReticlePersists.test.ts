@@ -147,6 +147,11 @@ function makeRig(): Rig {
 	inst.hoverWatchdog = null;
 	inst.mouseStroke = false;
 	inst.frame = new StrokeFrame();
+	inst.viewportPan = { x: 0, y: 0 };
+	inst.previewInkOffset = 0;
+	inst.boundReadout = { floorX: 0, floorY: 0, bx: 0, width: 0, rawX: 0, cx: 0, rawY: 0, cy: 0,
+		dragFrame: false, neverZoomed: false, steady: false, next: 0, fromScale: 0, fromScaleValid: false,
+		restCeilX: 0, startX: 0, startY: 0, lastX: 0, lastY: 0, bounded: false, settling: false };
 
 	// The reticle element. Real classList methods are not needed: the
 	// mode-specific LOOK is out of scope here (unchanged, and pinned

@@ -98,6 +98,7 @@ function makeRig(shared?: { view: Fields }) {
 		host = {
 			clientWidth: 640, clientHeight: 480,
 			ownerDocument: { defaultView: win },
+			getBoundingClientRect: () => ({ left: 0, top: 0 }),
 			style: {
 				removeProperty(name: string): void { delete hostStyles[name]; },
 			},
@@ -110,7 +111,7 @@ function makeRig(shared?: { view: Fields }) {
 		};
 		requestMeasure = vi.fn();
 		measure = vi.fn();
-		view = { dom: host, scrollDOM: scroller, requestMeasure, measure };
+		view = { dom: host, scrollDOM: scroller, contentDOM: { getBoundingClientRect: () => ({ left: 0, top: 0 }), children: [] as unknown[] }, requestMeasure, measure };
 	}
 
 	const overlay = Object.create(InkOverlayPlugin.prototype) as Fields;
@@ -128,6 +129,8 @@ function makeRig(shared?: { view: Fields }) {
 	overlay.pinchScaleNow = 1;
 	overlay.pinchRasterScale = 1;
 	overlay.pinchRefScale = null;
+	overlay.pinchStartPan = { x: 0, y: 0 };
+	overlay.pinchBand = { history: [] as number[], lastPan: { x: 0, y: 0 } };
 	overlay.pinchAnchor = null;
 	overlay.pinchPending = null;
 	overlay.pinchRaf = 0;

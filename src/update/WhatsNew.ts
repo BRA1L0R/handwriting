@@ -179,6 +179,7 @@ export const RELEASE_NOTES: Record<string, string[]> = {
 		"bug fixes",
 		"thank you to seekermarcel for help",
 	],
+	"1.4.21": ["Ink hotfix"],
 };
 
 /** One release's own notes, kept apart so the toast can label them honestly. */

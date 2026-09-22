@@ -3108,6 +3108,15 @@ export class MobileTools {
 	}
 
 	/**
+	 * Re-ask both halves of the rule and re-run the step-aside, exactly as the
+	 * mode listener does. Public for `refreshNoteZoomControlsAll`.
+	 */
+	refreshNoteZoomControls(): void {
+		this.applyNoteZoomControlsVisibility();
+		this.setInking(this.inking);
+	}
+
+	/**
 	 * "hide" removes the zoom bar from paint AND from the
 	 * accessibility tree/tab order, the same way the pen strip itself is
 	 * removed from both when `penToolsVisible` is false for it (InkOverlay.ts
@@ -3121,15 +3130,6 @@ export class MobileTools {
 	 * display:none subtree is out of the tab order and unannounced in every
 	 * browser without any extra aria/tabindex bookkeeping here.
 	 */
-	/**
-	 * Re-ask both halves of the rule and re-run the step-aside, exactly as the
-	 * mode listener does. Public for `refreshNoteZoomControlsAll`.
-	 */
-	refreshNoteZoomControls(): void {
-		this.applyNoteZoomControlsVisibility();
-		this.setInking(this.inking);
-	}
-
 	private applyNoteZoomControlsVisibility(): void {
 		this.viewportControls?.toggleClass("is-hidden", !this.zoomBarWanted());
 	}

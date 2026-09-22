@@ -352,8 +352,11 @@ const PDF_INK_CHANGED_DURING_BACKUP =
 interface HandwritingSettings {
 	/** Named locations use their own schema; opaque records survive older builds. */
 	savedViews: unknown[];
-	/** Per-page camera, kept out of the synced note on purpose (§22). */
-	/** The retired canvas page's per-note cameras: read, copied and removed with their note, never interpreted. */
+	/**
+	 * Per-page camera, kept out of the synced note on purpose (§22). The retired
+	 * canvas page's per-note cameras: read, copied and removed with their note,
+	 * never interpreted.
+	 */
 	cameras: Record<string, Record<string, unknown>>;
 	/** Nib size multipliers per tool (v0.13.6): 0.6 fine · 1 medium · 1.8 bold. */
 	inkSizes: { pen: number; highlighter: number };
@@ -4661,6 +4664,35 @@ export default class HandwritingPlugin extends Plugin {
 			this.settings.lastSeenVersion,
 			this.freshInstall
 		);
+		// One line to the vaults 1.4.20 caught. That release pinned pressure
+		// sensitivity on and rewrote a stored `false` to `true` on the next
+		// save, so a vault arriving from it draws its old ink under the
+		// pressure law and nothing in data.json says whether its owner ever
+		// chose that. 1.4.21 gives the row back; this says where it is, to the
+		// one version that can have been caught, on the one launch that reads
+		// `1.4.20` here - the record at the end then moves the version on.
+		//
+		// It goes FIRST, above the what's-new block. That block swallows its
+		// own failure and returns early so its notes retry next launch, and
+		// anything after it is skipped on that path - which would drop the one
+		// message this release exists to deliver (s238 add. 5).
+		//
+		// Reads only. Nothing about the setting is changed for them: which of
+		// these vaults wanted pressure on is not ours to guess.
+		if (this.settings.lastSeenVersion === "1.4.20" && this.settings.pressureSensitivity === true) {
+			try {
+				new Notice(
+					"Handwriting: ink too wide? Settings, Pen, Pressure sensitivity, off.",
+					20000
+				);
+			} catch (err) {
+				// Its own catch, deliberately: the record at the end is what
+				// keeps the what's-new notes from repeating, and a toast that
+				// failed to open must not cost that.
+				console.error("[handwriting] the pressure notice failed to open", err);
+			}
+		}
+
 		if (d.show) {
 			try {
 				new Notice(
@@ -5206,13 +5238,18 @@ export default class HandwritingPlugin extends Plugin {
 				pen: normalizeInkColor("pen", raw?.inkColors?.pen),
 				highlighter: normalizeInkColor("highlighter", raw?.inkColors?.highlighter),
 			},
-			// ALWAYS ON (1.4.20, Alan's settings simplification): the switch is
-			// gone from the tab, so a stored `false` - or the pre-rename
-			// `inkShaping: false` that used to stand in for it - is ignored
-			// rather than left in force with no row to turn it back on. The
-			// key is still written, as true, so an older build reading this
-			// file draws with pressure too.
-			pressureSensitivity: true,
+			// Vaults written before the rename carry `inkShaping`, which drove the
+			// same toggle. Honour it once so nobody's choice is silently reset.
+			//
+			// 1.4.20 pinned this to `true` and the tab lost the row, so a vault
+			// that had chosen off redrew every saved stroke under the pressure
+			// law - up to 3.2 times wider on firm samples, reported as ink that
+			// had become illegible. The stored value is read again, and the row
+			// is back, because 1.4.20 also rewrote a stored `false` to `true` on
+			// the next save: for those vaults the row is the only way back.
+			pressureSensitivity:
+				raw?.pressureSensitivity ??
+				(raw as { inkShaping?: boolean } | undefined)?.inkShaping !== false,
 			// Its own key, deliberately not the legacy `inkShaping` one: that
 			// key belonged to the pressure toggle it was renamed into, and
 			// reading it here would make one old choice silently set a
@@ -6241,6 +6278,16 @@ export class HandwritingSettingTab extends PluginSettingTab {
 				heading: "Pen",
 				items: [
 					{
+						name: "Pressure sensitivity",
+						desc: "Adjust line width with pen pressure. Default on.",
+						// The ordinary control path, not 1.4.19's `render` one. That
+						// row carried a Recalibrate button beside the toggle, and a
+						// button can only reach a row through `render`; Recalibrate
+						// has had its own Developer row since 1.4.20, so this row is
+						// the toggle and nothing else.
+						control: { type: "toggle", key: "pressureSensitivity" },
+					},
+					{
 						// The smoothing users can actually feel. setInkShaping has been
 						// honoured by the renderers all along but nothing ever called it: the
 						// toggle that drove it was renamed into "pressure sensitivity" and the
@@ -6451,6 +6498,14 @@ export class HandwritingSettingTab extends PluginSettingTab {
 				// predicate is read at render time: without this the row keeps the
 				// state it was drawn in until the tab is closed and opened again.
 				this.rerender();
+				break;
+			case "pressureSensitivity":
+				s.pressureSensitivity = on;
+				setPressureSensitivity(on);
+				// Saved strokes are shaped at render time from their stored
+				// samples, so the width law changes under ink already on the
+				// page: every overlay has to draw again to show it.
+				repaintAllInkOverlays();
 				break;
 			case "strokePrediction":
 				s.strokePrediction = on;

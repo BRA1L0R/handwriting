@@ -15,7 +15,7 @@ import { describe, expect, it, vi } from "vitest";
 (globalThis as { window?: unknown }).window = globalThis;
 
 import { InkOverlayPlugin } from "./InkOverlay";
-import { MIN_PINCH_SCALE, MAX_PINCH_SCALE } from "./PinchScale";
+import { MIN_PINCH_SCALE, MAX_PINCH_SCALE, PINCH_GIVE } from "./PinchScale";
 
 type Phase = "start" | "move" | "end";
 type Point = { x: number; y: number };
@@ -40,6 +40,7 @@ function makeRig(start = 1) {
 	const host = {
 		clientWidth: 640, clientHeight: 480,
 		ownerDocument: { defaultView: win },
+		getBoundingClientRect: () => ({ left: 0, top: 0 }),
 		// The host's `style` is a CSSStyleDeclaration, and production reads it as one: the resting
 		// column margin is read back before it is written so an unchanged value writes nothing
 		// (InkOverlay.ts, `restColumnAgainstCurrentGrant`). This stub carried `removeProperty`
@@ -56,7 +57,7 @@ function makeRig(start = 1) {
 	const scroller = { scrollLeft: 0, scrollTop: 0, scrollWidth: 64000, scrollHeight: 48000, getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 480 }) };
 
 	const overlay = Object.create(InkOverlayPlugin.prototype) as Fields;
-	overlay.view = { dom: host, scrollDOM: scroller, requestMeasure: vi.fn(), measure: vi.fn() };
+	overlay.view = { dom: host, scrollDOM: scroller, contentDOM: { getBoundingClientRect: () => ({ left: 0, top: 0 }), children: [] as unknown[] }, requestMeasure: vi.fn(), measure: vi.fn() };
 	overlay.container = { setCssStyles: vi.fn() };
 	overlay.frame = { locked: false };
 	// s179: THIS RIG'S SUBJECT IS ZOOM MECHANICS, so its note is a CANVAS note. With the canvas off a
@@ -70,6 +71,8 @@ function makeRig(start = 1) {
 	overlay.zoomFloor = MIN_PINCH_SCALE;
 	overlay.pinchRasterScale = start;
 	overlay.pinchRefScale = null;
+	overlay.pinchStartPan = { x: 0, y: 0 };
+	overlay.pinchBand = { history: [] as number[], lastPan: { x: 0, y: 0 } };
 	overlay.pinchAnchor = null;
 	overlay.pinchPending = null;
 	overlay.pinchRaf = 0;
@@ -288,7 +291,7 @@ describe("the pinch-in ceiling reaches MAX_PINCH_SCALE, not the old 400%", () =>
 	it("a live preview frame reaches the new ceiling exactly, and no further", () => {
 		const rig = makeRig();
 		expect(rig.previewTo(MAX_PINCH_SCALE)).toBe(MAX_PINCH_SCALE);
-		expect(rig.previewTo(MAX_PINCH_SCALE + 1), "past the ceiling the preview frame is refused, scale holds").toBe(MAX_PINCH_SCALE);
+		expect(rig.previewTo(MAX_PINCH_SCALE + 1), "past the ceiling the preview frame is refused, scale holds").toBe(MAX_PINCH_SCALE * PINCH_GIVE);
 	});
 
 	it("the plus button rides zoomNoteBy's own ceiling from 400% up to the new one", () => {

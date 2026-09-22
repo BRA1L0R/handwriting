@@ -1996,7 +1996,6 @@ export class InlinePenRouter {
 
 	// ---- standing gesture guard ---------------------------------------------
 
-	/** Apply a ManipulationGuard decision to the scroller and timers. */
 	/**
 	 * WHAT THE STANDING GUARD WRITES, for this surface AND this moment. s185 add. 1 (Architect):
 	 * Chromium reads `touch-action` at the FIRST contact of a sequence, so refusing to claim the
@@ -2012,6 +2011,7 @@ export class InlinePenRouter {
 		return (this.cb.pinchZoom?.() ?? true) ? this.guardTouchAction : "pinch-zoom";
 	}
 
+	/** Apply a ManipulationGuard decision to the scroller and timers. */
 	private applyGuard(d: GuardDecision, why: string): void {
 		if (!guardEnabled) {
 			this.restoreGuardStyle();
@@ -2426,16 +2426,6 @@ export class InlinePenRouter {
 		{ assistThisGesture: false, guardEnabled: false, edgeStart: false, took: false };
 
 	/**
-	 * True when a drag starting now could only produce give, not scrolling: the host offers an
-	 * allowance - which is Infinite Canvas OFF, since it answers 0 when on - and the scroller is
-	 * against an end on an axis, or has no range there at all.
-	 *
-	 * Asked at the CONTACT, because that is when ownership is decided; no later point in the gesture
-	 * can recover a drag that was handed to the native scroller. The direction is not known yet, so
-	 * either axis being at an end is enough: a drag that turns out to head back into the range is
-	 * carried by the assist exactly as it is at any other offset, and gives nothing.
-	 */
-	/**
 	 * s128: THE LIFT SITS WHERE NATIVE SCROLLING HAS NOTHING TO DO. Narrower than `dragBeginsAgainstAnEnd`
 	 * on purpose: an axis with no range at all is ignored (a note that fits sideways still scrolls natively
 	 * up and down), so only a lift at the top, bottom, left or right of an axis that CAN scroll, or on a note
@@ -2451,6 +2441,16 @@ export class InlinePenRouter {
 		return endX || endY || (rangeX <= 0 && rangeY <= 0);
 	}
 
+	/**
+	 * True when a drag starting now could only produce give, not scrolling: the host offers an
+	 * allowance - which is Infinite Canvas OFF, since it answers 0 when on - and the scroller is
+	 * against an end on an axis, or has no range there at all.
+	 *
+	 * Asked at the CONTACT, because that is when ownership is decided; no later point in the gesture
+	 * can recover a drag that was handed to the native scroller. The direction is not known yet, so
+	 * either axis being at an end is enough: a drag that turns out to head back into the range is
+	 * carried by the assist exactly as it is at any other offset, and gives nothing.
+	 */
 	private dragBeginsAgainstAnEnd(): boolean {
 		if ((this.cb.overscrollAllowancePx?.() ?? 0) <= 0) return false;
 		const el = this.scrollEl;
@@ -3546,11 +3546,6 @@ export class InlinePenRouter {
 	}
 
 	/**
-	 * Balance the touch maps when capture/window ends a finger without the
-	 * scroller's normal touch-up tail. Normal pointer-up reaches this same
-	 * helper first and therefore cannot double-decrement the guard afterward.
-	 */
-	/**
 	 * Every contact goes at once, because the browser says none are left.
 	 *
 	 * The helpers around this one each retire ONE contact, keyed by pointer
@@ -3583,6 +3578,11 @@ export class InlinePenRouter {
 		this.paroleOverlapped = false;
 	}
 
+	/**
+	 * Balance the touch maps when capture/window ends a finger without the
+	 * scroller's normal touch-up tail. Normal pointer-up reaches this same
+	 * helper first and therefore cannot double-decrement the guard afterward.
+	 */
 	private retireEndedFingerContact(pointerId: number): void {
 		this.touchPos.delete(pointerId);
 		if (!this.guardTouches.delete(pointerId)) return;

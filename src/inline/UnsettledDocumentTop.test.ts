@@ -455,6 +455,11 @@ function makeRig(): Rig {
 	o.damage = { addRect: () => undefined, addAll: () => undefined };
 	o.eraserEl = null;
 	o.mobileTools = null;
+	o.viewportPan = { x: 0, y: 0 };
+	o.previewInkOffset = 0;
+	o.boundReadout = { floorX: 0, floorY: 0, bx: 0, width: 0, rawX: 0, cx: 0, rawY: 0, cy: 0,
+		dragFrame: false, neverZoomed: false, steady: false, next: 0, fromScale: 0, fromScaleValid: false,
+		restCeilX: 0, startX: 0, startY: 0, lastX: 0, lastY: 0, bounded: false, settling: false };
 
 	// Own properties, so the prototype's versions never run: each of these
 	// reaches the editor, the strip, another pane or the file system, and

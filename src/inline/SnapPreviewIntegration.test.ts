@@ -28,6 +28,8 @@ function rig() {
   strokeIndex:new StrokeIndex(), indexDirty:true, repaintQueued:false, activeWet:wet, highlightWet:wet,
   highlightWetCanvas:{setCssStyles(){}}, tail:{clear(){},clearAll(){},drawHead(){}}, committedCtx:ctx,highlightCtx:ctx,
   damage:{addRect(){},addAll(){}},eraserEl:null,frame:{end(){},cancel(){},begin(){}},
+ viewportPan:{x:0,y:0}, previewInkOffset:0,
+ boundReadout:{floorX:0,floorY:0,bx:0,width:0,rawX:0,cx:0,rawY:0,cy:0,dragFrame:false,neverZoomed:false,steady:false,next:0,fromScale:0,fromScaleValid:false,restCeilX:0,startX:0,startY:0,lastX:0,lastY:0,bounded:false,settling:false},
   selection:{clear(){},prune(){},isEmpty:true}, selectionDeleteKeys:{reset(){}},
   erased:[],erasePieces:new Set(),eraseFrom:[],eraseWhole:false, predReal:[],predLastTail:[],
   camera:{snapshot:{x:0,y:0,zoom:1},screenToWorld:(x:number,y:number)=>({x,y})},

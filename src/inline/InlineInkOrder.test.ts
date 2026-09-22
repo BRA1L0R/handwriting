@@ -83,7 +83,11 @@ async function historyRig(initial: InkStroke[]) {
 			if (partial) inlineInk.applyAddLive(r.path, pieces, [1, 2, 3]);
 			Object.assign(overlay, { mode: "erase", frame: { end() {} }, mobileTools: null,
 				erased, eraseFrom: before, erasePieces: new Set(ids(pieces)),
-				stopFrameTicker() {}, hideEraserCursor() {}, frontierCache: { invalidate() {} } });
+				stopFrameTicker() {}, hideEraserCursor() {}, frontierCache: { invalidate() {} },
+				viewportPan: { x: 0, y: 0 },
+				boundReadout: { floorX: 0, floorY: 0, bx: 0, width: 0, rawX: 0, cx: 0, rawY: 0, cy: 0,
+					dragFrame: false, neverZoomed: false, steady: false, next: 0, fromScale: 0, fromScaleValid: false,
+					restCeilX: 0, startX: 0, startY: 0, lastX: 0, lastY: 0, bounded: false, settling: false } });
 			overlay.penUp();
 		},
 	};

@@ -43,6 +43,7 @@ function makeRig() {
 	const hostStyles: Record<string, string> = {};
 	const host = { clientWidth: 640, clientHeight: 480,
 		ownerDocument: { defaultView: win },
+		getBoundingClientRect: () => ({ left: 0, top: 0 }),
 		style: {
 			removeProperty(name: string): void {
 				delete hostStyles[name];
@@ -60,7 +61,7 @@ function makeRig() {
 
 	const overlay = Object.create(InkOverlayPlugin.prototype) as Fields;
 	const requestMeasure = vi.fn();
-	overlay.view = { dom: host, scrollDOM: scroller, requestMeasure, measure: vi.fn() };
+	overlay.view = { dom: host, scrollDOM: scroller, contentDOM: { getBoundingClientRect: () => ({ left: 0, top: 0 }), children: [] as unknown[] }, requestMeasure, measure: vi.fn() };
 	overlay.container = { setCssStyles: vi.fn() };
  overlay.frame = { locked: false }; overlay.cssScale = 1; overlay.fontZoom = 1;
  // s179: THIS RIG'S SUBJECT IS ZOOM MECHANICS, so its note is a CANVAS note. With the canvas off a
@@ -72,6 +73,8 @@ function makeRig() {
 	overlay.pinchScaleNow = 1;
 	overlay.pinchRasterScale = 1;
 	overlay.pinchRefScale = null;
+	overlay.pinchStartPan = { x: 0, y: 0 };
+	overlay.pinchBand = { history: [] as number[], lastPan: { x: 0, y: 0 } };
 	overlay.pinchAnchor = null;
 	overlay.pinchPending = null;
 	overlay.pinchRaf = 0;

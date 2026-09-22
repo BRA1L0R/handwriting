@@ -1814,7 +1814,11 @@ export class InkOverlayPlugin {
 	private bounceState: { hold: object; fromX: number; fromY: number; startedAt: number; raf: number } | null = null;
 	/** The settle that has had its bounce, playing or over, until that settle retires: one bounce per settle. */
 	private bouncedHold: object | null = null;
-	/** s97 add. 67: the last settle's bound geometry, for `overscrollBounceReadout`. Written at the bound, never read by production. */
+	/**
+	 * s97 add. 67: the last settle's bound geometry, for `overscrollBounceReadout`. Written at the bound, read
+	 * by production at :7688-7689, :7834-7835, :7866. A field initializer, so `Object.create(InkOverlayPlugin.prototype)` skips it - a
+	 * fixture built that way must set it itself or any path that reads it throws on the missing keys.
+	 */
 	private boundReadout = { floorX: 0, floorY: 0, bx: 0, width: 0, rawX: 0, cx: 0, rawY: 0, cy: 0,
 		// s150 add. 2, read-only: the drag-frame gate's own inputs, so a fixture can say WHY a frame was or
 		// was not bounded rather than infer it from the position it ended on.
@@ -6634,21 +6638,6 @@ export class InkOverlayPlugin {
 		this.paperGridBoxPanX = ax;
 	}
 
-	/**
-	 * s192: THE GRID'S VERTICAL BOX, made, sized or taken away. Grid paper only: the stylesheet states
-	 * `--handwriting-paper-grid` on the scroller for every paper kind, so a note's own choice beats a global one by
-	 * the ordinary cascade and this reads the answer rather than re-deriving it.
-	 *
-	 * THE SIZE IS THE CONTENT AND THE GRANTED EXTENT, never `scrollWidth` or `scrollHeight`: the box is inside the
-	 * scroller, so a size taken from the scroll range would feed the range it was taken from and grow on every pass.
-	 * The sizer's own box is the content; the extent spacer's position is what this overlay has granted beyond it;
-	 * the client box covers a note shorter than its pane. Nothing here can make the scroller scroll further than the
-	 * spacer already does.
-	 *
-	 * NOT ON A PREVIEW FRAME, and nothing calls it on one: while a preview lives the paper is the preview element,
-	 * which carries both axes itself, and this box is quiet under the previewing class. So a pinch adds no read and
-	 * no write here. A scroll adds none either: scrolling changes neither the content nor the grant.
-	 */
 	/** One frame's worth of the watch's work, however many mutations arrived. */
 	private watchPaperKind(): void {
 		const doc = this.view?.dom?.ownerDocument;
@@ -6665,6 +6654,21 @@ export class InkOverlayPlugin {
 		this.paperKindWatch = [body, note];
 	}
 
+	/**
+	 * s192: THE GRID'S VERTICAL BOX, made, sized or taken away. Grid paper only: the stylesheet states
+	 * `--handwriting-paper-grid` on the scroller for every paper kind, so a note's own choice beats a global one by
+	 * the ordinary cascade and this reads the answer rather than re-deriving it.
+	 *
+	 * THE SIZE IS THE CONTENT AND THE GRANTED EXTENT, never `scrollWidth` or `scrollHeight`: the box is inside the
+	 * scroller, so a size taken from the scroll range would feed the range it was taken from and grow on every pass.
+	 * The sizer's own box is the content; the extent spacer's position is what this overlay has granted beyond it;
+	 * the client box covers a note shorter than its pane. Nothing here can make the scroller scroll further than the
+	 * spacer already does.
+	 *
+	 * NOT ON A PREVIEW FRAME, and nothing calls it on one: while a preview lives the paper is the preview element,
+	 * which carries both axes itself, and this box is quiet under the previewing class. So a pinch adds no read and
+	 * no write here. A scroll adds none either: scrolling changes neither the content nor the grant.
+	 */
 	private syncGridPaperBox(): void {
 		const scroller = this.view?.scrollDOM;
 		if (!scroller?.isConnected) { this.removeGridPaperBox(); return; }
@@ -7358,6 +7362,18 @@ export class InkOverlayPlugin {
 	}
 
 	/**
+	 * THE PAGE'S BLANK INSIDE ITS PANE, painted px, both axes from one read pair. Positive means the
+	 * canvas's edge sits inside the pane, which is the case s97 addendum 1 corrects. Against the
+	 * SCROLLER and not the viewport: the settle writes scroll as well as pan, so an absolute rect moves
+	 * by the scroll too and reports a distance the page never travelled. The sizer is not read - the
+	 * intermediates carry their own offsets [Engineer, ENGINEER-add16-edge-source.md].
+	 */
+	private settleBlank(): { x: number; y: number } {
+		const content = this.view.contentDOM.getBoundingClientRect(), scroller = this.view.scrollDOM.getBoundingClientRect();
+		return { x: content.left - scroller.left, y: content.top - scroller.top };
+	}
+
+	/**
 	 * THE WINDOW A SETTLED PAN MAY SIT IN on one axis, as offsets from the
 	 * position the content sits at with no pan (its leading edge against the
 	 * viewport's).
@@ -7388,18 +7404,6 @@ export class InkOverlayPlugin {
 	 * pinch that comes back near its start, both read as pans and are not
 	 * clamped.
 	 */
-	/**
-	 * THE PAGE'S BLANK INSIDE ITS PANE, painted px, both axes from one read pair. Positive means the
-	 * canvas's edge sits inside the pane, which is the case s97 addendum 1 corrects. Against the
-	 * SCROLLER and not the viewport: the settle writes scroll as well as pan, so an absolute rect moves
-	 * by the scroll too and reports a distance the page never travelled. The sizer is not read - the
-	 * intermediates carry their own offsets [Engineer, ENGINEER-add16-edge-source.md].
-	 */
-	private settleBlank(): { x: number; y: number } {
-		const content = this.view.contentDOM.getBoundingClientRect(), scroller = this.view.scrollDOM.getBoundingClientRect();
-		return { x: content.left - scroller.left, y: content.top - scroller.top };
-	}
-
 	private panAxisWindow(size: number, span: number): { fits: boolean; min: number; max: number } {
 		if (!(Number.isFinite(size) && Number.isFinite(span))) return { fits: false, min: -MAX_VIEWPORT_LAYOUT, max: MAX_VIEWPORT_LAYOUT };
 		if (size > 0 && size <= span + PAN_FIT_SLACK_PX) return { fits: true, min: 0, max: Math.max(0, span - size) };
@@ -7589,11 +7593,6 @@ export class InkOverlayPlugin {
 	}
 
 	/**
-	 * WHERE A CENTRED COLUMN RESTS at scale `next`, as a host-local margin, or null when this column has no rest (the
-	 * guards are the ones above). `applyViewportBox` writes it as the sizer's margin at rest, so the resting page needs no
-	 * pan; `columnRestPan` reads it too, and returns the difference the layout has not taken.
-	 */
-	/**
 	 * s121 add. 6: THE FIT QUESTION SURVIVES THE CENTRED REST. Two settle sites asked "does the column have a
 	 * rest to sit in" by testing `columnRestPan !== null`, and used the answer for something else: a page that
 	 * fits the pane never settles onto a sideways SCROLL (its place is the margin, and a scroll left standing
@@ -7634,6 +7633,10 @@ export class InkOverlayPlugin {
 	 * The margin a RESTING frame gives a centred column, or null while a gesture is live (the pan holds it then) and for
 	 * every column that has no rest. Set on each commit before `applyViewportBox` writes the box; cleared for preview
 	 * frames, which keep the frozen margin so no layout moves under the fingers.
+	 *
+	 * WHERE A CENTRED COLUMN RESTS at scale `next`, as a host-local margin, or null when this column has no rest (the
+	 * guards are the ones above). `applyViewportBox` writes it as the sizer's margin at rest, so the resting page needs no
+	 * pan; `columnRestPan` reads it too, and returns the difference the layout has not taken.
 	 */
 	private columnRestMargin: number | null = null;
 
@@ -7650,19 +7653,6 @@ export class InkOverlayPlugin {
 	/** Counted whenever the settle's clamp moved a pan on a FITTING axis, with the largest correction so far. */
 	private panBoundHits = 0;
 	private panBoundMaxPx = 0;
-	/**
-	 * Start the bounce for the settle `hold`, from the overshoot `dx`/`dy` (the
-	 * clamp's correction, painted px, requested minus accepted). A settle
-	 * re-anchoring itself on a later frame does not bounce again, whether its
-	 * bounce is still playing or has ended: that would put the page back at the
-	 * overshoot.
-	 *
-	 * Per axis, and not where Infinite Canvas is on in that direction: a page
-	 * pushed left or up shows the room scrolling would grow into there, so there
-	 * is no boundary to bounce off (the correction then lands as it always did).
-	 * A page pushed right or down shows the note's origin edge, which Infinite
-	 * Canvas never extends past, so it bounces either way.
-	 */
 	/**
 	 * The page is being held past an end by the finger. Painted here, live, on the same
 	 * offset the bounce uses - `panX`/`panY` already add it, so one write shows it on the
@@ -7743,6 +7733,19 @@ export class InkOverlayPlugin {
 		this.writeViewportPan();
 	}
 
+	/**
+	 * Start the bounce for the settle `hold`, from the overshoot `dx`/`dy` (the
+	 * clamp's correction, painted px, requested minus accepted). A settle
+	 * re-anchoring itself on a later frame does not bounce again, whether its
+	 * bounce is still playing or has ended: that would put the page back at the
+	 * overshoot.
+	 *
+	 * Per axis, and not where Infinite Canvas is on in that direction: a page
+	 * pushed left or up shows the room scrolling would grow into there, so there
+	 * is no boundary to bounce off (the correction then lands as it always did).
+	 * A page pushed right or down shows the note's origin edge, which Infinite
+	 * Canvas never extends past, so it bounces either way.
+	 */
 	private startOverscrollBounce(hold: object, dx: number, dy: number, travelled = false): boolean {
 		const offset = this.bounceOffset;
 		// The unit fixtures drive the settle against partial objects built with Object.create: no class fields, no bounce.
@@ -7856,11 +7859,6 @@ export class InkOverlayPlugin {
 		if (by > this.panBoundMaxPx) this.panBoundMaxPx = by;
 	}
 
-	/**
-	 * The fit quantities the settle bounds by, read-only, for a fixture that has
-	 * to check its own regime against the code's rather than re-derive it from
-	 * the DOM. Sizes are painted px at the scale in force.
-	 */
 	/** s150 add. 2, read-only: the drag-frame gate's inputs on the last preview frame. */
 	dragGateReadout(): { dragFrame: boolean; neverZoomed: boolean; steady: boolean; next: number; fromScale: number; fromScaleValid: boolean;
 		rawX: number; cx: number; rawY: number; cy: number; restCeilX: number; startX: number; startY: number; lastX: number; lastY: number;
@@ -7872,6 +7870,11 @@ export class InkOverlayPlugin {
 			floorX: b.floorX, floorY: b.floorY };
 	}
 
+	/**
+	 * The fit quantities the settle bounds by, read-only, for a fixture that has
+	 * to check its own regime against the code's rather than re-derive it from
+	 * the DOM. Sizes are painted px at the scale in force.
+	 */
 	panFitReadout(): { fitsX: boolean; fitsY: boolean; contentX: number; contentY: number; viewportX: number; viewportY: number; boundHits: number; boundMaxPx: number } {
 		const layout = this.viewportLayout;
 		const path = this.filePath(), extent = (path ? surfaceExtents.get(path) : null) ?? { x: 0, y: 0 };

@@ -345,6 +345,7 @@ describe("a blur with a finger down strands no touch bookkeeping", () => {
 		const ev = {
 			type: "touchend",
 			target: el,
+			touches: [],
 			changedTouches: [{ identifier }],
 			preventDefault: () => void (prevented = true),
 			stopPropagation: () => void (stopped = true),

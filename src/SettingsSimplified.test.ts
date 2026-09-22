@@ -2,13 +2,15 @@
  * THREE ROWS OUT OF THE SETTINGS TAB, ONE KEPT (1.4.20, Alan's settings
  * simplification).
  *
- *   Pressure sensitivity  the switch is gone and pressure is always on. A vault
- *                         that stored `false` loads ON: a stored value with no
- *                         row left to change it back would be off forever.
- *                         Its Recalibrate button is a separate feature (it
- *                         forgets the learned per-device pressure max) and is
- *                         the only road to `resetPressureCalibration`, so it
- *                         moves to the Developer group (Alan: A3).
+ *   Pressure sensitivity  BACK (s236). Removing the row pinned the setting on,
+ *                         and saved strokes are shaped at render time, so a
+ *                         vault that had chosen off redrew its old ink under
+ *                         the pressure law and the ink became illegible. The
+ *                         stored value is honoured again and the row is back,
+ *                         as a toggle only: its Recalibrate button is a
+ *                         separate feature (it forgets the learned per-device
+ *                         pressure max) and keeps the Developer row it was
+ *                         given here (Alan: A3).
  *   Toolbar placement     KEPT. Its removal was reverted on Alan's word: the
  *                         dropdown is the only keyboard route to placement (the
  *                         drag grip is hidden from assistive tech on purpose,
@@ -20,8 +22,8 @@
  *   Boox mode             moved, not changed: into the existing Developer group.
  *
  * `setControlValue` ignores keys it has no case for, so the removed rows' cases
- * are removed with them: no road is left from the tab to pressure off, and none
- * to mouse ink.
+ * are removed with them: no road is left from the tab to mouse ink. Pressure
+ * sensitivity has its case back, because its row is back.
  *
  * Harness as PressureCurveRemoved.test.ts: `Object.create` on the real plugin
  * and tab, the settings object main.ts builds, nothing restated here.
@@ -132,13 +134,13 @@ function recordingSetting(): { setting: unknown; buttons: { text: string; click:
 }
 
 describe("the removed rows are gone from the settings tab", () => {
-	it("has no Pressure sensitivity or Mouse ink row, by name or by key", async () => {
+	it("has no Mouse ink row, by name or by key", async () => {
 		const rows = flatten(tabFor(await loaded({})).getSettingDefinitions());
 		const names = rows.map((r) => r.name);
 		const keys = rows.map((r) => r.control?.key);
 		expect(rows.length, "the definitions flattened to something").toBeGreaterThan(10);
-		for (const name of ["Pressure sensitivity", "Mouse ink"]) expect(names, name).not.toContain(name);
-		for (const key of ["pressureSensitivity", "mouseInk"]) expect(keys, key).not.toContain(key);
+		for (const name of ["Mouse ink"]) expect(names, name).not.toContain(name);
+		for (const key of ["mouseInk"]) expect(keys, key).not.toContain(key);
 	});
 
 	it("keeps the Toolbar placement dropdown, the keyboard route to placement, in the Toolbar group", async () => {
@@ -209,24 +211,34 @@ describe("Boox mode and Recalibrate live in the Developer group", () => {
 	});
 });
 
-describe("pressure is always on", () => {
+describe("pressure sensitivity is stored, not pinned", () => {
+	// The 1.4.20 shape loaded ON from every one of these and saved ON, which is
+	// how a vault that had chosen off lost the choice permanently: the value was
+	// rewritten true on the next save, with no row left to set it back.
 	it.each([
-		["no file", undefined],
-		["a stored true", { pressureSensitivity: true }],
-		["a stored false", { pressureSensitivity: false }],
-		["the pre-rename inkShaping false", { inkShaping: false }],
-	])("loads ON from %s, and saves ON", async (_label, raw) => {
+		["no file", undefined, true],
+		["a stored true", { pressureSensitivity: true }, true],
+		["a stored false", { pressureSensitivity: false }, false],
+		["the pre-rename inkShaping false", { inkShaping: false }, false],
+	])("loads %s as %s, and saves what it loaded", async (_label, raw, expected) => {
 		const plugin = await loaded(raw);
-		expect(plugin.settings.pressureSensitivity).toBe(true);
+		expect(plugin.settings.pressureSensitivity).toBe(expected);
 		await proto.persistSettings.call(plugin);
-		expect(plugin.saved?.pressureSensitivity).toBe(true);
+		expect(plugin.saved?.pressureSensitivity).toBe(expected);
 	});
 
-	it("gives the settings tab no road to pressure off", async () => {
+	// The row is the only way back for a vault 1.4.20 already rewrote to true,
+	// so the road from the tab to pressure off has to reach PenStyle itself,
+	// not just the settings object: saved strokes are shaped at render time and
+	// read the renderer's flag, not the stored one.
+	it("gives the settings tab a road to pressure off, all the way to PenStyle", async () => {
 		const plugin = await loaded({});
 		setPressureSensitivity(true);
 		try {
 			tabFor(plugin).setControlValue("pressureSensitivity", false);
+			expect(plugin.settings.pressureSensitivity).toBe(false);
+			expect(pressureSensitivityEnabled()).toBe(false);
+			tabFor(plugin).setControlValue("pressureSensitivity", true);
 			expect(plugin.settings.pressureSensitivity).toBe(true);
 			expect(pressureSensitivityEnabled()).toBe(true);
 		} finally {
@@ -234,9 +246,24 @@ describe("pressure is always on", () => {
 		}
 	});
 
+	it("keeps the row in the Pen group, as a toggle and nothing else", async () => {
+		const groups = tabFor(await loaded({})).getSettingDefinitions();
+		const pen = groups.filter((g) => g.heading === "Pen");
+		expect(pen, "one Pen group").toHaveLength(1);
+		const rows = flatten(groups).filter((r) => r.control?.key === "pressureSensitivity");
+		expect(rows, "one pressure row").toHaveLength(1);
+		expect(pen[0]!.items ?? []).toContain(rows[0]);
+		expect(rows[0]!.name).toBe("Pressure sensitivity");
+		expect(rows[0]!.control?.type).toBe("toggle");
+		// Recalibrate keeps its own Developer row; this one carries no button.
+		expect(rows[0]!.render, "no render hook on the pressure row").toBeUndefined();
+	});
+
 	it("applies the loaded value at startup", () => {
 		expect(MAIN).toContain("setPressureSensitivity(this.settings.pressureSensitivity);");
-		expect(MAIN.match(/setPressureSensitivity\(/g), "one call site in main.ts").toHaveLength(1);
+		// Two call sites since s236 restored the row: this one at startup, and
+		// the `setControlValue` case that the toggle goes through.
+		expect(MAIN.match(/setPressureSensitivity\(/g), "two call sites in main.ts").toHaveLength(2);
 	});
 });
 
