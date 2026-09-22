@@ -152,12 +152,6 @@ each command can be assigned its own hotkey.
 
 the commands are hidden by default because their number makes other Handwriting commands harder to find. disabling the setting removes them from the palette but preserves their hotkey assignments.
 
-
-
-### pinch zoom
-
-pinch to zoom works on notes and pdfs. the point where the pinch begins remains beneath your fingers while zooming.
-
 ### shape snap
 
 hold the pen still for about a third of a second at the end of a stroke to snap it into a line, triangle, rectangle, circle or ellipse.
@@ -177,16 +171,6 @@ with a mouse, pause at the end of a stroke and select **Snap**.
 ## how it works
 
 this is a section dedicated to anyone curious about the mechanisms
-
-### writing
-
-when you put pen to screen, then switch to keyboard and back, it should feel seamless. This is because of three layers interacting
-
-first, you are writing on an overlay canvas drawn to match the Obsidian text editor. this overlay is made in codemirror 6 and accepts+records pen inputs. codemirror 6 is a program component that Obsidian uses to handles things like typing, cursor movement, text selection, etc
-
-second layer is made of logic. the input guard lives here. He gets to decide which events belong to Handwriting and which fall through to Obsidian
-
-Obsidian or its live editor, sits underneath - this is the base where all inputs go unless otherwise claimed
 
 to sum up: Obsidian's live editor handles the Markdown. transparent canvas layer above it draws the ink. then logic layer decides whether or not the thing poking it is a pen, a finger, or a palm
 
@@ -218,24 +202,6 @@ this sounds pretty straightforward.
 
 however if you resize Obsidian, resize a window pane, change the font size, pinch the screen, zoom with ctrl+, ctrl-, or ctrl & scroll, use a theme that moves the text column, use a theme that moves the live editor, change the readable line length setting, or simply pan, the coordinates must transform to match
 
-### palm rejection
-
-most palm rejection tech starts with blocking hand input when pen begins input. Handwriting does this too.
-
-On notes, Handwriting's block persists 350 ms after pen lifts in case you brush the screen as you are lifting off.
-
-but this creates a problem: writers who hold their pen close to screen while scrolling with other hand
-
-because of this, pen-input blocked finger swipe gets one chance to prove it is a finger swiping. if it moves far enough, fast enough, and isn't reporting a palm-sized contact, it is allowed to become a pan. this is fairly reliable.
-
-however, palms can slide too, especially while you're erasing. if movement were the only test, lifting the eraser could suddenly let your resting hand drag the page. so movement isn't enough.
-
-therefore the input guard is given a short memory bank -  remembers whether a pen stroke happened at any point while a finger/palm touch was down. in this case, that contact stays blocked until you lift it
-
-a finger scrolling the page and a palm resting on it can look similar to bad logic, so Handwriting counts things like time in ms between hand contact to next pen input, whether contact stops moving after, size of the contact, speed of the contact, angle, etc
-
-this goes for pdfs too.
-
 ### undo/redo
 
 if you draw, type, then erase, ctrl+z should undo those things in the order you did them
@@ -245,24 +211,6 @@ this meant Obsidian, not just Handwriting, needed to know what an ink action is 
 each ink action had to be translated to be able to be recorded in obsidian's undo history. adding a stroke. moving a lasso selection. which strokes moved and by how much. erasing. what was removed and how much of it
 
 teaching these operations to participate in the editor's history alongside text gives seamless undo/redo for text and ink
-
-### saving and recovery
-
-I worked hard trying to guarantee that you wouldn't lose your ink no matter how hard you tried. i still didn't make it impossible so so be careful. :sob:
-
-some things i did included:
-
-before replacing the saved sidecar, Handwriting writes a complete temporary copy. if a save get corrupted or interrupted, recovery is possible
-
-if an ink file is corrupted, damaged, or can't be understood, Handwriting will refuse to overwrite it. this will stop you from loading a broken file and accidentally immediately overwriting all the information
-
-`Delete all ink` command always makes and saves a recovery copy before clearing the page. if that copy can't be saved, the command will refuse to delete ink
-
-every stroke is stored in memory first then saved to your drive with periodic saves when doing any writing. however there is still a short gap between drawing into memory and saving to disk so if you draw a stroke and then shut down your pc immediately, you might lose that stroke!
-
-also added an export to svg or pdf option so you can save your ink to use in other programs
-
-finally: deleting the entire handwriting folder will take all its recovery copies with it so be careful. and back up your vault!!
 
 if you have any questions i will try to answer as best i can
 
