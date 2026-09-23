@@ -96,6 +96,17 @@ Scroll down till you see this and hit the plus in upper right hand
 
 paste this in : ellimist-afk/handwriting > hit add plugin
 
+### method 4 - install this checkout
+
+from this repository, pass the absolute path of your vault:
+
+```bash
+npm ci
+npm run install:vault -- "/absolute/path/to/Your Vault"
+```
+
+the command shows the destination and asks for confirmation before it builds and installs the plugin. it updates `main.js`, `manifest.json`, and `styles.css`; existing plugin data is preserved.
+
 ### required
 
 Obsidian 1.12.3 or newer. please send reports.

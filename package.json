@@ -7,6 +7,7 @@
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit && node esbuild.config.mjs production",
+		"install:vault": "node scripts/install-vault.mjs",
 		"test": "vitest run",
 		"test:render": "vitest run --config vitest.render.mts",
 		"test:release-smoke": "node scripts/release-smoke.mjs",
