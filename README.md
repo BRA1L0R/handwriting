@@ -123,6 +123,14 @@ the keyboard button disables pen input so a tap can place the caret and open the
 
 this also applies to pdfs. with the pen disabled, taps pass through to the pdf viewer.
 
+### pressure sensitivity
+
+Settings → Pen → Pressure sensitivity controls new pen strokes. The choice is
+captured when the pen touches down. Turning it off records a fixed effective
+pressure at the historical off-width; it does not change existing ink. Pen
+speed can still affect width. Mouse, finger ink and highlighters keep their
+own input behavior.
+
 ### mouse input
 
 to use the toolbar with a mouse, run `Handwriting: Mouse on / off`.

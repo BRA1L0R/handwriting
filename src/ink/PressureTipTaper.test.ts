@@ -73,7 +73,7 @@ describe("pressure ink has no geometric tip taper", () => {
 		expect(tapered).toBeLessThan(0.5 * untapered);
 	});
 
-	it("legacy (1.4.12) ink and pressure-off ink keep their tips, committed and wet", () => {
+	it("legacy ink keeps its taper and constant-pressure exp7 uses ordinary exp7 tips", () => {
 		const pts = quickLiftStroke();
 		const check = (style: PenStyle, label: string) => {
 			const ribbon = flattenStrokeShaped(pts, style, 2);
@@ -84,7 +84,9 @@ describe("pressure ink has no geometric tip taper", () => {
 		};
 		check(legacyStyle(), "legacy");
 		setPressureSensitivity(false);
-		check(exp7Style(), "exp7 pressure off");
+		const constant = pts.map(p => ({ ...p, pressure: 0.32 }));
+		expect(flattenStrokeShaped(constant, exp7Style(), 2)).toEqual(flattenStrokeShaped(constant, exp7Style(), 2, UNTAPERED));
+		expect(wet(constant, exp7Style())).toEqual(wet(constant, exp7Style(), UNTAPERED));
 	});
 });
 

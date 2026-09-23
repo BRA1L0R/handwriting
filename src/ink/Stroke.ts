@@ -8,7 +8,7 @@ import type { PressureProfile, StrokeWidthMode } from "./StrokeWidth";
 export interface InkPoint {
 	x: number;
 	y: number;
-	/** 0..1; mouse/unknown devices are normalized to 0.5 by the builder. */
+	/** Effective ink pressure, 0..1, after input calibration and pen preferences. */
 	pressure: number;
 	/** ms, relative to stroke start (keeps numbers small for later storage). */
 	t: number;

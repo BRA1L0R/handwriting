@@ -152,13 +152,14 @@ describe("the pen's quarter-pressure lift sample is drawn at the previous pressu
 		expect(flattenStrokeShaped(pts, style, 2)).toEqual(flattenStrokeShaped(pts, style, 2, NO_HOLD));
 	});
 
-	it("leaves legacy (1.4.12) ink and pressure-off ink alone", () => {
+	it("leaves legacy ink and constant effective pressure alone", () => {
 		const pts = quickLiftStroke();
 		const legacy: PenStyle = legacyStyle();
 		expect(flattenStrokeShaped(pts, legacy, 2)).toEqual(flattenStrokeShaped(pts, legacy, 2, NO_HOLD));
 		setPressureSensitivity(false);
 		const style = exp7Style();
-		expect(flattenStrokeShaped(pts, style, 2)).toEqual(flattenStrokeShaped(pts, style, 2, NO_HOLD));
+		const constant = pts.map(p => ({ ...p, pressure: 0.32 }));
+		expect(flattenStrokeShaped(constant, style, 2)).toEqual(flattenStrokeShaped(constant, style, 2, NO_HOLD));
 	});
 
 	it("leaves the wet layer alone", () => {

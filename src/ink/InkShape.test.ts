@@ -209,14 +209,14 @@ describe("flattenStrokeShaped — the committed geometry", () => {
 		);
 	});
 
-	it("erases raw pressure from the full OFF ribbon, while ON still responds", () => {
+	it("keeps stored pressure in the ribbon regardless of the capture preference", () => {
 		const low = line(24, 3, 5, 0.06);
 		const high = line(24, 3, 5, 0.959);
 		expect(flattenStrokeShaped(low, DEFAULT_PEN, 1)).not.toEqual(
 			flattenStrokeShaped(high, DEFAULT_PEN, 1)
 		);
 		setPressureSensitivity(false);
-		expect(flattenStrokeShaped(low, DEFAULT_PEN, 1)).toEqual(
+		expect(flattenStrokeShaped(low, DEFAULT_PEN, 1)).not.toEqual(
 			flattenStrokeShaped(high, DEFAULT_PEN, 1)
 		);
 	});

@@ -229,8 +229,8 @@ describe("pressure sensitivity is stored, not pinned", () => {
 
 	// The row is the only way back for a vault 1.4.20 already rewrote to true,
 	// so the road from the tab to pressure off has to reach PenStyle itself,
-	// not just the settings object: saved strokes are shaped at render time and
-	// read the renderer's flag, not the stored one.
+	// not just the settings object: StrokeBuilder captures this preference at
+	// pen-down. Saved strokes no longer consult it when rendered.
 	it("gives the settings tab a road to pressure off, all the way to PenStyle", async () => {
 		const plugin = await loaded({});
 		setPressureSensitivity(true);

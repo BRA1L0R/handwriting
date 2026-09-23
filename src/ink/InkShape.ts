@@ -1,4 +1,4 @@
-import { PenStyle, pressureSensitivityEnabled, widthForPressure } from "./PenStyle";
+import { PenStyle, widthForPressure } from "./PenStyle";
 import { smoothSegments } from "./Smoothing";
 import { InkPoint } from "./Stroke";
 import { RibbonPt, flattenSegmentHw } from "./Ribbon";
@@ -46,20 +46,21 @@ export interface ShapeParams {
 	tipFloor: number;
 	/**
 	 * A final sample whose pressure is at or below this share of the one
-	 * before it is drawn at the one before's pressure (0 = never). exp7 ink
-	 * with pressure sensitivity on only; see shapedHalfWidths.
+	 * before it is drawn at the one before's pressure (0 = never). Applies
+	 * to exp7 pressure-profile ink only; see shapedHalfWidths.
 	 */
 	liftHoldRatio: number;
 	/**
-	 * Whether exp7 ink with pressure sensitivity on still takes the geometric
+	 * Whether exp7 pressure-profile ink still takes the geometric
 	 * tip taper, the pre-1.4.20 law (see applyEndTaper). false: pressure draws
 	 * the tips. A plant for tests and for the frozen pre-1.4.20 oracle; legacy
-	 * and pressure-off ink take the taper either way.
+	 * ink takes the taper either way. Constant effective pressure uses the
+	 * same exp7 geometry as measured pressure.
 	 */
 	exp7TipTaper: boolean;
 	/**
 	 * The fastest the half-width may change per world unit of path, either
-	 * way (Infinity = uncapped). exp7 ink with pressure sensitivity on only;
+	 * way (Infinity = uncapped). exp7 pressure-profile ink only;
 	 * see RIBBON_EDGE_SLOPE.
 	 */
 	edgeSlope: number;
@@ -179,8 +180,8 @@ function taperEase(u: number, tipFloor: number): number {
  * at or below `liftHoldRatio` of the one before is therefore drawn at the
  * one before's pressure. It keeps its position, so the ink still reaches the
  * pen-up point, and every earlier sample is untouched (the filter is causal).
- * Legacy ink and pressure-off ink are left as they were: the first has a
- * fixed tip floor, the second never reads pressure. The wet layer cannot know
+ * Legacy ink keeps its fixed tip floor. Constant effective pressure has no
+ * lift drop to hold. The wet layer cannot know
  * which sample is last, so the change lands with the committed repaint.
  */
 export function shapedHalfWidths(
@@ -193,7 +194,6 @@ export function shapedHalfWidths(
 	const last = points.length - 1;
 	const held =
 		style.pressureProfile === "exp7" &&
-		pressureSensitivityEnabled() &&
 		params.liftHoldRatio > 0 &&
 		last > 1 &&
 		points[last]!.pressure <= params.liftHoldRatio * points[last - 1]!.pressure;
@@ -221,7 +221,7 @@ export function shapedHalfWidths(
 
 /** Whether this style's half-widths take the edge slope cap. */
 function edgeSlopeFor(style: PenStyle, params: ShapeParams): boolean {
-	return style.pressureProfile === "exp7" && pressureSensitivityEnabled() && Number.isFinite(params.edgeSlope);
+	return style.pressureProfile === "exp7" && Number.isFinite(params.edgeSlope);
 }
 
 /** `hw`, moved no further from the previous (capped) half-width than `slope` per unit of travel `d`. */
@@ -237,14 +237,14 @@ function capEdge(hw: number, previous: number, d: number, slope: number): number
  * both ends of a flattened ribbon. Mutates `pts` in place (they are always
  * freshly built by the caller).
  *
- * Pressure ink draws its own tips (1.4.20). exp7 ink with pressure sensitivity
- * on starts and ends at the width its pressure gives, with no geometric taper.
+ * Pressure ink draws its own tips (1.4.20). exp7 ink starts and ends at the
+ * width its pressure gives, with no geometric taper.
  * The taper it used to take floored each end at that end's width over the
  * stroke's widest, and a push starts light: its start was already thin from
  * pressure and the taper multiplied it by that small ratio again, to about a
  * sixth of what the wet layer had drawn while the pen was down, so the start
- * visibly vanished at lift. Legacy (1.4.12) ink and pressure-off ink, which
- * carry no pressure in their width, keep the taper; `exp7TipTaper` restores the
+ * visibly vanished at lift. Legacy (1.4.12) ink keeps its geometric taper;
+ * constant effective pressure uses exp7's ordinary tips. `exp7TipTaper` restores the
  * old law for exp7 as a plant.
  */
 export function applyEndTaper(
@@ -254,7 +254,7 @@ export function applyEndTaper(
 ): void {
 	const n = pts.length;
 	if (n < 2) return;
-	if (style.pressureProfile === "exp7" && pressureSensitivityEnabled() && !params.exp7TipTaper) return;
+	if (style.pressureProfile === "exp7" && !params.exp7TipTaper) return;
 	const arc: number[] = [0];
 	for (let i = 1; i < n; i++) {
 		const a = pts[i - 1]!;
@@ -280,7 +280,7 @@ export function applyEndTaper(
 	if (taperLen < 1e-9) return;
 	let startFloor = params.tipFloor;
 	let endFloor = params.tipFloor;
-	if (style.pressureProfile === "exp7" && pressureSensitivityEnabled()) {
+	if (style.pressureProfile === "exp7") {
 		let maxHw = 0;
 		for (const point of pts) if (point.hw > maxHw) maxHw = point.hw;
 		if (maxHw > 0) {
@@ -360,7 +360,7 @@ export class IncrementalShaper {
 		this.maxHw = this.startHw;
 		this.cappedHw = this.startHw;
 		this.lastHw = this.startHw *
-			(style?.pressureProfile === "exp7" && pressureSensitivityEnabled() ? 1 : this.params.tipFloor);
+			(style?.pressureProfile === "exp7" ? 1 : this.params.tipFloor);
 	}
 
 	/** Shaped half-width at this sample, start taper included. */
@@ -383,7 +383,7 @@ export class IncrementalShaper {
 		if (prev && edgeSlopeFor(style, this.params)) hw = capEdge(hw, this.cappedHw, d, this.params.edgeSlope);
 		this.cappedHw = hw;
 		this.maxHw = Math.max(this.maxHw, hw);
-		const exp7 = style.pressureProfile === "exp7" && pressureSensitivityEnabled();
+		const exp7 = style.pressureProfile === "exp7";
 		const startFloor = exp7
 			? Math.max(this.params.tipFloor, this.maxHw > 0 ? this.startHw / this.maxHw : this.params.tipFloor)
 			: this.params.tipFloor;

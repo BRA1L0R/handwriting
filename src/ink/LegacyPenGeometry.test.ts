@@ -19,7 +19,10 @@ function expectRibbon(actual: RibbonPt[], expected: RibbonPt[]): void {
 
 afterEach(() => setPressureSensitivity(true));
 
-describe.each(historical.cases)(
+// Saved pressure now always determines legacy geometry. The old global-off
+// rendering mode cannot be inferred from a sidecar and is no longer applied.
+// These frozen arrays guard the unchanged sample-driven legacy law.
+describe.each(historical.cases.filter((value) => value.pressureOn))(
 	"saved 1.4.12 pen geometry: pressure=$pressure, sensitivity=$pressureOn",
 	(frozen) => {
 		function savedStroke() {

@@ -718,7 +718,7 @@ const tipModeSurfaces = new Set<() => void>();
  * And the same surfaces need to know when a RENDER-TIME setting changed the
  * committed geometry under them. `repaintAllInkOverlays` walked `instances`,
  * which is the editor overlays and nothing else, so flipping Ink smoothing or
- * pressure sensitivity left every open PDF and every page view showing ink in
+ * (historically) pressure sensitivity left PDFs and page views showing ink in
  * the old shape until something unrelated happened to repaint it - on the
  * surface the plugin calls the headline use for writing.
  */
@@ -1160,9 +1160,8 @@ export function armMouseInkQuietlyEverywhere(): void {
 }
 
 /**
- * Repaint every surface's committed ink: the shaping, smoothing and pressure
- * toggles all change render-time geometry and none of them touches a stroke,
- * so nothing else would.
+ * Repaint every surface's committed ink after shaping or smoothing changes.
+ * Pressure sensitivity is capture-only and does not use this path.
  */
 export function repaintAllInkOverlays(): void {
 	for (const p of instances) { p.clearSnapPreview(); p.scheduleRepaint("shaping-toggle"); }

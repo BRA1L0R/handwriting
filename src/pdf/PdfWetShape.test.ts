@@ -21,7 +21,7 @@
  * real one and not a stand-in for it.
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { InkOp } from "../inline/InkHistory";
 import { InkStroke } from "../ink/Stroke";
 import { PenSample } from "../input/PointerRouter";
@@ -29,6 +29,9 @@ import { resetTipModeForTest } from "../inline/TipMode";
 import { WetInkRenderer } from "../ink/WetInkRenderer";
 import { TailRenderer } from "../ink/TailRenderer";
 import { inkShapingEnabled, setInkShaping } from "../ink/InkShape";
+import { setPressureSensitivity } from "../ink/PenStyle";
+
+afterEach(() => { setPressureSensitivity(true); setInkShaping(true); });
 
 /** The gesture path constructs observers; node has none and none is needed. */
 class NoopObserver {
@@ -92,6 +95,8 @@ interface Drawn {
 	/** What the committed renderer will decide for the stroke that landed. */
 	commitShaped: boolean;
 	strokes: InkStroke[];
+	wetPressures: number[];
+	predictionPressures: number[];
 }
 
 /**
@@ -104,9 +109,9 @@ interface Drawn {
  * called and the injected pair survives pen-down. `wetOn` is a pure read of
  * `pair` and `wetHostPage`, so the layer the controller finds is this one.
  */
-function drawWith(pointerType: string | undefined): Drawn {
+function drawWith(pointerType: string | undefined, afterDown = () => {}, shape = true): Drawn {
 	resetTipModeForTest();
-	setInkShaping(true);
+	setInkShaping(shape);
 	const ops: InkOp[] = [];
 	// A mouse keeps the nib reticle on (`if (!this.mouseStroke)
 	// this.hideCursor()`), so the mouse path alone walks into `showCursor`,
@@ -178,17 +183,35 @@ function drawWith(pointerType: string | undefined): Drawn {
 	// `beginStroke` would leave `shapingThisStroke` wrong while `shape` looks
 	// right, and only sampling here tells the two apart.
 	let shapeAtLatch: boolean | undefined;
+	const wetPressures: number[] = [];
 	const realBegin = wet.beginStroke.bind(wet);
 	wet.beginStroke = (...args: Parameters<WetInkRenderer["beginStroke"]>) => {
 		shapeAtLatch = wet.shape;
+		wetPressures.push(args[0].pressure);
 		realBegin(...args);
+	};
+	const realAppend = wet.appendPoint.bind(wet);
+	wet.appendPoint = (...args: Parameters<WetInkRenderer["appendPoint"]>) => {
+		wetPressures.push(args[2].pressure);
+		realAppend(...args);
 	};
 
 	const pen = controller as unknown as Pen;
+	const predictionPressures: number[] = [];
+	const realWidth = wet.liveWidthPx.bind(wet);
+	wet.liveWidthPx = (...args: Parameters<WetInkRenderer["liveWidthPx"]>) => {
+		predictionPressures.push(args[2]);
+		return realWidth(...args);
+	};
 	const ev = pointerType === undefined ? undefined : ({ pointerType } as PointerEvent);
-	pen.penDown(sample(200, 200, 0), ev);
-	pen.penRaw([sample(240, 250, 16)]);
-	pen.penRaw([sample(290, 300, 32)]);
+	pen.penDown(sample(200, 200, 1000), ev);
+	afterDown();
+	pen.penRaw([sample(210, 210, 1016)]);
+	pen.penRaw([sample(220, 220, 1032)]);
+	const predict = controller as unknown as {
+		drawPredictedTail(ev: PointerEvent, box: unknown, scale: number, scroll: HTMLElement): void;
+	};
+	predict.drawPredictedTail({} as PointerEvent, (probe.current as { pages: unknown[] }).pages[0], SCALE, scroller as unknown as HTMLElement);
 	pen.penUp();
 
 	const added = ops.filter((op) => op.type === "add") as Extract<InkOp, { type: "add" }>[];
@@ -203,10 +226,30 @@ function drawWith(pointerType: string | undefined): Drawn {
 		wetShaped: (wet as unknown as Latch).shapingThisStroke,
 		commitShaped,
 		strokes: drawnStrokes,
+		wetPressures,
+		predictionPressures,
 	};
 }
 
 describe("the pdf wet layer agrees with the commit about shaping", () => {
+	it("uses effective pressure for the PDF prediction tail when width shaping is disabled", () => {
+		setPressureSensitivity(false);
+		const drawn = drawWith("pen", () => setPressureSensitivity(true), false);
+		expect(drawn.wetPressures).toEqual([0.32, 0.32, 0.32]);
+		expect(drawn.predictionPressures).toEqual([0.32]);
+	});
+
+	it.each([true, false])("captures pressure at pen-down for live and saved PDF ink (on=%s)", on => {
+		setPressureSensitivity(on);
+		const drawn = drawWith("pen", () => setPressureSensitivity(!on));
+		const expected = on ? 0.5 : 0.32;
+		expect(drawn.wetPressures).toEqual([expected, expected, expected]);
+		expect(drawn.strokes).toHaveLength(1);
+		expect(drawn.strokes[0]!.points.map(p => p.pressure)).toEqual(drawn.wetPressures);
+		expect(drawn.strokes[0]!.points.map(p => p.t)).toEqual([0, 16, 32]);
+		expect(drawn.strokes[0]!.pressureProfile).toBe("exp7");
+	});
+
 	it("does not shape a mouse stroke live, because it will not shape it at pen-up", () => {
 		const drawn = drawWith("mouse");
 		expect(drawn.strokes).toHaveLength(1);

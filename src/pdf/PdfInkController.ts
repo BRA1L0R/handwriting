@@ -793,6 +793,8 @@ export class PdfInkController {
 	private frame: PenFrame | null = null;
 	/** The last drawn point, in page units, for the wet segment. */
 	private wetFrom: { x: number; y: number; pressure: number } | null = null;
+	/** Effective pressure last painted, for prediction when width shaping is off. */
+	private ribbonPressure = 0.5;
 	/**
 	 * Whether the wet layer has been told this stroke started.
 	 *
@@ -3048,6 +3050,7 @@ export class PdfInkController {
 			undefined,
 			this.mouseStroke ? "mouse" : undefined
 		);
+		this.builder.start(sample.timestamp);
 		this.predReal = [];
 		this.predLastTail = [];
 		this.metrics.begin("pdf-ink", performance.now());
@@ -3427,7 +3430,7 @@ export class PdfInkController {
 			newest.y * scale,
 			result.points,
 			this.strokeStyle.color,
-			pair.wet.liveWidthPx(cam, this.strokeStyle, newest.pressure)
+			pair.wet.liveWidthPx(cam, this.strokeStyle, this.ribbonPressure)
 		);
 	}
 
@@ -3556,6 +3559,7 @@ export class PdfInkController {
 	 * ported.
 	 */
 	private drawWet(box: PageBox, point: InkPoint): void {
+		this.ribbonPressure = point.pressure;
 		const pair = this.wetOn(box.pageNumber);
 		const cam = this.cameraFor(box);
 		if (!pair || !cam) return;

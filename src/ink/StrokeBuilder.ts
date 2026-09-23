@@ -1,5 +1,13 @@
 import { InkPoint, InkStroke, InkTool, computeBBox, newStrokeId } from "./Stroke";
 import type { StrokeWidthMode, PressureProfile } from "./StrokeWidth";
+import { pressureSensitivityEnabled } from "./PenStyle";
+
+/**
+ * exp7 evaluated at 0.32 is its historical pressure-off width factor,
+ * 0.9945718882219903. Store that effective pressure in the ordinary point
+ * format; it also survives the sidecar's three-decimal pressure precision.
+ */
+const PRESSURE_OFF_SAMPLE = 0.32;
 
 /**
  * Some pens keep reporting contact while the nib is already leaving the
@@ -44,6 +52,9 @@ export const RELEASE_MAX_MS = 50;
  */
 export class StrokeBuilder {
 	private points: InkPoint[] = [];
+	/** Input evidence for lift filtering only; never rendered or serialized. */
+	private measuredPressures: number[] = [];
+	private fixedPressure: number | undefined;
 	private startedAt = 0;
 	private tool: InkTool;
 	private color: string;
@@ -83,6 +94,10 @@ export class StrokeBuilder {
 	start(now: number): void {
 		this.startedAt = now;
 		this.points = [];
+		this.measuredPressures = [];
+		this.fixedPressure = this.tool === "pen" && this.device !== "mouse" &&
+			this.widthMode !== "uniform" && !pressureSensitivityEnabled()
+			? PRESSURE_OFF_SAMPLE : undefined;
 	}
 
 	/**
@@ -90,6 +105,7 @@ export class StrokeBuilder {
 	 * it was deduped (too close to the previous sample).
 	 */
 	add(x: number, y: number, pressure: number, timestamp: number, tiltX?: number, tiltY?: number): InkPoint | undefined {
+		const effectivePressure = this.fixedPressure ?? pressure;
 		const prev = this.lastPoint;
 		if (prev) {
 			const dx = x - prev.x;
@@ -97,19 +113,21 @@ export class StrokeBuilder {
 			if (dx * dx + dy * dy < this.minDist * this.minDist) {
 				// Keep the newest pressure on the retained point so a held,
 				// pressed pen still updates width later.
-				prev.pressure = pressure;
+				prev.pressure = effectivePressure;
+				this.measuredPressures[this.measuredPressures.length - 1] = pressure;
 				return undefined;
 			}
 		}
 		const point: InkPoint = {
 			x,
 			y,
-			pressure,
+			pressure: effectivePressure,
 			t: Math.max(0, Math.round(timestamp - this.startedAt)),
 		};
 		if (tiltX !== undefined) point.tiltX = tiltX;
 		if (tiltY !== undefined) point.tiltY = tiltY;
 		this.points.push(point);
+		this.measuredPressures.push(pressure);
 		return point;
 	}
 
@@ -175,9 +193,9 @@ export class StrokeBuilder {
 		let i = 0;
 
 		while (i < this.points.length) {
-			const point = this.points[i]!;
-			if (point.pressure >= CONFIDENT_CONTACT_PRESSURE) confidentContactSeen = true;
-			if (!confidentContactSeen || point.pressure > RELEASE_PRESSURE_MAX) {
+			const pressure = this.measuredPressures[i]!;
+			if (pressure >= CONFIDENT_CONTACT_PRESSURE) confidentContactSeen = true;
+			if (!confidentContactSeen || pressure > RELEASE_PRESSURE_MAX) {
 				i++;
 				continue;
 			}
@@ -186,7 +204,7 @@ export class StrokeBuilder {
 			let recoveryStart = -1;
 			let recoveryConfirmed = -1;
 			for (let j = i + 1; j < this.points.length; j++) {
-				const pressure = this.points[j]!.pressure;
+				const pressure = this.measuredPressures[j]!;
 				if (pressure <= RELEASE_PRESSURE_MAX) {
 					recoveryStart = -1;
 				} else if (recoveryStart < 0) {
@@ -208,7 +226,7 @@ export class StrokeBuilder {
 			// the release band that never reach confident contact; they ride with
 			// the run, but its span stops at its last light sample.
 			let lastLight = gapEnd;
-			while (lastLight > gapStart && this.points[lastLight]!.pressure > RELEASE_PRESSURE_MAX) lastLight--;
+			while (lastLight > gapStart && this.measuredPressures[lastLight]! > RELEASE_PRESSURE_MAX) lastLight--;
 			const lightSpan = this.points[lastLight]!.t - this.points[gapStart]!.t;
 			// Longer than a bounce, a light run is writing: not release, so it
 			// stays in this group.

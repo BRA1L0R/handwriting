@@ -361,11 +361,9 @@ interface HandwritingSettings {
 	/** Nib size multipliers per tool (v0.13.6): 0.6 fine · 1 medium · 1.8 bold. */
 	inkSizes: { pen: number; highlighter: number };
 	/**
-	 * Shaped ink rendering (v0.13.10): velocity thinning, filtered pressure
-	 * Off pins pressure to its no-pressure value, so width stops following how
-	 * hard you press. Speed thinning and the endpoint taper stay in both
-	 * states. Applied at render time, so flipping this restyles every stroke
-	 * ever written.
+	 * Pen capture preference, frozen at pen-down. Off records a constant
+	 * effective pressure at the historical off-width. Existing ink and strokes
+	 * already in progress never consult this preference when rendered.
 	 */
 	pressureSensitivity: boolean;
 	/** Shaped ribbon: velocity thinning and the start/end taper. */
@@ -4664,35 +4662,6 @@ export default class HandwritingPlugin extends Plugin {
 			this.settings.lastSeenVersion,
 			this.freshInstall
 		);
-		// One line to the vaults 1.4.20 caught. That release pinned pressure
-		// sensitivity on and rewrote a stored `false` to `true` on the next
-		// save, so a vault arriving from it draws its old ink under the
-		// pressure law and nothing in data.json says whether its owner ever
-		// chose that. 1.4.21 gives the row back; this says where it is, to the
-		// one version that can have been caught, on the one launch that reads
-		// `1.4.20` here - the record at the end then moves the version on.
-		//
-		// It goes FIRST, above the what's-new block. That block swallows its
-		// own failure and returns early so its notes retry next launch, and
-		// anything after it is skipped on that path - which would drop the one
-		// message this release exists to deliver (s238 add. 5).
-		//
-		// Reads only. Nothing about the setting is changed for them: which of
-		// these vaults wanted pressure on is not ours to guess.
-		if (this.settings.lastSeenVersion === "1.4.20" && this.settings.pressureSensitivity === true) {
-			try {
-				new Notice(
-					"Handwriting: ink too wide? Settings, Pen, Pressure sensitivity, off.",
-					20000
-				);
-			} catch (err) {
-				// Its own catch, deliberately: the record at the end is what
-				// keeps the what's-new notes from repeating, and a toast that
-				// failed to open must not cost that.
-				console.error("[handwriting] the pressure notice failed to open", err);
-			}
-		}
-
 		if (d.show) {
 			try {
 				new Notice(
@@ -6279,7 +6248,7 @@ export class HandwritingSettingTab extends PluginSettingTab {
 				items: [
 					{
 						name: "Pressure sensitivity",
-						desc: "Adjust line width with pen pressure. Default on.",
+						desc: "Vary new pen strokes with pressure. When off, new strokes use a fixed pressure. Existing ink is unchanged. Default on.",
 						// The ordinary control path, not 1.4.19's `render` one. That
 						// row carried a Recalibrate button beside the toggle, and a
 						// button can only reach a row through `render`; Recalibrate
@@ -6502,10 +6471,6 @@ export class HandwritingSettingTab extends PluginSettingTab {
 			case "pressureSensitivity":
 				s.pressureSensitivity = on;
 				setPressureSensitivity(on);
-				// Saved strokes are shaped at render time from their stored
-				// samples, so the width law changes under ink already on the
-				// page: every overlay has to draw again to show it.
-				repaintAllInkOverlays();
 				break;
 			case "strokePrediction":
 				s.strokePrediction = on;

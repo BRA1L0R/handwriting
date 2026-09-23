@@ -1,9 +1,8 @@
 import { CameraState } from "../camera/coordinates";
-import {
-	PenStyle,
-	pressureSensitivityEnabled,
-	shapeFor,
-	widthForPressure,
+import {
+	PenStyle,
+	shapeFor,
+	widthForPressure,
 } from "./PenStyle";
 import { SmoothSegment } from "./Smoothing";
 import { flattenStroke, RibbonPt } from "./Ribbon";
@@ -56,16 +55,11 @@ function strokeStyleFor(stroke: { color: string; tool?: InkTool }): string {
  * the toggle - keyed on `shaping` alone, toggling the setting would have
  * served that stroke its stale ribbon forever.
  *
- * `pressure` is `pressureSensitivityEnabled()`, which `widthForPressure`
- * substitutes at EVERY sample and which neither `shaping` nor `smooth`
- * implies: it is its own setting with its own command, and both writers
- * (`applyPressureSensitivity` and the settings tab) repaint by calling
- * `repaintAllInkOverlays`, which found rev, zoom, shaping and smooth all
- * unchanged and handed back the ribbon built under the OTHER width law. A
- * page could show two, whichever strokes happened to be cached. `tool` is
- * here for completeness of the derivation - it decides `flat`, which decides
- * both `shaping` and `smooth` - and costs a comparison; no in-place tool
- * mutation exists today, so it is a guard and not a fix.
+ * Effective pressure is stored in the stroke's samples, never read from the
+ * current capture preference. `tool` is here for completeness of the
+ * derivation - it decides `flat`, which decides both `shaping` and `smooth` -
+ * and costs a comparison; no in-place tool mutation exists today, so it is a
+ * guard and not a fix.
  *
  * Memory: a WeakMap holds nothing alive, so the cache is bounded by the
  * strokes the stores already hold. Ribbons for strokes scrolled far out of
@@ -81,7 +75,6 @@ interface RibbonEntry {
 	zoom: number;
 	shaping: boolean;
 	smooth: boolean;
-	pressure: boolean;
 	tool: InkStroke["tool"];
 	widthMode: InkStroke["widthMode"];
 	pressureProfile: InkStroke["pressureProfile"];
@@ -272,7 +265,6 @@ export function drawStroke(
 			return;
 		}
 		const rev = strokeRev(stroke);
-		const pressure = pressureSensitivityEnabled();
 		const hit = ribbonCache.get(stroke);
 		if (
 			hit !== undefined &&
@@ -280,7 +272,6 @@ export function drawStroke(
 			hit.zoom === cam.zoom &&
 			hit.shaping === shaping &&
 			hit.smooth === smooth &&
-			hit.pressure === pressure &&
 			hit.tool === stroke.tool &&
 			hit.widthMode === stroke.widthMode &&
 			hit.pressureProfile === stroke.pressureProfile
@@ -296,7 +287,6 @@ export function drawStroke(
 			zoom: cam.zoom,
 			shaping,
 			smooth,
-			pressure,
 			tool: stroke.tool,
 			widthMode: stroke.widthMode,
 			pressureProfile: stroke.pressureProfile,

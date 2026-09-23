@@ -138,13 +138,15 @@ describe("the quick and push synthetics never reach the cap", () => {
 		}
 	});
 
-	it("leaves legacy ink and pressure-off ink exactly as they were, even on a landing press", () => {
+	it("leaves legacy ink uncapped and caps exp7 independently of the capture preference", () => {
 		const points = landingPress();
 		const legacy = legacyStyle(MAX_NIB);
 		expect(shapedHalfWidths(points, legacy)).toEqual(shapedHalfWidths(points, legacy, UNCAPPED));
 		expect(flattenStrokeShaped(points, legacy, 2)).toEqual(flattenStrokeShaped(points, legacy, 2, UNCAPPED));
+		const style = exp7Style(MAX_NIB);
+		const before = shapedHalfWidths(points, style);
 		setPressureSensitivity(false);
-		const off = exp7Style(MAX_NIB);
-		expect(shapedHalfWidths(points, off)).toEqual(shapedHalfWidths(points, off, UNCAPPED));
+		expect(shapedHalfWidths(points, style)).toEqual(before);
+		expect(before).not.toEqual(shapedHalfWidths(points, style, UNCAPPED));
 	});
 });

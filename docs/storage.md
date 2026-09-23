@@ -109,6 +109,21 @@ page it was drawn on - which must never be read as note-surface geometry.
 
 ## the sidecar format
 
+Stroke points store effective ink pressure: device calibration and the pen's
+pressure preference are applied during capture. Pressure-off pen strokes use
+`0.32` with the existing `exp7` profile, matching its historical off-width
+before speed shaping. The preference itself is not stored on a stroke, and
+rendering never consults the current pressure switch. Live and saved ink use
+the same samples and shaping rules, including exp7's untapered pressure tips.
+
+Existing sidecars are not converted. Older builds stored measured pressure
+even with sensitivity off, without recording that choice. Those strokes now
+render from their stored samples; their historical off appearance cannot be
+recovered automatically. A stock older build still applies its global switch
+at render time, so opening the same data there can change its appearance.
+The private fork's `max` profile is not produced or interpreted here; like
+other unknown profiles it survives storage round trips as opaque metadata.
+
 JSON, one object, with `schemaVersion` first. This build writes version 1
 and reads up to version 2.
 

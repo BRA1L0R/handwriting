@@ -12,7 +12,7 @@ export interface PenStyle {
 	gamma: number;
 	/** Upper width factor at full pressure. */
 	maxWidthFactor: number;
-	/** Historical width factor when pressure sensitivity is disabled. */
+	/** Historical off-width reference; rendering now reads effective samples. */
 	pressureOffWidthFactor: number;
 	/** Per-stroke geometry generation, absent for the 1.4.12 policy. */
 	pressureProfile?: "exp7";
@@ -87,11 +87,8 @@ export const HIGHLIGHTER_ALPHA = 0.35;
 export const NO_PRESSURE = 0.5;
 
 /**
- * Pressure sensitivity, off for anyone who wants an even line.
- *
- * Each style carries its OFF width. Speed thinning and geometric endpoint
- * taper stay active in both states. Every stroke is styled at render time,
- * so flipping this restyles ink that was written years ago.
+ * Capture preference, frozen by StrokeBuilder at pen-down. Renderers use only
+ * stored effective samples so changing this cannot restyle existing ink.
  */
 let pressureSensitive = true;
 
@@ -108,7 +105,6 @@ export function pressureSensitivityEnabled(): boolean {
  * Devices that report no pressure send 0.5 (normalized upstream).
  */
 export function widthForPressure(style: PenStyle, pressure: number): number {
-	if (!pressureSensitive) return style.baseWidth * style.pressureOffWidthFactor;
 	const p = Math.min(1, Math.max(0, pressure));
 	const effective = Math.pow(p, style.gamma);
 	const factor =

@@ -111,25 +111,17 @@ describe("the committed ribbon cache", () => {
 		expect(ribbonCacheStats().hits).toBe(1);
 	});
 
-	it("misses after pressure sensitivity flips", () => {
-		// `widthForPressure` substitutes NO_PRESSURE at every sample when this
-		// is off, so it is a second width law with its own setting and its own
-		// command. It was absent from the key, and both writers repaint through
-		// `repaintAllInkOverlays`, which found rev, zoom, shaping and smooth all
-		// unchanged: the page kept the ribbon built under the OTHER law, and a
-		// page with some strokes cached and some not showed both (§5l/AE5).
+	it("keeps the cached geometry after the new-stroke pressure preference flips", () => {
 		const s = stroke();
 		draw(s);
 		setPressureSensitivity(false);
 		draw(s);
-		expect(ribbonCacheStats().flattens).toBe(2);
-		expect(ribbonCacheStats().hits).toBe(0);
-		draw(s);
+		expect(ribbonCacheStats().flattens).toBe(1);
 		expect(ribbonCacheStats().hits).toBe(1);
-		// And back again: the entry keyed on the old value must not be served.
 		setPressureSensitivity(true);
 		draw(s);
-		expect(ribbonCacheStats().flattens).toBe(3);
+		expect(ribbonCacheStats().flattens).toBe(1);
+		expect(ribbonCacheStats().hits).toBe(2);
 	});
 
 	it("misses when the stroke's tool changes", () => {

@@ -1,32 +1,4 @@
-/**
- * THE ONE-TIME NOTICE FOR VAULTS UPGRADING OUT OF 1.4.20 (s236 add. 9).
- *
- * 1.4.20 removed the Pressure sensitivity row and pinned the setting on, and
- * saved strokes are shaped at render time, so a vault that had chosen pressure
- * off redrew its old ink under the pressure law. 1.4.21 honours the stored
- * value again and gives the row back, but 1.4.20 had already rewritten a stored
- * `false` to `true` on its next save: those vaults load ON and have to switch
- * the row off once by hand. Nothing in data.json separates them from the vaults
- * that chose pressure on, so the notice goes to all of them and changes nothing.
- *
- * The three arms below are the whole contract: the version that can have been
- * caught and is still on (notice), any other version (silence), and the version
- * that can have been caught but is already off (silence).
- *
- * The what's-new toast is exercised beside the notice, not stubbed away. The
- * first version of this cell was green only because 1.4.21 had no RELEASE_NOTES
- * entry yet, so that toast never ran: the moment the version bump added one, the
- * real `whatsNewFragment` called Obsidian's `createFragment`, which does not
- * exist in this environment, and the notice was never reached. Three arms went
- * red in the package gate (s238 add. 5). The fake fragment below is what lets
- * the due-toast path run here, and the last arm holds that path open.
- *
- * WHAT THIS CANNOT PROVE. The `obsidian` package ships no runtime, so the real
- * `Notice` never runs here; the fake below records what the plugin asked the
- * screen to show, in order, with the duration it asked for. Nothing here
- * touches a vault, and `saveData` is asserted on rather than mocked away, so a
- * notice path that quietly wrote to disk would be caught.
- */
+/** Capture-only pressure must never advertise a switch that repairs old ink. */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const notices = vi.hoisted(() => ({ messages: [] as unknown[], durations: [] as number[] }));
@@ -169,87 +141,41 @@ async function launched(
 
 const pressureNotices = (): unknown[] => notices.messages.filter((m) => m === PRESSURE_NOTICE);
 
-describe("the one-time notice for vaults arriving from 1.4.20", () => {
+
+describe("upgrade notices with capture-only pressure", () => {
 	beforeEach(() => {
 		notices.messages.length = 0;
 		notices.durations.length = 0;
 	});
 
-	it("shows once, for 20 seconds, when the vault comes from 1.4.20 with pressure on", async () => {
-		await launched({ lastSeenVersion: "1.4.20", pressureSensitivity: true });
-		expect(pressureNotices()).toHaveLength(1);
-		const at = notices.messages.indexOf(PRESSURE_NOTICE);
-		expect(notices.durations[at]).toBe(20000);
-	});
-
-	it("says nothing to a vault arriving from any other version", async () => {
-		for (const lastSeenVersion of ["1.4.19", "1.4.18", "1.3.20", "1.4.21"]) {
-			notices.messages.length = 0;
-			await launched({ lastSeenVersion, pressureSensitivity: true });
-			expect(pressureNotices(), lastSeenVersion).toHaveLength(0);
-		}
-	});
-
-	it("says nothing to a vault from 1.4.20 that is already drawing with pressure off", async () => {
-		await launched({ lastSeenVersion: "1.4.20", pressureSensitivity: false });
+	it.each([true, false])("does not offer to restyle old ink (pressure=%s), and preserves the preference", async pressureSensitivity => {
+		const plugin = await launched({ lastSeenVersion: "1.4.20", pressureSensitivity });
 		expect(pressureNotices()).toHaveLength(0);
+		expect(plugin.settings.pressureSensitivity).toBe(pressureSensitivity);
+		expect(plugin.saved?.pressureSensitivity).toBe(pressureSensitivity);
+		expect(plugin.saved?.lastSeenVersion).toBe("1.4.21");
 	});
 
-	it("changes nothing about the setting, and writes back the same value it read", async () => {
-		const plugin = await launched({ lastSeenVersion: "1.4.20", pressureSensitivity: true });
-		expect(plugin.settings.pressureSensitivity).toBe(true);
-		// The launch path does write, to record the version whose notes it
-		// showed. Named here rather than allowed: a null `saved` would make
-		// the assertion below pass without the write ever happening.
-		expect(plugin.saved, "the launch path wrote data.json").not.toBeNull();
-		expect(plugin.saved?.pressureSensitivity).toBe(true);
-	});
-
-	it("still shows when the what's-new toast is due as well", async () => {
-		const plugin = await launched(
-			{ lastSeenVersion: "1.4.20", pressureSensitivity: true },
-			"1.4.21",
-			NOTES_WITH_1421
-		);
-		// Both toasts, and the notice is not the one that goes missing.
-		expect(notices.messages.length, "two toasts on this launch").toBe(2);
-		expect(pressureNotices()).toHaveLength(1);
-		expect(plugin.saved?.lastSeenVersion, "the version still moved on").toBe("1.4.21");
-	});
-
-	// The reason the notice moved above the what's-new block (s238 add. 5). That
-	// block swallows its own failure and returns early, on purpose, so anything
-	// after it is skipped on that path - and this notice is the point of the
-	// release it ships in. Faking the failure is the only way to hold that open:
-	// with the notice below the block, this arm is red.
-	it("shows even when the what's-new toast fails to open", async () => {
-		const good = (globalThis as unknown as { createFragment: unknown }).createFragment;
-		(globalThis as unknown as { createFragment: unknown }).createFragment = (): never => {
-			throw new Error("no fragments in this environment");
-		};
-		try {
-			const plugin = await launched(
-				{ lastSeenVersion: "1.4.20", pressureSensitivity: true },
-				"1.4.21",
-				NOTES_WITH_1421
-			);
-			expect(pressureNotices(), "the pressure notice survived").toHaveLength(1);
-			// The what's-new block still leaves the version unrecorded so its own
-			// notes retry next launch. That is its contract, not ours to change.
-			expect(plugin.saved, "no record written on that path").toBeNull();
-		} finally {
-			(globalThis as unknown as { createFragment: unknown }).createFragment = good;
-		}
-	});
-
-	it("is one launch only: the second launch reads the version the first recorded", async () => {
-		const first = await launched({ lastSeenVersion: "1.4.20", pressureSensitivity: true });
-		expect(pressureNotices()).toHaveLength(1);
-		expect(first.saved, "the first launch wrote data.json").not.toBeNull();
-		expect(first.saved?.lastSeenVersion, "the version moved on").toBe("1.4.21");
+	it("still shows normal release notes once", async () => {
+		const first = await launched({ lastSeenVersion: "1.4.20", pressureSensitivity: true }, "1.4.21", NOTES_WITH_1421);
+		expect(notices.messages).toHaveLength(1);
+		expect(pressureNotices()).toHaveLength(0);
+		expect(first.saved?.lastSeenVersion).toBe("1.4.21");
 		notices.messages.length = 0;
-		// What the first launch left on disk is what the second one loads.
-		await launched({ ...(first.saved ?? {}) });
-		expect(pressureNotices(), "second launch").toHaveLength(0);
+		await launched({ ...first.saved });
+		expect(notices.messages).toHaveLength(0);
+	});
+
+	it("leaves the version unrecorded if release notes fail, so the next launch can retry", async () => {
+		const global = globalThis as unknown as { createFragment: unknown };
+		const original = global.createFragment;
+		global.createFragment = (): never => { throw new Error("no fragments"); };
+		try {
+			const plugin = await launched({ lastSeenVersion: "1.4.20", pressureSensitivity: true }, "1.4.21", NOTES_WITH_1421);
+			expect(plugin.saved).toBeNull();
+			expect(pressureNotices()).toHaveLength(0);
+		} finally {
+			global.createFragment = original;
+		}
 	});
 });

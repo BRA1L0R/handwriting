@@ -24,12 +24,12 @@ function wetCanvas(): HTMLCanvasElement {
 afterEach(() => setPressureSensitivity(true));
 
 describe("exp7 pressure profile", () => {
-	it("uses the immutable accepted ON and OFF laws", () => {
+	it("preserves the accepted pressure curve independently of the capture preference", () => {
 		expect(EXP7_PEN.minWidthFactor).toBe(0.18);
 		expect(EXP7_PEN.gamma).toBe(1.15);
 		expect(EXP7_PEN.maxWidthFactor).toBe(3.2);
 		expect(EXP7_PEN.pressureOffWidthFactor).toBe(0.9945718882219903);
-		for (const frozen of oracle.cases) {
+		for (const frozen of oracle.cases.filter(c => c.pressureOn)) {
 			setPressureSensitivity(frozen.pressureOn);
 			expect(widthForPressure({ ...EXP7_PEN, baseWidth: 2.2 }, frozen.pressure)).toBe(frozen.rawWidth);
 		}
@@ -43,9 +43,10 @@ describe("exp7 pressure profile", () => {
 	 * restores that law: every frozen byte is still checked. The export array is
 	 * what ribbonOf computed for these shaped strokes, flattenStrokeShaped at the
 	 * export resolution, and ribbonOf itself is tied to the law in force.
-	 * Pressure-off, raw, mouse-smoothed and highlighter arrays are unchanged.
+	 * Historical global-off arrays no longer describe rendering: the capture tests
+	 * verify constant effective pressure instead. Pressure-on arrays stay frozen.
 	 */
-	it("matches every frozen committed/export/wet/highlighter oracle array (pressure-on cases under the pre-1.4.20 tip taper law)", () => {
+	it("matches frozen pressure-on committed/export/wet/highlighter arrays under the pre-1.4.20 tip taper law", () => {
 		const preTipTaper = { ...PEN_SHAPE, exp7TipTaper: true } as ShapeParams;
 		const closeRibbon = (actual: Array<{ x: number; y: number; hw: number }>, expected: typeof actual) => {
 			expect(actual).toHaveLength(expected.length);
@@ -55,7 +56,7 @@ describe("exp7 pressure profile", () => {
 				expect(actual[i]!.hw).toBeCloseTo(expected[i]!.hw, 12);
 			}
 		};
-		for (const frozen of oracle.cases) {
+		for (const frozen of oracle.cases.filter(c => c.pressureOn)) {
 			setPressureSensitivity(frozen.pressureOn);
 			const stroke: InkStroke = { ...frozen.stroke, tool: frozen.stroke.tool as "pen", pressureProfile: "exp7" };
 			const style = strokeWidthPolicy({ ...EXP7_PEN, color: stroke.color, baseWidth: stroke.width }, undefined, "exp7").style;
@@ -107,7 +108,7 @@ describe("exp7 pressure profile", () => {
 	});
 
 	it("keeps the actual builder/wet consumer on the frozen generation", () => {
-		for (const frozen of oracle.cases.slice(0, 2)) {
+		for (const frozen of oracle.cases.filter(c => c.pressureOn).slice(0, 2)) {
 			setPressureSensitivity(frozen.pressureOn);
 			const builder = new StrokeBuilder("pen", frozen.stroke.color, frozen.stroke.width);
 			builder.start(0);
