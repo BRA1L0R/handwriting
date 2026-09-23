@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	attachEmbedInk,
 	embedInkExtent,
+	embedInkBounds,
 	embedInkLayerCount,
 	embedInkMarker,
 	embedInkNeedsPaint,
@@ -25,6 +26,15 @@ function strokeWithBBox(x: number, y: number, width: number, height: number): In
 }
 
 describe("embedInkExtent", () => {
+	it("includes ink entirely left of and above the text origin", () => {
+		expect(embedInkBounds([strokeWithBBox(-120.5, -60.2, 40, 20)]))
+			.toEqual({ x: -121, y: -61, w: 121, h: 61 });
+	});
+
+	it("includes both margins without shifting stored stroke coordinates", () => {
+		expect(embedInkBounds([strokeWithBBox(-120, 20, 30, 10), strokeWithBBox(900, 800, 40, 20)]))
+			.toEqual({ x: -120, y: 0, w: 1060, h: 820 });
+	});
 	it("covers the farthest stroke corner, rounded up", () => {
 		const { w, h } = embedInkExtent([
 			strokeWithBBox(10, 20, 30.2, 5),

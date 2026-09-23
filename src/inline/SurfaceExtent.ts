@@ -39,6 +39,11 @@ export interface Extent {
 	readonly y: number;
 }
 
+/** Ink reach in note coordinates, including the otherwise-unscrollable left side. */
+export interface InkFrontier extends Extent {
+	readonly left: number;
+}
+
 export const ZERO_EXTENT: Extent = Object.freeze({ x: 0, y: 0 });
 
 interface ScrollRoom {
@@ -205,17 +210,36 @@ export function shrunkAxis(current: number, needed: number, floor: number): { va
  */
 export const SHRINK_SCROLL_IDLE_MS = 250;
 
-/** The ink frontier: the furthest right/down any stroke's bbox reaches. */
-export function inkFrontier(strokes: readonly InkStroke[]): Extent {
+/** The ink frontier: the furthest left/right/down any stroke's bbox reaches. */
+export function inkFrontier(strokes: readonly InkStroke[]): InkFrontier {
+	let left = 0;
 	let x = 0;
 	let y = 0;
 	for (const s of strokes) {
+		if (s.bbox.x < left) left = s.bbox.x;
 		const right = s.bbox.x + s.bbox.width;
 		const bottom = s.bbox.y + s.bbox.height;
 		if (right > x) x = right;
 		if (bottom > y) y = bottom;
 	}
-	return { x, y };
+	return { left, x, y };
+}
+
+/**
+ * Positive viewport pan earned by real ink left of the text origin.
+ *
+ * Native scrolling cannot represent negative note coordinates. A wide pane
+ * can show them in the text column's left margin, but a narrower split clips
+ * that margin. Infinite Canvas may therefore move the page right by exactly
+ * the painted reach of negative-x ink, and no farther into blank space.
+ */
+export function leftInkPanCeiling(left: number, fontZoom: number, effectiveScale: number): number {
+	if (
+		!Number.isFinite(left) || left >= 0 ||
+		!Number.isFinite(fontZoom) || fontZoom <= 0 ||
+		!Number.isFinite(effectiveScale) || effectiveScale <= 0
+	) return 0;
+	return -left * fontZoom * effectiveScale;
 }
 
 /**

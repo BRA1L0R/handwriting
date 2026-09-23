@@ -1,5 +1,5 @@
 import { InkStroke } from "../ink/Stroke";
-import { Extent, inkFrontier } from "./SurfaceExtent";
+import { Extent, InkFrontier, inkFrontier } from "./SurfaceExtent";
 
 /**
  * The ink frontier, remembered per note.
@@ -24,10 +24,10 @@ import { Extent, inkFrontier } from "./SurfaceExtent";
  * fields.
  */
 export class FrontierCache {
-	private byPath = new Map<string, { count: number; frontier: Extent }>();
+	private byPath = new Map<string, { count: number; frontier: InkFrontier }>();
 
 	/** The frontier of `strokes`, computed at most once per invalidation. */
-	get(path: string, strokes: readonly InkStroke[]): Extent {
+	get(path: string, strokes: readonly InkStroke[]): InkFrontier {
 		const hit = this.byPath.get(path);
 		if (hit && hit.count === strokes.length) return hit.frontier;
 		const frontier = inkFrontier(strokes);
@@ -60,7 +60,7 @@ export interface ExtentInputs {
 	readonly scrollRevision?: number;
 	readonly granted?: Extent;
 	readonly path: string;
-	readonly frontier: Extent;
+	readonly frontier: InkFrontier;
 	readonly writtenOn: boolean;
 	readonly camX: number;
 	readonly camY: number;

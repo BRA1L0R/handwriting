@@ -68,6 +68,7 @@ import { drawStroke } from "../ink/StrokeRenderer";
 import { InkStroke } from "../ink/Stroke";
 import { InkSvgRun, inkSvgLayers } from "../ink/SvgExport";
 import { HIGHLIGHTER_ALPHA } from "../ink/PenStyle";
+import { InkMargin } from "./InkMargin";
 
 /**
  * Total device pixels one rendered layer may hold.
@@ -175,6 +176,8 @@ const bodyWatches = new Map<HTMLElement, { observer: MutationObserver; probes: S
 const sizeWatches = new Map<HTMLElement, () => void>();
 /** Reading-view roots whose layer offset has to keep up with the pane. */
 const anchorWatches = new Map<HTMLElement, { stop(): void; sizer: HTMLElement | null }>();
+const readingMargins = new Map<HTMLElement, InkMargin>();
+const layerBounds = new WeakMap<object, { x: number; y: number }>();
 
 export function embedInkAnchorWatchCount(): number {
 	return anchorWatches.size;
@@ -355,7 +358,8 @@ export function embedInkRootIsEmbed(root: { classList: { contains(cls: string): 
 export function embedInkAnchor(root: HTMLElement): { left: number; top: number } | null {
 	const sizer = anchorSizer(root);
 	if (!sizer || sizer.offsetParent !== root) return null;
-	return { left: sizer.offsetLeft, top: sizer.offsetTop };
+	const margin = readingMargins.get(root);
+	return { left: sizer.offsetLeft + (margin?.x ?? 0), top: sizer.offsetTop + (margin?.y ?? 0) };
 }
 
 /** The sizer a reading view's layer is anchored to, if this root is one. */
@@ -365,23 +369,50 @@ function anchorSizer(root: HTMLElement): HTMLElement | null {
 }
 
 function anchorLayer(root: HTMLElement, el: { style: CSSStyleDeclaration }): void {
-	const at = embedInkAnchor(root);
-	if (!at) return;
+	const at = embedInkAnchor(root) ?? { left: 0, top: 0 };
+	const bounds = layerBounds.get(el) ?? { x: 0, y: 0 };
 	// Through `style`, not `setCssStyles`: the print swap anchors an <svg>,
 	// and Obsidian's helper is an augmentation of HTMLElement.
-	el.style.left = `${at.left}px`;
-	el.style.top = `${at.top}px`;
+	el.style.left = `${at.left + bounds.x}px`;
+	el.style.top = `${at.top + bounds.y}px`;
 }
 
 /** Pure: the css extent that covers every stroke. Never clipped. */
-export function embedInkExtent(strokes: readonly InkStroke[]): { w: number; h: number } {
+export function embedInkBounds(strokes: readonly InkStroke[]): { x: number; y: number; w: number; h: number } {
+	let minX = 0;
+	let minY = 0;
 	let maxX = 0;
 	let maxY = 0;
 	for (const s of strokes) {
+		minX = Math.min(minX, s.bbox.x);
+		minY = Math.min(minY, s.bbox.y);
 		maxX = Math.max(maxX, s.bbox.x + s.bbox.width);
 		maxY = Math.max(maxY, s.bbox.y + s.bbox.height);
 	}
-	return { w: Math.ceil(maxX), h: Math.ceil(maxY) };
+	const x = Math.floor(minX), y = Math.floor(minY);
+	return { x, y, w: Math.ceil(maxX) - x, h: Math.ceil(maxY) - y };
+}
+
+export function embedInkExtent(strokes: readonly InkStroke[]): { w: number; h: number } {
+	const { w, h } = embedInkBounds(strokes);
+	return { w, h };
+}
+
+function clearReadingMargin(root: HTMLElement): void {
+	const margin = readingMargins.get(root);
+	if (!margin) return;
+	margin.clear();
+	readingMargins.delete(root);
+	root.classList.remove("handwriting-reading-ink");
+}
+
+function syncReadingMargin(root: HTMLElement, bounds: { x: number; y: number }): void {
+	const sizer = anchorSizer(root);
+	if (!sizer || sizer.offsetParent !== root) return;
+	let margin = readingMargins.get(root);
+	if (!margin) readingMargins.set(root, margin = new InkMargin());
+	margin.update(sizer, -bounds.x - sizer.offsetLeft, -bounds.y - sizer.offsetTop);
+	root.classList.add("handwriting-reading-ink");
 }
 
 /**
@@ -710,6 +741,7 @@ function stopAllSizeWatches(): void {
 }
 
 function stopAnchorWatch(root: HTMLElement): void {
+	clearReadingMargin(root);
 	const watch = anchorWatches.get(root);
 	if (!watch) return;
 	watch.stop();
@@ -749,6 +781,8 @@ function watchAnchor(root: HTMLElement): void {
 			if (sizer) ro.observe(sizer);
 		}
 		const canvas = root.querySelector<HTMLCanvasElement>(":scope > canvas.handwriting-embed-ink");
+		const bounds = canvas && layerBounds.get(canvas);
+		if (bounds) syncReadingMargin(root, bounds);
 		if (canvas) anchorLayer(root, canvas);
 		const svg = root.querySelector<SVGSVGElement>(":scope > svg.handwriting-embed-ink");
 		if (svg) anchorLayer(root, svg);
@@ -882,6 +916,7 @@ export function teardownEmbedInk(): void {
 	cancelPendingWaits();
 	stopAllSizeWatches();
 	stopAllAnchorWatches();
+	for (const root of readingMargins.keys()) clearReadingMargin(root);
 	for (const root of [...layers.keys()]) {
 		if (!root.isConnected) continue;
 		root.querySelector(":scope > canvas.handwriting-embed-ink")?.remove();
@@ -912,14 +947,16 @@ function usePrintVector(on: boolean): void {
 			continue;
 		}
 		const strokes = strokesFor ? strokesFor(path) : [];
-		const { w, h } = embedInkExtent(strokes);
+		const bounds = embedInkBounds(strokes);
+		const { x, y, w, h } = bounds;
 		if (strokes.length === 0 || w <= 0 || h <= 0) continue;
 		// createElementNS, not createEl: an <svg> built as an HTML element is
 		// an unknown tag that renders nothing.
 		const svg = existing ?? root.ownerDocument.createElementNS(SVG_NS, "svg");
 		svg.setAttribute("class", "handwriting-embed-ink");
 		svg.setAttribute("aria-hidden", "true");
-		svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+		svg.setAttribute("viewBox", `${x} ${y} ${w} ${h}`);
+		layerBounds.set(svg, bounds);
 		svg.setAttribute("width", `${w}`);
 		svg.setAttribute("height", `${h}`);
 		// Built as elements rather than markup. The content is safe either
@@ -989,7 +1026,8 @@ function paint(root: HTMLElement, path: string, strokes: readonly InkStroke[]): 
 	}
 	root.setAttribute(MARKER_ATTR, marker);
 	const view = root.ownerDocument.defaultView ?? window;
-	const { w, h } = embedInkExtent(strokes);
+	const bounds = embedInkBounds(strokes);
+	const { x, y, w, h } = bounds;
 	if (strokes.length === 0 || w <= 0 || h <= 0) {
 		// The last stroke was erased: the picture goes too, and so does any
 		// room we grew the embed by to hold it.
@@ -1018,6 +1056,8 @@ function paint(root: HTMLElement, path: string, strokes: readonly InkStroke[]): 
 	if (!canvas) {
 		canvas = root.createEl("canvas", { cls: "handwriting-embed-ink" });
 	}
+	layerBounds.set(canvas, bounds);
+	syncReadingMargin(root, bounds);
 	// Every paint, not only the ones that resize the backing store: a repaint
 	// can follow a resize that moved the sizer without changing the ink.
 	anchorLayer(root, canvas);
@@ -1030,12 +1070,13 @@ function paint(root: HTMLElement, path: string, strokes: readonly InkStroke[]): 
 	if (canvas.width !== backingW || canvas.height !== backingH) {
 		canvas.width = backingW;
 		canvas.height = backingH;
-		canvas.setCssStyles({ width: `${w}px`, height: `${h}px` });
 	}
+	canvas.setCssStyles({ width: `${w}px`, height: `${h}px` });
 	const ctx = canvas.getContext("2d");
 	if (!ctx) return;
 	ctx.setTransform(scale, 0, 0, scale, 0, 0);
 	ctx.clearRect(0, 0, w, h);
+	ctx.setTransform(scale, 0, 0, scale, -x * scale, -y * scale);
 	// Highlighter first and translucent as a layer would be; then pen.
 	ctx.globalAlpha = 0.35;
 	for (const s of strokes) if (s.tool === "highlighter") drawStroke(ctx, CAM, s, undefined, true);

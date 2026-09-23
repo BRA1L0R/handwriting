@@ -373,7 +373,17 @@ div.handwriting-snap-chip.handwriting-snap-chip {
 	left: 0;
 	top: 0;
 	pointer-events: none;
-	max-width: none;
+	/* Host media rules must not squeeze the ink into the Markdown column. */
+	max-width: none !important;
+	max-height: none !important;
+}
+
+.handwriting-ink-margin {
+	translate: var(--handwriting-ink-margin-x, 0px) var(--handwriting-ink-margin-y, 0px);
+}
+
+.markdown-preview-view.handwriting-reading-ink {
+	overflow-x: auto !important;
 }
 
 /* ---- paper ---- */

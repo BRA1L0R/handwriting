@@ -3,6 +3,7 @@ import { EditorView, keymap } from "@codemirror/view";
 import { history, historyKeymap, isolateHistory, redo, undo } from "@codemirror/commands";
 import { inkApplied, inkEffect, inkHistorySupport, type InkOp } from "../../src/inline/InkHistory";
 import { InkOverlayPlugin } from "../../src/inline/InkOverlay";
+import { InkMargin } from "../../src/inline/InkMargin";
 import { installObsidianDom } from "./obsidianDom";
 
 installObsidianDom();
@@ -43,6 +44,7 @@ function setup(caret: number, kind: "ink" | "text" | "mixed", operation: InkOp["
  const overlay = Object.assign(Object.create(InkOverlayPlugin.prototype), {
   view, frame:{locked:false}, cssScale:1, fontZoom:1, container:null, pinchAnchor:{scrollTop:0,scrollLeft:0,offsetX:0,offsetY:0},
   pinchRefScale:1,pinchScaleNow:1,pinchRasterScale:1,
+  inkMargin:new InkMargin(),pageInkLeft:0,
  });
  overlay.applyPinchScale(scale,true);
  measure();

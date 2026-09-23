@@ -19,7 +19,7 @@ describe("FrontierCache", () => {
 		const cache = new FrontierCache();
 		const strokes = [stroke(10, 20, 30, 40)];
 		const first = cache.get("a.md", strokes);
-		expect(first).toEqual({ x: 40, y: 60 });
+		expect(first).toEqual({ left: 0, x: 40, y: 60 });
 		expect(cache.get("a.md", strokes)).toBe(first);
 		expect(cache.get("a.md", strokes)).toBe(first);
 	});
@@ -34,19 +34,19 @@ describe("FrontierCache", () => {
 		cache.invalidate("a.md");
 		const second = cache.get("a.md", strokes);
 		expect(second).not.toBe(first);
-		expect(second).toEqual({ x: 100, y: 100 });
+		expect(second).toEqual({ left: 0, x: 100, y: 100 });
 	});
 
 	it("recomputes when the stroke count changed, with no invalidate at all", () => {
 		const cache = new FrontierCache();
 		const strokes = [stroke(0, 0, 10, 10)];
-		expect(cache.get("a.md", strokes)).toEqual({ x: 10, y: 10 });
+		expect(cache.get("a.md", strokes)).toEqual({ left: 0, x: 10, y: 10 });
 		// The lazy sidecar load: strokes appear without an ink-changed event.
 		strokes.push(stroke(0, 0, 500, 300));
-		expect(cache.get("a.md", strokes)).toEqual({ x: 500, y: 300 });
+		expect(cache.get("a.md", strokes)).toEqual({ left: 0, x: 500, y: 300 });
 		// And the other direction: an erase that splices strokes out.
 		strokes.length = 1;
-		expect(cache.get("a.md", strokes)).toEqual({ x: 10, y: 10 });
+		expect(cache.get("a.md", strokes)).toEqual({ left: 0, x: 10, y: 10 });
 	});
 
 	it("keeps paths independent, and invalidate touches only its own", () => {
@@ -55,8 +55,8 @@ describe("FrontierCache", () => {
 		const b = [stroke(0, 0, 20, 20)];
 		const frontierA = cache.get("a.md", a);
 		const frontierB = cache.get("b.md", b);
-		expect(frontierA).toEqual({ x: 10, y: 10 });
-		expect(frontierB).toEqual({ x: 20, y: 20 });
+		expect(frontierA).toEqual({ left: 0, x: 10, y: 10 });
+		expect(frontierB).toEqual({ left: 0, x: 20, y: 20 });
 		cache.invalidate("a.md");
 		expect(cache.get("b.md", b)).toBe(frontierB);
 		expect(cache.get("a.md", a)).not.toBe(frontierA);
@@ -65,14 +65,22 @@ describe("FrontierCache", () => {
 	it("gives an empty note a zero frontier and still caches it", () => {
 		const cache = new FrontierCache();
 		const first = cache.get("a.md", []);
-		expect(first).toEqual({ x: 0, y: 0 });
+		expect(first).toEqual({ left: 0, x: 0, y: 0 });
 		expect(cache.get("a.md", [])).toBe(first);
+	});
+
+	it("caches the part of a stroke that reaches left of the note origin", () => {
+		const cache = new FrontierCache();
+		const strokes = [stroke(-75, 10, 20, 30)];
+		const first = cache.get("a.md", strokes);
+		expect(first).toEqual({ left: -75, x: 0, y: 40 });
+		expect(cache.get("a.md", strokes)).toBe(first);
 	});
 });
 
 const BASE: ExtentInputs = {
 	path: "a.md",
-	frontier: { x: 10, y: 20 },
+	frontier: { left: 0, x: 10, y: 20 },
 	writtenOn: false,
 	camX: 1,
 	camY: 2,
@@ -94,7 +102,7 @@ describe("sameExtentInputs", () => {
 	});
 
 	it("compares the frontier by identity, not by value", () => {
-		expect(sameExtentInputs(BASE, { ...BASE, frontier: { x: 10, y: 20 } })).toBe(false);
+		expect(sameExtentInputs(BASE, { ...BASE, frontier: { left: 0, x: 10, y: 20 } })).toBe(false);
 	});
 
 	it("is false when any single input moved", () => {

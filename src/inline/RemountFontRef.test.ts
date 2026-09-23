@@ -228,6 +228,8 @@ function makeRig(): Rig {
 	o.selection = { clear: () => undefined, isEmpty: true };
 	o.selectionDeleteKeys = { reset: () => undefined };
 	o.axisGuard = { restore: () => undefined, capture: () => undefined };
+	// Object.create skips the margin helper's field initializer.
+	o.inkMargin = { clear: () => undefined };
 	o.penCursorEl = null;
 	o.eraserEl = null;
 	o.mobileTools = null;

@@ -163,14 +163,14 @@ async function setup(id:string,kind="far",font=1,external=1,initialDoc?:string,s
   // Disjoint: the same reachable body plus TWO outliers, one left-and-below
   // the origin (x<0, y huge positive) and one right-and-above (x huge
   // positive, y<0). This is the pair the old combined-bbox clamp got wrong:
-  // each outlier is wholly unreachable on its OWN axis, but its OTHER axis
-  // sits well inside the reachable range, so a union taken before clipping
-  // fabricates a huge box neither outlier's reachable extent supports.
-  if(kind==="disjoint")data.strokes=[
+  // left ink is now reachable through the layout reserve, but the above-origin
+  // stroke must still be clipped before taking the union.
+  if(kind==="disjoint"||kind==="reachable-left-with-body")data.strokes=[
    {id:"outlierLeftBelow",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:-504,y:99996,pressure:.5,t:0},{x:-476,y:100024,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
    {id:"outlierRightAbove",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:99996,y:-504,pressure:.5,t:0},{x:100024,y:-476,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
    {id:"body",tool:"pen" as const,color:"#000000",width:2,createdAt:1,points:[{x:96,y:96,pressure:.5,t:0},{x:124,y:124,pressure:.5,t:10}],bbox:{x:0,y:0,width:0,height:0}},
   ];
+  if(kind==="reachable-left-with-body")data.strokes=data.strokes.filter(s=>s.id!=="outlierRightAbove");
   // Ink above the first line (wholly unreachable) plus a separate reachable
   // body below it - the shape of Alan's real note. The unreachable stroke
   // must still let the reachable one produce "fit".

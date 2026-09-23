@@ -367,9 +367,10 @@ import {
 import { InlinePenRouter, anyHandOnGlass, bandEraserIntent } from "./InlinePenRouter";
 import { armMouseInkQuietly, markToolPicked, mouseInkEnabled, toolPickedHere } from "./MouseInk";
 import { penInkEnabled } from "./PenInk";
+import { InkMargin } from "./InkMargin";
 import { fingerInkEligible } from "./FingerInk";
 import { describeEl, setHitProbeContext } from "./PenHitProbe";
-import { Extent, inkClaimX, inkFrontier, isScrollableOverflow, onScreenFloorX, ScrollAxisGuard, ScrollExpansionDemand, SHRINK_SCROLL_IDLE_MS, shrunkAxis, spacerPosition, surfaceExtents, surfaceOriginInScroller, writeFrontier, writeFrontierApplies, ZERO_EXTENT, zoomFrontier } from "./SurfaceExtent";
+import { Extent, inkClaimX, inkFrontier, isScrollableOverflow, leftInkPanCeiling, onScreenFloorX, ScrollAxisGuard, ScrollExpansionDemand, SHRINK_SCROLL_IDLE_MS, shrunkAxis, spacerPosition, surfaceExtents, surfaceOriginInScroller, writeFrontier, writeFrontierApplies, ZERO_EXTENT, zoomFrontier } from "./SurfaceExtent";
 import { ProbeBox, capturePresented, parseHexColor, regionCensus } from "./PresentProbe";
 import { paperPlan, type PaperPlan } from "./PaperPlan";
 import { copyPreviewPaperBackground, foldIntoPitch, fractionOf, previewPaperCopyable, previewPaperPhase, previewPaperPitch, type PreviewPaperEnd, type PreviewPaperSource } from "./PaperPan";
@@ -1665,6 +1666,9 @@ export class InkOverlayPlugin {
 	 * list while a note reloads (InlineInkStore.ts:414-420), a walk that scales with note length.
 	 */
 	private pageInkX = 0;
+	/** Furthest painted ink left of the text origin, note px; zero when none. */
+	private pageInkLeft = 0;
+	private inkMargin = new InkMargin();
 	/** Unsubscribes the frontier cache from ink-changed events. */
 	private offInkChanged: (() => void) | null = null;
 	/** What updateExtent last acted on; equal inputs mean equal output. */
@@ -3100,6 +3104,7 @@ export class InkOverlayPlugin {
 		// editor painted at scale in a fraction-width box, with the only
 		// code that could undo it now unloaded.
 		this.restoreViewportLayout();
+		this.inkMargin.clear();
 		// The camera anchor lives in the editor's own DOM, beside the content,
 		// and the editor OUTLIVES this overlay: a plugin disable or reload
 		// would otherwise leave the wrapper and its rungs in the note, and the
@@ -7104,8 +7109,8 @@ export class InkOverlayPlugin {
 		const carryWidth = pageX;
 		// UNDER INFINITE CANVAS THE SETTLE'S TARGET IS B CLAMPED TO THE WORLD (s78 as s79(1)(b) reads it):
 		// the page stays where the fingers left it, and the one thing it may not keep is blank to the LEFT
-		// of its own natural margin. Infinite Canvas grants room to the right and below - room the user is
-		// entitled to - and nothing is ever granted left of the natural margin, so blank there is not canvas.
+		// of its own natural margin. The exception is painted negative-x ink: a wide pane exposes it in the
+		// column's left margin, so a narrow split must grant exactly enough positive pan to expose it too.
 		//
 		// This ceiling was +Infinity here, which is what left 200 px of margin standing on the pane after
 		// the page had settled: measured at e27fbcf0, zoom-out-settled and reachable-settled both 200.00 on
@@ -7124,8 +7129,9 @@ export class InkOverlayPlugin {
 		//
 		// With the setting OFF the ceiling is the no-room law and stays: the page eases back to the
 		// position the bounds allow, which is what ships today.
+		const inkLeftCeiling = this.canvasMode ? this.leftInkCeiling(effective) : 0;
 		const rightX = !settling ? Number.POSITIVE_INFINITY
-			: this.canvasMode ? nativeLeft * effective
+			: this.canvasMode ? nativeLeft * effective + inkLeftCeiling
 			: carriesX ? Math.max(nativeLeft * effective, -left + Math.max(0, spanX - carryWidth)) : nativeLeft * effective;
 		// Y TAKES THE SAME SHAPE, and the reason the older note here gave for exempting it does not survive the
 		// measurement. That note said a hold carried down through the preview came back as a jump at the lift, so
@@ -7165,9 +7171,10 @@ export class InkOverlayPlugin {
 		// drawing canvas's own left and top edge may not come to rest inside the pane. No rest, no fitting
 		// clamp, no margin payment, nothing at the right or bottom, in every regime (add. 3).
 		//
-		// A CEILING ON THE PAN, not a floor, and the ceiling is the HOST'S OWN LAYOUT: pan 0. Positive pan
+		// A CEILING ON THE PAN, not a floor. Normally it is the HOST'S OWN LAYOUT: pan 0. Positive pan
 		// carries the page right of where the layout puts it, which is the blank Alan's bound forbids;
-		// negative pan is the hang past the pane, which he allows. So `Math.min(raw, 0)` per axis.
+		// negative pan is the hang past the pane, which he allows. Negative-x ink raises only the x ceiling
+		// by its painted reach, keeping that ink navigable after a pane is split without granting blank canvas.
 		//
 		// NOT `-left`, which is the PANE edge [Architect, s97 add. 1 bound reference]. With Readable line
 		// length on, `left = columnLocal * next` is the column's native margin and is positive, so a bound
@@ -7252,8 +7259,8 @@ export class InkOverlayPlugin {
 		const plainX = Math.max(floorX, Math.min(rawX, 0)), plainY = Math.max(floorY, Math.min(rawY, 0));
 		// A NON-DRAG FRAME IS UNTOUCHED IN BOTH MODES: a zoom frame keeps the note under the focal point and
 		// carries no bound of its own, which is what the focal-hold cells measure.
-		const cx = bounded ? (this.canvasMode ? Math.min(rawX, 0) : plainX)
-			: dragFrame ? (this.canvasMode ? Math.min(rawX, Math.max(Math.max(restCeilX, startX) + give, lastX)) : plainX)
+		const cx = bounded ? (this.canvasMode ? Math.min(rawX, inkLeftCeiling) : plainX)
+			: dragFrame ? (this.canvasMode ? Math.min(rawX, Math.max(Math.max(restCeilX, startX, inkLeftCeiling) + give, lastX)) : plainX)
 			: rawX;
 		const cy = bounded ? (this.canvasMode ? Math.min(rawY, 0) : plainY)
 			: dragFrame ? (this.canvasMode ? Math.min(rawY, Math.max(Math.max(0, startY) + give, lastY)) : plainY)
@@ -7429,6 +7436,11 @@ export class InkOverlayPlugin {
 	 */
 	private pageContentWidth(): number {
 		return Math.max(this.viewportLayout?.columnBox ?? 0, this.pageInkX * this.fontZoom);
+	}
+
+	/** Positive pan that exposes real negative-x ink without granting blank canvas. */
+	private leftInkCeiling(effective = this.cssScale): number {
+		return leftInkPanCeiling(this.pageInkLeft, this.fontZoom, effective);
 	}
 
 	/**
@@ -7685,7 +7697,8 @@ export class InkOverlayPlugin {
 		// carried in full, and a page inside its bound gives exactly as before.
 		const pan = this.viewportPan, px = pan?.x ?? 0, py = pan?.y ?? 0;
 		const give = OVERSCROLL_GIVE_PX * (this.viewportLayout?.externalScale ?? 1);
-		const standX = px - (this.canvasMode ? Math.min(px, 0) : Math.max(this.boundReadout.floorX, Math.min(px, 0)));
+		// On x, real ink left of the note origin is part of the standing canvas rather than overscroll.
+		const standX = px - (this.canvasMode ? Math.min(px, this.leftInkCeiling()) : Math.max(this.boundReadout.floorX, Math.min(px, 0)));
 		const standY = py - (this.canvasMode ? Math.min(py, 0) : Math.max(this.boundReadout.floorY, Math.min(py, 0)));
 		// s135: THE ORIGIN SIDE ONLY, and never past the allowance. The lower bound is 0, not -give: a
 		// negative total is the page held past a FAR end, which in canvas mode is room rather than a
@@ -7829,9 +7842,9 @@ export class InkOverlayPlugin {
 	private resumeStrandedPan(): boolean {
 		if (this.bounceState || this.pinchPreview || this.frame.locked) return false;
 		const pan = this.viewportPan;
-		// The bound the last settle left standing, at the scale still in force (no zoom since): a ceiling of 0
-		// always, and IC off only, a floor too (add. 52) - byte-identical to 3578f29e with it on (add. 54).
-		const targetX = this.canvasMode ? Math.min(pan.x, 0) : Math.max(this.boundReadout.floorX, Math.min(pan.x, 0));
+		// The bound the last settle left standing, at the scale still in force (no zoom since): normally a
+		// ceiling of 0, raised on x only by real negative-x ink; IC off also has a floor (add. 52).
+		const targetX = this.canvasMode ? Math.min(pan.x, this.leftInkCeiling()) : Math.max(this.boundReadout.floorX, Math.min(pan.x, 0));
 		const targetY = this.canvasMode ? Math.min(pan.y, 0) : Math.max(this.boundReadout.floorY, Math.min(pan.y, 0));
 		const dx = pan.x - targetX, dy = pan.y - targetY;
 		if (dx === 0 && dy === 0) return false;
@@ -8533,7 +8546,9 @@ export class InkOverlayPlugin {
   // offset: measured 0px against offsetLeft 341 at scroll 4000 on a 10838 px
   // extent, which froze the column at 0 and made the first refresh "change"
   // it to 341.25 - a re-commit and an 85 px hop at 25 percent.
-  const columnLocal=(box?this.ownedColumnLayoutLeft(natural.line):null) ?? (natural.left===null?null:(natural.left-this.panX()-hostRect.left)/rectScale+scroller.scrollLeft);
+  // The ink reserve is independent of the theme's natural centring. Baking
+  // it into the frozen margin would apply it twice after a resize or zoom.
+  const columnLocal=(box?this.ownedColumnLayoutLeft(natural.line):null) ?? (natural.left===null?null:(natural.left-this.panX()-hostRect.left)/rectScale+scroller.scrollLeft-this.inkMargin.x);
   // No extra forced read: the scan above already laid all of this out.
   const lineBox=natural.line instanceof HTMLElement?natural.line.offsetWidth:0;
   const sr=scroller.getBoundingClientRect(),ss=this.winRef.getComputedStyle(scroller);
@@ -11186,7 +11201,12 @@ export class InkOverlayPlugin {
 			scrollRevision,
 			granted: surfaceExtents.get(path),
 			path,
-			frontier: (() => { const f = this.frontierCache.get(path, inlineInk.strokes(path)); this.pageInkX = f.x; return f; })(),
+			frontier: (() => {
+				const f = this.frontierCache.get(path, inlineInk.strokes(path));
+				this.pageInkX = f.x;
+				this.pageInkLeft = f.left;
+				return f;
+			})(),
 			writtenOn,
 			camX: cam.x,
 			camY: cam.y,
@@ -11220,6 +11240,16 @@ export class InkOverlayPlugin {
 			scrollTop: scroller.scrollTop,
 			scale: this.cssScale,
 		});
+		// Negative note coordinates cannot be reached with native scrollLeft.
+		// Keep the missing left margin in the document layout in both canvas
+		// modes, independent of whether a pinch/pan gesture has ever occurred.
+		const marginHost = this.panSizer() ?? this.view.contentDOM;
+		const missingLeft = -inputs.frontier.left * this.fontZoom - (origin.left - this.inkMargin.x);
+		if (this.inkMargin.update(marginHost, missingLeft)) {
+			this.lastExtentInputs = null;
+			this.scheduleRepaint("ink-margin");
+			return;
+		}
 		// The paper's phase follows this origin: read here, where the extent has
 		// already paid for the layout, and never on a preview frame.
 		this.capturePaperOrigin(origin.top, origin.left);

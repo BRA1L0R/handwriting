@@ -26,7 +26,7 @@ async function run(kind: string): Promise<Picture[]> {
 it.each([false, true])("reading recovery survives reconciliation and new-sizer resize, second document=%s", async popout => {
 	const trace = await page.evaluate(popout => (window as any).readingRecovery(popout), popout);
 	expect(trace.survivedEviction).toBe(true);
-	expect(trace.initial.parent).toBe("markdown-preview-view");
+	expect(trace.initial.parent.split(" ")).toContain("markdown-preview-view");
 	expect(trace.initial.gap).toEqual([0, 0]);
 	expect(trace.initial.watches).toBe(1);
 	for (const key of ["replacementGap", "resizeGap", "scrollGap", "modeGap", "printGap", "resizedPrintGap"]) {

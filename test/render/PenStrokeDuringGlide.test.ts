@@ -63,6 +63,8 @@ function sample(phase) {
 	const bounce = typeof overlay.overscrollBounceReadout === "function" ? overlay.overscrollBounceReadout() : null;
 	return { phase, k: overlay.pinchScaleNow, preview: !!overlay.pinchPreview,
 		panX: r2((overlay.viewportPan || { x: 0 }).x),
+		inkReservePx: r2(Math.max(0, ...inlineInk.strokes(rig.path).map(s => -s.bbox.x)) * overlay.scale),
+		scrollPx: r2(view.scrollDOM.scrollLeft * overlay.cssScale),
 		leftEdgePx: r2(cr.left - pr.left), bounce };
 }
 
@@ -183,5 +185,9 @@ it("a pen stroke landing during the post-lift glide does not strand the page: re
 	expect(rest.bounce.active, "the ease finished by the time the page is read at rest").toBe(false);
 	expect(Math.abs(rest.bounce.x), "the offset decayed to 0, not left standing").toBeLessThanOrEqual(0.5);
 	expect(Math.abs(rest.panX), `pan resumed to its bound instead of freezing where the pen landed (rest ${JSON.stringify(rest)})`).toBeLessThanOrEqual(0.5);
-	expect(Math.abs(rest.leftEdgePx), `the painted edge reached 0, not stuck mid-glide`).toBeLessThanOrEqual(0.5);
+	// Negative-X ink earns native scroll room. Rest may scroll within that
+	// room; it must not expose blank space beyond the saved ink's left bound.
+	expect(rest.leftEdgePx).toBeGreaterThanOrEqual(-0.5);
+	expect(rest.leftEdgePx).toBeLessThanOrEqual(rest.inkReservePx + 0.5);
+	expect(Math.abs(rest.leftEdgePx + rest.scrollPx - rest.inkReservePx), "native scroll can reach the ink bound without surplus blank space").toBeLessThanOrEqual(0.5);
 }, 60_000);

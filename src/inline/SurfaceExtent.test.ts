@@ -35,6 +35,7 @@ import {
 	inkClaimX,
 	inkFrontier,
 	isScrollableOverflow,
+	leftInkPanCeiling,
 	onScreenFloorX,
 	shrunkAxis,
 	spacerPosition,
@@ -198,12 +199,33 @@ describe("shrunkAxis (the grant after ink is removed)", () => {
 
 describe("inkFrontier", () => {
 	it("is zero for no strokes", () => {
-		expect(inkFrontier([])).toEqual({ x: 0, y: 0 });
+		expect(inkFrontier([])).toEqual({ left: 0, x: 0, y: 0 });
 	});
 
 	it("is the furthest right/bottom bbox corner across strokes", () => {
 		const f = inkFrontier([stroke(10, 400, 50, 20), stroke(300, 5, 40, 10)]);
-		expect(f).toEqual({ x: 340, y: 420 });
+		expect(f).toEqual({ left: 0, x: 340, y: 420 });
+	});
+
+	it("keeps the negative left reach that a narrow split must be able to reveal", () => {
+		expect(inkFrontier([stroke(-180, 20, 30, 40), stroke(50, 10, 20, 20)])).toEqual({
+			left: -180,
+			x: 70,
+			y: 60,
+		});
+	});
+});
+
+describe("left-side ink pan ceiling", () => {
+	it("converts negative ink reach into its exact painted width", () => {
+		expect(leftInkPanCeiling(-180, 1, 1)).toBe(180);
+		expect(leftInkPanCeiling(-180, 1.25, 0.5)).toBe(112.5);
+	});
+
+	it("grants no rightward canvas movement without real left-side ink", () => {
+		for (const left of [0, 20, Number.NaN]) expect(leftInkPanCeiling(left, 1, 1)).toBe(0);
+		expect(leftInkPanCeiling(-20, 0, 1)).toBe(0);
+		expect(leftInkPanCeiling(-20, 1, Number.NaN)).toBe(0);
 	});
 });
 

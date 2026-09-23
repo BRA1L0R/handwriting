@@ -107,35 +107,20 @@ it("edge audit: erase distant outlier then undo/redo changes live Fit bounds",as
 }finally{await p.close();}});
 it.each(["erase","lasso"])("edge audit: held %s refuses Fit until release",async kind=>{const p=await mounted();try{await call(p,"setup","tool");await call(p,"fit","tool");const r=await edge(p,"heldTool","tool",kind);expect(r.before.state.busy).toBe(true);expect(r.result).toBe("busy");expect(r.after.state.zoom).toBe(r.before.state.zoom);expect((await call(p,"fit","tool")).result).toBe("fit");}finally{await p.close();}});
 it("edge audit: low zoom Fit touch pan stops and pinch retains saved geometry",async()=>{const p=await mounted();try{const original=await call(p,"setup","touch");await call(p,"fit","touch");const r=await edge(p,"tinyTouch","touch");expect(r.before.state.zoom).toBeLessThan(.3);expect(r.panned.scroll.top).toBeGreaterThan(r.before.scroll.top);expect(r.fling).toBe(false);expect(r.pinched.state.zoom).toBeGreaterThan(r.before.state.zoom);expect(r.after.strokes).toEqual(original.strokes);expect(r.after.writes).toBe(original.writes);framed(await call(p,"fit","touch"));}finally{await p.close();}});
-it.each(["thick-dot","negative"])("edge audit: supported stored %s geometry",async kind=>{const p=await mounted();try{const original=await call(p,"setup","geometry",kind);expect(original.strokes).toHaveLength(1);expect(original.strokes[0].points).toHaveLength(1);const fitted=await call(p,"fit","geometry");expect(fitted.strokes).toEqual(original.strokes);expect(fitted.writes).toBe(original.writes);if(kind==="thick-dot"){expect(fitted.result).toBe("fit");framed(fitted);}else{expect(fitted.result).toBe("unrepresentable");expect(fitted.state.zoom).toBe(original.state.zoom);expect(fitted.scroll).toEqual(original.scroll);}}finally{await p.close();}});
+it.each(["thick-dot","negative"])("edge audit: supported stored %s geometry",async kind=>{const p=await mounted();try{const original=await call(p,"setup","geometry",kind);expect(original.strokes).toHaveLength(1);expect(original.strokes[0].points).toHaveLength(1);const fitted=await call(p,"fit","geometry");expect(fitted.strokes).toEqual(original.strokes);expect(fitted.writes).toBe(original.writes);expect(fitted.result).toBe("fit");framed(fitted);}finally{await p.close();}});
 
-it("edge audit: two outliers disjoint on opposite axes contribute nothing to Fit, and paint no visible pixels themselves",async()=>{const p=await mounted();try{
- // The exact receipted configuration: one outlier left-and-below the origin
- // (x<0, y huge positive), one right-and-above (x huge positive, y<0). Each
- // is wholly unreachable on its OWN axis, but its OTHER axis sits well
- // inside reachable range - a union taken before clipping fabricates a huge
- // box neither outlier's reachable extent supports (the bug the combined-
- // bbox clamp got wrong). Per-stroke clipping must make both contribute
- // nothing: same zoom AND same visible painted-pixel count as the body alone.
- const bodyOnly=await call(p,"setup","body-only","reachable-body-only");
- const bodyFit=await call(p,"fitVisible","body-only");expect(bodyFit.result).toBe("fit");framed(bodyFit);
+it("edge audit: Fit includes newly reachable left-margin ink but excludes wholly above-origin ink from its bounds",async()=>{const p=await mounted();try{
+ const leftOnly=await call(p,"setup","left-and-body","reachable-left-with-body");
+ const leftFit=await call(p,"fit","left-and-body");expect(leftFit.result).toBe("fit");framed(leftFit);
  const mixed=await call(p,"setup","disjoint","disjoint");expect(mixed.strokes).toHaveLength(3);
- const mixedFit=await call(p,"fitVisible","disjoint");expect(mixedFit.result).toBe("fit");
+ const mixedFit=await call(p,"fit","disjoint");expect(mixedFit.result).toBe("fit");
  expect(mixedFit.strokes).toEqual(mixed.strokes);expect(mixedFit.writes).toBe(mixed.writes);
- expect(mixedFit.state.zoom).toBe(bodyFit.state.zoom);
- expect(mixedFit.visiblePainted).toBe(bodyFit.visiblePainted);
- expect(mixedFit.visiblePainted).toBe(88); // measured in this harness; an independent harness reported 84 for the equivalent body
- const body=mixedFit.ink.find((s:any)=>s.id==="body")!;
- expect(body.x).toBeGreaterThanOrEqual(mixedFit.viewport.x-.5);expect(body.y).toBeGreaterThanOrEqual(mixedFit.viewport.y-.5);
- expect(body.right).toBeLessThanOrEqual(mixedFit.viewport.x+mixedFit.viewport.width+.5);expect(body.bottom).toBeLessThanOrEqual(mixedFit.viewport.y+mixedFit.viewport.height+.5);
- for(const id of ["outlierLeftBelow","outlierRightAbove"]){
-  const outlier=mixedFit.ink.find((s:any)=>s.id===id)!;
-  const outside=outlier.bottom<mixedFit.viewport.y-.5||outlier.right<mixedFit.viewport.x-.5||outlier.y>mixedFit.viewport.y+mixedFit.viewport.height+.5||outlier.x>mixedFit.viewport.x+mixedFit.viewport.width+.5;
-  expect(outside).toBe(true);
- }
+ expect(mixedFit.state.zoom).toBe(leftFit.state.zoom);
+ framed({...mixedFit,ink:mixedFit.ink.filter((s:any)=>s.id!=="outlierRightAbove")});
+ expect(leftOnly.strokes).toHaveLength(2);
 }finally{await p.close();}});
 it("edge audit: ink wholly above the first line still lets a separate reachable body fit and paint",async()=>{const p=await mounted();try{
- // Unlike "negative" (wholly left of the origin, correctly unrepresentable),
+ // Unlike left-margin ink, now reachable through its layout reserve,
  // this is the shape of Alan's real note: one stroke wholly above the first
  // line, one reachable stroke below it. The reachable one must still produce
  // "fit" and actually paint, not just compute a plausible-looking bbox.
@@ -160,12 +145,11 @@ it("edge audit: no ink resets zoom and scroll to empty's 100%/origin, distinct f
  const emptyFit=await call(p,"fit","none");
  expect(emptyFit.result).toBe("empty");expect(emptyFit.state.zoom).toBe(1);expect(emptyFit.scroll.left).toBe(0);expect(emptyFit.scroll.top).toBe(0);
 }finally{await p.close();}});
-it("edge audit: two outliers disjoint on opposite axes with no body refuse rather than reset to empty",async()=>{const p=await mounted();try{
+it("edge audit: a left-margin outlier can fit without a body while above-origin ink stays excluded",async()=>{const p=await mounted();try{
  const original=await call(p,"setup","unreachable2","wholly-unreachable-multi");expect(original.strokes).toHaveLength(2);
  const fitted=await call(p,"fit","unreachable2");
- expect(fitted.result).toBe("unrepresentable");
+ expect(fitted.result).toBe("fit");
  expect(fitted.strokes).toEqual(original.strokes);
  expect(fitted.writes).toBe(original.writes);
- expect(fitted.state.zoom).toBe(original.state.zoom);
- expect(fitted.scroll).toEqual(original.scroll);
+ framed({...fitted,ink:fitted.ink.filter((s:any)=>s.id==="outlierLeftBelow")});
 }finally{await p.close();}});
